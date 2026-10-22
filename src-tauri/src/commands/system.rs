@@ -1,5 +1,6 @@
 //! Process lifetime and OS-level probes (cursor, selection).
 use crate::{app_state::Managed, error::CommandError};
+use quicker_platform::health::PauseReasons;
 use std::sync::atomic::Ordering;
 use tauri::Manager;
 
@@ -33,7 +34,7 @@ pub fn exit_app(app: tauri::AppHandle) {
     let state = app.state::<Managed>();
     let s = state.lock();
     s.engine.cancel.store(true, Ordering::SeqCst);
-    s.engine.paused.store(true, Ordering::SeqCst);
+    s.runtime.set_pause(PauseReasons::MANUAL, true);
     crate::store::clear_run_marker_on_session_end();
     app.exit(0)
 }

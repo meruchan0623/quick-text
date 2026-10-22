@@ -991,6 +991,14 @@ pub(super) fn rebuild() -> bool {
     // A flag the old thread did not consume must not mark the next close
     // as expected.
     EXPECTED_CLOSE.store(false, Ordering::SeqCst);
+    // The engine began shutting down while the old window closed: no new
+    // detector, nobody would close it. A shutdown that begins between this
+    // check and the spawn can still leave one until the process exits
+    // (residual, 待实测).
+    if shared.shutdown.load(Ordering::SeqCst) {
+        tracing::info!(event = "rawinput.rebuild_skipped", "engine shutting down");
+        return false;
+    }
     match spawn_detector(shared.clone()) {
         Ok(()) => true,
         Err(error) => {

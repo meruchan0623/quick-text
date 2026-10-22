@@ -18,6 +18,7 @@ use std::{
     fs, io,
     ops::RangeInclusive,
     path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard, PoisonError},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -228,13 +229,29 @@ pub fn apply_clipboard_prefs(dir: &Path) {
 ///   original stays where it is.
 ///
 /// Callers that write prefs must load them first and give up on error.
+///
+/// Holds [`PREFS_FILE`] for the whole load, since a load may quarantine.
 pub fn load_prefs(dir: &Path) -> Result<Prefs, CommandError> {
+    load_prefs_then(dir, || {})
+}
+
+/// [`load_prefs`], running `after_read` (under the lock) between reading the
+/// bytes and acting on them: the gap a concurrent writer used to fall into
+/// (tests).
+fn load_prefs_then(dir: &Path, after_read: impl FnOnce()) -> Result<Prefs, CommandError> {
+    let _file = lock_prefs_file();
+    load_unlocked(dir, after_read)
+}
+
+/// The load itself; [`PREFS_FILE`] is held by the caller.
+fn load_unlocked(dir: &Path, after_read: impl FnOnce()) -> Result<Prefs, CommandError> {
     let path = dir.join(FILE);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Prefs::default()),
         Err(e) => return Err(CommandError::io(IoOp::Read, Some(&path), &e)),
     };
+    after_read();
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
     match serde_json::from_slice(bytes) {
         Ok(prefs) => Ok(prefs),
@@ -247,10 +264,55 @@ pub fn load_prefs(dir: &Path) -> Result<Prefs, CommandError> {
 }
 
 /// Writes `prefs.json` atomically (temp file + replace), unknown fields
-/// included.
+/// included. Holds [`PREFS_FILE`].
 pub fn save_prefs(dir: &Path, prefs: &Prefs) -> Result<(), CommandError> {
+    let _file = lock_prefs_file();
+    save_unlocked(dir, prefs)
+}
+
+/// The save itself; [`PREFS_FILE`] is held by the caller.
+fn save_unlocked(dir: &Path, prefs: &Prefs) -> Result<(), CommandError> {
     fs::create_dir_all(dir).map_err(|e| CommandError::io(IoOp::CreateDir, Some(dir), &e))?;
     atomic_json(&dir.join(FILE), prefs)
+}
+
+/// Serialises, within the process, every access to `prefs.json` that may
+/// move or replace it: each load (a damaged file is quarantined, i.e.
+/// renamed), each save and each read-modify-write ([`update_prefs`], held
+/// across the load and the save). So two writers (`set_auto_listen`, the
+/// log level) never lose each other's change, and a reader that saw a
+/// damaged file can never rename the file a writer has just quarantined
+/// and replaced (review A6-3).
+///
+/// Lock order: taken after any lock of the caller's (the store lock in
+/// `load_state`, the log level state), never before; nothing else is taken
+/// while it is held, including in an [`update_prefs`] closure.
+static PREFS_FILE: Mutex<()> = Mutex::new(());
+
+fn lock_prefs_file() -> MutexGuard<'static, ()> {
+    PREFS_FILE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Loads `prefs.json`, applies `change` and saves the result if `change`
+/// returned true; returns that value. Nothing is written when the load
+/// fails (the store rule, see [`load_prefs`]). [`PREFS_FILE`] is held
+/// throughout; `change` must not take any lock.
+pub fn update_prefs(
+    dir: &Path,
+    change: impl FnOnce(&mut Prefs) -> bool,
+) -> Result<bool, CommandError> {
+    let _file = lock_prefs_file();
+    let mut prefs = load_unlocked(dir, || {})?;
+    let changed = change(&mut prefs);
+    if changed {
+        save_unlocked(dir, &prefs)?;
+    }
+    Ok(changed)
+}
+
+/// `app.auto_listen_on_start`; false when prefs cannot be read.
+pub fn auto_listen_on_start(dir: &Path) -> bool {
+    load_prefs(dir).is_ok_and(|prefs| prefs.app.auto_listen_on_start)
 }
 
 /// Moves a damaged file aside, keeping its bytes. Only the error category
@@ -770,6 +832,94 @@ mod tests {
         fs::remove_file(dir.join(FILE)).unwrap();
         apply_clipboard_prefs(&dir);
         assert_eq!(lease_options(), LeaseOptions::default());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `update_prefs` keeps everything it does not change, writes only when
+    /// asked to, and never writes over prefs it could not read.
+    #[test]
+    fn update_prefs_changes_one_field_and_keeps_the_rest() {
+        let dir = temp_dir();
+        assert!(!auto_listen_on_start(&dir), "missing file: off");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(FILE),
+            br#"{"app":{"hotkey":"Ctrl+Q"},"ui":{"theme":"dark"},"future":1}"#,
+        )
+        .unwrap();
+        let changed = update_prefs(&dir, |prefs| {
+            prefs.app.auto_listen_on_start = true;
+            true
+        })
+        .unwrap();
+        assert!(changed);
+        assert!(auto_listen_on_start(&dir));
+        let written: Value = serde_json::from_slice(&fs::read(dir.join(FILE)).unwrap()).unwrap();
+        assert_eq!(written["app"]["auto_listen_on_start"], true);
+        assert_eq!(written["app"]["hotkey"], "Ctrl+Q");
+        assert_eq!(written["ui"], json!({"theme": "dark"}));
+        assert_eq!(written["future"], 1);
+        // No change asked for: the file is not touched.
+        fs::remove_file(dir.join(FILE)).unwrap();
+        assert!(!update_prefs(&dir, |_| false).unwrap());
+        assert!(!dir.join(FILE).exists());
+        // Unreadable: an error, nothing written, and auto-listen reads as off.
+        fs::create_dir_all(dir.join(FILE)).unwrap();
+        assert!(matches!(
+            update_prefs(&dir, |prefs| {
+                prefs.app.auto_listen_on_start = true;
+                true
+            }),
+            Err(CommandError::Io { op: IoOp::Read, .. })
+        ));
+        assert!(dir.join(FILE).is_dir());
+        assert!(!auto_listen_on_start(&dir));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Review A6-3: a load has just read a damaged prefs.json when a writer
+    /// arrives (barrier). The writer waits for the load (one lock), so the
+    /// load quarantines the damaged file, not the one the writer would have
+    /// put in its place: the writer's change ends up in prefs.json and the
+    /// only quarantined copy is the damaged bytes. Without the shared lock
+    /// the writer quarantines and replaces the file in the gap, and the
+    /// load then moves the writer's file aside.
+    #[test]
+    fn a_writer_never_lands_between_a_damaged_read_and_its_quarantine() {
+        use std::sync::{mpsc, Arc, Barrier};
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let damaged = b"{\"app\": {\"auto_listen_on_start\": tr";
+        fs::write(dir.join(FILE), damaged).unwrap();
+        let read = Arc::new(Barrier::new(2));
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer = {
+            let dir = dir.clone();
+            let read = Arc::clone(&read);
+            std::thread::spawn(move || {
+                read.wait();
+                let result = update_prefs(&dir, |prefs| {
+                    prefs.app.auto_listen_on_start = true;
+                    true
+                });
+                let _ = done_tx.send(());
+                result
+            })
+        };
+        let mut writer_ran_in_the_gap = false;
+        let loaded = load_prefs_then(&dir, || {
+            read.wait();
+            // Every chance for the writer to run now; it can only finish
+            // here if it does not wait for this load.
+            writer_ran_in_the_gap = done_rx.recv_timeout(Duration::from_millis(300)).is_ok();
+        });
+        assert_eq!(loaded.unwrap(), Prefs::default());
+        assert!(writer.join().unwrap().unwrap());
+        assert!(!writer_ran_in_the_gap);
+        assert!(auto_listen_on_start(&dir), "the writer's change is kept");
+        let files = quarantined(&dir);
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(fs::read(&files[0]).unwrap(), damaged);
         fs::remove_dir_all(dir).unwrap();
     }
 }

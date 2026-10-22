@@ -12,12 +12,12 @@ use crate::{
     startup::ProblemKind,
 };
 use quicker_domain::*;
-use quicker_platform::{fault::FaultPoint, Shared};
+use quicker_platform::{fault::FaultPoint, runtime::Runtime, Shared};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::atomic::Ordering,
+    sync::{atomic::Ordering, Arc},
 };
 
 impl Store {
@@ -35,13 +35,19 @@ impl Store {
         }
         let meta = MetaHandle::new(&dir, StoreMeta::default(), false);
         let report = load_or_fallback(&dir, env);
+        // Attached before `install`, so safe mode lands in the runtime's
+        // reasons; the engine starts paused (adopted as MANUAL).
+        let engine = Shared::new();
+        let runtime = engine_runtime();
+        runtime.attach(&engine);
         let mut store = Self {
             dir,
             draft: Config::default(),
             active: Config::default(),
             previous: None,
             disk_hash: None,
-            engine: Shared::new(),
+            engine,
+            runtime,
             unresolved: vec![],
             active_unresolved: vec![],
             previous_unresolved: vec![],
@@ -52,6 +58,9 @@ impl Store {
             safe_import: false,
             writable_hooks: vec![],
             writable_done: vec![],
+            problem_sink: None,
+            store_sink: None,
+            manual_changes: Default::default(),
         };
         store.install(report);
         store
@@ -79,15 +88,28 @@ impl Store {
         self.previous = report.previous;
         self.pending_import = None;
         self.load_metadata(safe_mode.is_none());
-        // Problems found outside the load (autostart) survive a reload.
-        let kept: Vec<_> = self
-            .startup_problems
-            .drain(..)
-            .filter(|p| matches!(p.kind, ProblemKind::AutostartRepaired {}))
-            .collect();
+        // Problems found outside the load (autostart, the startup self-test)
+        // survive a reload.
+        let before = std::mem::take(&mut self.startup_problems);
+        // A reload (Locked retry) reports what it found that was not
+        // already listed; at the first load nobody listens yet.
+        for problem in report.problems.iter().filter(|p| !before.contains(p)) {
+            self.report_problem(problem);
+        }
+        let kept = before.into_iter().filter(|p| {
+            matches!(
+                p.kind,
+                ProblemKind::AutostartRepaired {}
+                    | ProblemKind::SelfTestFailed { .. }
+                    | ProblemKind::LogLevelElevated { .. }
+            )
+        });
         self.startup_problems = report.problems;
         self.startup_problems.extend(kept);
         self.set_safe_mode(safe_mode);
+        // The new revision and the safe mode it left (or entered) together,
+        // in one report, under the lock the caller holds.
+        self.report_store_state();
     }
     /// Migration metadata of the draft, active and previous configurations.
     /// Outside safe mode the active one is also snapshotted.
@@ -135,6 +157,19 @@ impl Store {
         self.unresolved = unresolved;
         self.active_unresolved = active_unresolved;
         self.previous_unresolved = previous_unresolved;
+    }
+}
+/// The runtime a new store's engine reports to: the process-wide one in the
+/// app (the supervisor, the EventBus and the commands use it too). Each
+/// unit-test store gets its own, so parallel tests never share pause
+/// reasons or health.
+fn engine_runtime() -> Arc<Runtime> {
+    if cfg!(test) {
+        Arc::new(Runtime::new(Arc::new(
+            quicker_platform::traits::SystemClock,
+        )))
+    } else {
+        quicker_platform::runtime::current()
     }
 }
 /// `config_corrupt` fault: damages `active.json` before the load, as an

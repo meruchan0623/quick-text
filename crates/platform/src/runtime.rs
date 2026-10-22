@@ -164,17 +164,25 @@ struct PauseState {
     /// The value this runtime last wrote to `Shared::paused` (`None` until a
     /// `Shared` is attached).
     written: Option<bool>,
+    /// Whether the stored health accepts resume (Healthy/Degraded). Kept
+    /// here, under `pause`, because `sync_legacy` runs with only `pause`
+    /// held; `store_health` updates it together with the snapshot. False
+    /// until the first Healthy/Degraded publish (the default is Starting).
+    engine_up: bool,
 }
 
 /// Lock order, for every path that holds more than one of these at a time:
 /// the outbox's `latest` → `health` → `pause`. `events` is never held
 /// together with any of them, and the event thread takes only `latest`,
 /// just long enough to copy it. `process` is only taken with at most
-/// `latest` held, and `history` alone. Listeners run on the event thread
+/// `latest` held. `history` is taken alone, except in
+/// [`Runtime::record`]: `events` → `history`, then `events` → `listeners`
+/// (read), so the seq order is the queue order (review A8); nothing takes
+/// `events` while holding `history` or `listeners`. Listeners run on the event thread
 /// with none of these held; the process probe never runs with `health` or
 /// `pause` held. Each subscription's `delivered` is taken only by the event
-/// thread, with none of these held. `failed_latch` is written only with
-/// `latest` held, and publishers read it under `latest`.
+/// thread, with none of these held. `failed_latch` and `shutdown_mark` are
+/// written only with `latest` held, and publishers read them under `latest`.
 pub struct Runtime {
     clock: Arc<dyn Clock>,
     history: History,
@@ -187,6 +195,11 @@ pub struct Runtime {
     health: Mutex<HealthSnapshot>,
     /// Failed until repair (see [`Runtime::latch_failed`]).
     failed_latch: AtomicBool,
+    /// Set when the engine shutdown begins ([`Runtime::mark_shutdown`]);
+    /// never cleared.
+    shutdown_mark: AtomicBool,
+    /// Whether a Failed dropped after `shutdown_mark` was logged (once).
+    shutdown_drop_logged: AtomicBool,
     pause: Mutex<PauseState>,
     shared: ArcSwapOption<Shared>,
     process: RwLock<Option<ProcessProbe>>,
@@ -203,6 +216,8 @@ impl Runtime {
             events: Mutex::new(None),
             health: Mutex::new(HealthSnapshot::default()),
             failed_latch: AtomicBool::new(false),
+            shutdown_mark: AtomicBool::new(false),
+            shutdown_drop_logged: AtomicBool::new(false),
             pause: Mutex::new(PauseState::default()),
             shared: ArcSwapOption::empty(),
             process: RwLock::new(None),
@@ -213,9 +228,10 @@ impl Runtime {
         &self.clock
     }
 
-    /// Connects the engine's `Shared` state. The legacy `Shared::paused` flag
-    /// becomes a mirror of "any pause reason is set"; its current value is
-    /// adopted as the MANUAL reason (the engine starts paused).
+    /// Connects the engine's `Shared` state. `Shared::paused` becomes the
+    /// derived "not listening" flag (see [`Runtime::sync_legacy`]); its
+    /// current value is adopted as the MANUAL reason (the engine starts
+    /// paused).
     pub fn attach(&self, shared: &Arc<Shared>) {
         self.shared.store(Some(Arc::clone(shared)));
         {
@@ -296,11 +312,16 @@ impl Runtime {
     /// Wakes the event thread without blocking, first queueing `execution`
     /// if given; starts the thread on first use (or after it exited). Never
     /// called with `latest`, `health` or `pause` held.
-    fn post(&self, mut execution: Option<HistoryEntry>) {
+    fn post(&self, execution: Option<HistoryEntry>) {
         if self.listeners.read().is_empty() {
             return;
         }
-        let mut thread = self.events.lock();
+        self.post_locked(&mut self.events.lock(), execution);
+    }
+
+    /// [`Runtime::post`] with `events` already held (as `thread`) and the
+    /// listener check done by the caller.
+    fn post_locked(&self, thread: &mut Option<EventThread>, mut execution: Option<HistoryEntry>) {
         if let Some(running) = thread.as_ref() {
             if running.post(&mut execution, &self.outbox.dropped) {
                 return;
@@ -379,9 +400,16 @@ impl Runtime {
     /// While Failed is latched (`latch_failed`, set by the supervisor's
     /// watchdog until a repair) a snapshot that is not Failed is rejected:
     /// the current one stays, ENGINE_DOWN too.
+    ///
+    /// Once the shutdown is marked (`Runtime::mark_shutdown`) a Failed
+    /// snapshot is dropped the same way; other states are still taken.
     pub fn publish_health(&self, snapshot: HealthSnapshot) {
         let changed = {
             let mut latest = self.outbox.latest.lock();
+            if snapshot.state == HealthState::Failed && self.shutdown_mark.load(Ordering::SeqCst) {
+                self.log_failed_dropped("publish");
+                return;
+            }
             if snapshot.state != HealthState::Failed && self.failed_latch.load(Ordering::SeqCst) {
                 tracing::debug!(
                     event = "runtime.health_rejected",
@@ -402,9 +430,16 @@ impl Runtime {
     /// is set and the current snapshot is published as Failed, with
     /// ENGINE_DOWN. Until then [`Runtime::publish_health`] rejects any other
     /// state, so a publisher that raced with this cannot clear it.
+    ///
+    /// Once the shutdown is marked ([`Runtime::mark_shutdown`]) it does
+    /// nothing: no latch, no Failed.
     pub(crate) fn latch_failed(&self, reason: &'static str) {
         let changed = {
             let mut latest = self.outbox.latest.lock();
+            if self.shutdown_mark.load(Ordering::SeqCst) {
+                self.log_failed_dropped(reason);
+                return;
+            }
             if !self.failed_latch.swap(true, Ordering::SeqCst) {
                 tracing::error!(
                     event = "runtime.failed_latched",
@@ -434,6 +469,50 @@ impl Runtime {
         self.failed_latch.load(Ordering::SeqCst)
     }
 
+    /// Marks the engine shutdown at the publish boundary (review R1): from
+    /// now on a Failed snapshot ([`Runtime::publish_health`]) and
+    /// [`Runtime::latch_failed`] are dropped. `begin_shutdown` calls it
+    /// before it sets `Shared::shutdown`, so the mark is where the shutdown
+    /// begins for every publisher: each one checks it under `latest`, the
+    /// lock it publishes under, so a publish either completes entirely
+    /// before the mark (the shutdown had not begun) or sees it and drops
+    /// its Failed. Nothing published after the shutdown began is Failed.
+    ///
+    /// The supervisor's own `shutting_down()` checks stay early exits, but
+    /// they cannot order a decision against the shutdown: `begin_shutdown`
+    /// does not take the machine lock (a stuck tick may hold it). A commit
+    /// that read `false` just before may still count one more failure, even
+    /// the one that opens its circuit, after the mark. That is accepted:
+    /// its Failed is never published, and the machine is not consulted
+    /// again before the process exits.
+    ///
+    /// Other states are still taken: they are not latched, raise no Failed
+    /// notice or incident, and the shutdown path may still publish a final
+    /// state (it publishes none today).
+    ///
+    /// Takes only `latest`, briefly: its holders take nothing but `health`,
+    /// `pause` and the process probe under it, never the supervisor's
+    /// machine lock (the supervisor takes `latest` inside it, not the other
+    /// way round), so the caller (the Tauri main thread, the session window)
+    /// cannot be blocked by a stuck tick. Idempotent; never cleared (the
+    /// process exits).
+    pub(crate) fn mark_shutdown(&self) {
+        let _latest = self.outbox.latest.lock();
+        self.shutdown_mark.store(true, Ordering::SeqCst);
+    }
+
+    /// Logs the first Failed dropped after [`Runtime::mark_shutdown`];
+    /// `latest` is held by the caller.
+    fn log_failed_dropped(&self, source: &'static str) {
+        if !self.shutdown_drop_logged.swap(true, Ordering::SeqCst) {
+            tracing::info!(
+                event = "runtime.failed_dropped_on_shutdown",
+                source,
+                "engine shutting down; Failed not published"
+            );
+        }
+    }
+
     /// Stores `snapshot` with ENGINE_DOWN following its state (set in
     /// Recovering/Failed, cleared otherwise) and the derived State; `latest`
     /// is held by the caller. Returns whether Health or State changed.
@@ -451,6 +530,7 @@ impl Runtime {
             } else {
                 pause.reasons.without(PauseReasons::ENGINE_DOWN)
             };
+            pause.engine_up = snapshot.state.accepts_resume();
             self.sync_legacy(&mut pause);
             health.clone_from(&snapshot);
             (health.state, pause.reasons)
@@ -491,18 +571,22 @@ impl Runtime {
         pause.reasons
     }
 
-    /// Two-way bridge to the legacy `Shared::paused` flag, which detection
-    /// and `guarded_context` still read and older callers (main.rs
-    /// `set_paused`/publish, `start_recording`, the RawInput loop) still
-    /// write. A value that differs from what this runtime last wrote came
-    /// from such a writer and is adopted as MANUAL on/off; then the flag is
-    /// set to "any reason present". The compare-exchange retries if a legacy
-    /// writer races the update.
+    /// The one place `Shared::paused` is derived (P5 item 2). The pause
+    /// reasons here are the authority; the flag, which the detection and
+    /// execution gates read (Windows: rawinput, hook, actions, input), is
+    /// set to "not listening": any reason present, or a health that does not
+    /// accept resume (Starting/Recovering/Failed). So no automatic expansion
+    /// runs while the engine is not up, without a user-visible reason for
+    /// Starting (the Health row expresses it, contract §3).
     ///
-    /// A legacy write of the value the flag already holds is invisible (for
-    /// example a legacy pause while ENGINE_DOWN already holds the flag), and
-    /// main.rs `publish` restores its saved value afterwards; both are
-    /// reasons for callers to move to [`Runtime::set_pause`].
+    /// The src-tauri shell no longer writes the flag. The remaining writers
+    /// are platform code paths that stop detection on their own (Windows
+    /// hook installation failure, the macOS event tap) and tests: a value
+    /// that differs from what this runtime last wrote is adopted as MANUAL
+    /// on/off, then the flag is re-derived. The compare-exchange retries if
+    /// such a writer races the update. A write of the value the flag
+    /// already holds is invisible (for example a pause while ENGINE_DOWN or
+    /// Starting already holds the flag).
     fn sync_legacy(&self, pause: &mut PauseState) {
         let Some(shared) = self.shared.load_full() else {
             return;
@@ -516,7 +600,7 @@ impl Runtime {
                     pause.reasons.without(PauseReasons::MANUAL)
                 };
             }
-            let want = !pause.reasons.is_empty();
+            let want = !pause.reasons.is_empty() || !pause.engine_up;
             if shared
                 .paused
                 .compare_exchange(current, want, Ordering::SeqCst, Ordering::SeqCst)
@@ -586,11 +670,20 @@ impl Runtime {
     // ---- history ------------------------------------------------------
 
     /// Appends one execution to the history and emits `Execution`.
+    ///
+    /// Review A8: the seq is assigned and the entry queued under one lock
+    /// (`events`), so concurrent records reach the event thread, and every
+    /// subscriber, in seq order. Queueing never blocks (a bounded
+    /// `try_send`, see [`EventThread::post`]); the history ring and the
+    /// listener list are taken briefly inside it.
     pub fn record(&self, record: Record) -> HistoryEntry {
+        let mut thread = self.events.lock();
         let entry = self
             .history
             .push(record, self.clock.now(), self.clock.wall_ms());
-        self.post(Some(entry.clone()));
+        if !self.listeners.read().is_empty() {
+            self.post_locked(&mut thread, Some(entry.clone()));
+        }
         entry
     }
 
@@ -837,6 +930,49 @@ mod tests {
         assert_eq!(runtime.pause_reasons(), PauseReasons::MANUAL);
     }
 
+    /// R1: once the shutdown is marked, a Failed snapshot and `latch_failed`
+    /// are dropped inside the critical section that would have stored
+    /// them: health, pause reasons and the latest version (what the event
+    /// thread delivers, so no event) stay as they were, and nothing is
+    /// latched. Other states are still taken. Unmarked, the same calls go
+    /// through.
+    #[test]
+    fn failed_is_dropped_once_the_shutdown_is_marked() {
+        for marked in [false, true] {
+            let (runtime, _) = runtime();
+            runtime.publish_health(numbered(HealthState::Recovering, 1));
+            runtime.set_pause(PauseReasons::MANUAL, true);
+            if marked {
+                runtime.mark_shutdown();
+            }
+            let before = runtime.health();
+            let reasons = runtime.pause_reasons();
+            let version = runtime.outbox.latest.lock().version;
+
+            runtime.publish_health(numbered(HealthState::Failed, 2));
+            if marked {
+                assert_eq!(runtime.health(), before, "publish dropped");
+                assert_eq!(runtime.outbox.latest.lock().version, version);
+            } else {
+                assert_eq!(runtime.health(), numbered(HealthState::Failed, 2));
+                runtime.publish_health(before.clone());
+            }
+            runtime.latch_failed("test");
+            assert_eq!(runtime.failed_latched(), !marked, "marked {marked}");
+            if !marked {
+                assert_eq!(runtime.health().state, HealthState::Failed);
+                continue;
+            }
+            assert_eq!(runtime.health(), before, "latch dropped");
+            assert_eq!(runtime.pause_reasons(), reasons);
+            assert_eq!(runtime.outbox.latest.lock().version, version, "no event");
+
+            runtime.publish_health(numbered(HealthState::Healthy, 3));
+            assert_eq!(runtime.health(), numbered(HealthState::Healthy, 3));
+            assert_eq!(runtime.pause_reasons(), PauseReasons::MANUAL);
+        }
+    }
+
     /// Two publishers alternate Recovering/Healthy while a reader samples
     /// health and pause together: ENGINE_DOWN always matches the stored
     /// health (during and after), and MANUAL never moves.
@@ -969,6 +1105,59 @@ mod tests {
         assert_eq!(state.paused_reasons, PauseReasons::empty());
     }
 
+    /// P5 item 2: the flag the gates read is exactly "not listening". A
+    /// health that does not accept resume holds it without adding a pause
+    /// reason, so Starting stays off the user-visible "paused" row.
+    #[test]
+    fn the_legacy_flag_is_not_listening_and_starting_holds_it_without_a_reason() {
+        let (runtime, _) = runtime();
+        let shared = Shared::new();
+        runtime.attach(&shared);
+        runtime.set_pause(PauseReasons::MANUAL, false);
+        let flag = || shared.paused.load(Ordering::SeqCst);
+        assert_eq!(runtime.pause_reasons(), PauseReasons::empty());
+        assert!(flag(), "Starting: no expansion before the engine is up");
+        assert_eq!(runtime.status_text(), StatusText::Starting);
+        for (state, listening) in [
+            (HealthState::Healthy, true),
+            (HealthState::Degraded, true),
+            (HealthState::Recovering, false),
+            (HealthState::Starting, false),
+            (HealthState::Healthy, true),
+            (HealthState::Failed, false),
+        ] {
+            runtime.publish_health(snapshot(state));
+            let engine = runtime.engine_state();
+            assert_eq!(engine.listening, listening, "{state:?}");
+            assert_eq!(flag(), !listening, "{state:?}");
+            assert!(
+                !engine.paused_reasons.intersects(PauseReasons::USER_VISIBLE),
+                "{state:?}"
+            );
+        }
+        // A resume written to the flag while Failed is overruled (and, being
+        // a resume, adds no reason), so the engine listens again only when
+        // the health comes back.
+        shared.paused.store(false, Ordering::SeqCst);
+        assert!(runtime.pause_reasons().contains(PauseReasons::ENGINE_DOWN));
+        assert!(flag(), "Failed re-asserts the flag");
+        runtime.publish_health(snapshot(HealthState::Healthy));
+        assert!(!flag());
+        assert!(runtime.engine_state().listening);
+        // Each reason alone holds it while healthy.
+        for reason in [
+            PauseReasons::MANUAL,
+            PauseReasons::RECORDING,
+            PauseReasons::SAFE_MODE,
+            PauseReasons::SELF_TEST,
+        ] {
+            runtime.set_pause(reason, true);
+            assert!(flag(), "{reason:?}");
+            runtime.set_pause(reason, false);
+            assert!(!flag(), "{reason:?}");
+        }
+    }
+
     #[test]
     fn events_are_delivered_once_per_change() {
         let (runtime, _) = runtime();
@@ -1060,6 +1249,45 @@ mod tests {
         wait_until("execution event", || !entries(&events.lock()).is_empty());
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(entries(&events.lock()), [entry]);
+    }
+
+    /// Review A8: records from several threads at once reach a subscriber
+    /// (the EventBus is one) in seq order, each once: the seq is assigned
+    /// and the entry queued under one lock. Before, two records could be
+    /// queued in the opposite order to their seqs.
+    #[test]
+    fn concurrent_records_reach_subscribers_in_seq_order() {
+        const THREADS: usize = 8;
+        // 800 in all, below the queue capacity even if nothing drained.
+        const EACH: usize = 100;
+        let (runtime, _) = runtime();
+        let events = collect(&runtime);
+        let start = Arc::new(std::sync::Barrier::new(THREADS));
+        let workers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let runtime = Arc::clone(&runtime);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    for _ in 0..EACH {
+                        runtime.record(execution("a"));
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let total = THREADS * EACH;
+        wait_until("every execution", || entries(&events.lock()).len() == total);
+        let seqs: Vec<u64> = entries(&events.lock()).iter().map(|e| e.seq).collect();
+        let out_of_order = seqs.windows(2).find(|pair| pair[0] >= pair[1]);
+        assert_eq!(
+            out_of_order, None,
+            "seqs reached the subscriber out of order"
+        );
+        assert_eq!(seqs.first(), Some(&1));
+        assert_eq!(seqs.last(), Some(&(total as u64)));
     }
 
     /// A unique snapshot per `n` (carried in `since_ms`), so the order in

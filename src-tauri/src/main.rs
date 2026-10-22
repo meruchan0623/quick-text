@@ -11,7 +11,6 @@ mod store;
 mod tray;
 
 use app_state::{DataDir, Managed};
-use quicker_platform::ExecutionResult;
 use std::{path::PathBuf, sync::Arc};
 use tauri::Manager;
 
@@ -61,19 +60,37 @@ fn main() {
             store::prefs::apply_clipboard_prefs(&dir);
             let store = store::Store::load(dir);
             let engine = store.engine.clone();
+            let runtime = store.runtime.clone();
             app.manage(Managed::new(store));
+            // The tray and the EventBus come before anything that can
+            // change the engine or find a problem, so the frontend and the
+            // tray miss nothing after the state `load_state` reads.
+            let pause_item = tray::build(app)?;
+            let status = tray::TrayStatus::new(app.handle().clone(), pause_item, engine.clone());
+            let bus = {
+                let managed = app.state::<Managed>();
+                let mut store = managed.lock();
+                let bus = events::EventBus::start(
+                    &runtime,
+                    store.store_state(),
+                    app.handle().clone(),
+                    Box::new(status),
+                );
+                store.set_problem_sink(bus.problem_sink());
+                // Review A9: writes the revision and safe mode into the
+                // bus's view as the baseline, here, under this store lock
+                // (nothing sent, nothing waited for); every later change
+                // is a `store-state` above it. Commands reach the bus only
+                // after `manage` below.
+                store.set_store_sink(bus.store_sink());
+                bus
+            };
+            app.manage(bus);
             startup::after_load(app.handle());
-            tray::spawn_status_watcher(app.handle().clone(), engine.clone());
-            if let Err(message) = quicker_platform::start_engine(engine.clone()) {
-                *engine.last.lock().unwrap() = Some(ExecutionResult {
-                    id: "engine".into(),
-                    status: "blocked".into(),
-                    message,
-                    completed_steps: 0,
-                    side_effects: false,
-                });
-            }
-            tray::build(app)?;
+            startup::start_engine(engine, runtime);
+            // B-10: waits for Healthy, runs the self-test, then listens or
+            // stays paused and says why.
+            startup::spawn_self_test(app.handle().clone());
             if std::env::args().any(|x| x == "--background") {
                 if let Some(w) = app.get_webview_window("main") {
                     w.hide()?;
@@ -106,6 +123,7 @@ fn main() {
             commands::runtime::start_recording,
             commands::runtime::stop_recording,
             commands::settings::set_autostart,
+            commands::settings::set_auto_listen,
             commands::rules::preview_file,
             commands::rules::preview_image,
             commands::system::get_cursor,
@@ -117,7 +135,17 @@ fn main() {
             commands::diagnostics::open_data_dir,
             commands::diagnostics::log_frontend_error,
             commands::diagnostics::report_metric,
-            commands::runtime::startup_problems
+            commands::runtime::startup_problems,
+            commands::engine::get_runtime_snapshot,
+            commands::engine::get_health,
+            commands::engine::repair_engine,
+            commands::engine::get_capabilities,
+            commands::engine::list_history,
+            commands::engine::clear_history,
+            commands::engine::explain_last_miss,
+            commands::engine::self_test,
+            #[cfg(feature = "fault-injection")]
+            commands::engine::debug_inject_fault
         ])
         .build(tauri::generate_context!())
         .expect("Quicker Text startup failed")

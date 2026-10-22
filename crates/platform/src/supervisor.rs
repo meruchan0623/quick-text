@@ -43,6 +43,16 @@
 //! `probe`, `input_health` and `enforce_budget` must not block (see the
 //! trait docs). A tick handles the repair request and the deadlines before
 //! calling them, and `repair()` calls no adapter at all.
+//!
+//! Once the runtime is shutting down the machine decides nothing more: a
+//! tick applies no deadline (no hung attempt) and advances nothing, and an
+//! attempt that returns is discarded before any timeout accounting. So the
+//! engine's teardown never counts as a failure and Health keeps the last
+//! value published before the shutdown (never Failed because of the exit).
+//! These checks are early exits: the flag is not set under the machine
+//! lock, so a commit that read it just before the shutdown may still count
+//! a failure after it. The runtime's shutdown mark, set before the flag,
+//! drops the Failed such a commit publishes (`Runtime::mark_shutdown`).
 use crate::health::{Component, ComponentHealth, HealthSnapshot, HealthState, ReasonCode};
 use crate::runtime::Runtime;
 use crate::traits::Clock;
@@ -382,6 +392,11 @@ impl Supervisor {
         let Some(mut machine) = self.lock_for_tick() else {
             return;
         };
+        if self.runtime.shutting_down() {
+            // The shutdown began while this tick observed: what it saw may
+            // be the teardown, so nothing is decided or published.
+            return;
+        }
         let now = self.clock.now();
         let observed = match observed {
             Ok(observed) => observed,
@@ -430,11 +445,15 @@ impl Supervisor {
     /// (which ends that latch) and applies the deadlines (an attempt hung past
     /// ATTEMPT_TIMEOUT, a verification window that ran out). A change is
     /// published at once with the latest observation. False when the
-    /// machine stayed busy (the tick is skipped).
+    /// machine stayed busy or the runtime is shutting down (the tick is
+    /// skipped: an attempt still running then is not judged hung).
     fn handle_deadlines(&self) -> bool {
         let Some(mut machine) = self.lock_for_tick() else {
             return false;
         };
+        if self.runtime.shutting_down() {
+            return false;
+        }
         let now = self.clock.now();
         let reconciled = self.reconcile(&mut machine);
         let armed = self.take_repair(&mut machine, now);
@@ -570,6 +589,11 @@ impl Supervisor {
     /// noticed it while it ran, so it counts as one failure and whatever it
     /// returned (success included) is discarded. A repair requested while
     /// it ran is armed now, and the driver woken to run it.
+    ///
+    /// An attempt that returns once the runtime is shutting down only leaves
+    /// flight: its result is discarded before the timeout check (the
+    /// teardown may be what failed or slowed it), nothing is counted and
+    /// nothing is published.
     fn commit(&self, id: u64, outcome: Result<Observed, String>) {
         let mut machine = self.machine.lock();
         // The attempt can block for seconds (sequential reattach): backoff
@@ -588,6 +612,15 @@ impl Supervisor {
         beat.progress = now;
         drop(beat);
         machine.in_flight = None;
+        if self.runtime.shutting_down() {
+            tracing::info!(
+                event = "supervisor.attempt_discarded",
+                attempt = id,
+                shutdown = true,
+                "engine shutting down; result not counted"
+            );
+            return;
+        }
         if attempt.superseded || attempt.hung {
             tracing::warn!(
                 event = "supervisor.attempt_discarded",
@@ -1021,6 +1054,12 @@ impl Supervisor {
             }
             None => self.runtime.latch_failed("driver_hung"),
         }
+    }
+
+    /// Failed attempts counted in the circuit window (tests).
+    #[cfg(test)]
+    pub(crate) fn failure_count(&self) -> usize {
+        self.machine.lock().failures.len()
     }
 }
 

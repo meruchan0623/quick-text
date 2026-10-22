@@ -7,10 +7,12 @@
 //!
 //! Prefs follow the store rule (Codex review): they are only written after
 //! a successful `load_prefs`, so a file that could not be read or moved
-//! aside is never replaced.
+//! aside is never replaced. Every write goes through `update_prefs`, so it
+//! cannot lose a concurrent `set_auto_listen` (lock order: the level state,
+//! then the prefs write lock).
 use crate::{
     error::CommandError,
-    store::prefs::{load_prefs, save_prefs, LogLevelOverride},
+    store::prefs::{update_prefs, LogLevelOverride},
 };
 use parking_lot::{Condvar, Mutex};
 use quicker_domain::{Diagnostic, SourceSpan};
@@ -164,6 +166,8 @@ struct Inner {
 pub struct LogLevelControl {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
+    /// The override restored from prefs at start, if any.
+    restored: Option<LevelState>,
 }
 
 impl LogLevelControl {
@@ -180,7 +184,7 @@ impl LogLevelControl {
             }),
             wake: Condvar::new(),
         });
-        shared.restore();
+        let restored = shared.restore();
         let worker = shared.clone();
         let thread = std::thread::Builder::new()
             .name("quicker-log-level".into())
@@ -193,11 +197,21 @@ impl LogLevelControl {
                 )
             })
             .ok();
-        Self { shared, thread }
+        Self {
+            shared,
+            thread,
+            restored,
+        }
     }
 
     pub fn current(&self) -> LevelState {
         self.shared.state.lock().current
+    }
+
+    /// The temporary level restored from prefs at start (still in effect
+    /// then), for the `log_level_elevated` startup problem.
+    pub fn restored(&self) -> Option<LevelState> {
+        self.restored
     }
 
     /// `set_log_level`: persist first, then apply. Nothing changes if prefs
@@ -218,62 +232,69 @@ impl Drop for LogLevelControl {
 }
 
 impl Shared {
-    fn restore(&self) {
+    /// Applies the override saved in prefs while it is still in effect and
+    /// returns it (the caller reports `log_level_elevated`); clears an
+    /// expired one.
+    fn restore(&self) -> Option<LevelState> {
         let now = self.clock.wall_ms();
-        let mut prefs = match load_prefs(&self.dir) {
-            Ok(prefs) => prefs,
-            Err(e) => {
-                tracing::warn!(
-                    event = "log.level_restore_failed",
-                    error = %e,
-                    "prefs unavailable; using the default log level"
-                );
-                return;
+        let mut decision = Restore::Default;
+        let result = update_prefs(&self.dir, |prefs| {
+            decision = restore_decision(prefs.app.log_level.as_ref(), now);
+            let expired = decision == Restore::Expired;
+            if expired {
+                prefs.app.log_level = None;
             }
-        };
-        match restore_decision(prefs.app.log_level.as_ref(), now) {
-            Restore::Default => {}
-            Restore::Keep(state) => {
+            expired
+        });
+        match (decision, result) {
+            (Restore::Keep(state), _) => {
                 (self.apply)(state.level.filter());
                 self.state.lock().current = state;
-                // TODO(P3): report startup-problem `log_level_elevated { level, until_ms }`
-                // once the startup problem registry exists.
                 tracing::info!(
                     event = "log.level_restored",
                     level = state.level.as_str(),
                     until_ms = state.until_ms,
                     "temporary log level restored"
                 );
+                Some(state)
             }
-            Restore::Expired => {
-                prefs.app.log_level = None;
-                // Loaded successfully above, so writing back is safe.
-                let saved = save_prefs(&self.dir, &prefs);
+            (Restore::Expired, saved) => {
                 tracing::info!(
                     event = "log.level_expired",
                     persisted = saved.is_ok(),
                     "temporary log level expired while the app was not running"
                 );
+                None
             }
+            (Restore::Default, Err(e)) => {
+                tracing::warn!(
+                    event = "log.level_restore_failed",
+                    error = %e,
+                    "prefs unavailable; using the default log level"
+                );
+                None
+            }
+            (Restore::Default, Ok(_)) => None,
         }
     }
 
     fn set(&self, level: LogLevel, ttl_hours: Option<f64>) -> Result<LevelState, CommandError> {
         let target = resolve(level, ttl_hours, self.clock.wall_ms())?;
         let mut state = self.state.lock();
-        let mut prefs = load_prefs(&self.dir)?;
-        let extra = prefs
-            .app
-            .log_level
-            .take()
-            .map(|saved| saved.extra)
-            .unwrap_or_default();
-        prefs.app.log_level = target.until_ms.map(|until_ms| LogLevelOverride {
-            level: target.level.as_str().into(),
-            until_ms,
-            extra,
-        });
-        save_prefs(&self.dir, &prefs)?;
+        update_prefs(&self.dir, |prefs| {
+            let extra = prefs
+                .app
+                .log_level
+                .take()
+                .map(|saved| saved.extra)
+                .unwrap_or_default();
+            prefs.app.log_level = target.until_ms.map(|until_ms| LogLevelOverride {
+                level: target.level.as_str().into(),
+                until_ms,
+                extra,
+            });
+            true
+        })?;
         (self.apply)(target.level.filter());
         state.current = target;
         self.wake.notify_all();
@@ -297,7 +318,7 @@ impl Shared {
         }
         (self.apply)(LogLevel::Info.filter());
         state.current = LevelState::default();
-        let persisted = load_prefs(&self.dir).and_then(|mut prefs| {
+        let persisted = update_prefs(&self.dir, |prefs| {
             let due = prefs
                 .app
                 .log_level
@@ -305,9 +326,8 @@ impl Shared {
                 .is_some_and(|saved| saved.until_ms <= now);
             if due {
                 prefs.app.log_level = None;
-                save_prefs(&self.dir, &prefs)?;
             }
-            Ok(())
+            due
         });
         tracing::info!(
             event = "log.level_expired",
@@ -586,6 +606,50 @@ mod tests {
         assert!(control.expire_if_due());
         assert_eq!(*applied.lock(), [LevelFilter::DEBUG, LevelFilter::INFO]);
         assert!(dir.join("prefs.json").is_dir());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// What startup reports as `log_level_elevated`: only an override that
+    /// is still in effect.
+    #[test]
+    fn restore_returns_only_an_override_still_in_effect() {
+        let dir = temp_dir();
+        let clock = Arc::new(FakeClock(AtomicI64::new(T0)));
+        let (control, _) = manual(&dir, clock.clone());
+        assert_eq!(control.restore(), None);
+        control.set(LogLevel::Debug, Some(1.0)).unwrap();
+        assert_eq!(
+            control.restore(),
+            Some(LevelState {
+                level: LogLevel::Debug,
+                until_ms: Some(T0 + HOUR)
+            })
+        );
+        clock.advance(HOUR);
+        assert_eq!(control.restore(), None, "expired");
+        assert_eq!(prefs_json(&dir)["app"]["log_level"], Value::Null);
+        fs::remove_dir_all(dir).unwrap();
+
+        // `LogLevelControl` keeps what it restored at start.
+        let dir = temp_dir();
+        fs::write(
+            dir.join("prefs.json"),
+            br#"{"app":{"log_level":{"level":"trace","until_ms":4102444800000}}}"#,
+        )
+        .unwrap();
+        let control = LogLevelControl::start(
+            dir.clone(),
+            Arc::new(quicker_platform::traits::SystemClock),
+            Arc::new(|_| {}),
+        );
+        assert_eq!(
+            control.restored(),
+            Some(LevelState {
+                level: LogLevel::Trace,
+                until_ms: Some(4_102_444_800_000)
+            })
+        );
+        drop(control);
         fs::remove_dir_all(dir).unwrap();
     }
 

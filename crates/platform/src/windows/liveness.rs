@@ -203,6 +203,17 @@ impl CrossCheck {
         }
         None
     }
+    /// Whether `source` missed at least one key the other source saw (its
+    /// sighting expired unmatched) since the two last agreed on a key: the
+    /// evidence of a delivery gap, before it is enough for a verdict
+    /// (review A5). A key still inside [`MATCH_WINDOW`] is not a miss yet.
+    /// A verdict starts the count again, as does [`CrossCheck::forget`].
+    pub(super) fn missed(&self, source: Source) -> bool {
+        match source {
+            Source::Hook => self.hook.misses > 0,
+            Source::Raw => self.raw.misses > 0,
+        }
+    }
     /// When the oldest pending sighting expires, if any.
     pub(super) fn next_due(&self) -> Option<Instant> {
         [&self.hook, &self.raw]
@@ -453,6 +464,35 @@ mod tests {
         assert!(check.saw(Source::Hook, C, now));
         let end = one_sided(&mut check, Source::Raw, now, MISS_LIMIT as u16 - 1, ms(10));
         assert_eq!(check.expire(end + MATCH_WINDOW), None, "count restarted");
+    }
+
+    /// Review A5: `missed` reports a gap from the first expired key, long
+    /// before a verdict; an agreed key, a verdict or `forget` clear it.
+    #[test]
+    fn missed_reports_a_gap_from_the_first_expired_key() {
+        let mut check = CrossCheck::default();
+        let t = Instant::now();
+        assert!(!check.missed(Source::Hook) && !check.missed(Source::Raw));
+        let end = one_sided(&mut check, Source::Raw, t, 1, ms(10));
+        assert_eq!(check.expire(end), None);
+        assert!(!check.missed(Source::Hook), "still inside the window");
+        assert_eq!(check.expire(t + MATCH_WINDOW), None, "no verdict at one");
+        assert!(check.missed(Source::Hook) && !check.missed(Source::Raw));
+        // An agreed key clears it.
+        let now = t + MATCH_WINDOW;
+        assert!(!check.saw(Source::Raw, C, now));
+        assert!(check.saw(Source::Hook, C, now));
+        assert!(!check.missed(Source::Hook));
+        // So does forget (a reattach).
+        let end = one_sided(&mut check, Source::Hook, now, 1, ms(10));
+        assert_eq!(check.expire(end + MATCH_WINDOW), None);
+        assert!(check.missed(Source::Raw));
+        check.forget();
+        assert!(!check.missed(Source::Raw));
+        // And a verdict starts the count again.
+        let end = one_sided(&mut check, Source::Raw, end, MISS_LIMIT as u16, ms(10));
+        assert_eq!(check.expire(end + MATCH_WINDOW), Some(Verdict::HookLost));
+        assert!(!check.missed(Source::Hook));
     }
 
     #[test]

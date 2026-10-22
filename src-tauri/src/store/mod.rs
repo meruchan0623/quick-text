@@ -18,17 +18,21 @@ pub use metadata::merge_import_metadata;
 
 use crate::{
     error::{CommandError, IoOp, SafeModeReason},
+    events::{ProblemSink, StoreSink, StoreState},
     startup::{ProblemKind, StartupProblem},
 };
 use atomic::atomic_json;
 use meta::MetaHandle;
 use metadata::metadata_for_config;
 use quicker_domain::*;
-use quicker_platform::Shared;
+use quicker_platform::{health::PauseReasons, runtime::Runtime, Shared};
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 pub struct Store {
@@ -38,6 +42,10 @@ pub struct Store {
     previous: Option<Config>,
     disk_hash: Option<Vec<u8>>,
     pub engine: Arc<Shared>,
+    /// The runtime `engine` is attached to: the authority on pause reasons
+    /// and health (P5 item 2). `engine.paused` is only its derived value;
+    /// nothing in the shell writes it.
+    pub runtime: Arc<Runtime>,
     pub unresolved: Vec<MigrationItem>,
     active_unresolved: Vec<MigrationItem>,
     previous_unresolved: Vec<MigrationItem>,
@@ -53,6 +61,16 @@ pub struct Store {
     writable_hooks: Vec<(&'static str, WritableHook)>,
     /// Keys of hooks that already ran.
     writable_done: Vec<&'static str>,
+    /// Where problems found after startup go (the EventBus, which sends
+    /// `startup-problem`); `None` until the bus is up and in unit tests.
+    problem_sink: Option<ProblemSink>,
+    /// Where the revision and safe mode go after each change (the EventBus,
+    /// which sends `store-state`); `None` until the bus is up and in most
+    /// unit tests.
+    store_sink: Option<StoreSink>,
+    /// Successful [`Store::set_manual_pause`] calls so far, so startup can
+    /// tell whether the user paused or resumed while it waited.
+    manual_changes: AtomicU64,
 }
 
 /// Deferred work run with the store once it is writable.
@@ -85,9 +103,52 @@ impl Store {
     pub fn startup_problems(&self) -> &[StartupProblem] {
         &self.startup_problems
     }
+    /// Records a problem found after the load (autostart repaired, self-test
+    /// failed, ...) and reports it as one `startup-problem` event.
     pub fn add_problem(&mut self, kind: ProblemKind) {
-        // P5: push the `startup-problem` event here.
-        self.startup_problems.push(kind.into());
+        let problem = StartupProblem::from(kind);
+        self.report_problem(&problem);
+        self.startup_problems.push(problem);
+    }
+    /// From now on every new problem is also given to `sink`. Problems
+    /// already recorded are not: the frontend reads them with
+    /// `startup_problems` / `load_state`.
+    pub fn set_problem_sink(&mut self, sink: ProblemSink) {
+        self.problem_sink = Some(sink);
+    }
+    fn report_problem(&self, problem: &StartupProblem) {
+        if let Some(sink) = &self.problem_sink {
+            sink(problem.clone());
+        }
+    }
+    /// The active revision and safe mode (`store-state`,
+    /// `get_runtime_snapshot`).
+    pub fn store_state(&self) -> StoreState {
+        StoreState {
+            revision: self.active.revision,
+            safe_mode: self.safe_mode,
+        }
+    }
+    /// Review A9: the current revision and safe mode become the EventBus's
+    /// baseline at once, on this thread, under this store lock (no `seq`,
+    /// no event: the frontend reads initial values from `load_state` /
+    /// `get_runtime_snapshot`); from now on every change is reported to
+    /// `sink`. Called once, in setup, before the bus is managed.
+    pub fn set_store_sink(&mut self, sink: StoreSink) {
+        sink.baseline(self.store_state());
+        self.store_sink = Some(sink);
+    }
+    /// Reports the current revision and safe mode, still under the store
+    /// lock, so reports follow the order of the changes. The two places
+    /// that change them call it once they are done: [`Store::install`]
+    /// (startup and the SafeMode(Locked) retry: new revision and safe mode
+    /// left, one report) and `publish_with_metadata` (save/apply, rollback,
+    /// published import, which may also end safe mode). The EventBus drops
+    /// a report equal to its baseline or the last one it sent.
+    fn report_store_state(&self) {
+        if let Some(sink) = &self.store_sink {
+            sink.report(self.store_state());
+        }
     }
     /// The safe-mode gate for write commands (plan §7.2): everything that
     /// writes data or settings, or would resume the engine, is refused.
@@ -96,6 +157,52 @@ impl Store {
             Some(reason) => Err(CommandError::SafeMode { reason }),
             None => Ok(()),
         }
+    }
+    /// `set_paused` and the tray toggle (contract §4): sets or clears
+    /// `PauseReasons::MANUAL` and nothing else, so with another reason still
+    /// set (recording, self-test, an engine that is not up) the engine stays
+    /// paused after a successful resume.
+    ///
+    /// A resume is refused in safe mode (`safe_mode`, plan §7.2) and while
+    /// the health does not accept it (`engine_unavailable` with that health,
+    /// B-03); `ready` is the platform's own live readiness test, asked last.
+    /// The refusal is feedback only: even a resume that raced a health
+    /// change cannot expand, because the runtime derives the gates' flag
+    /// from the health as well. Every change bumps the generation, and a
+    /// pause cancels the running task.
+    pub fn set_manual_pause(
+        &self,
+        paused: bool,
+        ready: impl FnOnce() -> bool,
+    ) -> Result<(), CommandError> {
+        if !paused {
+            self.ensure_writable()?;
+            let health = self.runtime.health().state;
+            if !health.accepts_resume() {
+                return Err(CommandError::EngineUnavailable { health });
+            }
+            if !ready() {
+                return Err(CommandError::engine_unavailable(
+                    "This platform input adapter is not ready; engine remains paused",
+                ));
+            }
+        }
+        self.runtime.set_pause(PauseReasons::MANUAL, paused);
+        self.manual_changes.fetch_add(1, Ordering::SeqCst);
+        self.engine.generation.fetch_add(1, Ordering::SeqCst);
+        if paused {
+            self.engine.cancel.store(true, Ordering::SeqCst);
+        }
+        tracing::info!(
+            event = "engine.manual_pause",
+            paused,
+            "manual pause changed"
+        );
+        Ok(())
+    }
+    /// How many times [`Store::set_manual_pause`] has succeeded.
+    pub fn manual_changes(&self) -> u64 {
+        self.manual_changes.load(Ordering::SeqCst)
     }
     /// Runs `hook` once per session, the first time the store is writable:
     /// right away outside safe mode, otherwise when safe mode ends (the
@@ -118,21 +225,23 @@ impl Store {
             self.writable_hooks.push((key, hook));
         }
     }
-    /// The only place safe mode changes. The engine is never resumed here:
-    /// it starts paused and stays paused through safe mode.
-    // P1a: set/clear `PauseReasons::SAFE_MODE` here; P5: emit the change.
+    /// The only place safe mode changes, and with it
+    /// `PauseReasons::SAFE_MODE`. The engine is never resumed here: entering
+    /// also sets MANUAL (as the 0.3 flag did), and leaving clears only
+    /// SAFE_MODE, so the engine stays paused until the user resumes it.
+    /// Resuming is refused while in safe mode ([`Store::set_manual_pause`]).
     fn set_safe_mode(&mut self, reason: Option<SafeModeReason>) {
         if self.safe_mode == reason {
             return;
         }
         match reason {
             Some(reason) => {
-                self.engine
-                    .paused
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                self.runtime
+                    .set_pause(PauseReasons::SAFE_MODE.with(PauseReasons::MANUAL), true);
                 tracing::warn!(event = "store.safe_mode", ?reason, "safe mode active");
             }
             None => {
+                self.runtime.set_pause(PauseReasons::SAFE_MODE, false);
                 self.startup_problems
                     .retain(|p| !matches!(p.kind, ProblemKind::SafeMode { .. }));
                 tracing::info!(event = "store.safe_mode_exit", "safe mode ended");
@@ -225,6 +334,21 @@ impl Store {
 #[cfg(test)]
 mod test_support {
     use quicker_domain::*;
+    use quicker_platform::health::{HealthSnapshot, HealthState};
+
+    pub fn healthy() -> HealthSnapshot {
+        HealthSnapshot {
+            state: HealthState::Healthy,
+            components: vec![],
+        }
+    }
+    /// Brings a test store's engine to listening the way the app does: the
+    /// supervisor reports Healthy, then the user resumes (`set_paused`).
+    pub fn listening(store: &super::Store) {
+        store.runtime.publish_health(healthy());
+        store.set_manual_pause(false, || true).unwrap();
+        assert!(store.runtime.engine_state().listening);
+    }
 
     pub fn metadata_config(ids: &[&str]) -> Config {
         Config {
@@ -274,7 +398,70 @@ mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+    use quicker_platform::health::{HealthSnapshot, HealthState};
     use std::fs;
+    /// Contract §4: `set_paused` only sets or clears MANUAL. A resume is
+    /// refused while the engine is not up (with that health) or not ready;
+    /// with another reason still set it succeeds and stays paused.
+    #[test]
+    fn manual_pause_is_the_only_reason_set_paused_touches() {
+        let dir = std::env::temp_dir().join(format!("quicker-text-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::load(dir.clone());
+        assert_eq!(store.runtime.pause_reasons(), PauseReasons::MANUAL);
+        let generation = || store.engine.generation.load(Ordering::SeqCst);
+        // Starting: refused with the health that refused it, nothing changes.
+        let before = generation();
+        assert!(matches!(
+            store.set_manual_pause(false, || true),
+            Err(CommandError::EngineUnavailable {
+                health: HealthState::Starting
+            })
+        ));
+        assert_eq!(store.runtime.pause_reasons(), PauseReasons::MANUAL);
+        assert_eq!(generation(), before);
+        // Up but the platform adapter is not ready.
+        store.runtime.publish_health(healthy());
+        assert!(matches!(
+            store.set_manual_pause(false, || false),
+            Err(CommandError::EngineUnavailable {
+                health: HealthState::Failed
+            })
+        ));
+        assert!(store.engine.paused.load(Ordering::SeqCst));
+        // Resume while recording: MANUAL clears, the engine stays paused.
+        store.runtime.set_pause(PauseReasons::RECORDING, true);
+        store.set_manual_pause(false, || true).unwrap();
+        assert_eq!(store.runtime.pause_reasons(), PauseReasons::RECORDING);
+        assert!(!store.runtime.engine_state().listening);
+        assert!(store.engine.paused.load(Ordering::SeqCst));
+        assert_eq!(generation(), before + 1);
+        // Recording ends: listening.
+        store.runtime.set_pause(PauseReasons::RECORDING, false);
+        assert!(store.runtime.engine_state().listening);
+        assert!(!store.engine.paused.load(Ordering::SeqCst));
+        // A pause cancels the running task and leaves the other reasons alone.
+        store.engine.cancel.store(false, Ordering::SeqCst);
+        store.runtime.set_pause(PauseReasons::SELF_TEST, true);
+        store.set_manual_pause(true, || unreachable!()).unwrap();
+        assert!(store.engine.cancel.load(Ordering::SeqCst));
+        assert_eq!(
+            store.runtime.pause_reasons(),
+            PauseReasons::MANUAL.with(PauseReasons::SELF_TEST)
+        );
+        // The engine going down holds the flag without touching MANUAL.
+        store.runtime.set_pause(PauseReasons::SELF_TEST, false);
+        store.set_manual_pause(false, || true).unwrap();
+        store.runtime.publish_health(HealthSnapshot {
+            state: HealthState::Recovering,
+            components: vec![],
+        });
+        assert!(store.engine.paused.load(Ordering::SeqCst));
+        assert!(!store
+            .runtime
+            .pause_reasons()
+            .intersects(PauseReasons::USER_VISIBLE));
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn discard_import_restores_published_originals_after_reload() {
         let dir =

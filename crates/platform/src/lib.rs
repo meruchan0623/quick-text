@@ -177,8 +177,12 @@ pub use no_executor::*;
 
 mod capabilities;
 pub use capabilities::{
-    capabilities, capabilities_for, Capability, CapabilityReason, CapabilityStatus, PlatformReason,
+    capabilities_for, Capability, CapabilityReason, CapabilityStatus, PlatformReason,
 };
+/// Starts a recording session. Pausing detection for its duration is the
+/// caller's job, through the runtime's `PauseReasons::RECORDING` (the shell
+/// sets it before this call and clears it once no recording is active), so
+/// `Shared::paused` stays a value derived only by the runtime.
 pub fn start_recording(shared: &Arc<Shared>) -> Result<(), String> {
     // Recording needs a running engine (B-03: `accepts_resume` replaces
     // `native_ready`).
@@ -193,7 +197,6 @@ pub fn start_recording(shared: &Arc<Shared>) -> Result<(), String> {
     if r.is_some() {
         return Err("Recording already active".into());
     }
-    shared.paused.store(true, Ordering::SeqCst);
     shared.cancel.store(false, Ordering::SeqCst);
     shared.generation.fetch_add(1, Ordering::SeqCst);
     // A new recording session, under the recording lock (M2).
@@ -217,7 +220,9 @@ pub fn stop_recording(shared: &Arc<Shared>) -> Result<ActionPlan, String> {
 }
 pub mod history;
 pub mod runtime;
+pub mod self_test;
 pub mod supervisor;
+pub mod supervisor_wiring;
 
 /// The app's clipboard lease options, set at startup from prefs (B-08).
 pub mod clipboard_options;

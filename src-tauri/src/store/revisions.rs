@@ -8,6 +8,7 @@ use super::{
 };
 use crate::error::{CommandError, EntityKind, IoOp};
 use quicker_domain::*;
+use quicker_platform::health::PauseReasons;
 use sha2::{Digest, Sha256};
 use std::{fs, sync::atomic::Ordering};
 
@@ -38,11 +39,20 @@ impl Store {
                 .unwrap_or(self.active.revision);
             return Err(CommandError::RevisionConflict { current });
         }
-        let was_paused = self.engine.paused.swap(true, Ordering::SeqCst);
+        // Detection stops while the configuration is swapped: MANUAL is held
+        // for the publish and put back as it was afterwards, whatever the
+        // outcome (no-regression #8). Only MANUAL is touched, so a reason
+        // set meanwhile by someone else (safe mode, recording, the engine
+        // going down) is never cleared by the restore.
+        let was_manual = self.runtime.pause_reasons().contains(PauseReasons::MANUAL);
+        self.runtime.set_pause(PauseReasons::MANUAL, true);
         self.engine.cancel.store(true, Ordering::SeqCst);
         self.engine.generation.fetch_add(1, Ordering::SeqCst);
+        let restore = |store: &Self| {
+            store.runtime.set_pause(PauseReasons::MANUAL, was_manual);
+        };
         if self.engine.busy.load(Ordering::SeqCst) {
-            self.engine.paused.store(was_paused, Ordering::SeqCst);
+            restore(self);
             return Err(CommandError::Busy);
         }
         let old = self.active.clone();
@@ -78,7 +88,7 @@ impl Store {
             Ok::<_, CommandError>(())
         })();
         if let Err(e) = outcome {
-            self.engine.paused.store(was_paused, Ordering::SeqCst);
+            restore(self);
             return Err(e);
         }
         *self.engine.compiled.lock().unwrap() = compiled;
@@ -96,11 +106,12 @@ impl Store {
             )
             .to_vec(),
         );
-        self.engine.paused.store(was_paused, Ordering::SeqCst);
+        restore(self);
         if self.safe_mode.is_some() {
             tracing::info!(event = "store.safe_mode_import", "import published");
             self.set_safe_mode(None);
         }
+        self.report_store_state();
         Ok(())
     }
     /// One above the active revision and every `revisions/<n>.json`, so that
@@ -181,7 +192,8 @@ mod tests {
         let mut s = Store::load(dir.clone());
         s.publish(Config::default()).unwrap();
         let old = s.active.clone();
-        s.engine.paused.store(false, Ordering::SeqCst);
+        listening(&s);
+        assert!(!s.engine.paused.load(Ordering::SeqCst));
         fs::remove_file(dir.join("draft.json")).unwrap();
         fs::create_dir(dir.join("draft.json")).unwrap();
         let mut next = old.clone();
@@ -190,6 +202,31 @@ mod tests {
         assert_eq!(s.active, old);
         assert_eq!(read_config(&dir.join("active.json")).unwrap(), old);
         assert!(!s.engine.paused.load(Ordering::SeqCst));
+        assert!(s.runtime.engine_state().listening);
+        assert!(s.runtime.pause_reasons().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    /// The publish hold restores MANUAL as it was: a paused engine stays
+    /// paused and a listening one listens, on success and on failure, and
+    /// a reason set by someone else is left alone.
+    #[test]
+    fn publish_restores_only_the_manual_reason() {
+        let dir = std::env::temp_dir().join(format!("quicker-text-test-{}", uuid::Uuid::new_v4()));
+        let mut s = Store::load(dir.clone());
+        s.runtime.publish_health(healthy());
+        assert_eq!(s.runtime.pause_reasons(), PauseReasons::MANUAL);
+        s.publish(Config::default()).unwrap();
+        assert_eq!(s.runtime.pause_reasons(), PauseReasons::MANUAL);
+        listening(&s);
+        s.publish(Config::default()).unwrap();
+        assert!(s.runtime.engine_state().listening);
+        s.runtime.set_pause(PauseReasons::RECORDING, true);
+        s.engine.busy.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            s.publish(Config::default()),
+            Err(CommandError::Busy)
+        ));
+        assert_eq!(s.runtime.pause_reasons(), PauseReasons::RECORDING);
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
