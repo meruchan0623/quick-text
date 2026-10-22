@@ -33,7 +33,66 @@ pub type ProcessProbe = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SubscriptionId(u64);
 
-type Listeners = Arc<RwLock<Vec<(u64, Listener)>>>;
+type Listeners = Arc<RwLock<Vec<Arc<Subscription>>>>;
+
+/// One subscriber and what the event thread has handed to it so far.
+struct Subscription {
+    id: u64,
+    listener: Listener,
+    /// Taken only by the event thread, with nothing else held.
+    delivered: Mutex<Delivered>,
+}
+
+/// The Health and State one subscriber was last given (each `None` until
+/// the first delivery) and the version it is fully up to date with. A
+/// value whose callback panicked is not recorded, so a later round offers
+/// it again.
+#[derive(Default)]
+struct Delivered {
+    version: Option<u64>,
+    health: Option<HealthSnapshot>,
+    state: Option<EngineState>,
+}
+
+impl Subscription {
+    /// Calls the listener; false if it panicked (logged, never propagated).
+    fn call(&self, event: EngineEvent) -> bool {
+        let ok = catch_unwind(AssertUnwindSafe(|| (self.listener)(event))).is_ok();
+        if !ok {
+            tracing::warn!(
+                event = "runtime.listener_panic",
+                "event listener panicked; other listeners still run"
+            );
+        }
+        ok
+    }
+
+    /// Brings this subscriber up to `latest`: Health first when it has none
+    /// yet (the default snapshot included) or it differs, then State. A
+    /// panic stops there without recording that value, so a State is never
+    /// given without the Health it was computed with.
+    fn catch_up(&self, latest: &Latest) {
+        let mut delivered = self.delivered.lock();
+        if delivered.version == Some(latest.version) {
+            return;
+        }
+        if delivered.health.as_ref() != Some(&latest.health) {
+            if !self.call(EngineEvent::Health(latest.health.clone())) {
+                return;
+            }
+            delivered.health = Some(latest.health.clone());
+        }
+        if let Some(state) = &latest.state {
+            if delivered.state.as_ref() != Some(state) {
+                if !self.call(EngineEvent::State(state.clone())) {
+                    return;
+                }
+                delivered.state = Some(state.clone());
+            }
+        }
+        delivered.version = Some(latest.version);
+    }
+}
 
 /// Capacity of the `Execution` queue between [`Runtime::record`] and the
 /// event thread. Bounded so a blocked listener cannot grow memory without
@@ -109,7 +168,8 @@ struct PauseState {
 /// just long enough to copy it. `process` is only taken with at most
 /// `latest` held, and `history` alone. Listeners run on the event thread
 /// with none of these held; the process probe never runs with `health` or
-/// `pause` held.
+/// `pause` held. Each subscription's `delivered` is taken only by the event
+/// thread, with none of these held.
 pub struct Runtime {
     clock: Arc<dyn Clock>,
     history: History,
@@ -185,12 +245,17 @@ impl Runtime {
     /// your own channel and throttle there.
     ///
     /// Delivery semantics:
-    /// - `Health` and `State` carry **latest values**. Each subscriber
-    ///   eventually sees the latest Health and State, and they only move
-    ///   forward: an older value never arrives after a newer one, and a
-    ///   State never arrives before the Health it was computed with. Values
-    ///   that are replaced quickly (a fast round trip, or anything published
-    ///   while a listener blocks) may be merged away and never delivered.
+    /// - `Health` and `State` carry **latest values**, tracked per
+    ///   subscriber. A new subscriber is first given the current Health (the
+    ///   default snapshot if nothing was published yet) and then the current
+    ///   State, without waiting for a change. Each subscriber eventually
+    ///   sees the latest Health and State, and they only move forward: an
+    ///   older value never arrives after a newer one, and a State never
+    ///   arrives before the Health it was computed with. Values that are
+    ///   replaced quickly (a fast round trip, or anything published while a
+    ///   listener blocks) may be merged away and never delivered. A value
+    ///   whose callback panicked counts as not delivered to that subscriber
+    ///   and is offered again on a later wake-up.
     /// - `Execution` events are delivered in queue order. If a listener
     ///   blocks, at most `EVENT_QUEUE_CAPACITY` (1024) of them wait; beyond
     ///   that they are dropped and counted (one `runtime.events_dropped`
@@ -201,12 +266,20 @@ impl Runtime {
     /// most a full `Execution` queue plus one Health/State snapshot.
     pub fn subscribe(&self, listener: Box<dyn Fn(EngineEvent) + Send + Sync>) -> SubscriptionId {
         let id = self.next_listener.fetch_add(1, Ordering::Relaxed);
-        self.listeners.write().push((id, Arc::from(listener)));
+        self.listeners.write().push(Arc::new(Subscription {
+            id,
+            listener: Arc::from(listener),
+            delivered: Mutex::default(),
+        }));
+        // The next round gives it the current Health and State.
+        self.post(None);
         SubscriptionId(id)
     }
 
     pub fn unsubscribe(&self, id: SubscriptionId) {
-        self.listeners.write().retain(|(other, _)| *other != id.0);
+        self.listeners
+            .write()
+            .retain(|subscription| subscription.id != id.0);
     }
 
     /// Wakes the event thread without blocking, first queueing `execution`
@@ -473,38 +546,36 @@ impl Runtime {
 }
 
 /// The event thread. Each wake-up first takes the latest Health/State (one
-/// copy under `latest`, so both come from the same version) and delivers
-/// whichever differs from what it delivered last, Health before State; then
-/// it drains the `Execution` queue and reports drops. The wake-up token is
-/// consumed before `latest` is read, so a change made after that read sends
-/// a new token and is picked up by the next round. Exits when the runtime
-/// (and with it the sending side) is gone.
+/// copy under `latest`, so both come from the same version) and the
+/// subscriber list (once, so a Health and its State go to the same
+/// subscribers), and brings every listed subscriber up to date, Health
+/// before State (see [`Subscription::catch_up`]); then it drains the
+/// `Execution` queue and reports drops. The wake-up token is consumed
+/// before `latest` is read, so a change made after that read (or a
+/// subscriber added after the list was taken, whose `subscribe` sends a
+/// token) is picked up by the next round. Each `Execution` goes to the
+/// subscribers listed when it is taken from the queue, so a subscriber gets
+/// every execution recorded after its `subscribe` returned. Exits when the
+/// runtime (and with it the sending side) is gone.
 fn run_event_thread(
     wake: &mpsc::Receiver<()>,
     executions: &mpsc::Receiver<HistoryEntry>,
     outbox: &Outbox,
-    listeners: &RwLock<Vec<(u64, Listener)>>,
+    listeners: &RwLock<Vec<Arc<Subscription>>>,
 ) {
-    let mut delivered = Latest::default();
     while wake.recv().is_ok() {
-        let latest = {
-            let latest = outbox.latest.lock();
-            (latest.version != delivered.version).then(|| latest.clone())
-        };
-        if let Some(latest) = latest {
-            debug_assert!(latest.version > delivered.version);
-            if latest.health != delivered.health {
-                deliver(listeners, &EngineEvent::Health(latest.health.clone()));
-            }
-            if latest.state != delivered.state {
-                if let Some(state) = &latest.state {
-                    deliver(listeners, &EngineEvent::State(state.clone()));
-                }
-            }
-            delivered = latest;
+        let latest = outbox.latest.lock().clone();
+        // Bound first: no listener runs with the list locked.
+        let subscribers = listeners.read().clone();
+        for subscriber in &subscribers {
+            subscriber.catch_up(&latest);
         }
         while let Ok(entry) = executions.try_recv() {
-            deliver(listeners, &EngineEvent::Execution(entry));
+            let event = EngineEvent::Execution(entry);
+            let subscribers = listeners.read().clone();
+            for subscriber in &subscribers {
+                subscriber.call(event.clone());
+            }
         }
         let dropped = outbox.dropped.swap(0, Ordering::Relaxed);
         if dropped > 0 {
@@ -512,22 +583,6 @@ fn run_event_thread(
                 event = "runtime.events_dropped",
                 dropped,
                 "execution queue was full; execution events dropped"
-            );
-        }
-    }
-}
-
-fn deliver(listeners: &RwLock<Vec<(u64, Listener)>>, event: &EngineEvent) {
-    let targets: Vec<Listener> = listeners
-        .read()
-        .iter()
-        .map(|(_, listener)| Arc::clone(listener))
-        .collect();
-    for listener in targets {
-        if catch_unwind(AssertUnwindSafe(|| listener(event.clone()))).is_err() {
-            tracing::warn!(
-                event = "runtime.listener_panic",
-                "event listener panicked; other listeners still run"
             );
         }
     }
@@ -792,6 +847,12 @@ mod tests {
     fn events_are_delivered_once_per_change() {
         let (runtime, _) = runtime();
         let events = collect(&runtime);
+        // A new subscriber first gets the current (here default) Health.
+        wait_until("initial health", || !events.lock().is_empty());
+        assert_eq!(
+            events.lock().drain(..).collect::<Vec<_>>(),
+            [EngineEvent::Health(HealthSnapshot::default())]
+        );
         runtime.publish_health(snapshot(HealthState::Healthy));
         runtime.publish_health(snapshot(HealthState::Healthy));
         // Health/State are latest values: wait for this State before the
@@ -835,7 +896,7 @@ mod tests {
             Outcome::Succeeded,
             ReasonCode::Ok,
         ));
-        wait_until("both entries", || events.lock().len() == 2);
+        wait_until("both entries", || entries(&events.lock()).len() == 2);
         runtime.unsubscribe(bad);
         runtime.record(Record::new(
             "c",
@@ -843,16 +904,19 @@ mod tests {
             Outcome::Succeeded,
             ReasonCode::Ok,
         ));
-        wait_until("third entry", || events.lock().len() == 3);
-        let seqs: Vec<u64> = events
-            .lock()
+        wait_until("third entry", || entries(&events.lock()).len() == 3);
+        let seqs: Vec<u64> = entries(&events.lock())
             .iter()
-            .map(|event| match event {
-                EngineEvent::Execution(entry) => entry.seq,
-                other => panic!("unexpected {other:?}"),
-            })
+            .map(|entry| entry.seq)
             .collect();
         assert_eq!(seqs, [1, 2, 3]);
+        // The other subscriber also got its initial Health, once.
+        assert_eq!(
+            healths(&events.lock()),
+            [HealthSnapshot::default()],
+            "{:?}",
+            events.lock()
+        );
     }
 
     /// `record` is the "new history entry" callback: it emits `Execution`
@@ -867,9 +931,9 @@ mod tests {
             Outcome::Failed,
             ReasonCode::FocusChanged,
         ));
-        wait_until("execution event", || !events.lock().is_empty());
+        wait_until("execution event", || !entries(&events.lock()).is_empty());
         std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(*events.lock(), vec![EngineEvent::Execution(entry)]);
+        assert_eq!(entries(&events.lock()), [entry]);
     }
 
     /// A unique snapshot per `n` (carried in `since_ms`), so the order in
@@ -915,25 +979,38 @@ mod tests {
             .collect()
     }
 
-    /// Subscribes a listener that blocks the event thread inside the first
-    /// event it receives. Send on the returned sender to let it go.
-    fn block_event_thread(runtime: &Runtime) -> mpsc::Sender<()> {
+    fn entries(events: &[EngineEvent]) -> Vec<HistoryEntry> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::Execution(entry) => Some(entry.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Subscribes a listener that records every event and blocks the event
+    /// thread inside the first one (its initial Health). Send on the
+    /// returned sender to let it go.
+    fn block_event_thread(runtime: &Runtime) -> (mpsc::Sender<()>, Arc<Mutex<Vec<EngineEvent>>>) {
         use std::sync::atomic::AtomicBool;
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let release_rx = Mutex::new(release_rx);
         let blocked_once = AtomicBool::new(false);
-        runtime.subscribe(Box::new(move |_| {
+        let events = Arc::new(Mutex::new(vec![]));
+        let sink = Arc::clone(&events);
+        runtime.subscribe(Box::new(move |event| {
+            sink.lock().push(event);
             if !blocked_once.swap(true, Ordering::SeqCst) {
                 entered_tx.send(()).unwrap();
                 release_rx.lock().recv().unwrap();
             }
         }));
-        runtime.record(execution("block"));
         entered_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("event thread blocked in the listener");
-        release_tx
+        (release_tx, events)
     }
 
     /// The event thread is held up before it reads the snapshot while
@@ -943,7 +1020,7 @@ mod tests {
     #[test]
     fn delivery_after_a_stall_starts_from_the_latest_snapshot() {
         let (runtime, _) = runtime();
-        let release = block_event_thread(&runtime);
+        let (release, _) = block_event_thread(&runtime);
         let events = collect(&runtime);
         let h1 = numbered(HealthState::Recovering, 1);
         runtime.publish_health(h1);
@@ -962,6 +1039,99 @@ mod tests {
         let events = events.lock().clone();
         assert_eq!(healths(&events), [h2]);
         assert_eq!(states(&events), [s2]);
+    }
+
+    /// A subscriber that arrives after the values were delivered to another
+    /// one still gets them, Health first, without any further change; the
+    /// earlier subscriber gets nothing again.
+    #[test]
+    fn a_late_subscriber_first_gets_the_current_health_then_state() {
+        let (runtime, _) = runtime();
+        let early = collect(&runtime);
+        let h1 = numbered(HealthState::Healthy, 1);
+        runtime.publish_health(h1.clone());
+        let s1 = runtime.engine_state();
+        wait_until("early subscriber up to date", || {
+            let early = early.lock();
+            healths(&early).last() == Some(&h1) && states(&early).last() == Some(&s1)
+        });
+        let early_seen = early.lock().len();
+
+        let late = collect(&runtime);
+        wait_until("late subscriber initialised", || late.lock().len() >= 2);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            *late.lock(),
+            [EngineEvent::Health(h1), EngineEvent::State(s1)]
+        );
+        assert_eq!(early.lock().len(), early_seen, "nothing sent again");
+    }
+
+    /// B subscribes while A is paused inside its Health callback: B is not
+    /// part of that round, so it never gets the State without the Health;
+    /// the next round gives it both, Health first.
+    #[test]
+    fn a_subscriber_joining_during_a_health_callback_gets_health_before_state() {
+        let (runtime, _) = runtime();
+        let h1 = numbered(HealthState::Healthy, 1);
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let pause_on = EngineEvent::Health(h1.clone());
+        runtime.subscribe(Box::new(move |event| {
+            if event == pause_on {
+                let _ = entered_tx.send(());
+                let _ = release_rx.lock().recv();
+            }
+        }));
+        runtime.publish_health(h1.clone());
+        let s1 = runtime.engine_state();
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("A paused in its Health callback");
+
+        let late = collect(&runtime);
+        release.send(()).unwrap();
+        wait_until("B gets H1 and S1", || late.lock().len() >= 2);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            *late.lock(),
+            [EngineEvent::Health(h1), EngineEvent::State(s1)]
+        );
+    }
+
+    /// A Health whose callback panicked does not count as delivered: no
+    /// State follows it, and the next wake-up offers both again.
+    #[test]
+    fn a_value_whose_callback_panicked_is_offered_again() {
+        use std::sync::atomic::AtomicBool;
+        let (runtime, _) = runtime();
+        let h1 = numbered(HealthState::Healthy, 1);
+        runtime.publish_health(h1.clone());
+        let s1 = runtime.engine_state();
+        let panicked = Arc::new(AtomicBool::new(false));
+        let events = Arc::new(Mutex::new(vec![]));
+        let (once, sink) = (Arc::clone(&panicked), Arc::clone(&events));
+        runtime.subscribe(Box::new(move |event| {
+            if matches!(event, EngineEvent::Health(_)) && !once.swap(true, Ordering::SeqCst) {
+                panic!("listener bug on the first Health");
+            }
+            sink.lock().push(event);
+        }));
+        wait_until("first Health panicked", || panicked.load(Ordering::SeqCst));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(events.lock().is_empty(), "{:?}", events.lock());
+
+        let entry = runtime.record(execution("wake"));
+        wait_until("offered again", || events.lock().len() >= 3);
+        assert_eq!(
+            *events.lock(),
+            [
+                EngineEvent::Health(h1),
+                EngineEvent::State(s1),
+                EngineEvent::Execution(entry)
+            ]
+        );
     }
 
     /// Publishers race Recovering/Healthy and MANUAL on/off against a slow
@@ -1039,11 +1209,12 @@ mod tests {
     /// backlog is bounded: at most `EVENT_QUEUE_CAPACITY` executions wait
     /// (the rest are dropped) and Health/State occupy one snapshot, so after
     /// the block every subscriber gets the queued executions in order plus
-    /// exactly one Health and one State, the latest.
+    /// exactly one Health and one State, the latest (the blocked one also
+    /// had its initial Health, where it blocked).
     #[test]
     fn blocked_listener_holds_a_bounded_backlog() {
         let (runtime, _) = runtime();
-        let release = block_event_thread(&runtime);
+        let (release, blocked) = block_event_thread(&runtime);
         let events = collect(&runtime);
         let executions = 3 * EVENT_QUEUE_CAPACITY;
         let states_cycle = [
@@ -1071,38 +1242,48 @@ mod tests {
         );
         release.send(()).unwrap();
 
-        wait_until("latest health and state", || {
+        wait_until("latest health and state, queued executions", || {
             let events = events.lock();
             healths(&events).last() == Some(&final_health)
                 && states(&events).last() == Some(&final_state)
+                && entries(&events).len() == EVENT_QUEUE_CAPACITY
         });
         std::thread::sleep(Duration::from_millis(50));
         let events = events.lock().clone();
-        assert_eq!(healths(&events), [final_health]);
-        assert_eq!(states(&events), [final_state]);
-        let seqs: Vec<u64> = events
-            .iter()
-            .filter_map(|event| match event {
-                EngineEvent::Execution(entry) => Some(entry.seq),
-                _ => None,
-            })
-            .collect();
-        // Exactly a full queue of the burst (this subscriber came after the
-        // execution the blocked listener holds); the rest was dropped.
-        assert_eq!(seqs.len(), EVENT_QUEUE_CAPACITY);
-        assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(healths(&events), std::slice::from_ref(&final_health));
+        assert_eq!(states(&events), std::slice::from_ref(&final_state));
+        let seqs: Vec<u64> = entries(&events).iter().map(|entry| entry.seq).collect();
+        // Exactly a full queue: the start of the burst, in order; the rest
+        // was dropped.
+        let capacity = u64::try_from(EVENT_QUEUE_CAPACITY).unwrap();
+        assert_eq!(seqs, (1..=capacity).collect::<Vec<_>>());
         assert_eq!(events.len(), EVENT_QUEUE_CAPACITY + 2);
         assert_eq!(
             runtime.outbox.dropped.load(Ordering::Relaxed),
             0,
             "reported"
         );
+        // The blocked subscriber: its initial Health, then the same.
+        let blocked = blocked.lock().clone();
+        assert_eq!(
+            healths(&blocked),
+            [HealthSnapshot::default(), final_health.clone()]
+        );
+        assert_eq!(states(&blocked), std::slice::from_ref(&final_state));
+        assert_eq!(entries(&blocked), entries(&events));
 
         // The thread keeps working normally once the backlog is gone.
         let sink = collect(&runtime);
         let late = runtime.record(execution("late"));
-        wait_until("late execution", || !sink.lock().is_empty());
-        assert_eq!(*sink.lock(), vec![EngineEvent::Execution(late)]);
+        wait_until("late subscriber caught up", || {
+            let sink = sink.lock();
+            !entries(&sink).is_empty() && !states(&sink).is_empty()
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        let sink = sink.lock().clone();
+        assert_eq!(entries(&sink), [late]);
+        assert_eq!(healths(&sink), [final_health]);
+        assert_eq!(states(&sink), [final_state]);
     }
 
     #[test]
