@@ -3,6 +3,7 @@
 //! where locks or failed renames are needed, fake file access.
 use super::{
     atomic::atomic_json,
+    export::{final_path, StageHooks},
     fallback::{load_or_fallback, retry_locked, LoadOutcome, LoadReport, StoreEnv, StoreIo},
     meta::{parse_meta, StoreMeta, META_FILE},
     test_support::*,
@@ -868,6 +869,184 @@ fn export_refuses_other_spellings_of_the_data_dir() {
         let result = store.export_draft(&target);
         assert!(refused_as_data_dir(result), "{}", target.display());
     }
+    assert_eq!(files(&dir), before);
+}
+
+/// Replaces the staging steps of `export_config` ([`StageHooks`]).
+#[derive(Default)]
+struct Seams {
+    /// Reports the temp file as created in this directory, as a parent
+    /// junction redirected after the pathname check would.
+    lands_in: Option<PathBuf>,
+    /// Runs between the containment check and the write.
+    after_check: Option<Box<dyn FnMut()>>,
+    fail_write: bool,
+    checked: u32,
+}
+impl StageHooks for Seams {
+    fn final_path(&mut self, file: &fs::File, temp: &Path) -> io::Result<PathBuf> {
+        match &self.lands_in {
+            Some(dir) => Ok(dir.join(temp.file_name().unwrap())),
+            None => final_path(file, temp),
+        }
+    }
+    fn after_check(&mut self, temp: &Path) {
+        self.checked += 1;
+        assert!(temp.exists());
+        if let Some(hook) = &mut self.after_check {
+            hook();
+        }
+    }
+    fn write(&mut self, file: &mut fs::File, bytes: &[u8]) -> io::Result<()> {
+        if self.fail_write {
+            // Part of the package reaches the temp file before the failure.
+            io::Write::write_all(file, &bytes[..bytes.len() / 2])?;
+            return Err(io::Error::other("injected export write failure"));
+        }
+        io::Write::write_all(file, bytes)
+    }
+}
+
+/// Temp files of the staged export left in `dir`.
+fn export_temps(dir: &Path) -> Vec<String> {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".qt-export-"))
+        .collect()
+}
+
+/// Makes `link` another name for `original`.
+fn alias(kind: &str, original: &Path, link: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_file as symlink;
+    let _ = fs::remove_file(link);
+    if kind == "hard_link" {
+        fs::hard_link(original, link)
+    } else {
+        symlink(original, link)
+    }
+}
+
+/// A temp file that turns out to be inside the data directory (a parent
+/// junction redirected after the pathname check) is refused and removed
+/// before anything is written; the store and the old target keep their
+/// bytes.
+#[test]
+fn export_refuses_a_temp_file_that_lands_in_the_data_dir() {
+    for mode in [None, Some(SafeModeReason::CrashLoop)] {
+        let (dir, _world, store) = store_in(mode);
+        let elsewhere = TempDir::new();
+        let target = elsewhere.join("backup.json");
+        fs::write(&target, b"old backup").unwrap();
+        let before = files(&dir);
+        let mut seams = Seams {
+            lands_in: Some(dir.join("revisions")),
+            ..Seams::default()
+        };
+        let result = store.export_draft_with(&target, &mut seams);
+        assert!(refused_as_data_dir(result), "{mode:?}");
+        assert_eq!(seams.checked, 0, "{mode:?}: nothing written");
+        assert_eq!(export_temps(&elsewhere), Vec::<String>::new());
+        assert_eq!(fs::read(&target).unwrap(), b"old backup");
+        assert_eq!(files(&dir), before, "{mode:?}");
+    }
+}
+
+/// A target that is, or becomes after the checks, a hard link or symlink to
+/// `active.json` is replaced by the export, not written through: the store
+/// files keep their bytes and the target ends up a plain file.
+#[test]
+fn export_replaces_a_swapped_target_instead_of_writing_through_it() {
+    let (dir, _world, store) = store_in(None);
+    let elsewhere = TempDir::new();
+    let active = dir.join("active.json");
+    let before = files(&dir);
+    let mut kinds = vec!["hard_link"];
+    if alias("symlink", &active, &elsewhere.join("probe")).is_ok() {
+        kinds.push("symlink");
+    } else {
+        eprintln!("symlinks unavailable here (privilege); symlink swap not exercised");
+    }
+    let _ = fs::remove_file(elsewhere.join("probe"));
+    for kind in kinds {
+        for swap_after_check in [false, true] {
+            let case = format!("{kind} swapped after check: {swap_after_check}");
+            let target = elsewhere.join(format!("{kind}-{swap_after_check}.json"));
+            fs::write(&target, b"old backup").unwrap();
+            let mut seams = Seams::default();
+            if swap_after_check {
+                let (active, target) = (active.clone(), target.clone());
+                seams.after_check = Some(Box::new(move || alias(kind, &active, &target).unwrap()));
+            } else {
+                alias(kind, &active, &target).unwrap();
+            }
+            let result = store.export_draft_with(&target, &mut seams);
+            if kind == "symlink" && !swap_after_check {
+                // The pathname check already resolves the link.
+                assert!(refused_as_data_dir(result), "{case}");
+            } else {
+                result.unwrap();
+                assert!(!fs::symlink_metadata(&target)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+                let package = fs::read_to_string(&target).unwrap();
+                let imported = import_package(&package).unwrap();
+                assert_eq!(imported.config.rules, store.draft.rules, "{case}");
+            }
+            assert_eq!(files(&dir), before, "{case}");
+            assert_eq!(export_temps(&elsewhere), Vec::<String>::new(), "{case}");
+        }
+    }
+}
+
+/// A failed write or rename removes the temp file and leaves the old target
+/// as it was.
+#[test]
+fn failed_export_leaves_the_target_and_no_temp_file() {
+    let (dir, _world, store) = store_in(None);
+    let elsewhere = TempDir::new();
+    let before = files(&dir);
+    let target = elsewhere.join("backup.json");
+    fs::write(&target, b"old backup").unwrap();
+    let mut seams = Seams {
+        fail_write: true,
+        ..Seams::default()
+    };
+    let result = store.export_draft_with(&target, &mut seams);
+    assert!(
+        matches!(
+            result,
+            Err(CommandError::Io {
+                op: crate::error::IoOp::Write,
+                ..
+            })
+        ),
+        "{result:?}"
+    );
+    assert_eq!(seams.checked, 1);
+    assert_eq!(fs::read(&target).unwrap(), b"old backup");
+    assert_eq!(export_temps(&elsewhere), Vec::<String>::new());
+    // The rename fails when the target is a directory.
+    let folder = elsewhere.join("folder.json");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join("keep.txt"), b"keep").unwrap();
+    let result = store.export_draft(&folder);
+    assert!(
+        matches!(
+            result,
+            Err(CommandError::Io {
+                op: crate::error::IoOp::Rename,
+                ..
+            })
+        ),
+        "{result:?}"
+    );
+    assert_eq!(fs::read(folder.join("keep.txt")).unwrap(), b"keep");
+    assert_eq!(export_temps(&elsewhere), Vec::<String>::new());
     assert_eq!(files(&dir), before);
 }
 
