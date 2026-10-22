@@ -181,8 +181,8 @@ struct PauseState {
 /// `events` while holding `history` or `listeners`. Listeners run on the event thread
 /// with none of these held; the process probe never runs with `health` or
 /// `pause` held. Each subscription's `delivered` is taken only by the event
-/// thread, with none of these held. `failed_latch` is written only with
-/// `latest` held, and publishers read it under `latest`.
+/// thread, with none of these held. `failed_latch` and `shutdown_mark` are
+/// written only with `latest` held, and publishers read them under `latest`.
 pub struct Runtime {
     clock: Arc<dyn Clock>,
     history: History,
@@ -195,6 +195,11 @@ pub struct Runtime {
     health: Mutex<HealthSnapshot>,
     /// Failed until repair (see [`Runtime::latch_failed`]).
     failed_latch: AtomicBool,
+    /// Set when the engine shutdown begins ([`Runtime::mark_shutdown`]);
+    /// never cleared.
+    shutdown_mark: AtomicBool,
+    /// Whether a Failed dropped after `shutdown_mark` was logged (once).
+    shutdown_drop_logged: AtomicBool,
     pause: Mutex<PauseState>,
     shared: ArcSwapOption<Shared>,
     process: RwLock<Option<ProcessProbe>>,
@@ -211,6 +216,8 @@ impl Runtime {
             events: Mutex::new(None),
             health: Mutex::new(HealthSnapshot::default()),
             failed_latch: AtomicBool::new(false),
+            shutdown_mark: AtomicBool::new(false),
+            shutdown_drop_logged: AtomicBool::new(false),
             pause: Mutex::new(PauseState::default()),
             shared: ArcSwapOption::empty(),
             process: RwLock::new(None),
@@ -393,9 +400,16 @@ impl Runtime {
     /// While Failed is latched (`latch_failed`, set by the supervisor's
     /// watchdog until a repair) a snapshot that is not Failed is rejected:
     /// the current one stays, ENGINE_DOWN too.
+    ///
+    /// Once the shutdown is marked (`Runtime::mark_shutdown`) a Failed
+    /// snapshot is dropped the same way; other states are still taken.
     pub fn publish_health(&self, snapshot: HealthSnapshot) {
         let changed = {
             let mut latest = self.outbox.latest.lock();
+            if snapshot.state == HealthState::Failed && self.shutdown_mark.load(Ordering::SeqCst) {
+                self.log_failed_dropped("publish");
+                return;
+            }
             if snapshot.state != HealthState::Failed && self.failed_latch.load(Ordering::SeqCst) {
                 tracing::debug!(
                     event = "runtime.health_rejected",
@@ -416,9 +430,16 @@ impl Runtime {
     /// is set and the current snapshot is published as Failed, with
     /// ENGINE_DOWN. Until then [`Runtime::publish_health`] rejects any other
     /// state, so a publisher that raced with this cannot clear it.
+    ///
+    /// Once the shutdown is marked ([`Runtime::mark_shutdown`]) it does
+    /// nothing: no latch, no Failed.
     pub(crate) fn latch_failed(&self, reason: &'static str) {
         let changed = {
             let mut latest = self.outbox.latest.lock();
+            if self.shutdown_mark.load(Ordering::SeqCst) {
+                self.log_failed_dropped(reason);
+                return;
+            }
             if !self.failed_latch.swap(true, Ordering::SeqCst) {
                 tracing::error!(
                     event = "runtime.failed_latched",
@@ -446,6 +467,50 @@ impl Runtime {
     /// Whether Failed is latched (see [`Runtime::latch_failed`]).
     pub(crate) fn failed_latched(&self) -> bool {
         self.failed_latch.load(Ordering::SeqCst)
+    }
+
+    /// Marks the engine shutdown at the publish boundary (review R1): from
+    /// now on a Failed snapshot ([`Runtime::publish_health`]) and
+    /// [`Runtime::latch_failed`] are dropped. `begin_shutdown` calls it
+    /// before it sets `Shared::shutdown`, so the mark is where the shutdown
+    /// begins for every publisher: each one checks it under `latest`, the
+    /// lock it publishes under, so a publish either completes entirely
+    /// before the mark (the shutdown had not begun) or sees it and drops
+    /// its Failed. Nothing published after the shutdown began is Failed.
+    ///
+    /// The supervisor's own `shutting_down()` checks stay early exits, but
+    /// they cannot order a decision against the shutdown: `begin_shutdown`
+    /// does not take the machine lock (a stuck tick may hold it). A commit
+    /// that read `false` just before may still count one more failure, even
+    /// the one that opens its circuit, after the mark. That is accepted:
+    /// its Failed is never published, and the machine is not consulted
+    /// again before the process exits.
+    ///
+    /// Other states are still taken: they are not latched, raise no Failed
+    /// notice or incident, and the shutdown path may still publish a final
+    /// state (it publishes none today).
+    ///
+    /// Takes only `latest`, briefly: its holders take nothing but `health`,
+    /// `pause` and the process probe under it, never the supervisor's
+    /// machine lock (the supervisor takes `latest` inside it, not the other
+    /// way round), so the caller (the Tauri main thread, the session window)
+    /// cannot be blocked by a stuck tick. Idempotent; never cleared (the
+    /// process exits).
+    pub(crate) fn mark_shutdown(&self) {
+        let _latest = self.outbox.latest.lock();
+        self.shutdown_mark.store(true, Ordering::SeqCst);
+    }
+
+    /// Logs the first Failed dropped after [`Runtime::mark_shutdown`];
+    /// `latest` is held by the caller.
+    fn log_failed_dropped(&self, source: &'static str) {
+        if !self.shutdown_drop_logged.swap(true, Ordering::SeqCst) {
+            tracing::info!(
+                event = "runtime.failed_dropped_on_shutdown",
+                source,
+                "engine shutting down; Failed not published"
+            );
+        }
     }
 
     /// Stores `snapshot` with ENGINE_DOWN following its state (set in
@@ -863,6 +928,49 @@ mod tests {
         runtime.publish_health(numbered(HealthState::Healthy, 4));
         assert_eq!(runtime.health(), numbered(HealthState::Healthy, 4));
         assert_eq!(runtime.pause_reasons(), PauseReasons::MANUAL);
+    }
+
+    /// R1: once the shutdown is marked, a Failed snapshot and `latch_failed`
+    /// are dropped inside the critical section that would have stored
+    /// them: health, pause reasons and the latest version (what the event
+    /// thread delivers, so no event) stay as they were, and nothing is
+    /// latched. Other states are still taken. Unmarked, the same calls go
+    /// through.
+    #[test]
+    fn failed_is_dropped_once_the_shutdown_is_marked() {
+        for marked in [false, true] {
+            let (runtime, _) = runtime();
+            runtime.publish_health(numbered(HealthState::Recovering, 1));
+            runtime.set_pause(PauseReasons::MANUAL, true);
+            if marked {
+                runtime.mark_shutdown();
+            }
+            let before = runtime.health();
+            let reasons = runtime.pause_reasons();
+            let version = runtime.outbox.latest.lock().version;
+
+            runtime.publish_health(numbered(HealthState::Failed, 2));
+            if marked {
+                assert_eq!(runtime.health(), before, "publish dropped");
+                assert_eq!(runtime.outbox.latest.lock().version, version);
+            } else {
+                assert_eq!(runtime.health(), numbered(HealthState::Failed, 2));
+                runtime.publish_health(before.clone());
+            }
+            runtime.latch_failed("test");
+            assert_eq!(runtime.failed_latched(), !marked, "marked {marked}");
+            if !marked {
+                assert_eq!(runtime.health().state, HealthState::Failed);
+                continue;
+            }
+            assert_eq!(runtime.health(), before, "latch dropped");
+            assert_eq!(runtime.pause_reasons(), reasons);
+            assert_eq!(runtime.outbox.latest.lock().version, version, "no event");
+
+            runtime.publish_health(numbered(HealthState::Healthy, 3));
+            assert_eq!(runtime.health(), numbered(HealthState::Healthy, 3));
+            assert_eq!(runtime.pause_reasons(), PauseReasons::MANUAL);
+        }
     }
 
     /// Two publishers alternate Recovering/Healthy while a reader samples

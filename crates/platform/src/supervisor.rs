@@ -49,8 +49,10 @@
 //! attempt that returns is discarded before any timeout accounting. So the
 //! engine's teardown never counts as a failure and Health keeps the last
 //! value published before the shutdown (never Failed because of the exit).
-//! Each of these checks the flag under the machine lock, so a decision made
-//! there either precedes the shutdown or does not happen.
+//! These checks are early exits: the flag is not set under the machine
+//! lock, so a commit that read it just before the shutdown may still count
+//! a failure after it. The runtime's shutdown mark, set before the flag,
+//! drops the Failed such a commit publishes (`Runtime::mark_shutdown`).
 use crate::health::{Component, ComponentHealth, HealthSnapshot, HealthState, ReasonCode};
 use crate::runtime::Runtime;
 use crate::traits::Clock;

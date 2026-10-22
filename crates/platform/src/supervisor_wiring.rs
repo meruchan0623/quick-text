@@ -21,6 +21,13 @@
 //! input consumer closes the RawInput window once it sees `shutdown`) is
 //! therefore never read as a failure: no incident, no failed attempt, no
 //! Failed during exit.
+//!
+//! Those checks are early exits. What orders the shutdown against every
+//! publish is the runtime's shutdown mark, which [`begin_shutdown`] sets
+//! before the flag: a Failed published after it is dropped (review R1). A
+//! supervisor commit preempted between its check and the shutdown may
+//! still count one more failure internally; that is accepted because it
+//! is no longer published.
 use crate::health::{Component, ComponentHealth, HealthSnapshot, HealthState, ReasonCode};
 use crate::runtime::Runtime;
 use crate::supervisor::{self, ExecutorControl, InputSources, Status, Supervisor};
@@ -205,11 +212,20 @@ fn spawn_watchdog(
 /// Starts the engine shutdown (`RunEvent::Exit`, session end): sets
 /// `Shared::shutdown` of the engine attached to `runtime`, which stops the
 /// supervisor driver, the watchdog and the engine's own threads. Idempotent
-/// and non-blocking; false when no engine is attached.
+/// and non-blocking; false when no engine is attached (nothing is marked
+/// then either).
+///
+/// The runtime's shutdown mark (`Runtime::mark_shutdown`) is set first,
+/// then the flag: whoever sees `shutting_down()` finds Failed publishing
+/// already closed, and a publish that slips past a `shutting_down()` check
+/// (a supervisor commit preempted right after it) meets the mark instead.
+/// The mark takes only the runtime's `latest` lock, never the supervisor's
+/// machine lock, which a stuck tick may hold.
 pub fn begin_shutdown(runtime: &Runtime) -> bool {
     let Some(shared) = runtime.shared() else {
         return false;
     };
+    runtime.mark_shutdown();
     if !shared.shutdown.swap(true, Ordering::SeqCst) {
         tracing::info!(event = "engine.shutdown", "engine shutting down");
     }
@@ -1253,6 +1269,72 @@ mod tests {
         assert!(begin_shutdown(&rig.runtime));
         report_unsupervised(&rig.runtime);
         assert_eq!(rig.state(), HealthState::Starting);
+    }
+
+    /// R1: `begin_shutdown` sets the runtime's shutdown mark, so a Failed
+    /// published or latched afterwards (by a publisher that passed its own
+    /// `shutting_down()` check before) is dropped; other states are taken.
+    /// Without an engine nothing shuts down and nothing is marked.
+    #[test]
+    fn begin_shutdown_closes_failed_publishing() {
+        let rig = Rig::new();
+        assert!(begin_shutdown(&rig.runtime));
+        rig.runtime.publish_health(unsupervised(1));
+        rig.runtime.latch_failed("driver_hung");
+        assert_eq!(rig.state(), HealthState::Starting);
+        assert!(!rig.runtime.failed_latched());
+        rig.runtime.publish_health(HealthSnapshot {
+            state: HealthState::Healthy,
+            components: vec![],
+        });
+        assert_eq!(rig.state(), HealthState::Healthy);
+
+        let runtime = Runtime::new(Arc::new(FakeClock::new()));
+        assert!(!begin_shutdown(&runtime));
+        runtime.publish_health(unsupervised(1));
+        assert_eq!(runtime.health().state, HealthState::Failed);
+    }
+
+    /// R1: a commit that read `shutting_down()` false and was then preempted
+    /// by `begin_shutdown` (simulated: only the mark is set, as
+    /// `begin_shutdown` does first, while the CIRCUIT_FAILURES-th attempt is
+    /// held in its gate) still counts that failure and opens its circuit,
+    /// but the Failed it publishes after the mark is dropped: Health stays
+    /// as it was, nothing is latched. Without the mark the same sequence
+    /// ends in Failed.
+    #[test]
+    fn a_commit_preempted_by_the_shutdown_counts_the_failure_but_publishes_no_failed() {
+        for adapter in ["executor", "inputs"] {
+            for marked in [false, true] {
+                let case = format!("{adapter}, marked {marked}");
+                let g = GatedRig::new(adapter, CIRCUIT_FAILURES);
+                let (entered, before) = std::thread::scope(|scope| {
+                    let ticker = scope.spawn(|| g.tick_into_gate());
+                    let entered = g.gate().wait_entered();
+                    let before = g.rig.runtime.health();
+                    if marked {
+                        g.rig.runtime.mark_shutdown();
+                    }
+                    g.gate().open();
+                    ticker.join().unwrap();
+                    (entered, before)
+                });
+                assert!(entered, "{case}: the gated attempt ran");
+                assert_eq!(before.state, HealthState::Recovering, "{case}");
+                assert!(!g.rig.runtime.shutting_down(), "{case}: the check passed");
+                assert_eq!(
+                    g.supervisor.failure_count(),
+                    CIRCUIT_FAILURES,
+                    "{case}: counted"
+                );
+                if marked {
+                    assert_eq!(g.rig.runtime.health(), before, "{case}: Failed dropped");
+                    assert!(!g.rig.runtime.failed_latched(), "{case}");
+                } else {
+                    assert_eq!(g.rig.state(), HealthState::Failed, "{case}");
+                }
+            }
+        }
     }
 
     /// The Windows read: a busy table repeats the last value, and before
