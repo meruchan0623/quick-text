@@ -11,11 +11,12 @@
 use super::actions::{execute_with_proof, Ports};
 use super::executor::Candidate;
 use super::hook::{
-    classify, handle_key, handle_mouse, HookAction, HookPipe, HookRecord, HookSet, KeyInfo,
-    KeyRecord, MouseInfo, Origin,
+    classify, handle_key, handle_mouse, pointer_move, HookAction, HookPipe, HookRecord, HookSet,
+    KeyInfo, KeyRecord, MouseInfo, Origin,
 };
 use super::input::{
-    Consumer, Lane, Liveness, Monitor, Registration, SourcePorts, Sources, RESYNC_SECOND_PASS,
+    Consumer, Lane, Liveness, Monitor, OwnWindows, Registration, SourcePorts, Sources,
+    RESYNC_SECOND_PASS,
 };
 use super::keystate::{
     track_own_input, AsyncKeyProbe, KeyBits, OwnInput, INJECTION_QUIET, MODIFIER_VERIFY_AFTER,
@@ -23,6 +24,7 @@ use super::keystate::{
 };
 use super::liveness::{MATCH_WINDOW, MISS_LIMIT, REPEAT_RUN};
 use super::rawinput::{raw_record, InputEvent, RawRecord, KEYBOARD_LAYOUT_CACHE_INTERVAL};
+use super::recording::capture_gap;
 use super::session::{end_message, SessionEnd, SessionSignals, Signal};
 use super::*;
 use crate::health::{Component, ComponentHealth, HealthState, ReasonCode};
@@ -189,6 +191,7 @@ fn hardware(vk: u16) -> KeyInfo {
         scan: 0,
         flags: 0,
         extra: 0,
+        time: 0,
     }
 }
 fn injected(vk: u16) -> KeyInfo {
@@ -205,6 +208,7 @@ fn mouse(msg: u32, x: i32, y: i32) -> MouseInfo {
         y,
         flags: 0,
         extra: 0,
+        time: 0,
     }
 }
 /// What the RawInput callback captures for a hardware key typing `ch`.
@@ -350,7 +354,7 @@ fn hook_and_raw_callback_bodies_neither_allocate_nor_block() {
                 }),
                 HookRecord::Key(KeyRecord { vk: VK_LSHIFT, .. }),
                 HookRecord::Cancel,
-                HookRecord::Move { x: -5, y: 7 },
+                HookRecord::Move { x: -5, y: 7, .. },
                 HookRecord::Mouse {
                     msg: WM_LBUTTONDOWN,
                     x: -5,
@@ -526,7 +530,11 @@ fn pointer_moves_are_queued_and_only_clicks_break_contiguity() {
     assert!(matches!(
         records(&hooks).as_slice(),
         [
-            HookRecord::Move { x: -1920, y: 1080 },
+            HookRecord::Move {
+                x: -1920,
+                y: 1080,
+                ..
+            },
             HookRecord::Mouse {
                 msg: WM_RBUTTONDOWN,
                 x: 3,
@@ -535,6 +543,145 @@ fn pointer_moves_are_queued_and_only_clicks_break_contiguity() {
             }
         ]
     ));
+}
+
+/// No window counts as ours (recording tests).
+const NOT_OURS: OwnWindows = OwnWindows {
+    foreground: || false,
+    at: |_, _| false,
+};
+fn key_at(vk: u16, time: u32) -> KeyInfo {
+    KeyInfo {
+        time,
+        ..hardware(vk)
+    }
+}
+fn mouse_at(msg: u32, x: i32, y: i32, time: u32) -> MouseInfo {
+    MouseInfo {
+        time,
+        ..mouse(msg, x, y)
+    }
+}
+/// Starts a recording on `shared` (callers hold [`serial`]: the recorder's
+/// bookkeeping is global).
+fn begin_recording(shared: &Shared) {
+    *shared.recording.lock().unwrap() = Some(vec![]);
+}
+/// Ends the recording on `shared` and returns what it recorded.
+fn recorded(shared: &Shared) -> Vec<Operation> {
+    let steps = shared.recording.lock().unwrap().take().unwrap();
+    steps.into_iter().map(|step| step.operation).collect()
+}
+fn key_down(code: u16) -> Operation {
+    Operation::KeyDown {
+        key: Key::WindowsCode { code },
+    }
+}
+fn key_up(code: u16) -> Operation {
+    Operation::KeyUp {
+        key: Key::WindowsCode { code },
+    }
+}
+fn left(state: ButtonState) -> Operation {
+    Operation::MouseButton {
+        button: MouseButton::Left,
+        state,
+    }
+}
+fn delay(ms: u64) -> Operation {
+    Operation::Delay { ms }
+}
+
+/// M1: macro delays are the gaps between capture times, so a consumer that
+/// gets to the records late (here all of them in one drain, after the
+/// fact) keeps the user's timing, across a tick-count wrap.
+#[test]
+fn recorded_delays_keep_capture_intervals_when_the_consumer_drains_late() {
+    let _serial = serial();
+    let shared = engine("btw");
+    begin_recording(&shared);
+    let hooks = HookPipe::new(leaked_keys(), 16, false, nothing);
+    let raw = Lane::new(4, nothing);
+    let probe = FixedProbe(context());
+    // The tick count wraps between the key-up and the pointer move.
+    let at = |ms: u32| (u32::MAX - 99).wrapping_add(ms);
+    handle_key(&hooks, &shared, &probe, WM_KEYDOWN, key_at(0x41, at(0)));
+    handle_key(&hooks, &shared, &probe, WM_KEYUP, key_at(0x41, at(70)));
+    handle_mouse(&hooks, &shared, mouse_at(WM_MOUSEMOVE, 10, 20, at(570)));
+    handle_mouse(&hooks, &shared, mouse_at(WM_LBUTTONDOWN, 10, 20, at(1_820)));
+    handle_mouse(&hooks, &shared, mouse_at(WM_LBUTTONUP, 10, 20, at(1_900)));
+    handle_key(&hooks, &shared, &probe, WM_KEYDOWN, key_at(0x42, at(1_900)));
+    let mut consumer = Consumer::with_windows(NOT_OURS);
+    drain(&mut consumer, &shared, &hooks, &raw, &probe);
+    assert_eq!(
+        recorded(&shared),
+        [
+            key_down(0x41),
+            delay(70),
+            key_up(0x41),
+            delay(500),
+            pointer_move(10, 20),
+            delay(1_250),
+            left(ButtonState::Down),
+            delay(80),
+            left(ButtonState::Up),
+            key_down(0x42),
+        ]
+    );
+}
+
+#[test]
+fn capture_gaps_wrap_never_go_negative_and_are_capped() {
+    assert_eq!(capture_gap(10, 80), 70);
+    assert_eq!(capture_gap(u32::MAX - 9, 20), 30, "across the wrap");
+    assert_eq!(capture_gap(80, 10), 0, "out of order");
+    assert_eq!(capture_gap(0, 5_000_000), MAX_DELAY_MS);
+}
+
+/// Input aimed at our own windows stays out of a recording: keys while one
+/// has the focus, pointer events over one.
+#[test]
+fn input_aimed_at_our_own_windows_is_not_recorded() {
+    let _serial = serial();
+    let raw = Lane::new(4, nothing);
+    let probe = FixedProbe(context());
+    let focused = OwnWindows {
+        foreground: || true,
+        at: |_, _| false,
+    };
+    let shared = engine("btw");
+    begin_recording(&shared);
+    let hooks = HookPipe::new(leaked_keys(), 16, false, nothing);
+    handle_key(&hooks, &shared, &probe, WM_KEYDOWN, key_at(0x41, 0));
+    handle_mouse(&hooks, &shared, mouse_at(WM_LBUTTONDOWN, 5, 5, 10));
+    drain(
+        &mut Consumer::with_windows(focused),
+        &shared,
+        &hooks,
+        &raw,
+        &probe,
+    );
+    assert!(recorded(&shared).is_empty());
+    let left_half = OwnWindows {
+        foreground: || false,
+        at: |x, _| x < 0,
+    };
+    let shared = engine("btw");
+    begin_recording(&shared);
+    handle_key(&hooks, &shared, &probe, WM_KEYDOWN, key_at(0x41, 0));
+    handle_mouse(&hooks, &shared, mouse_at(WM_RBUTTONDOWN, -5, 5, 10));
+    handle_mouse(&hooks, &shared, mouse_at(WM_LBUTTONDOWN, 5, 5, 30));
+    drain(
+        &mut Consumer::with_windows(left_half),
+        &shared,
+        &hooks,
+        &raw,
+        &probe,
+    );
+    assert_eq!(
+        recorded(&shared),
+        [key_down(0x41), delay(30), left(ButtonState::Down)]
+    );
 }
 
 /// no-regression #7: the detector never caches the layout, and each key

@@ -143,6 +143,43 @@ fn delta(seen: &mut u64, now: u64) -> u64 {
 /// A physical key transition one source saw: (source, virtual key, down).
 pub(super) type Sighting = (Source, u16, bool);
 
+/// Where recorded input landed: input aimed at one of our own windows is
+/// never recorded. Asked only while a recording is active, on the consumer.
+#[derive(Clone, Copy)]
+pub(super) struct OwnWindows {
+    /// The foreground window belongs to this process.
+    pub(super) foreground: fn() -> bool,
+    /// The window under a screen point belongs to this process.
+    pub(super) at: fn(i32, i32) -> bool,
+}
+impl Default for OwnWindows {
+    fn default() -> Self {
+        Self {
+            foreground: own_foreground,
+            at: own_window_at,
+        }
+    }
+}
+fn own_foreground() -> bool {
+    // SAFETY: plain Win32 queries with no pointers we own.
+    unsafe {
+        let mut pid = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), &mut pid);
+        pid == GetCurrentProcessId()
+    }
+}
+fn own_window_at(x: i32, y: i32) -> bool {
+    // SAFETY: plain Win32 queries with no pointers we own.
+    unsafe {
+        let mut pid = 0;
+        GetWindowThreadProcessId(WindowFromPoint(POINT { x, y }), &mut pid);
+        pid == GetCurrentProcessId()
+    }
+}
+fn recording(shared: &Shared) -> bool {
+    shared.recording.try_lock().is_ok_and(|rows| rows.is_some())
+}
+
 /// Consumer state: the typed-key buffer, the logged lane counters and the
 /// physical key transitions each source saw since the last liveness tick.
 #[derive(Default)]
@@ -150,8 +187,17 @@ pub(super) struct Consumer {
     buffer: Buffer,
     reported: Reported,
     seen: Vec<Sighting>,
+    own: OwnWindows,
 }
 impl Consumer {
+    /// A consumer that asks `own` where recorded input landed.
+    #[cfg(test)]
+    pub(super) fn with_windows(own: OwnWindows) -> Self {
+        Self {
+            own,
+            ..Self::default()
+        }
+    }
     /// Drains both lanes once and returns how many records were handled.
     /// Candidates go to `enqueue`; the buffer is cleared when it accepts.
     pub(super) fn drain(
@@ -200,13 +246,14 @@ impl Consumer {
             HookRecord::Cancel => stop_record_events(shared),
             HookRecord::Key(key) => {
                 let code = Key::WindowsCode { code: key.vk };
-                record_event(
+                self.record_key(
                     shared,
                     if key.down {
                         Operation::KeyDown { key: code }
                     } else {
                         Operation::KeyUp { key: code }
                     },
+                    key.time,
                 );
                 if !key.down {
                     return;
@@ -220,12 +267,35 @@ impl Consumer {
                     "Espanso RawInput capture active"
                 });
             }
-            HookRecord::Mouse { msg, data, x, y } => {
+            HookRecord::Mouse {
+                msg,
+                data,
+                x,
+                y,
+                time,
+            } => {
                 if let Some(operation) = mouse_operation(msg, data) {
-                    record_pointer(shared, operation, x, y);
+                    self.record_pointer(shared, operation, x, y, time);
                 }
             }
-            HookRecord::Move { x, y } => record_pointer(shared, pointer_move(x, y), x, y),
+            HookRecord::Move { x, y, time } => {
+                self.record_pointer(shared, pointer_move(x, y), x, y, time)
+            }
+        }
+    }
+    /// Records a key operation captured at `time` unless one of our own
+    /// windows has the focus.
+    fn record_key(&self, shared: &Shared, operation: Operation, time: u32) {
+        if recording(shared) && !(self.own.foreground)() {
+            record_event(shared, operation, time);
+        }
+    }
+    /// Records a pointer operation captured at `time` unless the pointer is
+    /// over, or the focus is in, one of our own windows. Hit-testing runs
+    /// only while a recording is active, never on the hook.
+    fn record_pointer(&self, shared: &Shared, operation: Operation, x: i32, y: i32, time: u32) {
+        if recording(shared) && !(self.own.at)(x, y) && !(self.own.foreground)() {
+            record_event(shared, operation, time);
         }
     }
     fn detect(
@@ -838,22 +908,6 @@ impl<'a, P: SourcePorts, C: Clock> Liveness<'a, P, C> {
     }
 }
 
-/// Records a pointer operation unless the pointer is over our own window.
-/// Hit-testing runs only while a recording is active, never on the hook.
-fn record_pointer(shared: &Shared, operation: Operation, x: i32, y: i32) {
-    if !shared.recording.try_lock().is_ok_and(|rows| rows.is_some()) {
-        return;
-    }
-    // SAFETY: plain Win32 queries with no pointers we own.
-    let own = unsafe {
-        let mut pid = 0;
-        GetWindowThreadProcessId(WindowFromPoint(POINT { x, y }), &mut pid);
-        pid == GetCurrentProcessId()
-    };
-    if !own {
-        record_event(shared, operation);
-    }
-}
 fn run_consumer(
     shared: Arc<Shared>,
     hooks: &'static HookPipe<'static>,

@@ -45,6 +45,9 @@ pub(super) struct KeyInfo {
     pub(super) scan: u32,
     pub(super) flags: u32,
     pub(super) extra: usize,
+    /// When the event happened: the struct's `time`, a millisecond tick
+    /// count that wraps every 49.7 days.
+    pub(super) time: u32,
 }
 /// The fields the mouse hook reads from `MSLLHOOKSTRUCT`.
 #[derive(Clone, Copy, Debug)]
@@ -55,6 +58,8 @@ pub(super) struct MouseInfo {
     pub(super) y: i32,
     pub(super) flags: u32,
     pub(super) extra: usize,
+    /// When the event happened, as in [`KeyInfo::time`].
+    pub(super) time: u32,
 }
 /// Where a low-level input event came from (no-regression #4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,6 +110,9 @@ pub(super) struct KeyRecord {
     pub(super) hardware: bool,
     pub(super) generation: u64,
     pub(super) acceptance: Option<Acceptance>,
+    /// Capture time ([`KeyInfo::time`]); macro delays are measured between
+    /// capture times, not when the consumer gets to a record (M1).
+    pub(super) time: u32,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) enum HookRecord {
@@ -113,17 +121,19 @@ pub(super) enum HookRecord {
     External,
     /// Ctrl+Shift+Esc cancelled the running action.
     Cancel,
-    /// A click or wheel message.
+    /// A click or wheel message, with its capture time.
     Mouse {
         msg: u32,
         data: u32,
         x: i32,
         y: i32,
+        time: u32,
     },
-    /// A pointer move (macro recording only).
+    /// A pointer move (macro recording only), with its capture time.
     Move {
         x: i32,
         y: i32,
+        time: u32,
     },
 }
 
@@ -219,6 +229,7 @@ pub(super) fn on_key(
         hardware: origin == Origin::Hardware,
         generation,
         acceptance,
+        time: key.time,
     }));
     HookAction::Pass
 }
@@ -243,6 +254,7 @@ unsafe extern "system" fn keyboard(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                 scan: event.scanCode,
                 flags: event.flags,
                 extra: event.dwExtraInfo,
+                time: event.time,
             };
             if handle_key(pipe, shared, &WinForeground, w as u32, key) == HookAction::Swallow {
                 return 1;
@@ -286,6 +298,7 @@ pub(super) fn on_mouse(pipe: &HookPipe, shared: &Shared, mouse: MouseInfo) {
         pipe.lane.push(HookRecord::Move {
             x: mouse.x,
             y: mouse.y,
+            time: mouse.time,
         });
         return;
     }
@@ -298,6 +311,7 @@ pub(super) fn on_mouse(pipe: &HookPipe, shared: &Shared, mouse: MouseInfo) {
         data: mouse.data,
         x: mouse.x,
         y: mouse.y,
+        time: mouse.time,
     });
 }
 /// What the mouse hook runs: [`on_mouse`] with panics contained.
@@ -316,6 +330,7 @@ unsafe extern "system" fn mouse(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                 y: event.pt.y,
                 flags: event.flags,
                 extra: event.dwExtraInfo,
+                time: event.time,
             };
             handle_mouse(pipe, shared, mouse);
         }

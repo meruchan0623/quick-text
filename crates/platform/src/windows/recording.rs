@@ -1,30 +1,39 @@
 //! Macro recording fed by the hooks.
 use super::*;
 struct RecordMeta {
-    at: Instant,
+    /// Capture time of the last recorded event (hook tick count, ms).
+    at: u32,
     held: BTreeSet<Key>,
     buttons: Vec<MouseButton>,
     stopped: bool,
 }
 static RECORD_META: OnceLock<Mutex<RecordMeta>> = OnceLock::new();
-pub(super) fn record_event(shared: &Shared, operation: Operation) {
+/// The delay to record between two events captured at hook ticks `from`
+/// and `to` (ms). The tick count wraps, so the gap is taken modulo 2^32; a
+/// gap of more than half the range means `to` came first and counts as no
+/// delay. Capped at [`MAX_DELAY_MS`].
+pub(super) fn capture_gap(from: u32, to: u32) -> u64 {
+    let gap = to.wrapping_sub(from);
+    if gap > u32::MAX / 2 {
+        0
+    } else {
+        u64::from(gap).min(MAX_DELAY_MS)
+    }
+}
+/// Records `operation`, captured by a hook at tick `time`. The caller has
+/// already dropped input aimed at our own windows. Delays come from capture
+/// times, so a consumer that drains late keeps the user's timing (M1).
+pub(super) fn record_event(shared: &Shared, operation: Operation, time: u32) {
     let Ok(mut recorded) = shared.recording.try_lock() else {
         return;
     };
     let Some(rows) = recorded.as_mut() else {
         return;
     };
-    unsafe {
-        let mut pid = 0;
-        GetWindowThreadProcessId(GetForegroundWindow(), &mut pid);
-        if pid == GetCurrentProcessId() {
-            return;
-        }
-    }
     let mut meta = RECORD_META
         .get_or_init(|| {
             Mutex::new(RecordMeta {
-                at: Instant::now(),
+                at: time,
                 held: BTreeSet::new(),
                 buttons: vec![],
                 stopped: false,
@@ -33,7 +42,7 @@ pub(super) fn record_event(shared: &Shared, operation: Operation) {
         .lock()
         .unwrap();
     if rows.is_empty() {
-        meta.at = Instant::now();
+        meta.at = time;
         meta.held.clear();
         meta.buttons.clear();
         meta.stopped = false;
@@ -67,8 +76,8 @@ pub(super) fn record_event(shared: &Shared, operation: Operation) {
         }
         _ => {}
     }
-    let delay = meta.at.elapsed().as_millis().min(MAX_DELAY_MS as u128) as u64;
-    meta.at = Instant::now();
+    let delay = capture_gap(meta.at, time);
+    meta.at = time;
     if delay > 0 && !rows.is_empty() {
         rows.push(Step::new(
             Operation::Delay { ms: delay },
