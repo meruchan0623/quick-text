@@ -1,6 +1,7 @@
 //! Configuration store: draft, active and previous configurations plus their
 //! files in the data directory (§7.1 「数据目录」).
 mod atomic;
+mod export;
 mod fallback;
 mod load;
 mod meta;

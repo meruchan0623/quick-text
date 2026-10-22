@@ -56,7 +56,9 @@ pub async fn get_foreground(
     }
     Ok(result)
 }
-/// Returns `Ok(None)` when the user cancels the save dialog (B-42).
+/// Returns `Ok(None)` when the user cancels the save dialog (B-42). Refused
+/// in safe mode other than CrashLoop, and for targets inside the data
+/// directory (see `Store::export_draft`).
 #[tauri::command]
 pub fn export_config(
     path: Option<String>,
@@ -72,16 +74,7 @@ pub fn export_config(
     let Some(target) = target else {
         return Ok(None);
     };
-    let s = store.lock();
-    let unresolved = s
-        .unresolved
-        .iter()
-        .filter(|x| s.draft.rules.iter().any(|r| r.id == x.rule_id))
-        .cloned()
-        .collect();
-    let package =
-        export_package_with_unresolved(&s.draft, unresolved).map_err(CommandError::validation)?;
-    fs::write(&target, package).map_err(|e| CommandError::io(IoOp::Write, Some(&target), &e))?;
+    store.lock().export_draft(&target)?;
     Ok(Some(target.to_string_lossy().into_owned()))
 }
 /// Without `path`, asks for a JSON package; `Ok(None)` when the user cancels.

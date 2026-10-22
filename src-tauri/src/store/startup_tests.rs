@@ -719,6 +719,157 @@ fn mark_last_good_is_the_first_fallback() {
     assert_eq!(report.active.rules[0].id, "two");
 }
 
+const ALL_MODES: [Option<SafeModeReason>; 5] = [
+    None,
+    Some(SafeModeReason::Locked),
+    Some(SafeModeReason::NewerSchema),
+    Some(SafeModeReason::NoValidConfig),
+    Some(SafeModeReason::CrashLoop),
+];
+
+/// A data directory with every store file, loaded in `mode`.
+fn store_in(mode: Option<SafeModeReason>) -> (TempDir, Arc<World>, Store) {
+    let dir = TempDir::new();
+    let world = world();
+    write(&dir, "active.json", &bytes(&config_at(2)));
+    write(&dir, "draft.json", &bytes(&config_at(2)));
+    write(&dir, "previous.json", &bytes(&config_at(1)));
+    write(&dir, "revisions/1.json", &bytes(&config_at(1)));
+    atomic_json(&dir.join(META_FILE), &StoreMeta::default()).unwrap();
+    match mode {
+        None => {}
+        Some(SafeModeReason::Locked) => world.locked.lock().push("active.json"),
+        Some(SafeModeReason::NewerSchema) => {
+            let mut newer = serde_json::to_value(config_at(2)).unwrap();
+            newer["version"] = json!(SUPPORTED_SCHEMA_VERSION + 1);
+            write(&dir, "active.json", &value_bytes(&newer));
+        }
+        Some(SafeModeReason::NoValidConfig) => {
+            for name in ["active.json", "previous.json", "revisions/1.json"] {
+                write(&dir, name, TRUNCATED);
+            }
+        }
+        Some(SafeModeReason::CrashLoop) => {
+            for _ in 0..2 {
+                drop(Store::load_with(dir.path(), &env(&world)));
+                world.advance(1_000);
+            }
+        }
+    }
+    let store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.safe_mode(), mode);
+    (dir, world, store)
+}
+
+fn refused_as_data_dir(result: Result<(), CommandError>) -> bool {
+    matches!(
+        result,
+        Err(CommandError::Io {
+            op: crate::error::IoOp::Write,
+            os_code: None,
+            ..
+        })
+    )
+}
+
+/// `export_config` never writes into the data directory: in normal mode and
+/// CrashLoop the target is refused as inside it, in the other safe modes
+/// the export itself is refused.
+#[test]
+fn export_never_writes_into_the_data_dir() {
+    for mode in ALL_MODES {
+        let (dir, _world, store) = store_in(mode);
+        let before = files(&dir);
+        for name in [
+            "active.json",
+            "draft.json",
+            "previous.json",
+            "revisions/1.json",
+            META_FILE,
+        ] {
+            let result = store.export_draft(&dir.join(name));
+            match mode {
+                None | Some(SafeModeReason::CrashLoop) => {
+                    let label = Path::new(name).file_name().unwrap().to_string_lossy();
+                    assert!(
+                        matches!(
+                            &result,
+                            Err(CommandError::Io {
+                                op: crate::error::IoOp::Write,
+                                path: Some(path),
+                                os_code: None,
+                            }) if *path == label
+                        ),
+                        "{mode:?} {name}: {result:?}"
+                    );
+                }
+                Some(reason) => assert!(
+                    matches!(result, Err(CommandError::SafeMode { reason: r }) if r == reason),
+                    "{mode:?} {name}"
+                ),
+            }
+        }
+        assert_eq!(files(&dir), before, "{mode:?}");
+    }
+}
+
+/// CrashLoop and normal mode export outside the data directory, including
+/// to a sibling whose name only starts like it.
+#[test]
+fn crash_loop_exports_outside_the_data_dir() {
+    for mode in [None, Some(SafeModeReason::CrashLoop)] {
+        let (dir, _world, store) = store_in(mode);
+        let elsewhere = TempDir::new();
+        let sibling = TempDir(PathBuf::from(format!("{}-backup", dir.display())));
+        fs::create_dir_all(&sibling.0).unwrap();
+        for target in [elsewhere.join("backup.json"), sibling.join("backup.json")] {
+            store.export_draft(&target).unwrap();
+            let package = fs::read_to_string(&target).unwrap();
+            let imported = import_package(&package).unwrap();
+            assert_eq!(imported.config.rules, store.draft.rules, "{mode:?}");
+        }
+    }
+}
+
+/// Other spellings of a path inside the data directory are refused too.
+#[test]
+fn export_refuses_other_spellings_of_the_data_dir() {
+    let (dir, _world, store) = store_in(None);
+    let elsewhere = TempDir::new();
+    let before = files(&dir);
+    let mut variants = vec![
+        dir.join("revisions").join("..").join("active.json"),
+        elsewhere
+            .join("..")
+            .join(dir.file_name().unwrap())
+            .join("draft.json"),
+        dir.join("revisions").join(".."),
+        dir.path(),
+        dir.join("new-export.json"),
+        dir.join("revisions").join("9.json"),
+    ];
+    if cfg!(windows) {
+        let text = dir.display().to_string();
+        variants.extend([
+            PathBuf::from(text.to_uppercase()).join("ACTIVE.JSON"),
+            PathBuf::from(text.to_lowercase())
+                .join("Revisions")
+                .join("1.JSON"),
+            dir.join("active.json."),
+            dir.join("draft.json . "),
+            dir.join("brand-new.json."),
+            PathBuf::from(format!("{text}.")).join("previous.json"),
+            PathBuf::from(format!(r"\\?\{text}")).join("active.json"),
+            dir.join("active.json::$DATA"),
+        ]);
+    }
+    for target in variants {
+        let result = store.export_draft(&target);
+        assert!(refused_as_data_dir(result), "{}", target.display());
+    }
+    assert_eq!(files(&dir), before);
+}
+
 /// Fault injection (B-52): the store points behave as the real failures.
 #[cfg(feature = "fault-injection")]
 mod injected {
