@@ -143,7 +143,10 @@ describe('runtime status area (S-19)', () => {
     expect(headerStatus(container)).toBe('输入监听已停止');
     await click(mounted, '修复引擎');
     expect(callsOf(backend, 'repair_engine')).toHaveLength(1);
-    expect(['正在恢复…', '监听中']).toContain(headerStatus(container));
+    // repair_engine answers the current snapshot; `recovering` and the outcome arrive as events.
+    await waitFor(mounted, () => {
+      expect(headerStatus(container)).toBe('正在恢复…');
+    });
     await waitFor(mounted, () => {
       expect(headerStatus(container)).toBe('监听中');
     });
