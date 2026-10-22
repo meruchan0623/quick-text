@@ -267,6 +267,15 @@ impl Consumer {
 /// still in flight when the first one ran (B-05).
 pub(super) const RESYNC_SECOND_PASS: Duration = Duration::from_millis(200);
 
+/// Ends the current word and every candidate proof built on it: the next
+/// key takes a generation with a gap, and the caret epoch in each stamp
+/// moves. Used whenever input may have gone unseen (session signals, a lost
+/// or reattached input source; H3).
+pub(super) fn invalidate_prefix(shared: &Shared) {
+    shared.generation.fetch_add(1, Ordering::SeqCst);
+    observer::CARET_EPOCH.fetch_add(1, Ordering::SeqCst);
+}
+
 /// The earlier of two optional deadlines.
 fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
     match (a, b) {
@@ -355,8 +364,7 @@ impl<'a, P: AsyncKeyProbe, C: Clock> Monitor<'a, P, C> {
         }
         if signalled {
             // Typing before and after a session change is not one word.
-            shared.generation.fetch_add(1, Ordering::SeqCst);
-            observer::CARET_EPOCH.fetch_add(1, Ordering::SeqCst);
+            invalidate_prefix(shared);
             self.pending = Some("first");
             self.second_pass = None;
         } else if self.second_pass.is_some_and(|due| now >= due) {
@@ -367,6 +375,17 @@ impl<'a, P: AsyncKeyProbe, C: Clock> Monitor<'a, P, C> {
         let retry = self.pending.and_then(|pass| self.run_pending(pass, now));
         let modifiers = self.watch.check(self.keys, self.ports, now);
         earliest(earliest(self.second_pass, retry), modifiers)
+    }
+    /// Whether a candidate detected at `generation` may go to the executor
+    /// (H3). A signal raised since the last tick (an input source came back,
+    /// the session changed) is handled first, so the word boundary it
+    /// stands for applies to this candidate too.
+    pub(super) fn admits(&mut self, shared: &Shared, generation: u64) -> bool {
+        if !self.signals.pending() {
+            return true;
+        }
+        self.tick(shared);
+        generation == shared.generation.load(Ordering::SeqCst)
     }
     /// Runs the pending resync if our injections have settled. Returns when
     /// to try again otherwise.
@@ -480,6 +499,9 @@ pub(super) struct Sources<'a, P: SourcePorts, C: Clock> {
     started: AtomicBool,
     /// Bumped by every successful reattach.
     epoch: AtomicU64,
+    /// The engine whose typed prefix a lost or reattached source
+    /// invalidates (H3); bound once, before the sources start.
+    engine: OnceLock<Arc<Shared>>,
 }
 impl<'a, P: SourcePorts, C: Clock> Sources<'a, P, C> {
     pub(super) const fn new(ports: &'a P, clock: &'a C, signals: &'a SessionSignals) -> Self {
@@ -491,6 +513,19 @@ impl<'a, P: SourcePorts, C: Clock> Sources<'a, P, C> {
             work: Mutex::new(()),
             started: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
+            engine: OnceLock::new(),
+        }
+    }
+    /// Binds the engine whose prefix a source loss invalidates.
+    pub(super) fn bind(&self, shared: &Arc<Shared>) {
+        let _ = self.engine.set(shared.clone());
+    }
+    /// H3: input may have gone unseen, or is about to flow again after a
+    /// gap. Synchronous, on whichever thread noticed, so no key captured
+    /// afterwards can join the keys before it.
+    fn invalidate(&self) {
+        if let Some(shared) = self.engine.get() {
+            invalidate_prefix(shared);
         }
     }
     fn table(&self) -> MutexGuard<'_, HealthTable> {
@@ -569,6 +604,7 @@ impl<'a, P: SourcePorts, C: Clock> Sources<'a, P, C> {
                 Some(ReasonCode::RawInputMissing),
                 now,
             );
+            self.invalidate();
         }
         table.snapshot(now)
     }
@@ -581,9 +617,12 @@ impl<'a, P: SourcePorts, C: Clock> Sources<'a, P, C> {
                 .is_some_and(|entry| entry.state == HealthState::Healthy)
         })
     }
-    /// Marks `component` lost until a reattach succeeds.
+    /// Marks `component` lost until a reattach succeeds, and invalidates the
+    /// typed prefix (H3): keys, clicks or focus changes it missed never
+    /// reached the buffer.
     fn lost(&self, component: Component, reason: ReasonCode) {
         self.set(component, HealthState::Recovering, Some(reason));
+        self.invalidate();
     }
     /// The detector window closed without being asked to.
     pub(super) fn raw_lost(&self) {
@@ -614,6 +653,10 @@ impl<'a, P: SourcePorts, C: Clock> Sources<'a, P, C> {
     /// may have gone unseen) through [`Signal::InputReattached`]. A
     /// component that is healthy by the time the call gets its turn (the
     /// other hook component's reattach also replaced it) is left alone.
+    ///
+    /// H3: the prefix is invalidated *before* delivery is restored, so a key
+    /// captured the moment the source is back already leaves a generation
+    /// gap, even if the consumer drains it before it sees the signal.
     pub(super) fn reattach(&self, component: Component) -> Result<(), String> {
         if !self.started.load(Ordering::SeqCst) {
             return Err("input sources have not started".into());
@@ -631,6 +674,7 @@ impl<'a, P: SourcePorts, C: Clock> Sources<'a, P, C> {
         {
             return Ok(());
         }
+        self.invalidate();
         let ok = match component {
             Component::RawInput => {
                 let ok = self.restore_raw();
@@ -741,6 +785,9 @@ impl<'a, P: SourcePorts, C: Clock> Liveness<'a, P, C> {
     }
     fn act(&mut self, shared: &Shared, verdict: Verdict) {
         let sources = self.sources;
+        // Either source missed keys the other saw: what was typed around
+        // the gap is not one word, whatever the cause turns out to be (H3).
+        invalidate_prefix(shared);
         match verdict {
             Verdict::HookLost => {
                 tracing::warn!(
@@ -749,10 +796,6 @@ impl<'a, P: SourcePorts, C: Clock> Liveness<'a, P, C> {
                     result = "lost"
                 );
                 sources.lost(Component::KeyboardHook, ReasonCode::HookMissing);
-                // Keys the hook missed never reached the mirror or the
-                // recorder: what was typed around the loss is not one word.
-                shared.generation.fetch_add(1, Ordering::SeqCst);
-                observer::CARET_EPOCH.fetch_add(1, Ordering::SeqCst);
                 let _ = sources.reattach(Component::KeyboardHook);
             }
             Verdict::RawLost => {
@@ -826,6 +869,12 @@ fn run_consumer(
         let drained = catch_unwind(AssertUnwindSafe(|| {
             session::inject_fault(&session::SESSION_END);
             let handled = consumer.drain(&shared, hooks, raw, &WinForeground, &mut |candidate| {
+                // H3: a reattach or session signal is handled before any
+                // candidate; one that crosses it is not a word.
+                if !monitor.admits(&shared, candidate.generation) {
+                    tracing::info!(event = "input.refused", reason = "signal");
+                    return false;
+                }
                 // A lost hook leaves the key mirror and focus epochs stale:
                 // nothing is injected until it is back (B-06).
                 if !engine_ready() {
@@ -873,6 +922,7 @@ pub(crate) fn start_input_sources(shared: Arc<Shared>) -> Result<(), String> {
         .spawn(move || run_consumer(consumer_shared, hooks, raw))
         .map_err(|error| format!("Input consumer could not start: {error}"))?;
     CONSUMER.set(consumer.thread().clone()).ok();
+    SOURCES.bind(&shared);
     session::start();
     rawinput::start(shared.clone())?;
     if SOURCES.start() != HookSet::ALL {

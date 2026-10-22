@@ -1046,6 +1046,9 @@ struct FakeSources {
     installs: Mutex<Vec<HookSet>>,
     registers: AtomicUsize,
     rebuilds: AtomicUsize,
+    /// The engine whose generation [`FakeSources::restored_at`] records.
+    engine: OnceLock<Arc<Shared>>,
+    restored: Mutex<Vec<u64>>,
 }
 impl FakeSources {
     /// What `rawinput::start` leaves: a live, registered detector window.
@@ -1060,7 +1063,24 @@ impl FakeSources {
             installs: Mutex::new(Vec::new()),
             registers: AtomicUsize::new(0),
             rebuilds: AtomicUsize::new(0),
+            engine: OnceLock::new(),
+            restored: Mutex::new(Vec::new()),
         }
+    }
+    /// Records `shared`'s generation whenever delivery is restored.
+    fn watch(&self, shared: &Arc<Shared>) {
+        let _ = self.engine.set(shared.clone());
+    }
+    fn note_restored(&self) {
+        if let Some(shared) = self.engine.get() {
+            let generation = shared.generation.load(Ordering::SeqCst);
+            self.restored.lock().unwrap().push(generation);
+        }
+    }
+    /// The engine generation at each restore: a key captured that moment
+    /// takes the next one.
+    fn restored_at(&self) -> Vec<u64> {
+        self.restored.lock().unwrap().clone()
     }
     fn hooked(&self, kind: HookSet) -> bool {
         HOOK_KINDS
@@ -1100,6 +1120,9 @@ impl SourcePorts for FakeSources {
                 *on = installed.contains(*kind);
             }
         }
+        if installed != HookSet::NONE {
+            self.note_restored();
+        }
         installed
     }
     fn raw_alive(&self) -> bool {
@@ -1115,6 +1138,7 @@ impl SourcePorts for FakeSources {
         }
         if self.register_sticks.load(Ordering::SeqCst) {
             self.set_registration(Registration::Ours);
+            self.note_restored();
         }
         true
     }
@@ -1122,6 +1146,7 @@ impl SourcePorts for FakeSources {
         self.rebuilds.fetch_add(1, Ordering::SeqCst);
         self.alive.store(true, Ordering::SeqCst);
         self.set_registration(Registration::Ours);
+        self.note_restored();
         true
     }
     fn drop_hooks(&self) {
@@ -1170,32 +1195,39 @@ impl Pipeline {
     fn press(&mut self, fake: &FakeSources) {
         let ch = char::from(b'a' + (self.pressed % 26) as u8);
         self.pressed += 1;
-        let vk = ch.to_ascii_uppercase() as u16;
-        let hooked = fake.hooked(HookSet::KEYBOARD);
-        if hooked {
-            handle_key(
-                &self.hooks,
-                &self.shared,
-                &self.probe,
-                WM_KEYDOWN,
-                hardware(vk),
-            );
-        }
-        if fake.raw_delivers() {
-            let event = InputEvent::key_down(vk, &ch.to_string(), true);
-            let record = raw_record(&self.shared, self.keys, &event, &self.probe).unwrap();
-            assert!(self.raw.push(record));
-        }
-        if hooked {
-            handle_key(
-                &self.hooks,
-                &self.shared,
-                &self.probe,
-                WM_KEYUP,
-                hardware(vk),
-            );
-        }
+        self.type_text(fake, &ch.to_string());
         self.drain();
+    }
+    /// Physical keys typing `text` (down and up each), captured by every
+    /// source that works; not drained.
+    fn type_text(&mut self, fake: &FakeSources, text: &str) {
+        for ch in text.chars() {
+            let vk = ch.to_ascii_uppercase() as u16;
+            let hooked = fake.hooked(HookSet::KEYBOARD);
+            if hooked {
+                handle_key(
+                    &self.hooks,
+                    &self.shared,
+                    &self.probe,
+                    WM_KEYDOWN,
+                    hardware(vk),
+                );
+            }
+            if fake.raw_delivers() {
+                let event = InputEvent::key_down(vk, &ch.to_string(), true);
+                let record = raw_record(&self.shared, self.keys, &event, &self.probe).unwrap();
+                assert!(self.raw.push(record));
+            }
+            if hooked {
+                handle_key(
+                    &self.hooks,
+                    &self.shared,
+                    &self.probe,
+                    WM_KEYUP,
+                    hardware(vk),
+                );
+            }
+        }
     }
     fn drain(&mut self) {
         self.consumer.drain(
@@ -1205,6 +1237,44 @@ impl Pipeline {
             &self.probe,
             &mut |_| true,
         );
+    }
+    /// One consumer pass; the rule ids of the candidates it detected.
+    fn candidates(&mut self) -> Vec<String> {
+        let mut found = Vec::new();
+        self.consumer.drain(
+            &self.shared,
+            &self.hooks,
+            &self.raw,
+            &self.probe,
+            &mut |candidate: Candidate| {
+                found.push(candidate.rule.id.clone());
+                true
+            },
+        );
+        found
+    }
+    /// One consumer pass in production order: every candidate goes through
+    /// [`Monitor::admits`] first. The rule ids it admitted.
+    fn admitted(&mut self, monitor: &mut Monitor<'_, FakeAsyncKeys, FakeClock>) -> Vec<String> {
+        let mut admitted = Vec::new();
+        let shared = &self.shared;
+        self.consumer.drain(
+            shared,
+            &self.hooks,
+            &self.raw,
+            &self.probe,
+            &mut |candidate: Candidate| {
+                let ok = monitor.admits(shared, candidate.generation);
+                if ok {
+                    admitted.push(candidate.rule.id.clone());
+                }
+                ok
+            },
+        );
+        admitted
+    }
+    fn generation(&self) -> u64 {
+        self.shared.generation.load(Ordering::SeqCst)
     }
     fn tick(&mut self, liveness: &mut Liveness<'_, FakeSources, FakeClock>) -> Option<Instant> {
         liveness.tick(&self.shared, self.consumer.seen())
@@ -1814,6 +1884,153 @@ fn keys_before_start_are_not_held_against_the_hooks() {
     sources.start();
     assert_eq!(pipe.settle(&clock, &mut liveness), None);
     assert!(sources.hooks_ready());
+}
+
+/// H3 (no-regression #3): "bt" is buffered, RawInput's registration is
+/// taken away and typing goes on (only the hook sees it), the cross-check
+/// restores the registration, and a "w" is captured before the consumer
+/// runs again. The prefix was invalidated when the loss was found and
+/// before delivery came back, so "btw" never matches across the gap.
+#[test]
+fn a_prefix_from_before_a_raw_input_loss_never_completes_after_it() {
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    sources.start();
+    let mut liveness = Liveness::new(&sources);
+    let mut pipe = Pipeline::new();
+    sources.bind(&pipe.shared);
+    fake.watch(&pipe.shared);
+    // Control: without a loss the rule matches.
+    pipe.type_text(&fake, "btw");
+    assert_eq!(pipe.candidates(), ["btw"]);
+    pipe.tick(&mut liveness);
+    pipe.type_text(&fake, "bt");
+    assert!(pipe.candidates().is_empty());
+    assert_eq!(pipe.tick(&mut liveness), None, "both sources agree");
+    let prefix = pipe.generation();
+    fake.unregister_raw();
+    for ch in "cdefg".chars().take(MISS_LIMIT as usize) {
+        pipe.type_text(&fake, &ch.to_string());
+        assert!(pipe.candidates().is_empty());
+        pipe.tick(&mut liveness);
+        clock.advance(GAP);
+    }
+    assert_eq!(
+        pipe.generation(),
+        prefix,
+        "the hook alone never ends a word"
+    );
+    let (_, lines) = capture::logs(|| pipe.settle(&clock, &mut liveness));
+    assert_eq!(
+        count_of(
+            &lines,
+            r#"event="input.reattach" component="raw_input" reason="raw_input_missing" ok=true"#
+        ),
+        1,
+        "{lines:?}"
+    );
+    // A key captured the moment delivery came back already leaves a gap.
+    let restored = fake.restored_at();
+    assert_eq!(restored.len(), 1);
+    assert!(restored[0] > prefix, "{restored:?} {prefix}");
+    assert!(
+        signals.pending(),
+        "the consumer has not handled the reattach"
+    );
+    pipe.type_text(&fake, "w");
+    assert!(pipe.candidates().is_empty(), "no candidate across the loss");
+    pipe.type_text(&fake, "btw");
+    assert_eq!(pipe.candidates(), ["btw"], "a whole new word still works");
+}
+
+/// H3: the detector window disappears (seen by the supervisor's health
+/// poll, then reported by the detector thread) and the supervisor rebuilds
+/// it on its own thread. Every step invalidates the prefix synchronously,
+/// the rebuild before the new window delivers; and the consumer handles the
+/// reattach signal before it admits any candidate.
+#[test]
+fn a_rebuilt_detector_never_completes_an_old_prefix_and_its_signal_comes_first() {
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    sources.start();
+    let mut pipe = Pipeline::new();
+    sources.bind(&pipe.shared);
+    fake.watch(&pipe.shared);
+    let async_keys = FakeAsyncKeys::default();
+    let mut monitor = Monitor::new(pipe.keys, &async_keys, &clock, &signals, &NO_INJECTIONS);
+    pipe.type_text(&fake, "bt");
+    assert!(pipe.admitted(&mut monitor).is_empty());
+    let prefix = pipe.generation();
+    fake.close_raw();
+    assert_eq!(
+        health_of(&sources.health(), Component::RawInput),
+        (HealthState::Recovering, Some(ReasonCode::RawInputMissing))
+    );
+    let polled = pipe.generation();
+    assert!(polled > prefix, "invalidated when the poll found it");
+    sources.raw_lost();
+    let reported = pipe.generation();
+    assert!(reported > polled, "and when the detector reported it");
+    pipe.type_text(&fake, "x");
+    assert!(pipe.admitted(&mut monitor).is_empty());
+    assert_eq!(sources.reattach(Component::RawInput), Ok(()));
+    assert_eq!(fake.rebuilds(), 1);
+    let restored = fake.restored_at();
+    assert_eq!(restored.len(), 1);
+    assert!(restored[0] > reported, "invalidated before the rebuild");
+    // "w" is captured after the rebuild, before the consumer runs.
+    pipe.type_text(&fake, "w");
+    assert!(pipe.admitted(&mut monitor).is_empty());
+    assert!(
+        signals.pending(),
+        "no candidate, so nothing consumed it yet"
+    );
+    // A whole word typed before the consumer saw the signal: the signal is
+    // handled first and the word does not cross it.
+    pipe.type_text(&fake, "btw");
+    let (admitted, lines) = capture::logs(|| pipe.admitted(&mut monitor));
+    assert!(admitted.is_empty());
+    assert!(!signals.pending());
+    assert_eq!(
+        count_of(
+            &lines,
+            r#"event="session.signal" signal="input_reattached""#
+        ),
+        1,
+        "{lines:?}"
+    );
+    assert_eq!(
+        count_of(&lines, r#"event="keystate.resync" pass="first""#),
+        1
+    );
+    pipe.type_text(&fake, "btw");
+    assert_eq!(pipe.admitted(&mut monitor), ["btw"]);
+}
+
+/// H3: a hook component reattached by the supervisor invalidates the
+/// prefix before it is installed again (focus changes went unseen).
+#[test]
+fn a_reattached_hook_invalidates_the_prefix_before_it_is_back() {
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    fake.set_installable(HookSet::LOW_LEVEL);
+    sources.start();
+    let mut pipe = Pipeline::new();
+    sources.bind(&pipe.shared);
+    fake.watch(&pipe.shared);
+    pipe.type_text(&fake, "bt");
+    assert!(pipe.candidates().is_empty());
+    let prefix = pipe.generation();
+    fake.set_installable(HookSet::ALL);
+    assert_eq!(sources.reattach(Component::FocusEvents), Ok(()));
+    let restored = fake.restored_at();
+    assert_eq!(restored.len(), 1);
+    assert!(restored[0] > prefix, "{restored:?} {prefix}");
+    pipe.type_text(&fake, "w");
+    assert!(pipe.candidates().is_empty());
 }
 
 /// A session-end callback that records `name` when it runs.

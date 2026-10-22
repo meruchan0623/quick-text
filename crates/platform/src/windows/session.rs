@@ -108,6 +108,10 @@ impl SessionSignals {
     pub(super) fn raise(&self, signal: Signal) {
         self.0.fetch_or(signal.bit(), Ordering::SeqCst);
     }
+    /// Whether any signal is waiting, without taking it.
+    pub(super) fn pending(&self) -> bool {
+        self.0.load(Ordering::SeqCst) != 0
+    }
     /// Takes every pending signal (each at most once).
     pub(super) fn take(&self) -> impl Iterator<Item = Signal> {
         let pending = self.0.swap(0, Ordering::SeqCst);
