@@ -532,7 +532,7 @@ describe('tolerant reading (B-43)', () => {
     expect(container.querySelectorAll('tbody tr.unreadable-row')).toHaveLength(0);
   });
 
-  it('writes raw entries and unknown keys back unchanged when rules change', async () => {
+  it('writes raw entries and unknown keys back as the values received when rules change', async () => {
     const mounted = await mountSample();
     const { backend, container } = mounted;
     const before = structuredClone(backend.draft);
@@ -601,7 +601,7 @@ describe('tolerant reading (B-43)', () => {
     expect(ids).toEqual(['mock-unreadable-1', 'mock-rule-2', 'not a rule', null]);
   });
 
-  it('lists entries with a malformed nested field read-only and writes them back unchanged', async () => {
+  it('lists entries with a malformed nested field read-only and writes them back as received', async () => {
     const rule = (id: string) => ({
       id,
       enabled: true,
@@ -704,7 +704,7 @@ describe('tolerant reading (B-43)', () => {
     expect(lastSaved(backend).future_setting).toEqual({ sample: true });
   });
 
-  it('keeps a nested unknown key byte for byte and rule-level keys in place through the editor', async () => {
+  it('keeps a nested unknown key (same value, IPC number contract) and rule-level keys in place', async () => {
     // Codex's case: 「添加普通文字」 rebuilds `source`, so a rule with an unknown key in it must not
     // reach the editor. Rule-level keys of a newer version are edited around, in place.
     const nested = {
@@ -775,7 +775,8 @@ describe('tolerant reading (B-43)', () => {
     });
     expect(Object.keys(edited)).toEqual(Object.keys(before.rules[0] as object));
     expect(edited.future_middle).toEqual({ deep: [1, 'x'] });
-    // Every other entry, the nested-unknown one included, is written back byte for byte.
+    // Every other entry, the nested-unknown one included, is written back as the same value: all
+    // their numbers are within the IPC number contract (docs/ipc-contract-0.4.md §6).
     expect(saved.rules[2]).toEqual(nested);
     expect(JSON.stringify(saved.rules.slice(1))).toBe(JSON.stringify(before.rules.slice(1)));
 
@@ -793,6 +794,55 @@ describe('tolerant reading (B-43)', () => {
     expect(Object.keys(settings)).toEqual(Object.keys(before));
     expect(settings.future_setting).toEqual({ sample: true });
     expect(JSON.stringify(settings.rules[2])).toBe(JSON.stringify(nested));
+  });
+
+  it('flags an entry holding a number past the IPC contract, from JSON text, without blocking a save', async () => {
+    // JSON text as the IPC carries it (docs/ipc-contract-0.4.md §6). JSON.parse rounds
+    // 9007199254740993 to 2^53 before any frontend code runs; Codex's case is span.line.
+    const hugeText =
+      '{"id":"huge-number","match":{"kind":"literal","value":";huge"},"action":{"type":"steps",' +
+      '"plan":{"steps":[{"operation":{"type":"delay","ms":1},' +
+      '"span":{"line":9007199254740993,"column":1,"length":0}}]}}}';
+    // Another unreadable entry, with numbers right at the edge of the contract. Written in the
+    // form JSON.stringify writes, so the text itself can be compared.
+    const safeText =
+      '{"id":"safe-raw","match":42,"future_kind":{"counts":[9007199254740991,-9007199254740991,2.5],"note":null}}';
+    const mounted = await mount({}, (backend) => {
+      backend.draft.rules.splice(1, 0, ...(JSON.parse(`[${hugeText},${safeText}]`) as unknown[]));
+    });
+    const { backend, container } = mounted;
+    await waitFor(mounted, () => {
+      expect(container.querySelectorAll('tbody tr.unreadable-row')).toHaveLength(2);
+    });
+    const row = (id: string) =>
+      [...container.querySelectorAll('tbody tr.unreadable-row')].find(
+        (r) => r.querySelector('.unreadable-id')?.textContent === id,
+      );
+    expect(row('huge-number')?.querySelector('.unreadable-reason')?.textContent).toBe(
+      '含超出可安全保存范围的数值，保存其他内容时该数值可能被改写。',
+    );
+    expect(row('huge-number')?.textContent).not.toMatch(/保存时不会改动它/);
+    expect(row('safe-raw')?.querySelector('.unreadable-reason')).toBeNull();
+    expect(row('safe-raw')?.textContent).toMatch(/保存时不会改动它/);
+
+    // An unrelated save goes through.
+    const toggle = container.querySelector<HTMLInputElement>('input[aria-label="停用 ;s2"]');
+    await mounted.act(() => {
+      toggle?.click();
+    });
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+    });
+    await waitFor(mounted, () => {
+      expect(backend.draft.rules.at(-2)).toMatchObject({ id: 'mock-rule-2', enabled: false });
+    });
+    expect(container.querySelector('.alert.error')).toBeNull();
+    const saved = lastSaved(backend).rules;
+    // The safe entry goes out as the JSON it came in as.
+    expect(saved[2]).toEqual(JSON.parse(safeText));
+    expect(JSON.stringify(saved[2])).toBe(safeText);
+    // The flagged one goes out with the value JSON.parse rounded it to, as the list says.
+    expect(JSON.stringify(saved[1])).toBe(hugeText.replace('9007199254740993', '9007199254740992'));
   });
 
   it('reads absent fields as their serde defaults and edits such a rule', async () => {

@@ -1,8 +1,9 @@
 // Structural check of a `rules` entry (B-43). It mirrors the serde model in
 // crates/domain/src/model.rs field by field: an entry is a readable rule only when Rust would read
 // it the same way and the editor has a form for every value in it. Anything else is an unreadable
-// entry, listed read-only and written back unchanged, so the UI never calls a string or array method
-// on a value that is not one and never rebuilds an object it does not fully know.
+// entry, listed read-only and written back as the value received (the same value within the IPC
+// number contract, docs/ipc-contract-0.4.md §6), so the UI never calls a string or array method on
+// a value that is not one and never rebuilds an object it does not fully know.
 //
 // - Unknown keys. Every serde type has `deny_unknown_fields`; the backend keeps a newer version's
 //   keys only on the rule itself (and on the config and the globals, which this file does not
@@ -14,7 +15,8 @@
 //   or of an `Option` type may be absent; `withRuleDefaults` fills in the same default Rust would.
 //   A field without one must be there. `null` is only valid for an `Option`.
 // - Numbers. Integers are checked against their Rust type (u16, u32, i32, u64/usize) and floats must
-//   be finite. A u64 past 2^53 is not readable: JavaScript cannot write it back exactly.
+//   be finite. A u64 past 2^53−1 is outside the IPC number contract and not readable: it was
+//   already rounded when the IPC JSON was parsed, and the list flags the entry (`hasUnsafeNumber`).
 
 /** A runtime type check for one JSON value. */
 export type Guard = (value: unknown) => boolean;
@@ -49,7 +51,7 @@ const integer = (min: number, max: number): Spec =>
 const u16 = integer(0, 0xffff);
 const u32 = integer(0, 0xffff_ffff);
 const i32 = integer(-0x8000_0000, 0x7fff_ffff);
-/** u64 and usize, as far as JavaScript can represent them exactly. */
+/** u64 and usize, within the IPC number contract (docs/ipc-contract-0.4.md §6). */
 const u64 = integer(0, Number.MAX_SAFE_INTEGER);
 
 const oneOf = (...values: string[]): Spec =>

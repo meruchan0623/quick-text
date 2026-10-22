@@ -974,6 +974,11 @@ dialog.overlay::backdrop {
   margin-left: 8px;
   font-family: Consolas, 'Courier New', monospace;
 }
+/* The entry holds a number past the IPC number contract; saving may rewrite it. */
+.unreadable-reason {
+  display: block;
+  color: #8a5a00;
+}
 .extra-keys {
   margin: 0 0 12px;
   font-size: 12px;

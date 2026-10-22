@@ -6,6 +6,7 @@ import {
   countByGroup,
   diagnosticField,
   groupKey,
+  hasUnsafeNumber,
   isReadableRule,
   pruneSelection,
   replaceReadable,
@@ -174,12 +175,77 @@ describe('tolerant reading (B-43)', () => {
 
   it('lists unreadable entries with their position and id, if any', () => {
     expect(unreadableEntries(rules)).toEqual([
-      { index: 1, id: 'broken' },
-      { index: 3, id: null },
-      { index: 5, id: null },
+      { index: 1, id: 'broken', unsafeNumber: false },
+      { index: 3, id: null, unsafeNumber: false },
+      { index: 5, id: null, unsafeNumber: false },
     ]);
     expect(unreadableId({ id: '' })).toBeNull();
     expect(unreadableId({ id: 3 })).toBeNull();
+  });
+
+  describe('IPC number contract (docs/ipc-contract-0.4.md §6)', () => {
+    // Each case starts from JSON text, as the IPC carries it: JSON.parse rounds an integer past
+    // 2^53−1 before any frontend code sees it.
+    it.each([
+      ['2^53−1', '9007199254740991', false],
+      ['−(2^53−1)', '-9007199254740991', false],
+      ['a fraction', '0.5', false],
+      ['digits in a key or a string', '{"9007199254740993":"9007199254740993"}', false],
+      ['2^53+1, already rounded to 2^53', '9007199254740993', true],
+      ['−(2^53+1)', '-9007199254740993', true],
+      ['2^53 itself (flagged though it would round-trip)', '9007199254740992', true],
+      ['1e300', '1e300', true],
+      ['a number past f64, parsed as Infinity', '1e400', true],
+      ['one deep in arrays and objects', '[{"a":[1,{"b":[2,9007199254740993]}]}]', true],
+    ])('hasUnsafeNumber: %s', (_, text, expected) => {
+      expect(hasUnsafeNumber(JSON.parse(text))).toBe(expected);
+    });
+
+    // Codex's case: span.line = 9007199254740993 in a step.
+    const hugeText =
+      '{"id":"huge","match":{"kind":"literal","value":";huge"},"action":{"type":"steps","plan":' +
+      '{"steps":[{"operation":{"type":"delay","ms":1},' +
+      '"span":{"line":9007199254740993,"column":1,"length":0}}]}}}';
+    // Unreadable (`match` is not a MatchSpec), with numbers right at the edge of the contract.
+    // Written in the form JSON.stringify writes, so the text itself can be compared.
+    const safeText =
+      '{"id":"safe","match":42,"future":[9007199254740991,-9007199254740991,2.5,{"n":null}]}';
+    const readableText =
+      '{"id":"a","enabled":true,"group":"","description":"","ignore_case":false,' +
+      '"match":{"kind":"literal","value":";a"},"trigger_mode":"immediate","terminator":null,' +
+      '"ime_erasure":null,"action":{"type":"none"},"parameter":{"type":"default_match"},' +
+      '"notification":{"enabled":false,"message":""}}';
+
+    it('flags an unreadable entry whose integer the IPC JSON already rounded', () => {
+      const parsed = JSON.parse(`[${readableText},${hugeText},${safeText}]`) as unknown[];
+      // The original value is gone before any check runs.
+      expect(JSON.stringify(parsed[1])).toBe(
+        hugeText.replace('9007199254740993', '9007199254740992'),
+      );
+      expect(parsed.map(isReadableRule)).toEqual([true, false, false]);
+      // The same rule with a safe line is readable: the number is what makes it unreadable.
+      expect(isReadableRule(JSON.parse(hugeText.replace('9007199254740993', '3')))).toBe(true);
+      expect(unreadableEntries(parsed)).toEqual([
+        { index: 1, id: 'huge', unsafeNumber: true },
+        { index: 2, id: 'safe', unsafeNumber: false },
+      ]);
+    });
+
+    it('writes an unreadable entry with only safe numbers back as the JSON it came from', () => {
+      const parsed = JSON.parse(`[${readableText},${hugeText},${safeText}]`) as unknown[];
+      const [a] = parsed.filter(isReadableRule);
+      if (!a) throw new Error('no readable rule');
+      // An unrelated edit: rule a is disabled.
+      const off: ReadableRule = { ...a, enabled: false };
+      const next = replaceReadable(completeRules(parsed), [off]);
+      expect(next[0]).toBe(off);
+      expect(next[2]).toEqual(JSON.parse(safeText));
+      expect(JSON.stringify(next[2])).toBe(safeText);
+      // The flagged one goes back with the value it was rounded to, as the list warns.
+      expect(JSON.stringify(next[1])).toBe(
+        hugeText.replace('9007199254740993', '9007199254740992'),
+      );
+    });
   });
 
   describe('position-stable write-back', () => {
@@ -524,7 +590,7 @@ describe('tolerant reading (B-43)', () => {
 
     const keptUnreadable = (entry: unknown) => {
       expect(isReadableRule(entry)).toBe(false);
-      // …and writes it back unchanged, in place.
+      // …and writes it back in place, as the same value.
       const rules = [rule('a'), entry, rule('b')];
       const next = replaceReadable(rules, [{ ...rule('a'), enabled: false }, rule('b')]);
       expect(next[1]).toBe(entry);
@@ -651,7 +717,7 @@ describe('tolerant reading (B-43)', () => {
       ],
       ['delay.ms (negative)', delay(-1)],
       ['delay.ms (fraction)', delay(1.5)],
-      ['delay.ms (past 2^53)', delay(2 ** 53)],
+      ['delay.ms (past 2^53−1)', delay(2 ** 53)],
       ['delay.ms (NaN)', delay(Number.NaN)],
       ['windows_code.code (past u16)', code(65536)],
       ['windows_code.code (negative)', code(-1)],

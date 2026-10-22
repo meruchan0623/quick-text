@@ -309,7 +309,8 @@ export default function App() {
   };
   const selectedSet = new Set(selected);
   // Rules the UI can show and edit. An entry the backend could not read (B-43) is listed read-only
-  // and written back unchanged, in place; so are keys this version does not know.
+  // and written back in place as the value received, which within the IPC number contract
+  // (docs/ipc-contract-0.4.md §6) is the same value; so are keys this version does not know.
   const readable = config.rules.filter(isRule);
   const unreadable = unreadableEntries(config.rules);
   const ruleNames = new Map<string, string>(readable.map((r) => [r.id, r.match.value || r.id]));
@@ -659,9 +660,20 @@ export default function App() {
                     <td colSpan={hide ? 7 : 8}>
                       <strong>无法读取的规则</strong>
                       {u.id && <span className="unreadable-id">{u.id}</span>}
-                      <small className="muted">
-                        这条规则的内容当前版本无法读取，暂不生效；已原样保留在配置中，保存时不会改动它。
-                      </small>
+                      {u.unsafeNumber ? (
+                        <>
+                          <small className="muted">
+                            这条规则的内容当前版本无法读取，暂不生效；已保留在配置中。
+                          </small>
+                          <small className="unreadable-reason">
+                            含超出可安全保存范围的数值，保存其他内容时该数值可能被改写。
+                          </small>
+                        </>
+                      ) : (
+                        <small className="muted">
+                          这条规则的内容当前版本无法读取，暂不生效；已原样保留在配置中，保存时不会改动它。
+                        </small>
+                      )}
                     </td>
                   </tr>
                 ))}
