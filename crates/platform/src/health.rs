@@ -55,7 +55,11 @@ impl Component {
     pub fn required(self) -> bool {
         matches!(
             self,
-            Self::Executor | Self::KeyboardHook | Self::MouseHook | Self::RawInput | Self::Supervisor
+            Self::Executor
+                | Self::KeyboardHook
+                | Self::MouseHook
+                | Self::RawInput
+                | Self::Supervisor
         )
     }
 }
@@ -286,14 +290,31 @@ pub enum StatusText {
 }
 
 impl StatusText {
-    /// Rows are evaluated top to bottom; the executing overlay applies only on
-    /// top of Healthy/Degraded without a pause reason.
+    /// Rows of the §7.2 table are evaluated top to bottom and the first match
+    /// wins:
+    ///
+    /// 1. Health Starting / Failed / Recovering (rows 1-3), whatever the
+    ///    pause bits say.
+    /// 2. Healthy/Degraded with any user-visible reason (MANUAL, TIMED,
+    ///    FULLSCREEN, RECORDING, SAFE_MODE) → Paused (row 4). This row is
+    ///    above every row an internal bit can map to, so a user-visible pause
+    ///    is never hidden behind "starting" or "recovering".
+    /// 3. Fallback for the case the table does not cover: Health already
+    ///    reads Healthy/Degraded but only internal bits remain (`SELF_TEST`,
+    ///    `ENGINE_DOWN`; the two are published separately from Health). The
+    ///    bit is shown as the Health row it stands for — SELF_TEST → Starting,
+    ///    ENGINE_DOWN → Recovering — so the status never claims to listen or
+    ///    execute while input is held.
+    /// 4. Executing overlay on Healthy/Degraded without any pause reason
+    ///    (row 7), then Degraded (row 5) and Listening (row 6).
     pub fn resolve(health: HealthState, paused: PauseReasons, busy: bool) -> Self {
         match health {
             HealthState::Starting => Self::Starting,
             HealthState::Failed => Self::Failed,
             HealthState::Recovering => Self::Recovering,
             _ if paused.intersects(PauseReasons::USER_VISIBLE) => Self::Paused,
+            _ if paused.contains(PauseReasons::SELF_TEST) => Self::Starting,
+            _ if paused.contains(PauseReasons::ENGINE_DOWN) => Self::Recovering,
             _ if busy => Self::Executing,
             HealthState::Degraded => Self::Degraded,
             HealthState::Healthy => Self::Listening,
@@ -336,18 +357,220 @@ mod tests {
         let none = PauseReasons::empty();
         let manual = PauseReasons::MANUAL;
         let down = PauseReasons::ENGINE_DOWN;
-        assert_eq!(StatusText::resolve(Starting, manual, true), StatusText::Starting);
+        assert_eq!(
+            StatusText::resolve(Starting, manual, true),
+            StatusText::Starting
+        );
         assert_eq!(StatusText::resolve(Failed, down, false), StatusText::Failed);
-        assert_eq!(StatusText::resolve(Recovering, down, true), StatusText::Recovering);
-        assert_eq!(StatusText::resolve(Healthy, manual, true), StatusText::Paused);
-        assert_eq!(StatusText::resolve(Degraded, manual, false), StatusText::Paused);
-        assert_eq!(StatusText::resolve(Healthy, down, true), StatusText::Executing);
-        assert_eq!(StatusText::resolve(Degraded, none, false), StatusText::Degraded);
-        assert_eq!(StatusText::resolve(Healthy, none, false), StatusText::Listening);
+        assert_eq!(
+            StatusText::resolve(Recovering, down, true),
+            StatusText::Recovering
+        );
+        assert_eq!(
+            StatusText::resolve(Healthy, manual, true),
+            StatusText::Paused
+        );
+        assert_eq!(
+            StatusText::resolve(Degraded, manual, false),
+            StatusText::Paused
+        );
+        assert_eq!(
+            StatusText::resolve(Healthy, down, true),
+            StatusText::Recovering
+        );
+        assert_eq!(
+            StatusText::resolve(Degraded, none, false),
+            StatusText::Degraded
+        );
+        assert_eq!(
+            StatusText::resolve(Healthy, none, false),
+            StatusText::Listening
+        );
         assert_eq!(
             StatusText::Paused.tooltip(PauseReasons::SAFE_MODE),
             "Quicker Text · 已暂停（安全模式）"
         );
+    }
+
+    /// Every row of the §7.2 Health mapping table, for every pause bit and
+    /// both busy values, plus the tooltip of each row.
+    #[test]
+    fn mapping_table_every_row() {
+        use HealthState::*;
+        let none = PauseReasons::empty();
+        let all_bits = [
+            PauseReasons::MANUAL,
+            PauseReasons::TIMED,
+            PauseReasons::FULLSCREEN,
+            PauseReasons::RECORDING,
+            PauseReasons::SAFE_MODE,
+            PauseReasons::ENGINE_DOWN,
+            PauseReasons::SELF_TEST,
+        ];
+        let user_visible = &all_bits[..5];
+        let mut every_set = vec![none];
+        every_set.extend(all_bits);
+        every_set.push(PauseReasons::from_bits_truncate(u32::MAX));
+        for busy in [false, true] {
+            // Rows 1-3: Starting / Failed / Recovering win over any pause bit.
+            for &paused in &every_set {
+                assert_eq!(
+                    StatusText::resolve(Starting, paused, busy),
+                    StatusText::Starting
+                );
+                assert_eq!(
+                    StatusText::resolve(Failed, paused, busy),
+                    StatusText::Failed
+                );
+                assert_eq!(
+                    StatusText::resolve(Recovering, paused, busy),
+                    StatusText::Recovering
+                );
+            }
+            for health in [Healthy, Degraded] {
+                // Row 4: any user-visible reason pauses, busy or not.
+                for &reason in user_visible {
+                    assert_eq!(
+                        StatusText::resolve(health, reason, busy),
+                        StatusText::Paused
+                    );
+                }
+                // Row 4 sits above the internal-bit fallback: a user-visible
+                // reason still reads "paused" when SELF_TEST / ENGINE_DOWN is
+                // also set.
+                let self_test = PauseReasons::SELF_TEST;
+                let down = PauseReasons::ENGINE_DOWN;
+                for &reason in user_visible {
+                    for internal in [self_test, down, self_test.with(down)] {
+                        assert_eq!(
+                            StatusText::resolve(health, reason.with(internal), busy),
+                            StatusText::Paused
+                        );
+                    }
+                }
+                // Only internal bits left: expressed by the Health row they
+                // stand for, never as "listening" or "executing".
+                for extra in [none, down] {
+                    assert_eq!(
+                        StatusText::resolve(health, self_test.with(extra), busy),
+                        StatusText::Starting
+                    );
+                }
+                assert_eq!(
+                    StatusText::resolve(health, down, busy),
+                    StatusText::Recovering
+                );
+            }
+            // Rows 5-6 without busy; row 7 (executing) overlays both.
+            let (degraded, healthy) = if busy {
+                (StatusText::Executing, StatusText::Executing)
+            } else {
+                (StatusText::Degraded, StatusText::Listening)
+            };
+            assert_eq!(StatusText::resolve(Degraded, none, busy), degraded);
+            assert_eq!(StatusText::resolve(Healthy, none, busy), healthy);
+        }
+        let tooltips = [
+            (StatusText::Starting, none, "Quicker Text · 正在启动…"),
+            (StatusText::Failed, none, "Quicker Text · 输入监听已停止"),
+            (StatusText::Recovering, none, "Quicker Text · 正在恢复…"),
+            (
+                StatusText::Paused,
+                PauseReasons::MANUAL,
+                "Quicker Text · 已暂停",
+            ),
+            (
+                StatusText::Paused,
+                PauseReasons::SAFE_MODE.with(PauseReasons::MANUAL),
+                "Quicker Text · 已暂停（安全模式）",
+            ),
+            (
+                StatusText::Degraded,
+                none,
+                "Quicker Text · 监听中（部分功能降级）",
+            ),
+            (StatusText::Listening, none, "Quicker Text · 监听中"),
+            (StatusText::Executing, none, "Quicker Text · 执行中"),
+        ];
+        for (status, paused, text) in tooltips {
+            assert_eq!(status.tooltip(paused), text, "{status:?}");
+        }
+    }
+
+    /// Reference model written row by row from the §7.2 table (plus the
+    /// internal-bit fallback the table does not cover), independent of
+    /// `resolve`'s match arms and of `PauseReasons::USER_VISIBLE`.
+    fn table_reference(health: HealthState, paused: PauseReasons, busy: bool) -> StatusText {
+        use HealthState::*;
+        let up = matches!(health, Healthy | Degraded);
+        let user_visible = [
+            PauseReasons::MANUAL,
+            PauseReasons::TIMED,
+            PauseReasons::FULLSCREEN,
+            PauseReasons::RECORDING,
+            PauseReasons::SAFE_MODE,
+        ]
+        .iter()
+        .any(|&bit| paused.contains(bit));
+        let no_reason = paused.is_empty();
+        type Row = (bool, StatusText);
+        let rows: [Row; 10] = [
+            // Row 1-3: Health rows.
+            (health == Starting, StatusText::Starting),
+            (health == Failed, StatusText::Failed),
+            (health == Recovering, StatusText::Recovering),
+            // Row 4: Healthy/Degraded with any user-visible reason.
+            (up && user_visible, StatusText::Paused),
+            // Fallback (not in the table): only internal bits remain.
+            (
+                up && paused.contains(PauseReasons::SELF_TEST),
+                StatusText::Starting,
+            ),
+            (
+                up && paused.contains(PauseReasons::ENGINE_DOWN),
+                StatusText::Recovering,
+            ),
+            // Row 7 overlays rows 5-6 (Healthy/Degraded without a reason).
+            (up && no_reason && busy, StatusText::Executing),
+            // Row 5-6.
+            (health == Degraded && no_reason, StatusText::Degraded),
+            (health == Healthy && no_reason, StatusText::Listening),
+            // Unreachable: every combination matched above.
+            (true, StatusText::Failed),
+        ];
+        let (index, (_, status)) = rows
+            .iter()
+            .enumerate()
+            .find(|(_, (matched, _))| *matched)
+            .unwrap();
+        assert!(
+            index < rows.len() - 1,
+            "table does not cover {health:?} {paused:?}"
+        );
+        *status
+    }
+
+    /// All 5 Health states × all 2^7 pause-bit combinations × busy.
+    #[test]
+    fn mapping_table_exhaustive() {
+        use HealthState::*;
+        let mut checked = 0;
+        for health in [Starting, Healthy, Degraded, Recovering, Failed] {
+            for bits in 0..(1u32 << 7) {
+                let paused = PauseReasons::from_bits_truncate(bits);
+                assert_eq!(paused.bits(), bits);
+                for busy in [false, true] {
+                    assert_eq!(
+                        StatusText::resolve(health, paused, busy),
+                        table_reference(health, paused, busy),
+                        "{health:?} {:?} busy={busy}",
+                        paused.names()
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 5 * 128 * 2);
     }
 
     #[test]
