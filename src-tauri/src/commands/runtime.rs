@@ -28,7 +28,13 @@ pub fn set_paused(paused: bool, store: State<Managed>) -> Result<AppState, Comma
             // Recording owns the input until it stops.
             return Err(CommandError::Busy);
         }
-        quicker_platform::native_ready().map_err(CommandError::engine_unavailable)?;
+        // Resume follows the supervisor's health (B-03): one snapshot read,
+        // the same test as `runtime::accepts_resume()`, so the error carries
+        // the state that refused it.
+        let health = quicker_platform::runtime::current_health().state;
+        if !health.accepts_resume() {
+            return Err(CommandError::EngineUnavailable { health });
+        }
     }
     if !paused && !quicker_platform::engine_ready() {
         return Err(CommandError::engine_unavailable(

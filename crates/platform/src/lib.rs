@@ -112,8 +112,12 @@ pub use capabilities::{
     capabilities, capabilities_for, Capability, CapabilityReason, CapabilityStatus, PlatformReason,
 };
 pub fn start_recording(shared: &Arc<Shared>) -> Result<(), String> {
+    // Recording needs a running engine (B-03: `accepts_resume` replaces
+    // `native_ready`).
     #[cfg(any(windows, target_os = "macos"))]
-    native_ready()?;
+    if !runtime::accepts_resume() {
+        return Err("The input engine is not running; recording is unavailable".into());
+    }
     if shared.busy.load(Ordering::SeqCst) {
         return Err("Wait for the running action to stop before recording".into());
     }

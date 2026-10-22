@@ -95,7 +95,7 @@ pub fn build(app: &tauri::App) -> tauri::Result<()> {
                 // Safe mode keeps the engine paused (B-04).
                 if old
                     && (s.safe_mode().is_some()
-                        || quicker_platform::native_ready().is_err()
+                        || !quicker_platform::runtime::accepts_resume()
                         || s.engine.recording.lock().unwrap().is_some())
                 {
                     return;
