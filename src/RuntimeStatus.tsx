@@ -1,21 +1,6 @@
 import { Fragment, type ReactNode } from 'react';
+import { capabilityViews } from './lib/capabilities';
 import { Data, State } from './model';
-const names: Record<string, string> = {
-  keyboard_hook: '键盘监听',
-  keys: '逐字键入',
-  paste: '粘贴文本',
-  html: '粘贴 HTML',
-  file_clipboard: '粘贴文件对象',
-  image_clipboard: '粘贴图片对象',
-  mouse: '鼠标操作',
-  recording: '键鼠录制',
-  foreground: '目标窗口识别',
-  open: '打开文件与应用',
-  ime_committed_text: '缩写与输入法候选识别',
-  quicker_private_action: 'Quicker 专有动作',
-  selection: '读取选中文本',
-  notification: '触发后提示',
-};
 const resultNames: Record<string, string> = {
   success: '执行成功',
   failed: '执行失败',
@@ -139,10 +124,29 @@ function TargetStatus({ state }: { state: State | null }) {
     </>
   );
 }
-function CapabilityTable({ capabilities }: { capabilities: Data[] }) {
+/**
+ * Capabilities by principle 5 (S-16): what this platform never provides is left out of the table
+ * and only named below it; unavailable rows are grayed out, experimental and degraded ones tagged.
+ */
+function CapabilityTable({
+  capabilities,
+  platform,
+}: {
+  capabilities: unknown;
+  platform?: string | undefined;
+}) {
+  const views = capabilityViews(capabilities, platform);
+  const shown = views.filter((c) => c.presentation !== 'hidden');
+  const hidden = views.filter((c) => c.presentation === 'hidden');
   return (
     <>
       <h3>平台能力</h3>
+      {platform === 'macos' && (
+        <p className="muted">
+          <span className="capability-tag experimental">实验性</span> macOS
+          版尚未经过实机验收，下列能力均为实验性，可能不稳定。
+        </p>
+      )}
       <p className="muted">
         支持状态来自当前桌面引擎。发送输入后，目标应用是否已完成处理可能无法确认。
       </p>
@@ -155,19 +159,20 @@ function CapabilityTable({ capabilities }: { capabilities: Data[] }) {
           </tr>
         </thead>
         <tbody>
-          {capabilities.map((c: Data) => (
-            <tr key={c.id}>
-              <td>{names[c.id] || c.id}</td>
+          {shown.map((c) => (
+            <tr key={c.id} className={`capability-row ${c.presentation}`}>
+              <td>{c.name}</td>
               <td>
-                <span className={c.available ? 'available' : 'unavailable'}>
-                  {c.available ? '可用' : '不可用'}
-                </span>
+                <span className={`capability-tag ${c.presentation}`}>{c.tag}</span>
               </td>
-              <td>{c.reason || '暂无额外说明'}</td>
+              <td>{c.reason ?? '暂无额外说明'}</td>
             </tr>
           ))}
         </tbody>
       </table>
+      {hidden.length > 0 && (
+        <p className="muted">本平台不提供：{hidden.map((c) => c.name).join('、')}。</p>
+      )}
     </>
   );
 }
@@ -209,7 +214,10 @@ export default function RuntimeStatus({
   return (
     <>
       <TargetStatus state={state} />
-      <CapabilityTable capabilities={state?.capabilities ?? []} />
+      <CapabilityTable
+        capabilities={state?.capabilities}
+        platform={state?.platform ?? state?.engine_detail?.platform}
+      />
       {history ?? <ExecutionStatus result={result} />}
       <details className="expert-details">
         <summary>详细运行信息（高级）</summary>

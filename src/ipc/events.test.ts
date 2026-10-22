@@ -115,10 +115,10 @@ function setup(options: MockOptions = {}, io?: (backend: MockBackend) => Runtime
 }
 
 /**
- * Mock IPC whose snapshot responses can be held back (they are taken when asked for, like the
- * backend does, and delivered on `release`) and rewritten.
+ * Mock IPC whose `held` responses (snapshots by default) can be held back (they are taken when asked
+ * for, like the backend does, and delivered on `release`), and whose snapshots can be rewritten.
  */
-function controlled() {
+function controlled(held = 'get_runtime_snapshot') {
   const gates: (() => void)[] = [];
   let holding = false;
   let rewrite: ((snapshot: RuntimeSnapshot) => RuntimeSnapshot) | null = null;
@@ -131,8 +131,8 @@ function controlled() {
         if (command === 'get_runtime_snapshot') {
           if (rewrite) result = rewrite(result as RuntimeSnapshot);
           rewrite = null;
-          if (holding) await new Promise<void>((resolve) => gates.push(resolve));
         }
+        if (command === held && holding) await new Promise<void>((resolve) => gates.push(resolve));
         return result as never;
       },
     };
@@ -519,6 +519,102 @@ describe('RuntimeSync seq ledger (late, old and overlapping snapshots)', () => {
     expect(sync.getView().seq).toBe(backend.seq);
     expect(sync.getView().engine?.busy).toBe(false);
     expect(clock.waiting()).toEqual([]);
+  });
+});
+
+describe('RuntimeSync store-state', () => {
+  const reads = (backend: MockBackend, command: string) =>
+    backend.calls.filter((c) => c.command === command).length;
+
+  it('takes revision and safe mode from a store-state newer than the snapshot', async () => {
+    const { backend, sync, snapshots } = setup();
+    await sync.start();
+    expect(sync.getView()).toMatchObject({ revision: 1, safeMode: null });
+    const problemReads = reads(backend, 'startup_problems');
+    backend.publishExternally();
+    await settle();
+    expect(sync.getView()).toMatchObject({ seq: backend.seq, revision: 2, safeMode: null });
+    backend.deliver('store-state', { seq: backend.seq + 1, revision: 2, safe_mode: 'locked' });
+    await settle();
+    expect(sync.getView()).toMatchObject({ seq: backend.seq + 1, revision: 2, safeMode: 'locked' });
+    expect(snapshots()).toBe(1); // the events continue the view
+    expect(reads(backend, 'startup_problems')).toBe(problemReads); // entering safe mode reads nothing
+  });
+
+  it('drops a store-state the snapshot covers, also one held while the snapshot was in flight', async () => {
+    const gate = controlled();
+    const { backend, focus, sync, snapshots, clock } = setup({}, gate.io);
+    await sync.start();
+    const mark = backend.seq;
+    backend.deliver('store-state', { seq: mark, revision: 99, safe_mode: 'locked' });
+    await settle();
+    expect(sync.getView()).toMatchObject({ seq: mark, revision: 1, safeMode: null });
+    // Sent before the next snapshot was taken, delivered while that snapshot is on its way.
+    backend.skipSeq(1);
+    const late = backend.seq;
+    gate.hold();
+    focus.dispatchEvent(new Event('focus'));
+    await settle();
+    backend.deliver('store-state', { seq: late, revision: 98, safe_mode: 'crash_loop' });
+    gate.release();
+    await settle();
+    await settle();
+    expect(sync.getView()).toMatchObject({ seq: late, revision: 1, safeMode: null });
+    expect(snapshots()).toBe(2);
+    expect(clock.waiting()).toEqual([]);
+  });
+
+  it('drops the safe mode problem at once and reads the problems again when safe mode ends', async () => {
+    const gate = controlled('startup_problems');
+    const { backend, sync, snapshots } = setup(
+      {
+        safeMode: 'locked',
+        problems: [
+          { kind: 'safe_mode', severity: 'error', args: { reason: 'locked' } },
+          { kind: 'rules_skipped', severity: 'warning', args: { count: 1 } },
+          { kind: 'autostart_repaired', severity: 'info', args: {} },
+        ],
+      },
+      gate.io,
+    );
+    await sync.start();
+    const kinds = () => sync.getView().problems.map((p) => p.kind);
+    expect(kinds()).toEqual(['safe_mode', 'rules_skipped', 'autostart_repaired']);
+    const before = reads(backend, 'startup_problems');
+    // The retry that ends safe mode also finds the rules readable again: that goes unannounced (§3).
+    backend.problems = backend.problems.filter((p) => p.kind !== 'rules_skipped');
+    gate.hold();
+    backend.endSafeMode();
+    await settle();
+    expect(sync.getView()).toMatchObject({ seq: backend.seq, revision: 1, safeMode: null });
+    expect(kinds()).toEqual(['rules_skipped', 'autostart_repaired']);
+    expect(reads(backend, 'startup_problems')).toBe(before + 1);
+    // A problem pushed while the list is being read is kept.
+    backend.addProblem({ kind: 'disk_almost_full', severity: 'warning', args: { free: 1 } });
+    await settle();
+    gate.release();
+    await settle();
+    expect(kinds()).toEqual(['autostart_repaired', 'disk_almost_full']);
+    expect(snapshots()).toBe(1);
+  });
+
+  it('replaces the problems when a snapshot finds safe mode over without a store-state', async () => {
+    const { backend, focus, sync } = setup({
+      safeMode: 'locked',
+      problems: [
+        { kind: 'safe_mode', severity: 'error', args: { reason: 'locked' } },
+        { kind: 'rules_skipped', severity: 'warning', args: { count: 1 } },
+      ],
+    });
+    await sync.start();
+    // As with a backend that has no store-state: safe mode and its problems go silently.
+    backend.safeMode = null;
+    backend.problems = [{ kind: 'autostart_repaired', severity: 'info', args: {} }];
+    focus.dispatchEvent(new Event('focus'));
+    await settle();
+    await settle();
+    expect(sync.getView().safeMode).toBeNull();
+    expect(sync.getView().problems).toEqual(backend.problems);
   });
 });
 

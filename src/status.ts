@@ -4,14 +4,17 @@
 import type { HistoryRow, RuntimeView } from './ipc/events';
 import {
   componentNames,
+  healthNames,
   label,
+  logLevelNames,
+  other,
   outcomeNames,
   pauseNames,
   reasonNames,
   safeModeNames,
   selfTestNames,
 } from './ipc/labels';
-import type { HealthSnapshot, HistoryEntry, StartupProblem } from './ipc/types';
+import type { EngineState, HealthSnapshot, HistoryEntry, StartupProblem } from './ipc/types';
 import { keyNames } from './model';
 
 /** One row of the mapping table; `unknown` is the fallback for a Health value newer than us. */
@@ -85,7 +88,7 @@ export function statusText(
     case 'listening':
       return '监听中';
     case 'unknown':
-      return `引擎状态：${health?.state ?? '未知'}`;
+      return `引擎状态：${health ? label(healthNames, health.state) : '未知'}`;
   }
 }
 
@@ -129,12 +132,21 @@ function listIds(ids: string[], total: number): string {
   return shown.join('、') + (Math.max(total, ids.length) > shown.length ? ' 等' : '');
 }
 
-/** One sentence per startup-problem kind; unknown kinds keep their raw name (contract §3). */
-export function problemText(problem: StartupProblem): string {
+/** What the engine is doing now, as far as a problem's wording depends on it. */
+export type EngineNow = Pick<EngineState, 'listening' | 'paused_reasons'>;
+
+/**
+ * One sentence per startup-problem kind; an unknown kind is 「其他」 with its raw name (contract §1).
+ * `engine` is the engine-state shown now (null while it is not known): a banner stands all session,
+ * so a sentence about listening follows the state as it changes, not the one the problem came with.
+ */
+export function problemText(problem: StartupProblem, engine: EngineNow | null = null): string {
   const a = problem.args;
   switch (problem.kind) {
-    case 'safe_mode':
-      return `已进入安全模式：${label(safeModeNames, str(a.reason) || '原因未知')}。输入监听已暂停，设置暂时不能修改；可以导入配置或打开数据目录检查。`;
+    case 'safe_mode': {
+      const reason = str(a.reason);
+      return `已进入安全模式：${reason ? label(safeModeNames, reason) : '原因未知'}。输入监听已暂停，设置暂时不能修改；可以导入配置或打开数据目录检查。`;
+    }
     case 'recovered': {
       const revision = num(a.revision);
       const from =
@@ -173,19 +185,29 @@ export function problemText(problem: StartupProblem): string {
     case 'self_test_failed': {
       const checks = strs(a.checks).map((c) => label(selfTestNames, c));
       const which = checks.length > 0 ? `：${checks.join('、')}` : '';
-      return `启动自检未通过${which}。文本指令可能无法触发，可在「运行状态与恢复」中查看详情或导出诊断包。`;
+      // S-09 / B-10: a failed self-test keeps the engine paused instead of starting to listen, but
+      // keeps a resume the user made while startup waited (contract §5 「自检」), and the user may
+      // resume or pause later. `listening` is the backend's own verdict (Health accepts a resume and
+      // no pause reason at all), so a pause for any other reason, or a failed engine, never reads
+      // as listening; 「恢复监听」 is pointed to only while the user's own pause is set, the one
+      // reason it clears (the header button reads 「暂停监听」 otherwise).
+      if (engine?.listening)
+        return `启动自检未通过${which}。输入监听当前已开启，但可能无法正常工作；可在「运行状态与恢复」中查看详情或导出诊断包。`;
+      if (engine && !engine.paused_reasons.includes('manual'))
+        return `启动自检未通过${which}，输入监听可能无法正常工作。可在「运行状态与恢复」中查看详情或导出诊断包。`;
+      return `启动自检未通过${which}，没有自动开始监听。可在「运行状态与恢复」中查看详情或导出诊断包；排除问题后可点「恢复监听」。`;
     }
     case 'log_level_elevated': {
       const until = num(a.until_ms);
-      const level = str(a.level) || '详细';
+      const level = str(a.level) ? label(logLevelNames, str(a.level)) : '详细';
       return until === null
-        ? `日志已临时调为 ${level} 级别。`
-        : `日志已临时调为 ${level} 级别，将于 ${clock(until)} 自动恢复。`;
+        ? `日志已临时调为「${level}」级别。`
+        : `日志已临时调为「${level}」级别，将于 ${clock(until)} 自动恢复。`;
     }
     case 'store_meta_reset':
       return '启动记录文件无法读取，已重新建立；连续启动失败的计数已清零。';
     default:
-      return `启动时发现一个问题（${problem.kind}）。可在「运行状态与恢复」中导出诊断包了解详情。`;
+      return `启动时发现一个问题：${other(problem.kind)}。可在「运行状态与恢复」中导出诊断包了解详情。`;
   }
 }
 
@@ -204,8 +226,14 @@ const toneOf = (severity: string): BannerItem['tone'] =>
 /**
  * Banners in priority order (§6.3 ⑪): safe mode first, then startup problems by severity.
  * A `safe_mode` problem is the same fact as the snapshot's `safe_mode`, so it is shown once.
+ * The text follows `engine` (see problemText); the key is the problem's alone, so a dismissed
+ * banner stays dismissed whatever its text becomes.
  */
-export function bannerItems(safeMode: string | null, problems: StartupProblem[]): BannerItem[] {
+export function bannerItems(
+  safeMode: string | null,
+  problems: StartupProblem[],
+  engine: EngineNow | null = null,
+): BannerItem[] {
   const items: BannerItem[] = [];
   if (safeMode)
     items.push({
@@ -220,7 +248,7 @@ export function bannerItems(safeMode: string | null, problems: StartupProblem[])
       key: `${p.kind}:${JSON.stringify(p.args)}`,
       kind: p.kind,
       tone: toneOf(p.severity),
-      text: problemText(p),
+      text: problemText(p, engine),
     }));
   // Array.prototype.sort is stable, so equal severities keep the backend's order.
   rest.sort((a, b) => toneOrder[a.tone] - toneOrder[b.tone]);

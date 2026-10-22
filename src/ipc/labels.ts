@@ -1,8 +1,24 @@
-// Chinese display names for contract codes. Unknown values (newer backend) fall back to the raw
-// code via `label()`, never to an exception (docs/ipc-contract-0.4.md §1).
+// Chinese display names for contract codes. Unknown values (newer backend) are shown as
+// 「其他（原文）」 via `label()`, never as an exception (docs/ipc-contract-0.4.md §1).
 
-export const label = (names: Readonly<Record<string, string>>, code: string): string =>
-  names[code] ?? code;
+type Names = Readonly<Record<string, string>>;
+
+/** The name of `code` in `names`; own keys only, so `constructor` and the like stay unknown. */
+const lookup = (names: Names, code: unknown): string | undefined =>
+  typeof code === 'string' && Object.hasOwn(names, code) ? names[code] : undefined;
+
+/** 「其他」 with the raw value, for an enum value newer than this frontend. */
+export function other(raw: unknown): string {
+  const text =
+    typeof raw === 'string'
+      ? raw
+      : typeof raw === 'number' || typeof raw === 'boolean'
+        ? `${raw}`
+        : '';
+  return text ? `其他（${text}）` : '其他';
+}
+
+export const label = (names: Names, code: unknown): string => lookup(names, code) ?? other(code);
 
 /**
  * Diagnostics of tolerant reading (B-43). The backend's `message` is English developer text, so
@@ -32,6 +48,7 @@ export const safeModeNames: Readonly<Record<string, string>> = {
   no_valid_config: '没有找到可用的配置',
 };
 
+/** Capability ids of `get_capabilities` (crates/platform/src/capabilities.rs). */
 export const capabilityNames: Readonly<Record<string, string>> = {
   keyboard_hook: '键盘监听',
   keys: '逐字键入',
@@ -45,8 +62,31 @@ export const capabilityNames: Readonly<Record<string, string>> = {
   open: '打开文件与应用',
   ime_committed_text: '缩写与输入法候选识别',
   quicker_private_action: 'Quicker 专有动作',
+  // macOS only.
+  wheel_delta: '精细滚轮滚动',
+  media_system_actions: '媒体与系统操作',
+  window_ime_actions: '窗口与输入法操作',
+  // Ids of older backends.
   selection: '读取选中文本',
   notification: '触发后提示',
+};
+
+/** Capability status tags (contract §5 `get_capabilities`). */
+export const capabilityStatusNames: Readonly<Record<string, string>> = {
+  available: '可用',
+  unavailable: '不可用',
+  experimental: '实验性',
+  degraded: '降级',
+};
+
+/**
+ * Capability reasons about the platform rather than a component (Rust `PlatformReason`); a
+ * capability's `reason` is one of these or a ReasonCode.
+ */
+export const platformReasonNames: Readonly<Record<string, string>> = {
+  experimental_platform: '本平台的实现尚未经过实机验收，可能不稳定',
+  permission_missing: '缺少系统权限（辅助功能、输入监控或模拟输入），授权后重启本程序',
+  not_implemented: '本平台不提供此功能',
 };
 
 export const ioOpNames: Readonly<Record<string, string>> = {
@@ -138,3 +178,26 @@ export const selfTestNames: Readonly<Record<string, string>> = {
   foreground: '前台窗口识别',
   clipboard: '剪贴板',
 };
+
+/** `set_log_level` levels, as in the `log_level_elevated` banner. */
+export const logLevelNames: Readonly<Record<string, string>> = {
+  error: '仅错误',
+  warn: '警告',
+  info: '常规',
+  debug: '调试',
+  trace: '最详细',
+};
+
+/** Codes look like this; anything else in a reason field is prose from a 0.3 backend. */
+const CODE = /^[a-z][a-z0-9_]*$/;
+
+/**
+ * Chinese text for a capability's `reason`: a ReasonCode or a PlatformReason, `null` when there is
+ * nothing to explain. A 0.3 backend sent Chinese prose here, which is kept as is.
+ */
+export function capabilityReasonText(reason: unknown): string | null {
+  if (typeof reason !== 'string' || reason === '' || reason === 'ok') return null;
+  const known = lookup(reasonNames, reason) ?? lookup(platformReasonNames, reason);
+  if (known !== undefined) return known;
+  return CODE.test(reason) ? other(reason) : reason;
+}

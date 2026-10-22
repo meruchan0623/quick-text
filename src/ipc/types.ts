@@ -126,12 +126,23 @@ export interface ExecutionResultEvent {
 export interface StartupProblemEvent extends StartupProblem {
   seq: number;
 }
+/**
+ * Sent whenever the store revision or safe mode changes, whoever caused it (this window's own
+ * save/rollback/import too, or a background Locked retry that succeeded). Not rate limited, never
+ * repeated for unchanged values. An older backend never sends it.
+ */
+export interface StoreStateEvent {
+  seq: number;
+  revision: number;
+  safe_mode: SafeModeReason | null;
+}
 
 export interface EventPayloads {
   'engine-health': EngineHealthEvent;
   'engine-state': EngineStateEvent;
   'execution-result': ExecutionResultEvent;
   'startup-problem': StartupProblemEvent;
+  'store-state': StoreStateEvent;
 }
 export type EventName = keyof EventPayloads;
 export const EVENT_NAMES: readonly EventName[] = [
@@ -139,6 +150,7 @@ export const EVENT_NAMES: readonly EventName[] = [
   'engine-state',
   'execution-result',
   'startup-problem',
+  'store-state',
 ];
 
 // ---- 0.4 commands (§5) ----
@@ -155,6 +167,15 @@ export interface RuntimeSnapshot {
 }
 
 export type CapabilityStatus = 'available' | 'unavailable' | 'experimental' | 'degraded';
+/**
+ * One row of get_capabilities / load_state.capabilities, as crates/platform/src/capabilities.rs
+ * serializes it. Kept looser than the Rust type on purpose (lib/capabilities.ts reads it):
+ * - `status` is always sent by a 0.4 backend; a 0.3 one sends only `available`.
+ * - `reason` is untagged in Rust: a ReasonCode (`unsupported`, or one lowered from health) or a
+ *   PlatformReason (`experimental_platform`, `permission_missing`, `not_implemented`), and null
+ *   exactly when `status` is `available`. A 0.3 backend sends prose; an unknown code is 「其他」.
+ * - `available` is `status !== 'unavailable'`.
+ */
 export interface Capability {
   id: string;
   status?: CapabilityStatus;

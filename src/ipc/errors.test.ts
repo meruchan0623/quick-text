@@ -98,9 +98,12 @@ describe('parseCommandError', () => {
     );
   });
 
-  it('shows unknown enum values verbatim', () => {
+  it('shows unknown enum values as 其他 with the raw text', () => {
     const text = errorText({ code: 'safe_mode', detail: { reason: 'cosmic_ray' } });
-    expect(text).toBe('当前处于安全模式（cosmic_ray），暂时不能修改设置。');
+    expect(text).toBe('当前处于安全模式（其他（cosmic_ray）），暂时不能修改设置。');
+    expect(errorText({ code: 'unsupported', detail: { capability: 'teleport' } })).toBe(
+      '当前平台不支持此功能：其他（teleport）。',
+    );
   });
 
   it('keeps an unknown code visible as internal', () => {

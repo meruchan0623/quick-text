@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { initialView, type RuntimeView } from './ipc/events';
-import type { ComponentHealth, HealthSnapshot, HealthState } from './ipc/types';
+import type {
+  ComponentHealth,
+  EngineState,
+  HealthSnapshot,
+  HealthState,
+  StartupProblem,
+} from './ipc/types';
 import {
   affectedComponents,
   bannerItems,
@@ -68,7 +74,7 @@ describe('statusText', () => {
     expect(statusText('executing', [], null)).toBe('执行中');
     expect(statusText('listening', [], null)).toBe('监听中');
     expect(statusText('unknown', [], health('hibernating' as HealthState))).toBe(
-      '引擎状态：hibernating',
+      '引擎状态：其他（hibernating）',
     );
   });
 
@@ -79,9 +85,9 @@ describe('statusText', () => {
       component('clipboard', 'failed'),
       component('teleporter' as ComponentHealth['component'], 'degraded'),
     ]);
-    expect(affectedComponents(snapshot)).toEqual(['前台窗口跟踪', '剪贴板', 'teleporter']);
+    expect(affectedComponents(snapshot)).toEqual(['前台窗口跟踪', '剪贴板', '其他（teleporter）']);
     expect(statusText('degraded', [], snapshot)).toBe(
-      '部分功能降级：前台窗口跟踪、剪贴板、teleporter',
+      '部分功能降级：前台窗口跟踪、剪贴板、其他（teleporter）',
     );
     expect(statusText('degraded', [], health('degraded'))).toBe('部分功能降级');
   });
@@ -161,9 +167,9 @@ describe('problemText', () => {
       [
         'self_test_failed',
         { checks: ['raw_input', 'hook_heartbeat'] },
-        '启动自检未通过：原始键盘输入、键盘监听心跳。文本指令可能无法触发，可在「运行状态与恢复」中查看详情或导出诊断包。',
+        '启动自检未通过：原始键盘输入、键盘监听心跳，没有自动开始监听。可在「运行状态与恢复」中查看详情或导出诊断包；排除问题后可点「恢复监听」。',
       ],
-      ['log_level_elevated', { level: 'debug', until_ms: null }, '日志已临时调为 debug 级别。'],
+      ['log_level_elevated', { level: 'debug', until_ms: null }, '日志已临时调为「调试」级别。'],
       ['store_meta_reset', {}, '启动记录文件无法读取，已重新建立；连续启动失败的计数已清零。'],
     ];
     for (const [kind, args, text] of cases)
@@ -178,7 +184,7 @@ describe('problemText', () => {
         severity: 'info',
         args: { level: 'debug', until_ms: until },
       }),
-    ).toBe('日志已临时调为 debug 级别，将于 14:05 自动恢复。');
+    ).toBe('日志已临时调为「调试」级别，将于 14:05 自动恢复。');
   });
 
   it('survives missing or malformed args', () => {
@@ -190,13 +196,62 @@ describe('problemText', () => {
     ).toBe('配置文件已损坏，已改名保留，可在数据目录中查看。');
     expect(
       problemText({ kind: 'safe_mode', severity: 'error', args: { reason: 'solar_flare' } }),
-    ).toMatch(/^已进入安全模式：solar_flare。/);
+    ).toMatch(/^已进入安全模式：其他（solar_flare）。/);
   });
 
   it('shows an unknown kind verbatim with a generic text', () => {
     expect(problemText({ kind: 'disk_almost_full', severity: 'warning', args: { free: 1 } })).toBe(
-      '启动时发现一个问题（disk_almost_full）。可在「运行状态与恢复」中导出诊断包了解详情。',
+      '启动时发现一个问题：其他（disk_almost_full）。可在「运行状态与恢复」中导出诊断包了解详情。',
     );
+  });
+});
+
+describe('self_test_failed, worded by the engine state now (review A6-2)', () => {
+  const failed: StartupProblem = {
+    kind: 'self_test_failed',
+    severity: 'warning',
+    args: { checks: ['clipboard'] },
+  };
+  const PAUSED =
+    '启动自检未通过：剪贴板，没有自动开始监听。可在「运行状态与恢复」中查看详情或导出诊断包；排除问题后可点「恢复监听」。';
+
+  it('says listening is on, and points to no resume, while the engine listens', () => {
+    const text = problemText(failed, { listening: true, paused_reasons: [] });
+    expect(text).toBe(
+      '启动自检未通过：剪贴板。输入监听当前已开启，但可能无法正常工作；可在「运行状态与恢复」中查看详情或导出诊断包。',
+    );
+    expect(text).not.toMatch(/恢复监听|没有自动开始监听/);
+  });
+
+  it('keeps 「没有自动开始监听」 and 「恢复监听」 while the user pause is set', () => {
+    expect(problemText(failed, { listening: false, paused_reasons: ['manual'] })).toBe(PAUSED);
+    // With another reason too: resuming clears the user pause, the rest stands.
+    expect(problemText(failed, { listening: false, paused_reasons: ['safe_mode', 'manual'] })).toBe(
+      PAUSED,
+    );
+    // Not known yet: the backend's default, paused.
+    expect(problemText(failed)).toBe(PAUSED);
+    expect(problemText(failed, null)).toBe(PAUSED);
+  });
+
+  it('claims neither listening nor a resume to click while paused otherwise', () => {
+    for (const paused_reasons of [['recording'], ['fullscreen'], ['safe_mode'], ['engine_down']]) {
+      const text = problemText(failed, {
+        listening: false,
+        paused_reasons: paused_reasons as EngineState['paused_reasons'],
+      });
+      expect(text).toBe(
+        '启动自检未通过：剪贴板，输入监听可能无法正常工作。可在「运行状态与恢复」中查看详情或导出诊断包。',
+      );
+    }
+  });
+
+  it('keeps one banner key whatever the text', () => {
+    const [listening] = bannerItems(null, [failed], { listening: true, paused_reasons: [] });
+    const [paused] = bannerItems(null, [failed], { listening: false, paused_reasons: ['manual'] });
+    expect(listening?.key).toBe(paused?.key);
+    expect(listening?.text).not.toBe(paused?.text);
+    expect(paused?.text).toBe(PAUSED);
   });
 });
 
@@ -244,7 +299,7 @@ describe('history formatting', () => {
       '已跳过：目标是密码框或只读控件',
     );
     expect(outcomeText({ outcome: 'exploded' as 'failed', reason: 'gremlins' as 'internal' })).toBe(
-      'exploded：gremlins',
+      '其他（exploded）：其他（gremlins）',
     );
   });
 
@@ -276,6 +331,6 @@ describe('history formatting', () => {
     const at = new Date(2026, 0, 2, 3, 4, 5).getTime();
     expect(clock(at)).toBe('03:04');
     expect(clock(at, true)).toBe('03:04:05');
-    expect(pauseText(['safe_mode', 'manual', 'later'])).toBe('安全模式、手动暂停、later');
+    expect(pauseText(['safe_mode', 'manual', 'later'])).toBe('安全模式、手动暂停、其他（later）');
   });
 });

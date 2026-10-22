@@ -7,13 +7,14 @@ import {
   createMockTransport,
   isMockRule,
   MockBackend,
+  mockCapabilities,
   mockOptionsFromQuery,
   syntheticRules,
   validate,
   type MockConfig,
 } from './mock';
 import { call, createTauriTransport, invoke, setTransport } from './transport';
-import { EVENT_NAMES, type HistoryEntry, type RuntimeSnapshot } from './types';
+import { EVENT_NAMES, type HealthSnapshot, type HistoryEntry, type RuntimeSnapshot } from './types';
 
 afterEach(() => {
   clearMocks();
@@ -128,7 +129,6 @@ describe('mock backend commands', () => {
     });
     expect(await invoke<HistoryEntry[]>('list_history', { since_seq: 1 })).toHaveLength(1);
     expect(await invoke('explain_last_miss')).toMatchObject({ reason: 'dropped_busy' });
-    expect(await invoke('repair_engine')).toMatchObject({ state: 'recovering' });
     expect(await invoke('export_diagnostics', { redaction: 'summary' })).toMatch(/\.zip$/);
     expect(await invoke('open_log_dir')).toBeNull();
     expect(await invoke('startup_problems')).toEqual([]);
@@ -136,8 +136,120 @@ describe('mock backend commands', () => {
       expect.objectContaining({ id: 'keys', status: 'available', available: true }),
     );
     expect(await invoke('self_test')).toMatchObject({ passed: true });
+    expect(await invoke('set_log_level', { level: 'debug', ttl_hours: 1 })).toEqual({
+      level: 'debug',
+      until_ms: expect.any(Number) as unknown,
+    });
+    expect(await invoke('set_log_level', { level: 'debug', ttl_hours: null })).toEqual({
+      level: 'info',
+      until_ms: null,
+    });
     await invoke('clear_history');
     expect(await invoke('list_history', { since_seq: null })).toEqual([]);
+  });
+
+  it('answers repair_engine with the current snapshot and pushes recovering (contract §5)', async () => {
+    const backend = new MockBackend({ rules: 0, health: 'failed' });
+    use(backend);
+    const pushed: string[] = [];
+    backend.on('engine-health', (payload) => pushed.push((payload as HealthSnapshot).state));
+    const answer = await invoke<HealthSnapshot>('repair_engine');
+    expect(answer.state).toBe('failed');
+    expect(answer).toEqual(backend.health);
+    expect(pushed).toEqual([]);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(pushed).toEqual(['recovering']);
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    expect(pushed).toEqual(['recovering', 'healthy']);
+  });
+
+  it('builds get_capabilities like crates/platform/src/capabilities.rs', () => {
+    const windows = mockCapabilities('windows');
+    expect(windows.map((c) => c.id)).toEqual([
+      'keyboard_hook',
+      'keys',
+      'paste',
+      'html',
+      'file_clipboard',
+      'image_clipboard',
+      'mouse',
+      'recording',
+      'foreground',
+      'open',
+      'ime_committed_text',
+      'quicker_private_action',
+    ]);
+    expect(windows.find((c) => c.id === 'quicker_private_action')).toEqual({
+      id: 'quicker_private_action',
+      status: 'unavailable',
+      reason: 'not_implemented',
+      available: false,
+    });
+    expect(windows.filter((c) => c.status === 'available')).toHaveLength(11);
+    for (const c of windows) expect(c.available).toBe(c.status !== 'unavailable');
+
+    const macos = mockCapabilities('macos');
+    expect(macos.filter((c) => c.reason === 'not_implemented').map((c) => c.id)).toEqual([
+      'ime_committed_text',
+      'wheel_delta',
+      'window_ime_actions',
+      'quicker_private_action',
+    ]);
+    for (const c of macos.filter((c) => c.reason !== 'not_implemented'))
+      expect(c).toMatchObject({ status: 'experimental', reason: 'experimental_platform' });
+
+    expect(mockCapabilities('linux').every((c) => c.reason === 'unsupported')).toBe(true);
+
+    // Health lowers what depends on a component; the worst one wins.
+    const lowered = mockCapabilities('windows', [
+      { component: 'clipboard', state: 'degraded', reason: 'clipboard_changed', since_ms: 0 },
+      { component: 'raw_input', state: 'failed', reason: null, since_ms: 0 },
+    ]);
+    const status = (id: string) => lowered.find((c) => c.id === id);
+    expect(status('paste')).toMatchObject({ status: 'degraded', reason: 'clipboard_changed' });
+    expect(status('keyboard_hook')).toMatchObject({
+      status: 'unavailable',
+      reason: 'raw_input_missing',
+    });
+    expect(status('keys')).toMatchObject({ status: 'available', reason: null });
+  });
+
+  it('reports the 0.4 capability table in load_state, the 0.3 one in legacy mode', async () => {
+    use(new MockBackend({ rules: 0, platform: 'macos' }));
+    const state = await invoke<{ capabilities: { id: string; status?: string }[] }>('load_state');
+    expect(state.capabilities).toEqual(mockCapabilities('macos'));
+    use(new MockBackend({ rules: 0, legacy: true }));
+    const legacy = await invoke<{ capabilities: { status?: string }[] }>('load_state');
+    expect(legacy.capabilities.every((c) => c.status === undefined)).toBe(true);
+  });
+
+  it('keeps auto_listen_on_start with set_auto_listen (S-09), refused in safe mode, absent in 0.3', async () => {
+    const backend = new MockBackend({ rules: 0 });
+    use(backend);
+    expect(
+      (await invoke<{ auto_listen_on_start?: unknown }>('load_state')).auto_listen_on_start,
+    ).toBe(false);
+    expect(await invoke('set_auto_listen', { enabled: true })).toBe(true);
+    expect(
+      (await invoke<{ auto_listen_on_start?: unknown }>('load_state')).auto_listen_on_start,
+    ).toBe(true);
+    expect(await invoke('set_auto_listen', { enabled: false })).toBe(false);
+    expect(backend.autoListen).toBe(false);
+
+    use(new MockBackend({ rules: 0, safeMode: 'locked' }));
+    const refused: unknown = await invoke('set_auto_listen', { enabled: true }).catch(
+      (e: unknown) => e,
+    );
+    expect(refused).toEqual({ code: 'safe_mode', detail: { reason: 'locked' } });
+
+    use(new MockBackend({ rules: 0, legacy: true }));
+    const missing: unknown = await invoke('set_auto_listen', { enabled: true }).catch(
+      (e: unknown) => e,
+    );
+    expect(isMissingCommand(missing)).toBe(true);
+    expect(
+      (await invoke<{ auto_listen_on_start?: unknown }>('load_state')).auto_listen_on_start,
+    ).toBeUndefined();
   });
 
   it('toggles only the manual pause reason', async () => {
@@ -155,6 +267,51 @@ describe('mock backend commands', () => {
     use(backend);
     const error: unknown = await invoke('apply_settings').catch((e: unknown) => e);
     expect(error).toEqual({ code: 'safe_mode', detail: { reason: 'locked' } });
+  });
+
+  it('pushes store-state when the revision or safe mode changes, and only then', async () => {
+    const backend = new MockBackend({ rules: 0 });
+    use(backend);
+    const pushed: unknown[] = [];
+    backend.on('store-state', (payload) => pushed.push(payload));
+    const { draft } = await invoke<LegacyState>('load_state');
+    await invoke('save_draft', { config: { ...draft, enabled: false } });
+    await invoke('discard_draft');
+    expect(pushed).toEqual([]); // the draft is not the store's revision
+    await invoke('apply_settings');
+    const applied = backend.seq;
+    await invoke('rollback');
+    backend.publishExternally();
+    expect(pushed).toEqual([
+      { seq: applied, revision: 2, safe_mode: null },
+      { seq: applied + 1, revision: 3, safe_mode: null },
+      { seq: applied + 2, revision: 4, safe_mode: null },
+    ]);
+
+    // In crash_loop a refused write pushes nothing; committing and applying an import ends it.
+    const crashed = new MockBackend({ rules: 0, safeMode: 'crash_loop' });
+    use(crashed);
+    const states: unknown[] = [];
+    crashed.on('store-state', (payload) => states.push(payload));
+    expect(await invoke('rollback').catch((e: unknown) => e)).toMatchObject({ code: 'safe_mode' });
+    const preview = await invoke<{ config: MockConfig }>('import_config', {
+      path: 'mock://import.json',
+      strategy: 'replace',
+    });
+    await invoke('save_draft', { config: preview.config });
+    expect(states).toEqual([]);
+    await invoke('apply_settings');
+    expect(states).toEqual([{ seq: crashed.seq, revision: 2, safe_mode: null }]);
+    expect(crashed.problems).toEqual([]);
+    expect(crashed.engine.paused_reasons).toEqual(['manual']);
+
+    // The backend's Locked retry succeeding: pushed once, not again for the same values.
+    const locked = new MockBackend({ rules: 0, safeMode: 'locked' });
+    const retried: unknown[] = [];
+    locked.on('store-state', (payload) => retried.push(payload));
+    locked.endSafeMode(5);
+    locked.endSafeMode();
+    expect(retried).toEqual([{ seq: locked.seq, revision: 5, safe_mode: null }]);
   });
 
   it('returns null when a dialog is cancelled', async () => {

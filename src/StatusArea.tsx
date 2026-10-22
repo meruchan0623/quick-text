@@ -23,7 +23,11 @@ export function BannerStack({
   onOpenDataDir?: (() => void) | undefined;
 }) {
   const [dismissed, setDismissed] = useState<ReadonlySet<string>>(() => new Set());
-  const visible = bannerItems(view.safeMode, view.problems).filter((b) => !dismissed.has(b.key));
+  // Worded by the engine-state shown now (as the status line), keyed by the problem alone.
+  const engine = view.status === 'ready' ? view.engine : null;
+  const visible = bannerItems(view.safeMode, view.problems, engine).filter(
+    (b) => !dismissed.has(b.key),
+  );
   const [first] = visible;
   if (!first) return null;
   return (

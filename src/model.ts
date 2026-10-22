@@ -1,3 +1,4 @@
+import type { SafeModeReason } from './ipc/types';
 import { completeRules, hasUnsafeNumber, isReadableRule } from './lib/rules';
 import { DEFAULT_TERMINATORS } from './lib/terminators';
 export type Data = Record<string, any>;
@@ -51,6 +52,10 @@ export interface State extends Data {
   engine_status: string;
   last_result: any;
   capabilities: any;
+  /** S-09 「启动时自动开始监听」; absent on a 0.3 backend. */
+  auto_listen_on_start?: boolean;
+  /** Absent on a 0.3 backend. */
+  safe_mode?: SafeModeReason | null;
 }
 export const emptyConfig = (): Config => ({
   version: 1,

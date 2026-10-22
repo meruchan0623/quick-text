@@ -392,15 +392,37 @@ footer {
   border: 0;
   padding: 0 8px;
 }
+.alert button.retry {
+  border: 1px solid currentColor;
+  border-radius: 4px;
+}
+.alert.notice {
+  background: #eef6fc;
+  color: #1f4e70;
+  border-bottom: 1px solid #c5ddef;
+}
+.alert.notice button {
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  margin-left: 6px;
+}
 .settings {
   padding: 25px 34px;
   background: white;
   flex: 1;
   overflow: auto;
 }
-.settings > .field {
+.settings > .field,
+.settings-fields > .field {
   max-width: 580px;
   margin: 18px 0;
+}
+/* Groups the settings fields only to disable them together before the config is read. */
+.settings-fields {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
 }
 .settings h2 {
   font-size: 18px;
@@ -822,11 +844,29 @@ dialog.overlay::backdrop {
 .capability-table td:nth-child(2) {
   width: 130px;
 }
-.available {
+/* Capability status (principle 5, S-16): unavailable rows are grayed, the others tagged. */
+.capability-row.unavailable {
+  opacity: 0.55;
+}
+.capability-tag {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  border: 1px solid currentColor;
   color: #1b7a61;
 }
-.unavailable {
+.capability-tag.experimental {
+  color: #4a4fa8;
+}
+.capability-tag.degraded {
+  color: #8a5a00;
+}
+.capability-tag.unavailable {
   color: #9a5b13;
+}
+.fixed-value {
+  font-size: 13px;
 }
 .execution-result {
   padding: 16px;

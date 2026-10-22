@@ -15,6 +15,7 @@ import type { CommandArgs, Transport, Unlisten } from './transport';
 import type {
   Capability,
   CapabilityStatus,
+  Component,
   ComponentHealth,
   Diagnostic,
   EngineState,
@@ -24,6 +25,7 @@ import type {
   HealthState,
   HistoryEntry,
   PauseReason,
+  ReasonCode,
   RuntimeSnapshot,
   SafeModeReason,
   StartupProblem,
@@ -153,6 +155,83 @@ export function syntheticRules(count: number): MockRule[] {
   });
 }
 
+// get_capabilities as crates/platform/src/capabilities.rs builds it: per row, whether an adapter
+// provides it at all and the components it depends on at run time.
+type CapabilityRow = [id: string, adapter: boolean, dependsOn: Component[]];
+const SHARED_ROWS: CapabilityRow[] = [
+  ['keys', true, ['executor']],
+  ['paste', true, ['executor', 'clipboard']],
+  ['html', true, ['executor', 'clipboard']],
+  ['file_clipboard', true, ['executor', 'clipboard']],
+  ['image_clipboard', true, ['executor', 'clipboard']],
+  ['mouse', true, ['executor']],
+  ['recording', true, ['keyboard_hook', 'mouse_hook']],
+  ['foreground', true, ['focus_events']],
+  ['open', true, ['executor']],
+];
+const WINDOWS_ROWS: CapabilityRow[] = [
+  ['keyboard_hook', true, ['keyboard_hook', 'raw_input']],
+  ...SHARED_ROWS,
+  ['ime_committed_text', true, ['keyboard_hook', 'raw_input']],
+  ['quicker_private_action', false, []],
+];
+const MACOS_ROWS: CapabilityRow[] = [
+  ['keyboard_hook', true, ['keyboard_hook']],
+  ...SHARED_ROWS,
+  ['ime_committed_text', false, []],
+  ['wheel_delta', false, []],
+  ['media_system_actions', true, ['executor']],
+  ['window_ime_actions', false, []],
+  ['quicker_private_action', false, []],
+];
+const DEFAULT_REASON: Record<Component, ReasonCode> = {
+  executor: 'engine_down',
+  supervisor: 'engine_down',
+  keyboard_hook: 'hook_missing',
+  mouse_hook: 'hook_missing',
+  focus_events: 'hook_missing',
+  raw_input: 'raw_input_missing',
+  clipboard: 'clipboard_busy',
+  protection: 'internal',
+};
+const SEVERITY: Record<CapabilityStatus, number> = {
+  available: 0,
+  experimental: 1,
+  degraded: 2,
+  unavailable: 3,
+};
+
+/**
+ * The capability table of `platform` lowered by component health, like `capabilities_for`: a
+ * degraded dependency makes a capability degraded, a starting, recovering or failed one makes it
+ * unavailable, the worst one wins. macOS is experimental throughout; other platforms than Windows
+ * and macOS report the Windows ids, all `unsupported`.
+ */
+export function mockCapabilities(
+  platform: MockOptions['platform'],
+  components: readonly ComponentHealth[] = [],
+): Capability[] {
+  const rows = platform === 'macos' ? MACOS_ROWS : WINDOWS_ROWS;
+  return rows.map(([id, adapter, dependsOn]) => {
+    let verdict: [CapabilityStatus, string | null] =
+      platform !== 'windows' && platform !== 'macos'
+        ? ['unavailable', 'unsupported']
+        : !adapter
+          ? ['unavailable', 'not_implemented']
+          : platform === 'macos'
+            ? ['experimental', 'experimental_platform']
+            : ['available', null];
+    for (const c of components) {
+      if (!dependsOn.includes(c.component) || c.state === 'healthy') continue;
+      const reason = c.reason && c.reason !== 'ok' ? c.reason : DEFAULT_REASON[c.component];
+      const status: CapabilityStatus = c.state === 'degraded' ? 'degraded' : 'unavailable';
+      if (SEVERITY[status] > SEVERITY[verdict[0]]) verdict = [status, reason];
+    }
+    const [status, reason] = verdict;
+    return { id, status, reason, available: status !== 'unavailable' };
+  });
+}
+
 const blankTimings = () => ({
   queue_us: null,
   resolve_us: null,
@@ -181,10 +260,18 @@ export class MockBackend {
   problems: StartupProblem[];
   history: HistoryEntry[] = [];
   autostart = false;
+  /** S-09 `auto_listen_on_start`; a 0.3 backend has no such setting. */
+  autoListen = false;
   recording = false;
   #seq = 0;
   #historySeq = 0;
   readonly #handlers = new Map<string, Set<(payload: unknown) => void>>();
+  /** What the last store-state said (or the start); store-state is sent only on a change. */
+  #store: { revision: number; safeMode: SafeModeReason | null };
+  /** The config import_config last previewed (as JSON), until the next save_draft. */
+  #pendingImport: string | null = null;
+  /** In safe mode, the draft is a committed import: apply_settings may publish it. */
+  #safeImport = false;
 
   constructor(options: MockOptions = {}) {
     this.options = {
@@ -224,6 +311,7 @@ export class MockBackend {
       (this.safeMode
         ? [{ kind: 'safe_mode', severity: 'error', args: { reason: this.safeMode } }]
         : []);
+    this.#store = { revision: this.active.revision, safeMode: this.safeMode };
   }
 
   // ---- events ----
@@ -288,6 +376,33 @@ export class MockBackend {
     return entry;
   }
 
+  /**
+   * A revision published from outside this window (another instance, say): the draft is replaced
+   * by it, as after apply_settings. `edit` changes the published config.
+   */
+  publishExternally(edit?: (config: MockConfig) => void): void {
+    const next = { ...clone(this.draft), revision: this.active.revision + 1 };
+    edit?.(next);
+    this.previous.push(this.active);
+    this.active = next;
+    this.draft = clone(next);
+    this.#emitStore();
+  }
+
+  /**
+   * Safe mode ends without a command, as when the backend's SafeMode(Locked) retry succeeds: the
+   * store is read again (at `revision`, when given), the safe_mode pause and problem go, and the
+   * changes are pushed. A problem going is never pushed (contract §3).
+   */
+  endSafeMode(revision?: number): void {
+    if (revision !== undefined && revision !== this.active.revision) {
+      this.active = { ...clone(this.active), revision };
+      this.draft = clone(this.active);
+    }
+    this.#leaveSafeMode();
+    this.#emitStore();
+  }
+
   // ---- commands ----
 
   async handle(command: string, args: CommandArgs = {}): Promise<unknown> {
@@ -303,7 +418,11 @@ export class MockBackend {
     const handler = (legacy ? this.#legacyCommands : this.#commands)[command];
     // eslint-disable-next-line @typescript-eslint/only-throw-error -- Tauri rejects with a plain string
     if (!handler) throw notFound(command);
-    return handler(args);
+    const answer = handler(args);
+    // A command that changed the revision or safe mode pushes store-state before it answers, so the
+    // event may reach the window first (apply_settings, rollback).
+    this.#emitStore();
+    return answer;
   }
 
   /** Reject like the backend: CommandError in 0.4, plain string in legacy mode. */
@@ -320,27 +439,36 @@ export class MockBackend {
   readonly #shared: Record<string, (args: CommandArgs) => unknown> = {
     load_state: () => this.#state(),
     save_draft: (args) => {
-      this.#guardSafeMode();
       const config = clone(args.config as MockConfig);
+      // In safe mode only the previewed import may be committed, and only where importing is the
+      // way out (src-tauri store/mod.rs).
+      const importing = this.#pendingImport === JSON.stringify(config);
+      if (!(importing && (this.safeMode === 'crash_loop' || this.safeMode === 'no_valid_config')))
+        this.#guardSafeMode();
       if (!this.options.legacy) {
         const errors = validate(config).filter((d) => d.severity === 'error');
         if (errors.length > 0)
           this.#fail({ code: 'validation', detail: { diagnostics: errors } }, '');
       }
       this.draft = config;
+      this.#pendingImport = null;
+      this.#safeImport = this.safeMode !== null;
       return this.#state();
     },
     apply_settings: () => {
-      this.#guardSafeMode();
+      // In safe mode only the committed import may be published; that ends safe mode.
+      if (!this.#safeImport) this.#guardSafeMode();
       const errors = validate(this.draft).filter((d) => d.severity === 'error');
       if (errors.length > 0)
         this.#fail({ code: 'validation', detail: { diagnostics: errors } }, JSON.stringify(errors));
       this.previous.push(this.active);
       this.active = { ...clone(this.draft), revision: this.active.revision + 1 };
       this.draft = clone(this.active);
+      if (this.safeMode) this.#leaveSafeMode();
       return this.#state();
     },
     discard_draft: () => {
+      this.#guardSafeMode();
       this.draft = clone(this.active);
       return this.#state();
     },
@@ -436,6 +564,7 @@ export class MockBackend {
       const config = clone(this.draft);
       if (args.strategy === 'replace') config.rules = incoming;
       else for (const rule of incoming) config.rules.push(rule);
+      this.#pendingImport = JSON.stringify(config);
       return {
         config,
         report: [`2 条合成示例规则；策略：${String(args.strategy)}`, '0 conflicts'],
@@ -483,37 +612,25 @@ export class MockBackend {
       safe_mode: this.safeMode,
     }),
     get_health: () => clone(this.health),
-    repair_engine: () => {
-      this.setHealth('recovering');
-      const repaired = clone(this.health);
-      // The real backend reports the outcome through engine-health; so does the mock.
-      setTimeout(() => this.setHealth('healthy'), 600);
-      return repaired;
+    // Contract §5: the snapshot as it is now; `recovering` and the outcome follow as engine-health
+    // events (a latched failure answers `failed` here first).
+    repair_engine: (): HealthSnapshot => {
+      const current = clone(this.health);
+      setTimeout(() => {
+        this.setHealth('recovering');
+        setTimeout(() => this.setHealth('healthy'), 600);
+      }, 0);
+      return current;
     },
     startup_problems: () => clone(this.problems),
-    get_capabilities: (): Capability[] => {
-      const recording: CapabilityStatus =
-        this.options.platform === 'windows' ? 'available' : 'unavailable';
-      const list: [string, CapabilityStatus][] = [
-        ['keyboard_hook', 'available'],
-        ['keys', 'available'],
-        ['paste', 'available'],
-        ['html', 'experimental'],
-        ['recording', recording],
-      ];
-      return list.map(([id, status]) => ({
-        id,
-        status,
-        reason: status === 'unavailable' ? 'unsupported' : null,
-        available: status !== 'unavailable',
-      }));
-    },
+    get_capabilities: (): Capability[] => this.#capabilities(),
     export_diagnostics: () =>
       this.options.dialog === 'cancel' ? null : 'mock://quicker-text-diagnostics.zip',
-    set_log_level: (args) => ({
-      level: args.level,
-      until_ms: typeof args.ttl_hours === 'number' ? Date.now() + args.ttl_hours * 3_600_000 : null,
-    }),
+    // `ttl_hours: null` restores the default level, `info` (diagnostics.rs).
+    set_log_level: (args) =>
+      typeof args.ttl_hours === 'number'
+        ? { level: args.level, until_ms: Date.now() + args.ttl_hours * 3_600_000 }
+        : { level: 'info', until_ms: null },
     open_log_dir: () => null,
     open_data_dir: () => null,
     self_test: () => ({
@@ -547,6 +664,12 @@ export class MockBackend {
           }
         : null;
     },
+    // S-09: a setting, so safe mode refuses it like set_autostart in the backend.
+    set_auto_listen: (args) => {
+      this.#guardSafeMode();
+      this.autoListen = args.enabled === true;
+      return this.autoListen;
+    },
   };
 
   // ---- internals ----
@@ -573,11 +696,17 @@ export class MockBackend {
     if (this.options.legacy) return legacy;
     return {
       ...legacy,
+      capabilities: this.#capabilities(),
+      auto_listen_on_start: this.autoListen,
       health: clone(this.health),
       engine_state: clone(this.engine),
       startup_problems: clone(this.problems),
       safe_mode: this.safeMode,
     };
+  }
+
+  #capabilities(): Capability[] {
+    return mockCapabilities(this.options.platform, this.health.components);
   }
 
   #healthOf(state: HealthState): HealthSnapshot {
@@ -616,6 +745,28 @@ export class MockBackend {
 
   #emitState(): void {
     this.emit('engine-state', clone(this.engine));
+  }
+
+  /**
+   * Safe mode ends (store set_safe_mode(None)): its pause reason and problem go. The engine is not
+   * resumed by it; it stays paused (manually) until the user resumes listening.
+   */
+  #leaveSafeMode(): void {
+    if (!this.safeMode) return;
+    this.safeMode = null;
+    this.#safeImport = false;
+    this.problems = this.problems.filter((p) => p.kind !== 'safe_mode');
+    this.#togglePause('safe_mode', false);
+    if (!this.engine.paused_reasons.includes('manual')) this.#togglePause('manual', true);
+    this.#emitState();
+  }
+
+  /** Push store-state when the revision or safe mode differs from the last push. */
+  #emitStore(): void {
+    const store = { revision: this.active.revision, safeMode: this.safeMode };
+    if (store.revision === this.#store.revision && store.safeMode === this.#store.safeMode) return;
+    this.#store = store;
+    this.emit('store-state', { revision: store.revision, safe_mode: store.safeMode });
   }
 
   #appendHistory(partial: Partial<HistoryEntry>): HistoryEntry {
