@@ -1276,6 +1276,45 @@ describe('number fields of the editor', () => {
       steps({ type: 'key_press', key: { type: 'windows_code', code: 13 } }, delay),
     );
   });
+
+  it('saves an edit next to kept arrays of any width (Codex round 6)', async () => {
+    // Wide enough that a call with one argument per element throws a RangeError; every save sends
+    // them through the last check before sending, which must not block an unrelated edit.
+    const wide = (): number[] => new Array<number>(200_000).fill(0);
+    const kept = { ...rule(';a-wide', steps({ type: 'delay', ms: 100 })), future_list: wide() };
+    const raw = { id: 'raw-wide', match: 42, future_list: wide() };
+    const mounted = await mount({}, (backend) => {
+      backend.draft.future_setting = wide();
+      backend.draft.rules.push(structuredClone(kept), structuredClone(raw));
+    });
+    const { backend, container } = mounted;
+    await waitFor(mounted, () => {
+      expect(container.querySelectorAll('tbody tr')).toHaveLength(5);
+    });
+    expect(container.querySelectorAll('tbody tr.unreadable-row')).toHaveLength(1);
+    await click(mounted, '编辑');
+    const editor = dialog(container, EDITOR);
+    expect(editor?.querySelector('.extra-keys')?.textContent).toBe(
+      '含有本版本不认识的字段（future_list），保存时会保留。',
+    );
+    await type(mounted, input(editor, '等待时间（毫秒）'), '200');
+    await clickIn(mounted, editor, '保存');
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+    });
+    await waitFor(mounted, () => {
+      expect(dialog(container, EDITOR)).toBeNull();
+    });
+    const saved = callsOf(backend, 'save_draft')[0]?.args.config as {
+      rules: unknown[];
+      future_setting: unknown;
+    };
+    expect(saved.rules).toHaveLength(5);
+    expect(saved.rules.at(-2)).toEqual({ ...kept, action: steps({ type: 'delay', ms: 200 }) });
+    expect(saved.rules.at(-1)).toEqual(raw);
+    expect(saved.future_setting).toEqual(wide());
+    expect(container.querySelector('.alert.error')).toBeNull();
+  });
 });
 
 describe('production build outside the desktop app', () => {

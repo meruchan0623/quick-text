@@ -26,6 +26,25 @@ describe('unsendablePath', () => {
     );
   });
 
+  it('walks arrays and objects of any width without a call per element (Codex round 6)', () => {
+    // Wide enough that `push(...items)` throws a RangeError; JSON.stringify writes it fine.
+    const wide = (): unknown[] => new Array<number>(200_000).fill(0);
+    const config = {
+      config: { rules: [{ future: wide() }, { id: 'raw', match: 42, future: wide() }] },
+    };
+    expect(JSON.stringify(config).length).toBeGreaterThan(400_000);
+    expect(unsendablePath(config)).toBe(null);
+
+    const last = wide();
+    last[199_999] = NaN;
+    expect(unsendablePath({ config: { rules: [{ future: last }] } })).toBe(
+      'config.rules[0].future[199999]',
+    );
+    const keys = Object.fromEntries(wide().map((n, i) => [`k${String(i)}`, n]));
+    keys.k199999 = Infinity;
+    expect(unsendablePath({ keys })).toBe('keys.k199999');
+  });
+
   it('ends on cyclic values', () => {
     const cyclic: Record<string, unknown> = { a: 1 };
     cyclic.self = cyclic;

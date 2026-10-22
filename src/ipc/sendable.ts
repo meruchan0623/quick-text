@@ -6,25 +6,53 @@
 // src/lib/numberFields.ts): the marker always carries a NaN for this reason. The editor's own
 // checks refuse such values first, with a message at the field; this check holds for every
 // command, whatever path its arguments took.
+//
+// Every save sends the whole config through here, with whatever it keeps as it is: unknown fields
+// and unreadable entries can hold arrays of any size, at any depth (Codex round 6). So the walk
+// takes no recursion and no call with one argument per element (`push(...items)` throws a
+// RangeError past some 100 000 arguments): it keeps one frame per open array or object, and builds
+// a path string only for a container it enters or for the number it reports.
+
+interface Frame {
+  readonly path: string;
+  /** The array's items, or the object's values. */
+  readonly values: readonly unknown[];
+  /** The object's keys, in the order of `values`; `null` for an array (the key is the index). */
+  readonly keys: readonly string[] | null;
+  /** The position of the next child to look at. */
+  next: number;
+}
+
+const frame = (node: object, path: string): Frame =>
+  Array.isArray(node)
+    ? { path, values: node, keys: null, next: 0 }
+    : { path, values: Object.values(node), keys: Object.keys(node), next: 0 };
+
+function childPath(parent: Frame, index: number): string {
+  const key = parent.keys?.[index];
+  if (key === undefined) return `${parent.path}[${String(index)}]`;
+  return parent.path ? `${parent.path}.${key}` : key;
+}
 
 /** The path of the first number in `value` that JSON cannot carry, or `null` when there is none. */
 export function unsendablePath(value: unknown, root = ''): string | null {
-  const pending: [unknown, string][] = [[value, root]];
-  const seen = new Set<object>();
-  for (let next = pending.pop(); next; next = pending.pop()) {
-    const [item, path] = next;
-    if (typeof item === 'number') {
-      if (!Number.isFinite(item)) return path;
-    } else if (typeof item === 'object' && item !== null && !seen.has(item)) {
-      seen.add(item);
-      const entries = Array.isArray(item)
-        ? item.map((child, i): [unknown, string] => [child, `${path}[${String(i)}]`])
-        : Object.entries(item).map(([key, child]): [unknown, string] => [
-            child,
-            path ? `${path}.${key}` : key,
-          ]);
-      // Reversed onto the stack, so the first problem in document order is the one reported.
-      pending.push(...entries.reverse());
+  if (typeof value === 'number') return Number.isFinite(value) ? null : root;
+  if (typeof value !== 'object' || value === null) return null;
+  const seen = new Set<object>([value]);
+  const stack: Frame[] = [frame(value, root)];
+  for (let top = stack.at(-1); top; top = stack.at(-1)) {
+    if (top.next >= top.values.length) {
+      stack.pop();
+      continue;
+    }
+    const index = top.next++;
+    const child = top.values[index];
+    if (typeof child === 'number') {
+      if (!Number.isFinite(child)) return childPath(top, index);
+    } else if (typeof child === 'object' && child !== null && !seen.has(child)) {
+      // Depth first, children in order: the first problem in document order is the one reported.
+      seen.add(child);
+      stack.push(frame(child, childPath(top, index)));
     }
   }
   return null;

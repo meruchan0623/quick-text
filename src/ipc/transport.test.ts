@@ -93,6 +93,26 @@ describe('the last check before sending', () => {
     });
     expect(sent).toEqual(['execute_action']);
   });
+
+  it('sends a config whose kept fields hold arrays of any width (Codex round 6)', async () => {
+    const received: unknown[] = [];
+    mockIPC((command, payload) => {
+      received.push([command, payload]);
+      return null;
+    });
+    const transport = await freshTransport({ dev: false });
+    const wide = (): number[] => new Array<number>(200_000).fill(0);
+    const config = {
+      version: 1,
+      future_setting: wide(),
+      rules: [
+        { id: 'a', match: { kind: 'literal', value: ';a' }, future_rule_field: wide() },
+        { id: 'raw', match: 42, future: wide() },
+      ],
+    };
+    await expect(transport.invoke('save_draft', { config })).resolves.toBe(null);
+    expect(received).toEqual([['save_draft', { config }]]);
+  });
 });
 
 describe('development', () => {

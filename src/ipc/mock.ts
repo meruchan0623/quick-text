@@ -435,7 +435,7 @@ export class MockBackend {
       }));
       const config = clone(this.draft);
       if (args.strategy === 'replace') config.rules = incoming;
-      else config.rules.push(...incoming);
+      else for (const rule of incoming) config.rules.push(rule);
       return {
         config,
         report: [`2 条合成示例规则；策略：${String(args.strategy)}`, '0 conflicts'],
