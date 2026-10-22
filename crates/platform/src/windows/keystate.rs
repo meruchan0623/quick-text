@@ -285,6 +285,38 @@ impl OwnInput {
         };
         family.iter().any(|&v| self.bit(v))
     }
+    /// A key-up (or button-up) of `vk` that is not ours reached the hooks:
+    /// the user's, or another program's. The system key state is shared, so
+    /// whoever pressed the key, it is up now and we no longer hold it (H1).
+    /// Without this a press of ours whose release the executor skipped,
+    /// because the user held the same key at cleanup, would stay owned for
+    /// good and keep every later resync away from that key. If the executor
+    /// still sends its own key-up later, the extra release is harmless.
+    ///
+    /// Clears the ownership bits this key-up ends: a left-side modifier also
+    /// ends the generic one and the reverse, while a right-side modifier
+    /// ends only itself. 「待实测」: that an injected generic modifier
+    /// (`VK_CONTROL`, `VK_SHIFT`, `VK_MENU` without a scan code) sets the
+    /// left-side key state. When a bit was cleared it advances `seq`, so a
+    /// resync sampling at the same time is discarded and retried. Atomics
+    /// only: this runs in the hook callbacks.
+    pub(super) fn released_elsewhere(&self, vk: u16) {
+        let ended = match vk {
+            VK_CONTROL | VK_LCONTROL => [VK_CONTROL, VK_LCONTROL],
+            VK_SHIFT | VK_LSHIFT => [VK_SHIFT, VK_LSHIFT],
+            VK_MENU | VK_LMENU => [VK_MENU, VK_LMENU],
+            _ => [vk; 2],
+        };
+        let mut cleared = false;
+        for v in ended {
+            if let Some((word, bit)) = self.slot(v) {
+                cleared |= word.fetch_and(!bit, Ordering::SeqCst) & bit != 0;
+            }
+        }
+        if cleared {
+            self.seq.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 /// One injection in flight; see [`OwnInput::begin`].
@@ -766,6 +798,36 @@ mod tests {
             panic!("injector failed");
         }));
         assert!(unwound.is_err() && !own.active());
+    }
+
+    #[test]
+    fn a_key_up_from_elsewhere_ends_our_hold_of_that_key() {
+        let own = OwnInput::new();
+        {
+            let injecting = own.begin();
+            for vk in [0x41, VK_CONTROL, VK_RSHIFT, VK_LMENU, VK_XBUTTON1] {
+                injecting.pressed(vk);
+            }
+        }
+        // Nothing of ours ends: no bit changes and no resync is disturbed.
+        let seen = own.seq();
+        for vk in [0x42, VK_RCONTROL, VK_LSHIFT, VK_SHIFT, VK_RMENU, 256] {
+            own.released_elsewhere(vk);
+        }
+        assert!(own.settled(seen), "seq only moves when a hold ends");
+        assert!(own.holds(0x41) && own.holds(VK_CONTROL) && own.holds(VK_RSHIFT));
+        assert!(own.holds(VK_MENU) && own.holds(VK_XBUTTON1));
+        // A plain key, a button, and a left-side key-up ending our generic
+        // Ctrl (and a generic key-up ending our left Alt).
+        own.released_elsewhere(0x41);
+        assert!(!own.holds(0x41) && !own.settled(seen));
+        own.released_elsewhere(VK_XBUTTON1);
+        own.released_elsewhere(VK_LCONTROL);
+        own.released_elsewhere(VK_MENU);
+        assert!(!own.holds(VK_XBUTTON1) && !own.holds(VK_CONTROL) && !own.holds(VK_MENU));
+        // A right-side key-up ends only the right side.
+        own.released_elsewhere(VK_RSHIFT);
+        assert!(!own.holds(VK_SHIFT));
     }
 
     #[test]

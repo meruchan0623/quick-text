@@ -21,7 +21,7 @@ use super::*;
 use super::{
     foreground::WinForeground,
     input::{self, Lane},
-    keystate::{KeyBits, PHYSICAL},
+    keystate::{own_input, KeyBits, PHYSICAL},
 };
 use crate::fault::{self, FaultPoint};
 use crate::traits::{ForegroundProbe, InputContext};
@@ -198,6 +198,12 @@ pub(super) fn on_key(
         injected_panic();
     }
     let injected = origin == Origin::External;
+    let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+    if !down {
+        // H1: a key-up that is not ours ends our hold of the key, whoever
+        // pressed it (the key state is shared).
+        own_input().released_elsewhere(key.vk);
+    }
     // no-regression #4: external injected input (LLKHF_INJECTED without MARK) invalidates the buffer.
     if injected && !pipe.test_mode {
         shared.generation.fetch_add(1, Ordering::SeqCst);
@@ -205,7 +211,6 @@ pub(super) fn on_key(
         pipe.lane.push(HookRecord::External);
         return HookAction::Pass;
     }
-    let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
     let keys = pipe.keys;
     keys.set(key.vk, down);
     if down && key.vk == VK_ESCAPE && keys.held(VK_CONTROL) && keys.held(VK_SHIFT) {
@@ -310,6 +315,10 @@ pub(super) fn on_mouse(pipe: &HookPipe, shared: &Shared, mouse: MouseInfo) {
         return;
     }
     if let Some((button, down)) = mouse_button(mouse.msg, mouse.data) {
+        if !down {
+            // H1: as for keys, a button-up not ours ends our hold.
+            own_input().released_elsewhere(button);
+        }
         pipe.keys.set(button, down);
     }
     if mouse.msg == WM_MOUSEMOVE {

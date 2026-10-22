@@ -179,8 +179,8 @@ fn context() -> InputContext {
     MockForeground::context_for(&window())
 }
 
-/// Hook tests consume the global HookPanic fault point; they must not
-/// overlap.
+/// Hook tests consume the global HookPanic fault point, and some tests
+/// write the global key mirror; they must not overlap.
 static SERIAL: Mutex<()> = Mutex::new(());
 fn serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
@@ -317,6 +317,14 @@ fn hook_and_raw_callback_bodies_neither_allocate_nor_block() {
     let accept = Arc::new(HookPipe::new(keys, 64, true, nothing));
     let raw = Arc::new(Lane::<RawRecord>::new(64, nothing));
     let probe = FixedProbe(context());
+    // We hold B and the right button, so the user's key-up and button-up
+    // below end those holds (H1) inside the measured bodies.
+    let own: &'static OwnInput = Box::leak(Box::new(OwnInput::new()));
+    {
+        let injecting = own.begin();
+        injecting.pressed(0x42);
+        injecting.pressed(VK_RBUTTON);
+    }
     // Hold every engine lock a callback could reach: a body that takes one
     // never finishes.
     let compiled = shared.compiled.lock().unwrap();
@@ -328,6 +336,7 @@ fn hook_and_raw_callback_bodies_neither_allocate_nor_block() {
         let (shared, plain, accept, raw) =
             (shared.clone(), plain.clone(), accept.clone(), raw.clone());
         std::thread::spawn(move || {
+            let _track = track_own_input(own);
             let measured = allocations(|| {
                 let event = InputEvent::key_down(0x42, "b", true);
                 let up = InputEvent::key_up(0x42, true);
@@ -346,6 +355,7 @@ fn hook_and_raw_callback_bodies_neither_allocate_nor_block() {
                 ];
                 handle_mouse(&plain, &shared, mouse(WM_MOUSEMOVE, -5, 7));
                 handle_mouse(&plain, &shared, mouse(WM_LBUTTONDOWN, -5, 7));
+                handle_mouse(&plain, &shared, mouse(WM_RBUTTONUP, -5, 7));
                 (raw_queued, actions)
             });
             tx.send(measured).unwrap();
@@ -391,9 +401,17 @@ fn hook_and_raw_callback_bodies_neither_allocate_nor_block() {
                     y: 7,
                     ..
                 },
+                HookRecord::Mouse {
+                    msg: WM_RBUTTONUP,
+                    ..
+                },
             ]
         ),
         "{plain:?}"
+    );
+    assert!(
+        !own.holds(0x42) && !own.holds(VK_RBUTTON),
+        "the user's key-up and button-up ended our holds"
     );
     assert!(matches!(
         records(&accept).as_slice(),
@@ -1195,6 +1213,8 @@ impl Clock for ConsumerTicks<'_> {
 #[test]
 fn an_action_releases_its_key_across_the_second_resync() {
     const A: u16 = 0x41;
+    // Resyncs the global mirror.
+    let _serial = serial();
     let own: &'static OwnInput = Box::leak(Box::new(OwnInput::new()));
     let _track = track_own_input(own);
     // `physical()` in the executor reads the global mirror; nothing in the
@@ -1469,6 +1489,117 @@ fn a_partially_accepted_chord_stays_ours_through_both_resyncs() {
     for vk in [VK_CONTROL, VK_LCONTROL, VK_RCONTROL, V] {
         assert!(!keys.held(vk), "{vk:#x} was imported");
     }
+}
+
+/// The executor's clock in
+/// [`a_key_the_user_releases_is_no_longer_ours_after_a_skipped_cleanup`]:
+/// during the first executor sleep the user presses `key`, through the real
+/// keyboard hook body.
+struct PressDuringSleep<'a> {
+    clock: &'a FakeClock,
+    hooks: &'a HookPipe<'a>,
+    shared: &'a Shared,
+    key: u16,
+    pressed: AtomicBool,
+}
+impl Clock for PressDuringSleep<'_> {
+    fn now(&self) -> Instant {
+        self.clock.now()
+    }
+    fn wall_ms(&self) -> i64 {
+        self.clock.wall_ms()
+    }
+    fn sleep(&self, duration: Duration) {
+        self.clock.sleep(duration);
+        if !self.pressed.swap(true, Ordering::SeqCst) {
+            let probe = FixedProbe(context());
+            handle_key(
+                self.hooks,
+                self.shared,
+                &probe,
+                WM_KEYDOWN,
+                hardware(self.key),
+            );
+        }
+    }
+}
+/// Puts a key back up in the global mirror when the test ends, pass or
+/// fail.
+struct LiftOnDrop(u16);
+impl Drop for LiftOnDrop {
+    fn drop(&mut self) {
+        PHYSICAL.set(self.0, false);
+    }
+}
+
+/// H1: our action presses K and the user presses K too, so the executor
+/// skips releasing K (it is physically held) and our press stays marked as
+/// ours. The user's key-up releases K whoever pressed it; it must end that
+/// mark, or every later resync would skip K. When the user later holds K
+/// and the hooks miss the press, a resync restores it.
+#[test]
+fn a_key_the_user_releases_is_no_longer_ours_after_a_skipped_cleanup() {
+    // F13: no other test uses it. The executor's `physical()` reads the
+    // global mirror, so the hooks here write that mirror; tests that resync
+    // it are serialized.
+    const K: u16 = 0x7C;
+    let _serial = serial();
+    let own: &'static OwnInput = Box::leak(Box::new(OwnInput::new()));
+    let _track = track_own_input(own);
+    PHYSICAL.mark_seeded();
+    let _lift = LiftOnDrop(K);
+    let shared = engine("btw");
+    let clock = FakeClock::new();
+    let hooks = HookPipe::new(&PHYSICAL, 8, false, nothing);
+    let probe = FixedProbe(context());
+    let user = PressDuringSleep {
+        clock: &clock,
+        hooks: &hooks,
+        shared: &shared,
+        key: K,
+        pressed: AtomicBool::new(false),
+    };
+    let injector = MockInjector::new();
+    let (status, message) = execute_steps(
+        &shared,
+        &injector,
+        &user,
+        [
+            Operation::KeyDown {
+                key: Key::named("F13"),
+            },
+            Operation::Delay { ms: 100 },
+            Operation::KeyUp {
+                key: Key::named("F13"),
+            },
+        ],
+    );
+    assert!(user.pressed.load(Ordering::SeqCst), "{status}: {message}");
+    assert!(message.contains("Physical key conflicts"), "{message}");
+    assert_eq!(
+        injector.calls(),
+        [InjectCall::Key { key: K, up: false }],
+        "the KeyUp and the cleanup skipped K, physically held: {status}: {message}"
+    );
+    assert!(own.holds(K) && PHYSICAL.held(K));
+    // The user lets go of K.
+    handle_key(&hooks, &shared, &probe, WM_KEYUP, hardware(K));
+    assert!(!PHYSICAL.held(K));
+    assert!(!own.holds(K), "the user's key-up ended our hold of K");
+    // Later the user holds K again, the hooks miss that press, and the
+    // session unlocks.
+    let async_keys = FakeAsyncKeys::default();
+    async_keys.set(&[K]);
+    let signals = SessionSignals::new();
+    let mut monitor = Monitor::new(&PHYSICAL, &async_keys, &clock, &signals, own);
+    signals.raise(Signal::Unlock);
+    let lines = settle_resyncs(&mut monitor, &shared, &clock);
+    assert_eq!(
+        count_of(&lines, "event=\"keystate.resync\""),
+        2,
+        "{lines:?}"
+    );
+    assert!(PHYSICAL.held(K), "the resync restored the user's K");
 }
 
 /// The hook kinds behind [`FakeSources::hooked`], in order.
