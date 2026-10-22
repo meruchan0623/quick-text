@@ -207,5 +207,6 @@ pub fn stop_recording(shared: &Arc<Shared>) -> Result<ActionPlan, String> {
 }
 pub mod history;
 pub mod runtime;
+pub mod self_test;
 pub mod supervisor;
 pub mod supervisor_wiring;

@@ -1199,6 +1199,37 @@ fn later_problems_are_reported_once() {
     assert_eq!(*seen.lock(), [skipped, ProblemKind::AutostartRepaired {}]);
 }
 
+/// What was found outside the load (autostart, the startup self-test) is
+/// still listed after a Locked retry reloads; what the earlier load found
+/// is replaced by the reload's own findings.
+#[test]
+fn problems_found_outside_the_load_survive_a_reload() {
+    let dir = TempDir::new();
+    let world = world();
+    write(&dir, "active.json", &bytes(&config_at(2)));
+    write(&dir, "draft.json", &bytes(&config_at(2)));
+    world.locked.lock().push("active.json");
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    let outside = [
+        ProblemKind::AutostartRepaired {},
+        ProblemKind::SelfTestFailed {
+            checks: vec![quicker_platform::self_test::CheckName::Foreground],
+        },
+    ];
+    for kind in outside.clone() {
+        store.add_problem(kind);
+    }
+    world.locked.lock().clear();
+    store.apply_retry(retry_locked(&dir, &env(&world)).unwrap());
+    assert_eq!(store.safe_mode(), None);
+    let kinds: Vec<_> = store
+        .startup_problems()
+        .iter()
+        .map(|p| p.kind.clone())
+        .collect();
+    assert_eq!(kinds, outside);
+}
+
 /// Fault injection (B-52): the store points behave as the real failures.
 #[cfg(feature = "fault-injection")]
 mod injected {

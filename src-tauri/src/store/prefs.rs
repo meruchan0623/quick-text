@@ -95,6 +95,34 @@ pub fn save_prefs(dir: &Path, prefs: &Prefs) -> Result<(), CommandError> {
     atomic_json(&dir.join(FILE), prefs)
 }
 
+/// Serialises read-modify-write cycles on `prefs.json` within the process,
+/// so two writers (`set_auto_listen`, the log level) never lose each
+/// other's change. Taken after any lock of the caller's, never before.
+static WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Loads `prefs.json`, applies `change` and saves the result if `change`
+/// returned true; returns that value. Nothing is written when the load
+/// fails (the store rule, see [`load_prefs`]).
+pub fn update_prefs(
+    dir: &Path,
+    change: impl FnOnce(&mut Prefs) -> bool,
+) -> Result<bool, CommandError> {
+    let _one = WRITE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut prefs = load_prefs(dir)?;
+    let changed = change(&mut prefs);
+    if changed {
+        save_prefs(dir, &prefs)?;
+    }
+    Ok(changed)
+}
+
+/// `app.auto_listen_on_start`; false when prefs cannot be read.
+pub fn auto_listen_on_start(dir: &Path) -> bool {
+    load_prefs(dir).is_ok_and(|prefs| prefs.app.auto_listen_on_start)
+}
+
 /// Moves a damaged file aside, keeping its bytes. Only the error category
 /// and position are logged: serde messages can quote file content.
 fn quarantine(path: &Path, reason: &serde_json::Error) -> io::Result<PathBuf> {
@@ -383,6 +411,48 @@ mod tests {
             file_label(&second).unwrap(),
             "prefs.corrupt-20261022-102133-1.json"
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `update_prefs` keeps everything it does not change, writes only when
+    /// asked to, and never writes over prefs it could not read.
+    #[test]
+    fn update_prefs_changes_one_field_and_keeps_the_rest() {
+        let dir = temp_dir();
+        assert!(!auto_listen_on_start(&dir), "missing file: off");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(FILE),
+            br#"{"app":{"hotkey":"Ctrl+Q"},"ui":{"theme":"dark"},"future":1}"#,
+        )
+        .unwrap();
+        let changed = update_prefs(&dir, |prefs| {
+            prefs.app.auto_listen_on_start = true;
+            true
+        })
+        .unwrap();
+        assert!(changed);
+        assert!(auto_listen_on_start(&dir));
+        let written: Value = serde_json::from_slice(&fs::read(dir.join(FILE)).unwrap()).unwrap();
+        assert_eq!(written["app"]["auto_listen_on_start"], true);
+        assert_eq!(written["app"]["hotkey"], "Ctrl+Q");
+        assert_eq!(written["ui"], json!({"theme": "dark"}));
+        assert_eq!(written["future"], 1);
+        // No change asked for: the file is not touched.
+        fs::remove_file(dir.join(FILE)).unwrap();
+        assert!(!update_prefs(&dir, |_| false).unwrap());
+        assert!(!dir.join(FILE).exists());
+        // Unreadable: an error, nothing written, and auto-listen reads as off.
+        fs::create_dir_all(dir.join(FILE)).unwrap();
+        assert!(matches!(
+            update_prefs(&dir, |prefs| {
+                prefs.app.auto_listen_on_start = true;
+                true
+            }),
+            Err(CommandError::Io { op: IoOp::Read, .. })
+        ));
+        assert!(dir.join(FILE).is_dir());
+        assert!(!auto_listen_on_start(&dir));
         fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -39,6 +39,9 @@ pub struct AppState {
     last_result: Option<ExecutionResult>,
     capabilities: Vec<Capability>,
     autostart: bool,
+    /// `prefs.json` `app.auto_listen_on_start` (B-10); false when prefs
+    /// cannot be read. Written by `set_auto_listen`.
+    auto_listen_on_start: bool,
     engine_detail: serde_json::Value,
     platform: String,
     startup_problems: Vec<StartupProblem>,
@@ -65,6 +68,7 @@ impl Store {
             last_result: self.engine.last.lock().unwrap().clone(),
             capabilities: capabilities(&health),
             autostart: autostart::is_enabled(),
+            auto_listen_on_start: crate::store::prefs::auto_listen_on_start(self.dir()),
             engine_detail: quicker_platform::input_status(),
             platform: PLATFORM.into(),
             startup_problems: self.startup_problems().to_vec(),
@@ -114,6 +118,27 @@ mod tests {
             serde_json::to_value(quicker_platform::capabilities_for(&health.components)).unwrap()
         );
         assert_eq!(state["platform"], std::env::consts::OS);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `load_state.auto_listen_on_start` follows prefs.json (contract §4).
+    #[test]
+    fn load_state_reports_auto_listen_on_start_from_prefs() {
+        let dir = temp_dir();
+        let store = Store::load(dir.clone());
+        assert_eq!(
+            serde_json::to_value(store.state()).unwrap()["auto_listen_on_start"],
+            false
+        );
+        crate::store::prefs::update_prefs(&dir, |prefs| {
+            prefs.app.auto_listen_on_start = true;
+            true
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(store.state()).unwrap()["auto_listen_on_start"],
+            true
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

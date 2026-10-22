@@ -29,7 +29,10 @@ use quicker_platform::{health::PauseReasons, runtime::Runtime, Shared};
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::{atomic::Ordering, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 pub struct Store {
@@ -61,6 +64,9 @@ pub struct Store {
     /// Where problems found after startup go (the EventBus, which sends
     /// `startup-problem`); `None` until the bus is up and in unit tests.
     problem_sink: Option<ProblemSink>,
+    /// Successful [`Store::set_manual_pause`] calls so far, so startup can
+    /// tell whether the user paused or resumed while it waited.
+    manual_changes: AtomicU64,
 }
 
 /// Deferred work run with the store once it is writable.
@@ -149,6 +155,7 @@ impl Store {
             }
         }
         self.runtime.set_pause(PauseReasons::MANUAL, paused);
+        self.manual_changes.fetch_add(1, Ordering::SeqCst);
         self.engine.generation.fetch_add(1, Ordering::SeqCst);
         if paused {
             self.engine.cancel.store(true, Ordering::SeqCst);
@@ -159,6 +166,10 @@ impl Store {
             "manual pause changed"
         );
         Ok(())
+    }
+    /// How many times [`Store::set_manual_pause`] has succeeded.
+    pub fn manual_changes(&self) -> u64 {
+        self.manual_changes.load(Ordering::SeqCst)
     }
     /// Runs `hook` once per session, the first time the store is writable:
     /// right away outside safe mode, otherwise when safe mode ends (the

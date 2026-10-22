@@ -73,6 +73,9 @@ fn main() {
             app.manage(bus);
             startup::after_load(app.handle());
             startup::start_engine(engine, runtime);
+            // B-10: waits for Healthy, runs the self-test, then listens or
+            // stays paused and says why.
+            startup::spawn_self_test(app.handle().clone());
             if std::env::args().any(|x| x == "--background") {
                 if let Some(w) = app.get_webview_window("main") {
                     w.hide()?;
@@ -105,6 +108,7 @@ fn main() {
             commands::runtime::start_recording,
             commands::runtime::stop_recording,
             commands::settings::set_autostart,
+            commands::settings::set_auto_listen,
             commands::rules::preview_file,
             commands::rules::preview_image,
             commands::system::get_cursor,
@@ -124,6 +128,7 @@ fn main() {
             commands::engine::list_history,
             commands::engine::clear_history,
             commands::engine::explain_last_miss,
+            commands::engine::self_test,
             #[cfg(feature = "fault-injection")]
             commands::engine::debug_inject_fault
         ])

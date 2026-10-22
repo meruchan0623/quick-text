@@ -1,7 +1,8 @@
 //! Engine health, capabilities and execution history (contract §5, 0.4).
 //!
 //! Every command takes the store lock only to clone the runtime handle (and
-//! read the revision and safe mode); nothing here blocks on the engine.
+//! read the revision and safe mode); nothing here blocks on the engine
+//! (`self_test` waits for its checks on a blocking worker).
 use crate::{
     app_state::{capabilities, Managed},
     error::{CommandError, SafeModeReason},
@@ -11,11 +12,12 @@ use quicker_platform::{
     health::{EngineState, HealthSnapshot, HistoryEntry},
     history::MissExplanation,
     runtime::Runtime,
+    self_test::SelfTestReport,
     Capability,
 };
 use serde::Serialize;
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Manager, State};
 
 /// `get_runtime_snapshot`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -116,6 +118,21 @@ pub fn clear_history(store: State<Managed>) -> Result<(), CommandError> {
 #[tauri::command(rename_all = "snake_case")]
 pub fn explain_last_miss(store: State<Managed>) -> Result<Option<MissExplanation>, CommandError> {
     Ok(runtime(&store).explain_last_miss())
+}
+
+/// Runs the four platform checks (S-09, contract §5 `self_test`) on a
+/// blocking worker, never under the store lock. Detection pauses through
+/// `SelfTest` while it runs; it resumes nothing and writes nothing, so it
+/// is allowed in safe mode. Takes at most one check timeout (2.5 s), after
+/// a run already in progress.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn self_test(app: tauri::AppHandle) -> Result<SelfTestReport, CommandError> {
+    let runtime = runtime(&app.state::<Managed>());
+    tauri::async_runtime::spawn_blocking(move || {
+        quicker_platform::self_test::run_platform(&runtime)
+    })
+    .await
+    .map_err(CommandError::internal)
 }
 
 /// Arms a one-shot fault (B-52). Exists only with the `fault-injection`

@@ -103,7 +103,7 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 | `rules_skipped` | warning | `{ count, ids: string[] }`（宽容读取或逐条编译失败的规则） |
 | `terminator_unsupported` | warning | `{ keys: string[] }`（旧配置中的 tab、enter） |
 | `autostart_repaired` | info | `{}`（自启项路径与当前程序不符，已修正） |
-| `self_test_failed` | warning | `{ checks: string[] }`（未通过的自检项名称） |
+| `self_test_failed` | warning | `{ checks: ("raw_input" \| "hook_heartbeat" \| "foreground" \| "clipboard")[] }`：启动自检未通过的项（原因为 `unsupported` 的项不计入），引擎保持暂停，界面提供「恢复监听」。见 §5「自检」 |
 | `log_level_elevated` | info | `{ level, until_ms }` |
 | `store_meta_reset` | warning | `{}`（`store-meta.json` 无法解析，已重建） |
 
@@ -115,6 +115,7 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 |---|---|
 | 全部 | 错误类型改为 `CommandError` |
 | `load_state` | 返回值在原字段之外新增 `health: HealthSnapshot`、`engine_state: EngineState`（不含 `seq`）、`startup_problems: StartupProblem[]`、`safe_mode: SafeModeReason \| null`；`engine_status` 字符串保留。`health`、`engine_state` 是调用时运行时的实时值（不是 EventBus 最后发出的值，需要 `seq` 基准时用 `get_runtime_snapshot`）；`capabilities` 与 `get_capabilities` 同源，按这份 `health` 的组件降级 |
+| `load_state.auto_listen_on_start` | 新增 `boolean`：`prefs.json` 的 `app.auto_listen_on_start`（启动自检通过后是否自动开始监听），prefs 读不出时为 `false`。由 `set_auto_listen` 修改 |
 | `load_state.platform` | 取 `std::env::consts::OS`：`"windows"`、`"macos"`，或没有输入适配器的平台名（如 `"linux"`）。0.3 在 macOS 以外一律返回 `"windows"`；Windows 与 macOS 上的值不变 |
 | `set_paused(paused)` | 只置位或清除 `manual`；其他暂停原因仍在时，返回的状态仍是暂停。恢复（`paused: false`）在安全模式下返回 `safe_mode`；Health 不是 `healthy` / `degraded` 时返回 `engine_unavailable { health }`；录制中恢复不再返回 `busy`，而是清除 `manual` 后仍因 `recording` 保持暂停。托盘菜单项走同一逻辑：监听中显示「暂停监听」，否则显示「恢复监听」；托盘恢复被拒绝时发系统通知说明原因（安全模式、引擎启动中、恢复中、已停止） |
 | `start_recording`、`stop_recording` | 录制期间置位 `recording` 暂停原因，录制结束即清除；结束后引擎回到其他原因决定的状态（录制前已手动暂停的仍暂停，原来在监听的恢复监听） |
@@ -136,7 +137,8 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 | `export_diagnostics` | `{ redaction: "summary" \| "full" }` | `string \| null`：弹出保存对话框，返回写入的 zip 路径；取消返回 `null` |
 | `set_log_level` | `{ level: "error" \| "warn" \| "info" \| "debug" \| "trace", ttl_hours: number \| null }` | `{ level, until_ms: number \| null }`；`ttl_hours` 为空表示恢复默认级别 |
 | `open_log_dir`、`open_data_dir` | — | `null` |
-| `self_test` | — | `{ passed: boolean, checks: { name: "raw_input" \| "hook_heartbeat" \| "foreground" \| "clipboard", passed: boolean, reason: ReasonCode \| null, elapsed_ms: number }[] }` |
+| `self_test` | — | `{ passed: boolean, checks: { name: "raw_input" \| "hook_heartbeat" \| "foreground" \| "clipboard", passed: boolean, reason: ReasonCode \| null, elapsed_ms: number }[] }`；`checks` 恒为这四项、按此顺序；`reason` 在 `passed` 为真时为 `null`。细则见下方「自检」 |
+| `set_auto_listen` | `{ enabled: boolean }` | `boolean`：写入 `prefs.json` 的 `app.auto_listen_on_start`，返回写入后的值。与 `set_autostart` 对称，但安全模式下也允许（prefs 与安全模式保护的配置、修订、导出分开存放；无法读取的 prefs 文件不会被覆盖，此时返回错误，通常是 `io`）。只影响下次启动，不改变当前的监听状态 |
 | `log_frontend_error` | `{ message: string, stack: string \| null, source: string \| null }` | `null`；后端截断到 8 KiB 后写日志 |
 | `report_metric` | `{ name: string, value: number }` | `null`；只接受白名单内的名称（0.4：`ui_first_paint_ms`、`ui_event_lag_ms`），其他名称忽略 |
 | `list_history` | `{ since_seq: number \| null }` | `HistoryEntry[]`，按 `seq` 升序，只含 `seq > since_seq` 的条目；`null` 返回全部（内存中最多 200 条、30 分钟内） |
@@ -152,6 +154,23 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 - 其余字段（`revision`、`safe_mode`、`history_seq`）在这份拷贝之后读取，所以至少和它一样新。快照没有包含的变化，一定以大于快照 `seq` 的事件到达；`seq` 不大于快照的事件可以直接丢弃，不会漏掉变化。
 - `history_seq` 是读取时已分配的最大历史序号。`seq` 不大于快照的 `execution-result` 所带的条目都满足 `entry.seq ≤ history_seq`；`entry.seq > history_seq` 的条目都是快照之后记录的，会以更大的 `seq` 推送（或计入某条推送的 `suppressed`）。快照之前的明细用 `list_history(null)` 取，之后的条目跟随事件；被合并的条目用 `list_history(history_seq)` 补齐。
 - 与 `load_state` 的区别：`load_state` 给实时值、不带 `seq`，适合首屏；对齐事件流用 `get_runtime_snapshot`。
+
+### 自检（`self_test`、启动自检）
+
+| 检查项 | 含义（Windows） | 失败原因 |
+|---|---|---|
+| `raw_input` | `raw_input` 组件健康，检测窗口存在，进程的键盘 RawInput 注册指向它 | 组件给出的原因，否则 `raw_input_missing` |
+| `hook_heartbeat` | `keyboard_hook`、`mouse_hook` 组件健康，钩子线程在 1.5 秒内应答一条消息 | 组件给出的原因（如 `hook_install_failed`），否则 `hook_missing` |
+| `foreground` | 存在前台窗口，能取到它的进程 id 和焦点控件（不读标题） | `focus_changed`（安全桌面、锁屏、切换中） |
+| `clipboard` | 剪贴板能打开，随即关闭（不读不写，序号与所有者不变） | `clipboard_busy` |
+
+- 每项在自己的线程上运行，超时 2.5 秒（探测本身在 1.5 秒内放弃）；超时的项失败，`elapsed_ms` 为超时值，原因依次为 `raw_input_missing`、`hook_missing`、`internal`、`clipboard_busy`；探测 panic 为 `internal`。一项卡住不影响其他项，整次调用最多约 2.5 秒。
+- 运行期间置位 `self_test` 暂停原因，结束即清除（它由 Health 行表达，不是用户可见的暂停）。同一时间只运行一次，后来的调用等前一次结束。不持有 store 锁，安全模式下也可调用，不恢复监听、不写任何数据。
+- Windows 以外的平台四项都以 `unsupported` 失败。
+- 启动流程：引擎启动后最多等 30 秒让 Health 进入 `healthy`（超时也照常自检），然后运行同样的四项检查：
+  - 有未通过的项（不计原因为 `unsupported` 的项，所以 macOS 不受影响）：推送 `startup-problem` `self_test_failed { checks }` 并发系统通知，引擎保持暂停，用户可从托盘或界面「恢复监听」。安全模式、关闭自动监听时同样报告。
+  - 全部通过：仅当 `prefs.json` 的 `app.auto_listen_on_start` 为真、不在安全模式、且用户在启动等待期间没有手动暂停或恢复过时，清除 `manual` 开始监听；恢复被拒绝（Health 已不接受恢复）时发系统通知说明原因。其余情况保持暂停。
+  - SafeMode(Locked) 重试成功离开安全模式后不会补做自动监听，需用户手动恢复。
 
 ### 能力表（`get_capabilities`）
 

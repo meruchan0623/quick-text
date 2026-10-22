@@ -87,7 +87,7 @@ fn toggle_pause(app: &AppHandle) {
 }
 
 /// The notification body for a refused tray resume.
-fn resume_refused(error: &CommandError) -> &'static str {
+pub(crate) fn resume_refused(error: &CommandError) -> &'static str {
     match error {
         CommandError::SafeMode { .. } => "安全模式下不能恢复监听。请打开管理界面处理配置问题。",
         CommandError::EngineUnavailable {
@@ -102,7 +102,7 @@ fn resume_refused(error: &CommandError) -> &'static str {
 
 /// Shows a system notification. The plugin dispatches it in the background;
 /// a failure is only logged.
-fn notify(handle: &AppHandle, title: &str, body: &str) {
+pub(crate) fn notify(handle: &AppHandle, title: &str, body: &str) {
     if let Err(e) = handle
         .notification()
         .builder()

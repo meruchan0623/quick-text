@@ -529,6 +529,11 @@ const WM_HOOK_INSTALL: u32 = WM_APP + 0x51;
 /// low-level hooks without updating [`INSTALLED`], as Windows does after a
 /// callback timeout. Ignored in builds without `fault-injection`.
 const WM_HOOK_DROP: u32 = WM_APP + 0x53;
+/// Hook-thread message (self-test heartbeat): store `lParam` in [`PONGED`].
+const WM_HOOK_PING: u32 = WM_APP + 0x54;
+/// Heartbeats sent by [`ping`], and the last one the hook thread answered.
+static PINGS: AtomicU64 = AtomicU64::new(0);
+static PONGED: AtomicU64 = AtomicU64::new(0);
 /// How long [`install`] waits for the hook thread.
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(2);
 const INSTALL_POLL: Duration = Duration::from_millis(2);
@@ -651,6 +656,7 @@ fn run_hooks(initial: HookSet, seq: u64) {
                 (true, WM_HOOK_DROP) if cfg!(feature = "fault-injection") => {
                     hooks.drop_low_level();
                 }
+                (true, WM_HOOK_PING) => PONGED.store(msg.lParam as u64, Ordering::SeqCst),
                 _ => {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
@@ -731,6 +737,34 @@ pub(super) fn install(which: HookSet) -> HookSet {
     }
     tracing::warn!(event = "hook.install_timeout");
     HookSet::NONE
+}
+/// Self-test heartbeat (B-10): true when the running hook thread answers a
+/// message within `timeout` and both low-level hooks are installed by its
+/// last answer. Never starts the hook thread. Only the answer to this call's
+/// heartbeat counts, so a late answer to an earlier one, or a forged
+/// message, never satisfies it. Callers serialise (the self-test runner);
+/// never call this from a hook callback. 待实测: a busy or hung hook thread
+/// on a real desktop.
+pub(super) fn ping(timeout: Duration) -> bool {
+    let thread = HOOK_THREAD.load(Ordering::SeqCst);
+    if thread == 0 || thread == HOOK_THREAD_STARTING {
+        return false;
+    }
+    let seq = PINGS.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+    // SAFETY: posting to a thread that has exited fails harmlessly.
+    let posted = unsafe { PostThreadMessageW(thread, WM_HOOK_PING, 0, seq as isize) != 0 };
+    if !posted {
+        return false;
+    }
+    let deadline = Instant::now() + timeout;
+    while PONGED.load(Ordering::SeqCst) != seq {
+        if Instant::now() >= deadline {
+            tracing::warn!(event = "hook.ping_timeout");
+            return false;
+        }
+        std::thread::sleep(INSTALL_POLL);
+    }
+    HookSet::from_bits(usize::from(INSTALLED.load(Ordering::SeqCst))).contains(HookSet::LOW_LEVEL)
 }
 /// Fault injection (HookUnhook): removes the low-level hooks the way
 /// Windows does after a callback timeout, without telling anyone.
