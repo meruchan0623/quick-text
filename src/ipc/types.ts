@@ -155,6 +155,15 @@ export interface RuntimeSnapshot {
 }
 
 export type CapabilityStatus = 'available' | 'unavailable' | 'experimental' | 'degraded';
+/**
+ * One row of get_capabilities / load_state.capabilities, as crates/platform/src/capabilities.rs
+ * serializes it. Kept looser than the Rust type on purpose (lib/capabilities.ts reads it):
+ * - `status` is always sent by a 0.4 backend; a 0.3 one sends only `available`.
+ * - `reason` is untagged in Rust: a ReasonCode (`unsupported`, or one lowered from health) or a
+ *   PlatformReason (`experimental_platform`, `permission_missing`, `not_implemented`), and null
+ *   exactly when `status` is `available`. A 0.3 backend sends prose; an unknown code is 「其他」.
+ * - `available` is `status !== 'unavailable'`.
+ */
 export interface Capability {
   id: string;
   status?: CapabilityStatus;
