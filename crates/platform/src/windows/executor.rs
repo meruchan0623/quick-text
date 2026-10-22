@@ -96,10 +96,12 @@
 //!   publishes `last`, writes its history entry and frees `busy`, all in
 //!   one hold; if either comparison fails it leaves silently (no history,
 //!   no `last`, `busy` untouched), so a fenced task never clears state that
-//!   a newer run owns. The busy guard's drop does the same.
-//!   (`src-tauri`'s manual `execute_action` still flips `busy` itself
-//!   around a manual run, outside this lock; that code is not ours to
-//!   change, and `enqueue` only ever compare-exchanges `busy`.)
+//!   a newer run owns. The busy guard's drop does the same. A manual run
+//!   (`src-tauri`'s `execute_action`) holds `busy` through [`ManualBusy`]:
+//!   claimed by a compare-and-set under `life`, like `enqueue`'s, and given
+//!   back under `life` only while that claim still owns `busy` (a fence
+//!   frees `busy` and drops the claim with it). Its output still goes
+//!   through [`Serialized`].
 //! * While holding `life`: never call the injector or the clipboard, never
 //!   call a callback, never join a thread, never make a channel send that
 //!   can block, and never wait for `send_lock`. Only bounded leaf locks are
@@ -474,6 +476,8 @@ struct Running {
 #[derive(Default)]
 struct Life {
     running: Option<Running>,
+    /// The id of the manual run's claim holding `busy` ([`ManualBusy`]).
+    manual: Option<u64>,
 }
 
 /// Points where a test can hold a thread (no-ops outside tests).
@@ -934,6 +938,35 @@ impl ExecutorCore {
             .record(task.record(verdict, StageTimings::default()));
     }
 
+    /// A manual run claims `busy` ([`ManualBusy`]): compare-and-set in one
+    /// hold of the lifecycle lock, as [`enqueue`](Self::enqueue) does, and
+    /// the claim's id is kept there so only this claim can give it back.
+    /// `None` while a task or another manual run holds `busy`.
+    fn claim_manual(&self) -> Option<u64> {
+        let mut life = self.life.lock();
+        self.shared
+            .busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        life.manual = Some(id);
+        Some(id)
+    }
+
+    /// Gives a manual claim back: in one hold of the lifecycle lock, and
+    /// only while claim `id` still owns `busy`. A fence frees `busy` and
+    /// drops the claim with it, so a stale claim never frees the `busy` of
+    /// a run that started since.
+    fn end_manual(&self, id: u64) {
+        let mut life = self.life.lock();
+        if life.manual.take_if(|manual| *manual == id).is_some() {
+            let _ =
+                self.shared
+                    .busy
+                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst);
+        }
+    }
+
     /// [`ExecutorControl::rebuild`]: makes the executor serve again. Uses
     /// only the executor's own locks, so it is safe without the
     /// supervisor's machine lock and concurrently with `probe` and
@@ -1052,8 +1085,9 @@ impl ExecutorCore {
 
     /// The fence's decision, in the caller's one hold of the lifecycle lock
     /// (with the epoch checked there): the epoch moves on, the debt is
-    /// recorded, `busy` is freed, the queue closes, and taking `running`
-    /// makes the fence the only writer of the run's history entry.
+    /// recorded, `busy` is freed (a manual claim on it, if any, with it),
+    /// the queue closes, and taking `running` makes the fence the only
+    /// writer of the run's history entry.
     fn bump(
         &self,
         life: &mut Life,
@@ -1062,6 +1096,7 @@ impl ExecutorCore {
     ) -> Option<Running> {
         self.epoch.fetch_add(1, Ordering::SeqCst);
         self.shared.busy.store(false, Ordering::SeqCst);
+        life.manual = None;
         worker.sender = None;
         *fault = Some(ReasonCode::ExecutorTimeout);
         self.release_owed.store(true, Ordering::SeqCst);
@@ -2009,4 +2044,68 @@ pub fn executor_control() -> Option<Arc<dyn ExecutorControl>> {
     EXECUTOR
         .load_full()
         .map(|core| core as Arc<dyn ExecutorControl>)
+}
+
+/// A manual run's claim on `shared.busy` (`src-tauri`'s `execute_action`).
+/// [`claim`](Self::claim) compares and sets `busy` under the executor's
+/// lifecycle lock, like a task's [`enqueue`](ExecutorCore::enqueue), and
+/// dropping the claim compares and clears it under the same lock, only
+/// while this claim still owns `busy`, so it never frees a newer run's.
+/// The run's output still goes through [`Serialized`] (the send lock, owed
+/// key-ups paid first). Without the executor of this `shared` (before
+/// `start_engine`) there is no lock to take: the claim is a bare
+/// compare-and-set on `busy`, and nothing else writes `busy` meanwhile.
+#[must_use = "dropping the claim frees `busy` at once"]
+pub struct ManualBusy {
+    shared: Arc<Shared>,
+    /// The executor that granted the claim, and the claim's id.
+    grant: Option<(Arc<ExecutorCore>, u64)>,
+}
+
+impl ManualBusy {
+    /// Claims `busy` for a manual run; `None` while a task or another
+    /// manual run holds it.
+    pub fn claim(shared: &Arc<Shared>) -> Option<Self> {
+        let core = EXECUTOR
+            .load_full()
+            .filter(|core| Arc::ptr_eq(&core.shared, shared));
+        Self::claim_on(core, shared)
+    }
+
+    /// [`claim`](Self::claim) on a given executor (tests pass their rig's).
+    pub(super) fn claim_on(core: Option<Arc<ExecutorCore>>, shared: &Arc<Shared>) -> Option<Self> {
+        let grant = match core {
+            Some(core) => {
+                let id = core.claim_manual()?;
+                Some((core, id))
+            }
+            None => {
+                shared
+                    .busy
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .ok()?;
+                None
+            }
+        };
+        Some(Self {
+            shared: Arc::clone(shared),
+            grant,
+        })
+    }
+}
+
+impl Drop for ManualBusy {
+    fn drop(&mut self) {
+        match &self.grant {
+            Some((core, id)) => core.end_manual(*id),
+            None => {
+                let _ = self.shared.busy.compare_exchange(
+                    true,
+                    false,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+            }
+        }
+    }
 }

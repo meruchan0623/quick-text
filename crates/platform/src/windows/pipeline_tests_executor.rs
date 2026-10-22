@@ -781,6 +781,85 @@ fn busy_shadow_reports_are_recorded_as_dropped_busy() {
     assert!(rig.injector.calls().is_empty(), "nothing runs");
 }
 
+/// A manual run (`src-tauri`'s `execute_action`) claims `busy` like a task
+/// does, by a compare-and-set under the lifecycle lock: while the claim is
+/// held a second claim fails and a trigger is dropped busy; dropping the
+/// claim frees `busy`. The claim is decided in a hold of `life`, so it
+/// waits while another thread holds that lock.
+#[test]
+fn a_manual_claim_takes_and_frees_busy_under_the_lifecycle_lock() {
+    let mut rig = ExecRig::new(vec![text_rule("kw", OutputMethod::Keys, TYPED)]);
+    let claim = |rig: &ExecRig| ManualBusy::claim_on(Some(Arc::clone(&rig.core)), &rig.shared);
+    let late = rig.detect("kw");
+    let manual = claim(&rig).expect("busy is free");
+    assert!(rig.shared.busy.load(Ordering::SeqCst));
+    assert!(claim(&rig).is_none(), "one claim at a time");
+    assert!(
+        !rig.core.enqueue(late),
+        "dropped while the manual run holds busy"
+    );
+    assert_eq!(rig.last_entry().outcome, Outcome::DroppedBusy);
+    drop(manual);
+    assert!(
+        !rig.shared.busy.load(Ordering::SeqCst),
+        "dropping the claim frees busy"
+    );
+
+    let held = LockHolder::hold(&rig.core, CoreLock::Life);
+    let (core, shared) = (Arc::clone(&rig.core), Arc::clone(&rig.shared));
+    let claimer = std::thread::spawn(move || ManualBusy::claim_on(Some(core), &shared).is_some());
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        !claimer.is_finished(),
+        "the claim waits for the lifecycle lock"
+    );
+    assert!(!rig.shared.busy.load(Ordering::SeqCst));
+    drop(held);
+    assert!(claimer.join().unwrap(), "claimed once the lock was free");
+    assert!(
+        !rig.shared.busy.load(Ordering::SeqCst),
+        "and freed when the claim dropped"
+    );
+    rig.run("kw");
+    assert_eq!(rig.last_entry().outcome, Outcome::Succeeded);
+}
+
+/// A fence frees `busy` and drops a manual claim with it, so a claim given
+/// back late compares, finds itself replaced, and leaves the `busy` of the
+/// run that started since alone.
+#[test]
+fn a_stale_manual_claim_leaves_a_newer_runs_busy_alone() {
+    let mut rig = ExecRig::new(vec![text_rule("kw", OutputMethod::Keys, TYPED)]);
+    let stale =
+        ManualBusy::claim_on(Some(Arc::clone(&rig.core)), &rig.shared).expect("busy is free");
+    assert!(rig.core.fence(rig.core.epoch()));
+    assert!(
+        !rig.shared.busy.load(Ordering::SeqCst),
+        "the fence freed busy"
+    );
+    rig.core.rebuild().expect("a new worker");
+    let in_send = hold_first_send(&rig.injector);
+    assert!(rig.trigger("kw"));
+    in_send.wait_arrived("the new run's first send");
+
+    drop(stale);
+    assert!(
+        rig.shared.busy.load(Ordering::SeqCst),
+        "the new run keeps busy"
+    );
+    assert_eq!(
+        rig.core.running_task().map(|(_, rule)| rule),
+        Some("rule-kw".to_string())
+    );
+    drop(in_send);
+    rig.wait_idle();
+    let entry = rig.last_entry();
+    assert_eq!(
+        (entry.rule_id.as_str(), entry.outcome),
+        ("rule-kw", Outcome::Succeeded)
+    );
+}
+
 /// B-35: automatic runs record their real outcome (no longer always
 /// "unknown") with per-stage timings.
 #[test]

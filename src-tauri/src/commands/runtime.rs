@@ -59,19 +59,22 @@ pub async fn execute_action(
     action: Action,
     app: tauri::AppHandle,
 ) -> Result<ExecutionResult, CommandError> {
-    let (engine, compiled, action, speed) = {
+    let (engine, busy, compiled, action, speed) = {
         let state = app.state::<Managed>();
         let s = state.lock();
         // Safe mode: the data is for viewing; nothing runs (B-04).
         s.ensure_writable()?;
-        if s.engine.busy.swap(true, Ordering::SeqCst) {
+        // `busy` is the executor's: claimed and given back under its
+        // lifecycle lock, never over a task's (dropping the claim frees it).
+        let Some(busy) = quicker_platform::ManualBusy::claim(&s.engine) else {
             return Err(CommandError::Busy);
-        }
+        };
         s.engine.cancel.store(false, Ordering::SeqCst);
         // The active rules as compiled at load or publish (B-43).
         let compiled = s.engine.compiled.lock().unwrap().clone();
         (
             s.engine.clone(),
+            busy,
             compiled,
             action.clone(),
             match &action {
@@ -83,7 +86,7 @@ pub async fn execute_action(
     let window = app.get_webview_window("main");
     if let Some(w) = &window {
         if let Err(e) = w.hide() {
-            engine.busy.store(false, Ordering::SeqCst);
+            drop(busy);
             return Err(CommandError::internal(e));
         }
     }
@@ -115,7 +118,7 @@ pub async fn execute_action(
             .map_err(CommandError::internal)
     })
     .await;
-    engine.busy.store(false, Ordering::SeqCst);
+    drop(busy);
     if let Some(w) = window {
         let _ = w.show();
     }

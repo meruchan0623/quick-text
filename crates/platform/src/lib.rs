@@ -106,6 +106,42 @@ pub use macos::*;
 mod unsupported;
 #[cfg(not(any(windows, target_os = "macos")))]
 pub use unsupported::*;
+/// The Windows executor's public API where there is no such executor.
+#[cfg(not(windows))]
+mod no_executor {
+    use super::*;
+    /// A manual run's claim on [`Shared::busy`] (`src-tauri`'s
+    /// `execute_action`). There is no executor lifecycle lock here: the
+    /// claim is a bare compare-and-set and dropping it a compare-and-clear,
+    /// the atomics the manual run used before the Windows executor owned
+    /// `busy`.
+    #[must_use = "dropping the claim frees `busy` at once"]
+    pub struct ManualBusy {
+        shared: Arc<Shared>,
+    }
+    impl ManualBusy {
+        /// Claims `busy` for a manual run; `None` while another run holds it.
+        pub fn claim(shared: &Arc<Shared>) -> Option<Self> {
+            shared
+                .busy
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .ok()?;
+            Some(Self {
+                shared: Arc::clone(shared),
+            })
+        }
+    }
+    impl Drop for ManualBusy {
+        fn drop(&mut self) {
+            let _ =
+                self.shared
+                    .busy
+                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst);
+        }
+    }
+}
+#[cfg(not(windows))]
+pub use no_executor::*;
 
 mod capabilities;
 pub use capabilities::{

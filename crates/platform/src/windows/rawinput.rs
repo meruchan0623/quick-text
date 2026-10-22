@@ -517,7 +517,10 @@ pub(super) fn clear_dropped_busy_sink() {
 /// does not flood the sink.
 ///
 /// Busy is set when the consumer hands the executor a candidate, and also
-/// by src-tauri's `execute_action` for actions started from the UI, so the
+/// by src-tauri's `execute_action` for actions started from the UI (its
+/// [`ManualBusy`](super::ManualBusy) claim, under the same executor lock
+/// as a candidate's, held from before the window hides until the run
+/// returned), so the
 /// invariant that keeps two busy periods apart is: between them there is
 /// either a key captured while not busy or a change of stamp. A candidate
 /// is completed by a key captured while not busy that came through here
