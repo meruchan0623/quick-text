@@ -182,15 +182,85 @@ fn mock_runner(
     })
 }
 
+/// The executor's release port in tests: records every call through its
+/// mock (so hooks and journals see it), then reports the key-up refused
+/// (0 accepted) while `refuse_all` is set or its key is in `refused`, as
+/// `SendInput` does when it rejects the input.
+struct ReleasePort {
+    mock: Arc<MockInjector>,
+    refuse_all: AtomicBool,
+    refused: Mutex<BTreeSet<u16>>,
+}
+impl ReleasePort {
+    fn new(mock: Arc<MockInjector>) -> Self {
+        Self {
+            mock,
+            refuse_all: AtomicBool::new(false),
+            refused: Mutex::new(BTreeSet::new()),
+        }
+    }
+    /// Refuses every key-up from now on (`false`: accepts them again).
+    fn refuse_all(&self, refuse: bool) {
+        self.refuse_all.store(refuse, Ordering::SeqCst);
+    }
+    /// Refuses the key-ups of `keys` only.
+    fn refuse(&self, keys: &[u16]) {
+        *self.refused.lock().unwrap_or_else(PoisonError::into_inner) =
+            keys.iter().copied().collect();
+    }
+    fn answer(&self, key: Option<u16>, accepted: u32) -> u32 {
+        let refused = self.refuse_all.load(Ordering::SeqCst)
+            || key.is_some_and(|key| {
+                self.refused
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .contains(&key)
+            });
+        if refused {
+            0
+        } else {
+            accepted
+        }
+    }
+}
+impl std::ops::Deref for ReleasePort {
+    type Target = MockInjector;
+    fn deref(&self) -> &MockInjector {
+        &self.mock
+    }
+}
+impl Injector for ReleasePort {
+    fn send_text(&self, text: &str) -> u32 {
+        let accepted = self.mock.send_text(text);
+        self.answer(None, accepted)
+    }
+    fn send_keys(&self, keys: &[u16]) -> u32 {
+        let accepted = self.mock.send_keys(keys);
+        self.answer(None, accepted)
+    }
+    fn send_chord(&self, keys: &[u16]) -> u32 {
+        let accepted = self.mock.send_chord(keys);
+        self.answer(None, accepted)
+    }
+    fn send_key(&self, key: u16, up: bool) -> u32 {
+        let accepted = self.mock.send_key(key, up);
+        self.answer(Some(key), accepted)
+    }
+    fn send_mouse(&self, flags: u32, data: u32, x: i32, y: i32) -> u32 {
+        let accepted = self.mock.send_mouse(flags, data, x, y);
+        self.answer(None, accepted)
+    }
+}
+
 /// One engine: a real executor service and supervisor over mock ports.
 struct ExecRig {
     shared: Arc<Shared>,
     buffer: Buffer,
     generation: u64,
     injector: Arc<MockInjector>,
-    /// The executor's release port (WinInjector, MARK, in production); the
-    /// same mock as `injector` unless built by [`ExecRig::with_release`].
-    release: Arc<MockInjector>,
+    /// The executor's release port (WinInjector, MARK, in production); over
+    /// the same mock as `injector` unless built by [`ExecRig::with_release`].
+    release: Arc<ReleasePort>,
     foreground: MockForeground,
     clipboard: MockClipboard,
     clock: Arc<FakeClock>,
@@ -221,11 +291,11 @@ impl ExecRig {
         *shared.compiled.lock().unwrap() = compile_config(&config).unwrap();
         *shared.config.lock().unwrap() = config;
         let injector = Arc::new(MockInjector::new());
-        let release = if separate_release {
+        let release = Arc::new(ReleasePort::new(if separate_release {
             Arc::new(MockInjector::new())
         } else {
             Arc::clone(&injector)
-        };
+        }));
         let foreground = MockForeground::new(MockForeground::window(FOCUS, APP));
         let clock = Arc::new(FakeClock::new());
         let clipboard = MockClipboard::new(7, vec![(13, utf16("original"))]);
@@ -239,7 +309,7 @@ impl ExecRig {
             STALL_BUDGET,
             Arc::clone(&runtime),
         );
-        core.respawn().expect("worker starts");
+        core.rebuild().expect("worker starts");
         let supervisor = Supervisor::new(
             clock.clone(),
             Arc::clone(&runtime),
@@ -529,8 +599,9 @@ fn s01_panic_is_isolated_and_the_executor_keeps_serving() {
 }
 
 /// A task stuck inside a send exceeds the budget: the supervisor bumps the
-/// epoch, re-sends the held key's MARK key-up from the bitmap and starts a
-/// new worker; the stuck thread wakes up, sends nothing and exits.
+/// epoch and owes the held key's MARK key-up (sending nothing itself); its
+/// rebuild pays it from the bitmap and starts a new worker; the stuck thread
+/// wakes up, sends nothing and exits.
 #[cfg(feature = "fault-injection")]
 #[test]
 fn hung_task_is_fenced_and_a_new_worker_takes_over() {
@@ -561,15 +632,10 @@ fn hung_task_is_fenced_and_a_new_worker_takes_over() {
     );
     assert_eq!(entry.rule_id, "rule-btw");
     assert!(entry.side_effects);
-    let fenced = rig.injector.calls();
-    assert_eq!(
-        fenced.last(),
-        Some(&InjectCall::Key {
-            key: KEY_A,
-            up: true
-        })
-    );
-    assert!(rig.core.held_keys().is_empty());
+    // The supervisor's tick sent nothing: the key-up is owed.
+    assert_eq!(rig.core.held_keys(), vec![KEY_A]);
+    assert!(rig.core.release_owed());
+    assert!(!rig.injector.calls().contains(&key_up(KEY_A)));
     assert!(!rig.shared.busy.load(Ordering::SeqCst));
     assert!(matches!(
         rig.executor_status(),
@@ -579,6 +645,11 @@ fn hung_task_is_fenced_and_a_new_worker_takes_over() {
     rig.clock.advance(BACKOFF[0]);
     rig.supervisor.tick();
     assert_eq!(rig.state(), HealthState::Healthy);
+    // The rebuild paid it.
+    let fenced = rig.injector.calls();
+    assert_eq!(fenced.last(), Some(&key_up(KEY_A)));
+    assert!(rig.core.held_keys().is_empty());
+    assert!(!rig.core.release_owed());
 
     assert!(rig.core.join_retired(Duration::from_secs(5)));
     assert_eq!(
@@ -1066,7 +1137,7 @@ fn a_guard_held_before_the_clear_leaves_the_replacement_alone() {
     assert!(rig.trigger("btw"));
     before_clear.wait_arrived("the first task's guard");
     assert!(rig.core.fence(rig.core.epoch()));
-    rig.core.respawn().expect("a new worker");
+    rig.core.rebuild().expect("a new worker");
     let in_send = hold_first_send(&rig.injector);
     assert!(rig.trigger("kw"));
     in_send.wait_arrived("the replacement's first send");
@@ -1144,8 +1215,9 @@ fn press_b() -> Rule {
 
 /// Send exclusion (a): a task stopped after its epoch check and before the
 /// send, then fenced, submits nothing once let go: the check is repeated
-/// inside the send lock, right before the call. The fence's MARK key-up
-/// (release port) comes first, then the new epoch's input.
+/// inside the send lock, right before the call. The fence only owes the
+/// MARK key-up; the rebuild pays it (release port) before the new epoch's
+/// input.
 #[test]
 fn a_send_checked_before_the_fence_submits_nothing_after_it() {
     let mut rig = ExecRig::with_release(vec![
@@ -1181,12 +1253,12 @@ fn a_send_checked_before_the_fence_submits_nothing_after_it() {
     assert_eq!(rig.core.held_keys(), vec![KEY_A]);
 
     assert!(rig.core.fence(rig.core.epoch()));
-    assert!(
-        rig.core.held_keys().is_empty(),
-        "the fence paid its key-ups"
-    );
+    assert_eq!(rig.core.held_keys(), vec![KEY_A], "the fence sent nothing");
+    assert!(rig.core.release_owed());
+    assert!(rig.release.calls().is_empty());
+    rig.core.rebuild().expect("a new worker");
+    assert!(rig.core.held_keys().is_empty(), "the rebuild paid");
     assert!(!rig.core.release_owed());
-    rig.core.respawn().expect("a new worker");
     let result = rig.run("kw");
     assert_eq!(result.status, "unknown", "{}", result.message);
 
@@ -1272,7 +1344,7 @@ fn a_partial_send_returning_after_the_fence_gets_its_key_up() {
     );
     assert!(fenced.side_effects, "a send was in flight");
     assert!(
-        rig.core.respawn().is_err(),
+        rig.core.rebuild().is_err(),
         "no worker while a send is stuck"
     );
     assert!(!rig.trigger("kb"), "the queue stays closed");
@@ -1298,7 +1370,7 @@ fn a_partial_send_returning_after_the_fence_gets_its_key_up() {
     assert!(rig.core.held_keys().is_empty());
     assert!(!rig.core.release_owed());
 
-    rig.core.respawn().expect("the lock is free again");
+    rig.core.rebuild().expect("the lock is free again");
     assert!(matches!(rig.executor_status(), Status::Ok));
     let result = rig.run("kb");
     assert_eq!(result.status, "unknown", "{}", result.message);
@@ -1391,7 +1463,7 @@ fn nothing_is_sent_without_the_send_lock() {
     assert!(rig.injector.calls().is_empty());
 
     drop(stuck);
-    rig.core.respawn().expect("the lock is free again");
+    rig.core.rebuild().expect("the lock is free again");
     assert!(!rig.core.release_owed());
     assert!(matches!(rig.executor_status(), Status::Ok));
     let result = rig.run("kw");
@@ -1399,6 +1471,290 @@ fn nothing_is_sent_without_the_send_lock() {
     assert_eq!(rig.injector.typed(), TYPED);
     assert_eq!(serialized.send_text("manual"), 12);
     assert_eq!(manual.calls(), vec![InjectCall::Text("manual".into())]);
+}
+
+const KEY_C: u16 = 0x43;
+
+fn key_down(key: u16) -> InjectCall {
+    InjectCall::Key { key, up: false }
+}
+
+/// Presses A, then B, taps C, releases B and A.
+fn hold_a_and_b() -> Rule {
+    steps_rule(
+        "hold",
+        vec![
+            Operation::KeyDown { key: code(KEY_A) },
+            Operation::KeyDown { key: code(KEY_B) },
+            Operation::KeyPress { key: code(KEY_C) },
+            Operation::KeyUp { key: code(KEY_B) },
+            Operation::KeyUp { key: code(KEY_A) },
+        ],
+    )
+}
+
+/// Holds the rig's first worker at `BeforeSend` once the task port took
+/// `after`: epoch checked, send lock not yet taken.
+fn hold_before_send_after(rig: &ExecRig, after: InjectCall) -> Hold {
+    let checked = Hold::new();
+    let wait = checked.waiter();
+    let injector = Arc::clone(&rig.injector);
+    rig.core.on_pause(move |at| {
+        if at == Pause::BeforeSend
+            && is_thread("qt-executor-0")
+            && injector.calls().contains(&after)
+        {
+            wait();
+        }
+    });
+    checked
+}
+
+/// Runs `call` on a fresh thread; its value when it returned within
+/// `limit`. A call that never returns leaves its thread blocked until the
+/// test's gates open (on drop).
+fn within<T: Send + 'static>(
+    limit: Duration,
+    call: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(call());
+    });
+    finished.recv_timeout(limit).ok()
+}
+
+fn ups(port: &MockInjector, key: u16) -> usize {
+    port.calls()
+        .iter()
+        .filter(|call| **call == key_up(key))
+        .count()
+}
+
+/// Round 2, issue 2: key-ups `SendInput` refuses stay owed, and while they
+/// are owed no input is sent at all. The rebuild returns Err (the supervisor
+/// backs off and ends in Failed); the replacement worker's task fails with
+/// no input; manual output is refused, recorded like a refused task. Once
+/// `SendInput` accepts again, the next task pays first and then outputs as
+/// usual, and repair heals the engine.
+#[test]
+fn refused_key_ups_stay_owed_and_no_input_is_sent_until_they_are_paid() {
+    let mut rig = ExecRig::with_release(vec![
+        hold_a_and_b(),
+        text_rule("kw", OutputMethod::Keys, TYPED),
+    ]);
+    let journal = journal(&rig, |_| {});
+    rig.release.refuse_all(true);
+    let checked = hold_before_send_after(&rig, key_down(KEY_B));
+    assert!(rig.trigger("hold"));
+    checked.wait_arrived("the task, A and B pressed");
+    assert!(rig.core.fence(rig.core.epoch()));
+    drop(checked);
+    assert!(rig.core.join_retired(Duration::from_secs(5)));
+    assert_eq!(rig.core.held_keys(), vec![KEY_A, KEY_B]);
+    assert!(rig.core.release_owed());
+
+    // ① Refused: the rebuild fails; the replacement worker sends nothing.
+    let error = rig.core.rebuild().expect_err("key-ups still refused");
+    assert!(error.contains("still refused"), "{error}");
+    assert_eq!(rig.core.held_keys(), vec![KEY_A, KEY_B]);
+    assert!(rig.core.release_owed());
+    assert!(matches!(
+        rig.executor_status(),
+        Status::Down(ReasonCode::ExecutorTimeout)
+    ));
+    let sent = rig.injector.calls();
+    let refused = rig.run("kw");
+    assert_eq!(refused.status, "failed");
+    assert!(
+        refused.message.contains("still owed"),
+        "{}",
+        refused.message
+    );
+    assert!(!refused.side_effects);
+    assert_eq!(rig.injector.calls(), sent, "the task sent nothing");
+    let entry = rig.last_entry();
+    assert_eq!(
+        (entry.rule_id.as_str(), entry.outcome, entry.reason),
+        ("rule-kw", Outcome::Failed, ReasonCode::ExecutorTimeout)
+    );
+    assert!(!entry.side_effects);
+    let manual = MockInjector::new();
+    let serialized = Serialized::new(&manual, Some(Arc::clone(&rig.core)));
+    assert_eq!(serialized.send_text("manual"), 0);
+    assert!(manual.calls().is_empty(), "manual output refused");
+    let process = "qt-owed-manual.exe";
+    super::executor::record_manual(
+        process,
+        &Err("SendInput accepted 0/12 events".into()),
+        Instant::now(),
+    );
+    let recorded = crate::runtime::current()
+        .list_history(None)
+        .into_iter()
+        .rfind(|entry| entry.process.as_deref() == Some(process))
+        .expect("the manual run is recorded");
+    assert_eq!(
+        (recorded.trigger, recorded.outcome, recorded.reason),
+        (
+            TriggerKind::Manual,
+            Outcome::Failed,
+            ReasonCode::ExecutorTimeout
+        )
+    );
+    // Only key-ups ever reached the release port, every one refused.
+    let releases = rig.release.calls();
+    assert!(releases
+        .iter()
+        .all(|call| *call == key_up(KEY_A) || *call == key_up(KEY_B)));
+    rig.supervisor.tick();
+    assert_eq!(rig.state(), HealthState::Recovering);
+    for delay in BACKOFF {
+        rig.clock.advance(delay);
+        rig.supervisor.tick();
+    }
+    assert_eq!(rig.state(), HealthState::Failed, "retries ran out");
+    assert_eq!(rig.core.held_keys(), vec![KEY_A, KEY_B]);
+    assert!(rig.injector.typed().is_empty());
+
+    // ② Accepted again: the next task pays first, then outputs normally.
+    rig.release.refuse_all(false);
+    let result = rig.run("kw");
+    assert_eq!(result.status, "unknown", "{}", result.message);
+    assert_eq!(rig.injector.typed(), TYPED);
+    assert!(rig.core.held_keys().is_empty());
+    assert!(!rig.core.release_owed());
+    let entries = journaled(&journal);
+    let paid = entries
+        .iter()
+        .rposition(|(port, _)| *port == "release")
+        .unwrap();
+    let typed = entries
+        .iter()
+        .position(|(_, call)| matches!(call, InjectCall::Text(_)))
+        .unwrap();
+    assert!(paid < typed, "the payment comes first: {entries:?}");
+    assert!(matches!(rig.executor_status(), Status::Ok));
+    rig.supervisor.repair();
+    rig.supervisor.tick();
+    assert_eq!(rig.state(), HealthState::Healthy);
+}
+
+/// Round 2, issue 2 ③: a payment `SendInput` accepts only in part settles
+/// nothing. The accepted key-up's bit is cleared; the refused key stays held
+/// and owed (rebuild Err); the next payment sends only that key's key-up.
+#[test]
+fn a_partly_accepted_payment_keeps_the_refused_key_owed() {
+    let mut rig = ExecRig::with_release(vec![hold_a_and_b()]);
+    rig.release.refuse(&[KEY_B]);
+    let checked = hold_before_send_after(&rig, key_down(KEY_B));
+    assert!(rig.trigger("hold"));
+    checked.wait_arrived("the task, A and B pressed");
+    assert!(rig.core.fence(rig.core.epoch()));
+    assert_eq!(rig.core.held_keys(), vec![KEY_A, KEY_B]);
+
+    assert!(rig.core.rebuild().is_err(), "B refused: still owed");
+    assert_eq!(rig.core.held_keys(), vec![KEY_B]);
+    assert!(rig.core.release_owed());
+    assert_eq!(ups(&rig.release, KEY_A), 1);
+    assert!(ups(&rig.release, KEY_B) >= 1);
+    assert!(matches!(
+        rig.executor_status(),
+        Status::Down(ReasonCode::ExecutorTimeout)
+    ));
+
+    rig.release.refuse(&[]);
+    rig.core.rebuild().expect("B accepted: paid");
+    assert!(rig.core.held_keys().is_empty());
+    assert!(!rig.core.release_owed());
+    assert_eq!(ups(&rig.release, KEY_A), 1, "A is not sent again");
+    assert_eq!(rig.release.calls().last(), Some(&key_up(KEY_B)));
+    assert!(matches!(rig.executor_status(), Status::Ok));
+    drop(checked);
+    assert!(rig.core.join_retired(Duration::from_secs(5)));
+    assert!(!rig
+        .injector
+        .calls()
+        .contains(&InjectCall::Keys(vec![KEY_C])));
+}
+
+/// Round 2, issue 3: the supervisor's calls never reach the injector. With
+/// the release port blocking inside every key-up, `enforce_budget` (fencing
+/// a stalled task) and `probe` return within 50 ms on real threads, sending
+/// nothing. The rebuild, a supervisor attempt that may block, is the payer:
+/// it blocks inside the key-up holding only the send lock, so the
+/// supervisor's next attempt fails fast instead of hanging and no thread is
+/// started (the queue stays closed). Unblocked, the rebuild completes and
+/// the engine recovers.
+#[test]
+fn supervisor_calls_return_while_a_key_up_blocks() {
+    const LIMIT: Duration = Duration::from_millis(50);
+    let mut rig = ExecRig::with_release(vec![
+        hold_a_and_b(),
+        text_rule("kw", OutputMethod::Keys, TYPED),
+    ]);
+    let in_key_up = Hold::new();
+    let wait = in_key_up.waiter();
+    rig.release.on_call(move |_| wait());
+    let checked = hold_before_send_after(&rig, key_down(KEY_B));
+    assert!(rig.trigger("hold"));
+    checked.wait_arrived("the task, A and B pressed");
+    let epoch = rig.core.epoch();
+
+    rig.clock.advance(STALL_BUDGET + Duration::from_secs(1));
+    let (core, now) = (Arc::clone(&rig.core), rig.clock.now());
+    assert!(
+        within(LIMIT, move || core.enforce_budget(now)).is_some(),
+        "enforce_budget returned"
+    );
+    assert_eq!(rig.core.epoch(), epoch + 1, "it fenced the stalled task");
+    assert!(rig.core.release_owed());
+    assert!(rig.release.calls().is_empty(), "and sent nothing");
+    let (core, now) = (Arc::clone(&rig.core), rig.clock.now());
+    let probed = within(LIMIT, move || core.probe(now)).expect("probe returned");
+    assert!(probed.contains(&(
+        Component::Executor,
+        Status::Down(ReasonCode::ExecutorTimeout)
+    )));
+
+    // The rebuild pays, and blocks inside the first key-up.
+    let core = Arc::clone(&rig.core);
+    let rebuild = std::thread::spawn(move || core.rebuild());
+    in_key_up.wait_arrived("the rebuild's key-up");
+    let (core, now) = (Arc::clone(&rig.core), rig.clock.now());
+    assert!(within(LIMIT, move || core.enforce_budget(now)).is_some());
+    let (core, now) = (Arc::clone(&rig.core), rig.clock.now());
+    assert!(within(LIMIT, move || core.probe(now)).is_some());
+    rig.supervisor.tick();
+    assert_eq!(rig.state(), HealthState::Recovering);
+    rig.clock.advance(BACKOFF[0]);
+    rig.supervisor.tick();
+    assert_eq!(
+        rig.state(),
+        HealthState::Recovering,
+        "that attempt failed fast"
+    );
+    assert!(!rig.trigger("kw"), "no worker was started meanwhile");
+    assert_eq!(rig.last_entry().outcome, Outcome::Skipped);
+
+    drop(in_key_up);
+    rebuild
+        .join()
+        .unwrap()
+        .expect("paid once SendInput returned");
+    assert!(rig.core.held_keys().is_empty());
+    assert!(!rig.core.release_owed());
+    rig.clock.advance(BACKOFF[1]);
+    rig.supervisor.tick();
+    assert_eq!(rig.state(), HealthState::Healthy);
+    let result = rig.run("kw");
+    assert_eq!(result.status, "unknown", "{}", result.message);
+    drop(checked);
+    assert!(rig.core.join_retired(Duration::from_secs(5)));
+    assert!(!rig
+        .injector
+        .calls()
+        .contains(&InjectCall::Keys(vec![KEY_C])));
 }
 
 /// Sources of the failure texts the executor's reason table maps.
@@ -1552,6 +1908,11 @@ const ORIGINALS: &[(&str, &str, ReasonCode)] = &[
     (
         EXECUTOR_RS,
         "Executor task was fenced after a stall; stopped without further input",
+        ReasonCode::ExecutorTimeout,
+    ),
+    (
+        EXECUTOR_RS,
+        "Key-ups of a stopped action are still owed; refused without input",
         ReasonCode::ExecutorTimeout,
     ),
     (
