@@ -1,0 +1,11 @@
+QT-THIRD-PARTY-LICENSES-PLACEHOLDER
+
+Quicker Text - third-party licenses (placeholder)
+
+This file only exists so that `cargo build`, `cargo test` and `tauri build` work from a plain
+checkout (tauri-build fails when a bundled resource is missing). It is NOT the notice file.
+
+The release workflow (.github/workflows/release.yml) overwrites it with the generated file
+(scripts/generate-third-party-licenses.ps1) before building the installer, and the packaging
+scripts (scripts/package-artifacts.ps1, scripts/package-portable.ps1) refuse to ship it while
+the marker on the first line is still present. Never commit the generated file.

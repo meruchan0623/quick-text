@@ -1,0 +1,53 @@
+{
+  "description": "License texts for distributed crates whose published package carries no license file. Read by scripts/generate-third-party-licenses.ps1 only for packages that really have none. Entries are pinned to an exact name and version: a version bump drops the entry, the generator then fails for that crate, and a maintainer re-checks upstream before extending the pin. Each text is copied verbatim from the upstream repository named in 'source' (fetched 2026-10-22); 'fromPackage' reuses the license files of a sibling crate from the same upstream repository (same project, same license). Review these entries when they change.",
+  "entries": [
+    {
+      "packages": [ { "name": "clipboard-win", "version": "5.4.1" } ],
+      "license": "BSL-1.0",
+      "reason": "crates.io package has no license file; Cargo.toml declares BSL-1.0",
+      "texts": [
+        { "file": "license-clarifications/clipboard-win-LICENSE.txt", "source": "https://raw.githubusercontent.com/DoumanAsh/clipboard-win/master/LICENSE" }
+      ]
+    },
+    {
+      "packages": [
+        { "name": "webview2-com", "version": "0.39.1" },
+        { "name": "webview2-com-macros", "version": "0.8.1" },
+        { "name": "webview2-com-sys", "version": "0.39.1" }
+      ],
+      "license": "MIT",
+      "reason": "crates.io packages have no license file and no authors; Cargo.toml declares MIT; all three crates belong to the wravery/webview2-rs repository",
+      "texts": [
+        { "file": "license-clarifications/webview2-rs-LICENSE.txt", "source": "https://raw.githubusercontent.com/wravery/webview2-rs/main/LICENSE" }
+      ]
+    },
+    {
+      "packages": [ { "name": "alloc-stdlib", "version": "0.3.0" } ],
+      "license": "BSD-3-Clause",
+      "reason": "crates.io package has no license file; Cargo.toml declares BSD-3-Clause",
+      "texts": [
+        { "file": "license-clarifications/alloc-stdlib-LICENSE.txt", "source": "https://raw.githubusercontent.com/dropbox/rust-alloc-no-stdlib/master/LICENSE" }
+      ]
+    },
+    {
+      "packages": [ { "name": "defmt-parser", "version": "1.0.0" } ],
+      "license": "MIT OR Apache-2.0",
+      "reason": "crates.io package has no license file; Cargo.toml declares MIT OR Apache-2.0; the MIT alternative is reproduced",
+      "texts": [
+        { "file": "license-clarifications/defmt-LICENSE-MIT.txt", "source": "https://raw.githubusercontent.com/knurling-rs/defmt/main/LICENSE-MIT" }
+      ]
+    },
+    {
+      "packages": [ { "name": "tauri-plugin", "version": "2.7.1" } ],
+      "license": "Apache-2.0 OR MIT",
+      "reason": "crates.io package has no license file; it is part of the tauri-apps/tauri repository, whose license files tauri-utils ships",
+      "fromPackage": { "name": "tauri-utils", "version": "2.10.1", "files": [ "LICENSE-APACHE-2.0", "LICENSE-MIT" ] }
+    },
+    {
+      "packages": [ { "name": "selectors", "version": "0.38.0" } ],
+      "license": "MPL-2.0",
+      "reason": "crates.io package has no license file; Cargo.toml declares MPL-2.0 (The Servo Project Developers); cssparser comes from the same servo organisation under the same unmodified MPL-2.0 text",
+      "fromPackage": { "name": "cssparser", "version": "0.37.0", "files": [ "LICENSE" ] }
+    }
+  ]
+}

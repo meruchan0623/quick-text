@@ -11,6 +11,9 @@
 #   deps           every PR; weekly    dependency direction + cargo deny (B-51); the
 #                                      advisories check runs weekly / on demand only
 #   frontend       every PR            typecheck, lint, format, test (FE-53)
+#   notices        every PR            every distributed Rust crate and npm package has a license
+#                                      text for THIRD-PARTY-LICENSES.txt (S-28); the release
+#                                      workflow generates the real file and fails the same way
 #
 # Not implemented yet (planned in the same table): bindings (0.5), bench (nightly),
 # e2e-windows (nightly, R-10), frontend test:e2e / test:desktop / size (0.5).
@@ -179,3 +182,28 @@ jobs:
 
       - name: Test
         run: npm run test
+
+  # Early warning for the release gate: a dependency bump that brings in a crate without a
+  # license file fails here, not on release day. Checks only, writes nothing
+  # (scripts/generate-third-party-licenses.ps1 -CheckOnly). `cargo metadata` fetches the crates
+  # it needs; node_modules holds the production npm packages.
+  notices:
+    name: notices
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Every distributed dependency has a license text (S-28)
+        run: pwsh -NoProfile -File scripts/generate-third-party-licenses.ps1 -CheckOnly

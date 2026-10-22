@@ -19,9 +19,11 @@
 # neither listed nor excluded, and the release workflow runs it with -Strict (every tracked
 # file must be classified).
 #
-# crates.io and npm dependencies are NOT listed here. They are not part of this repository;
-# Cargo.lock and package-lock.json (both listed) pin the exact versions and checksums, and
-# cargo / npm fetch the sources from the registries. See docs/licensing-0.3.1.md.
+# crates.io and npm dependencies are NOT listed here: they are not part of this repository.
+# Their source ships in the separate Quicker-Text-<version>-Source-deps.zip
+# (scripts/package-dependency-sources.ps1), and Source.zip plus Source-deps.zip together are the
+# complete corresponding source. Cargo.lock and package-lock.json (both listed) pin the exact
+# versions and checksums that archive was made from. See docs/release-checklist.md.
 #
 # Paths use '/' (valid on Windows and elsewhere) and are relative to the repository root.
 
@@ -66,6 +68,7 @@ $SourceDirectories = @(
     'src',
     'src-tauri/capabilities',
     'src-tauri/icons',
+    'src-tauri/resources',
     'src-tauri/src',
     'vendor'
 )
