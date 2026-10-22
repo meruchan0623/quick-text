@@ -35,11 +35,21 @@
 //! | `app.start` | info | process started; version and build profile |
 //! | `app.exit` | info | event loop finished; the log is flushed next |
 //! | `app.panic` | error | a panic; thread, crate-relative location, payload class, length and fingerprint (never the payload), crash file name |
+//! | `clipboard.options_set` | info | the clipboard lease options were set at startup (`app.clipboard` prefs); restore policy and `restore_delay_ms` |
 //! | `command.internal` | error | `CommandError::Internal`; `trace_id` and the original error |
 //! | `command.io` | warn | `CommandError::Io`; operation, file name, OS error |
 //! | `diagnostics.export` | info | a bundle was written; redaction, entry count, `elapsed_ms` |
 //! | `engine.unavailable` | warn | the platform refused to start or resume |
+//! | `engine.manual_pause` | info | `set_paused` changed the manual pause; `paused` |
+//! | `engine.shutdown` | info | the engine began shutting down (logged once) |
+//! | `engine.start_failed` | error | `start_engine` failed at startup; the platform's error |
+//! | `events.emit_failed` | warn | an event could not be sent to the frontend; event name and error |
+//! | `events.observer_panic` | warn | an EventBus observer (the tray) panicked; which callback |
+//! | `events.start_failed` | error | the EventBus thread did not start; no events will be sent |
+//! | `executor.clipboard_probe_cached` | debug | the clipboard health could not be read without waiting; the status last read is reported |
 //! | `frontend.error` | warn | `log_frontend_error`; error class (a built-in name or `other`), message length and fingerprint, source and stack frames as `<chunk hash>.js:line:col` only for Vite chunks embedded in the binary (the list `AssetResolver::iter` gives; empty in dev builds) at a line and column inside the chunk, printed from the parsed numbers, whether the source was dropped, count of dropped stack lines; never any caller text |
+//! | `history.cleared` | info | `clear_history` emptied the execution history |
+//! | `hook.ping_timeout` | warn | the hook thread did not answer the self-test heartbeat in time |
 //! | `log.file_unavailable` | error | log files could not be opened; stderr only |
 //! | `log.level_set` | info | `set_log_level`; level and `until_ms` |
 //! | `log.level_restored` | info | a saved temporary level was re-applied at startup |
@@ -47,8 +57,30 @@
 //! | `log.level_restore_failed` | warn | prefs unreadable at startup; default level |
 //! | `log.reload_failed` | error | the filter could not be swapped |
 //! | `log.expiry_thread_failed` | error | the expiry thread did not start |
+//! | `prefs.auto_listen` | info | `set_auto_listen`; `enabled` and whether it `changed` |
+//! | `rawinput.rebuild_skipped` | info | a RawInput detector rebuild was skipped: the engine is shutting down |
+//! | `runtime.failed_dropped_on_shutdown` | info | a Failed health was not published: the engine is shutting down (logged once); `source` |
+//! | `self_test.check` | info | one self-test check; check name, `passed`, reason code, `elapsed_ms` |
+//! | `self_test.finished` | info | a self-test run ended; overall `passed` and the names of the failed checks |
+//! | `self_test.startup` | info | the startup self-test ended; health, `auto_listen`, outcome label |
+//! | `self_test.startup_thread_failed` | error | the startup self-test thread did not start |
 //! | `store.quarantine` | warn | a damaged file was renamed aside |
 //! | `store.quarantine_failed` | error | the rename failed; the file stays in place |
+//! | `store.prefs_invalid` | warn | a prefs field had the wrong type or was out of range and its default is used; file name, field path, problem, the JSON type found (or an out-of-range number with `min` / `max`), never a string value |
+//! | `store.prefs_unavailable` | warn | prefs.json could not be read at startup; clipboard restore uses the defaults; file name and error |
+//! | `supervisor.installed` | info | the production supervisor and its watchdog are running |
+//! | `supervisor.watchdog_spawn_failed` | error | the watchdog thread did not start; the supervisor runs without it |
+//! | `supervisor.driver_spawn_failed` | error | the supervisor driver thread did not start; Health is Failed until the watchdog starts it |
+//! | `supervisor.unsupervised` | error | no supervisor driver ran for `checks` watchdog checks; Health is published as Failed |
+//! | `supervisor.engine_unavailable` | error | the engine did not start; its executor refuses every action (`engine_down`) and Health ends in Failed |
+//! | `supervisor.rebuild_skipped` | info | an engine rebuild was skipped: the engine is shutting down |
+//! | `supervisor.rebuild_discarded` | info | a rebuild returned after shutdown began, so its result is not counted; `failed` |
+//! | `supervisor.reattach_skipped` | info | a component reattach was skipped: the engine is shutting down; component |
+//! | `supervisor.reattach_discarded` | info | a reattach returned after shutdown began, so its result is not counted; component, `failed` |
+//! | `supervisor.watchdog_stopped` | info | the watchdog stopped: the engine is shutting down |
+//! | `tray.resume_refused` | info | the tray's resume was refused; the command error (the user is notified) |
+//! | `tray.notify_failed` | warn | a desktop notification was not shown; error |
+//! | `tray.notify_start_failed` | warn | the run-notification thread did not start; run notifications are off |
 //! | `ui.metric` | info / debug | `report_metric`; whitelisted name and value (first paint at info, event lag at debug) |
 //!
 //! # Privacy
