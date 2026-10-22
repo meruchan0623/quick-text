@@ -1,105 +1,223 @@
 //! Low-level keyboard/mouse hooks and the foreground focus WinEvent hook.
+//!
+//! B-02: the callbacks only read and update atomics, push one fixed-size
+//! [`HookRecord`] onto a bounded lock-free queue and return. Macro recording,
+//! gate text and acceptance translation run on the input consumer
+//! (`input.rs`). A panic inside a callback is caught and counted, the event
+//! still goes to `CallNextHookEx`, and the consumer logs `hook.panic`.
 //! Hooks never perform file I/O or execute actions.
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 use super::*;
 use super::{
-    keystate::{physical, PHYSICAL},
-    recording::{record_event, stop_record_events},
+    foreground::WinForeground,
+    input::{self, Lane},
+    keystate::{KeyBits, PHYSICAL},
 };
+use crate::fault::{self, FaultPoint};
+use crate::traits::{ForegroundProbe, InputContext};
+use std::sync::PoisonError;
+
 pub(super) static HOOK_READY: AtomicBool = AtomicBool::new(false);
+/// Hook queue capacity in records. 待实测: sized for about a second of key
+/// autorepeat plus clicks while the consumer is descheduled. A full queue
+/// drops records; it never blocks the hook thread.
+pub(super) const HOOK_QUEUE_CAPACITY: usize = 1024;
+static PIPE: OnceLock<HookPipe<'static>> = OnceLock::new();
+
 pub(super) fn test_input_enabled() -> bool {
     acceptance_test_input_enabled()
 }
-pub(super) unsafe fn expected_key_text(event: &KBDLLHOOKSTRUCT) -> Option<String> {
-    if event.vkCode == VK_PACKET as u32 {
-        return char::from_u32(event.scanCode).map(|ch| ch.to_string());
-    }
-    let mut state = [0u8; 256];
-    if physical(VK_SHIFT) {
-        state[VK_SHIFT as usize] = 0x80;
-    }
-    if GetKeyState(VK_CAPITAL as i32) & 1 != 0 {
-        state[VK_CAPITAL as usize] = 1;
-    }
-    let thread = GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut());
-    let mut units = [0u16; 8];
-    // This acceptance adapter preserves dead-key state; hardware translation
-    // uses the vendored detector and its own upstream flags.
-    let len = ToUnicodeEx(
-        event.vkCode,
-        event.scanCode,
-        state.as_ptr(),
-        units.as_mut_ptr(),
-        units.len() as i32,
-        4,
-        GetKeyboardLayout(thread),
-    );
-    (len > 0 && len as usize <= units.len())
-        .then(|| String::from_utf16(&units[..len as usize]).ok())
-        .flatten()
+
+/// The fields the keyboard hook reads from `KBDLLHOOKSTRUCT`.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct KeyInfo {
+    pub(super) vk: u16,
+    pub(super) scan: u32,
+    pub(super) flags: u32,
+    pub(super) extra: usize,
 }
-unsafe extern "system" fn keyboard(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
-    if code < 0 {
-        return CallNextHookEx(std::ptr::null_mut(), code, w, l);
+/// The fields the mouse hook reads from `MSLLHOOKSTRUCT`.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct MouseInfo {
+    pub(super) msg: u32,
+    pub(super) data: u32,
+    pub(super) x: i32,
+    pub(super) y: i32,
+    pub(super) extra: usize,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HookAction {
+    /// Hand the event to `CallNextHookEx`.
+    Pass,
+    /// Return 1: the event is consumed (Ctrl+Shift+Esc cancel).
+    Swallow,
+}
+/// Acceptance mode only: what the consumer needs to translate an injected
+/// key, captured when the key happened.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Acceptance {
+    pub(super) context: InputContext,
+    pub(super) shift: bool,
+    pub(super) modified: bool,
+    pub(super) allowed: bool,
+}
+#[derive(Clone, Copy, Debug)]
+pub(super) struct KeyRecord {
+    pub(super) vk: u16,
+    pub(super) scan: u32,
+    pub(super) down: bool,
+    pub(super) generation: u64,
+    pub(super) acceptance: Option<Acceptance>,
+}
+#[derive(Clone, Copy, Debug)]
+pub(super) enum HookRecord {
+    Key(KeyRecord),
+    /// An external injected key was filtered (no-regression #4).
+    External,
+    /// Ctrl+Shift+Esc cancelled the running action.
+    Cancel,
+    /// A click or wheel message.
+    Mouse {
+        msg: u32,
+        data: u32,
+        x: i32,
+        y: i32,
+    },
+    /// A pointer move (macro recording only).
+    Move {
+        x: i32,
+        y: i32,
+    },
+}
+
+/// Hook side of the input pipeline: the record queue and the physical key
+/// mirror the hooks update.
+pub(super) struct HookPipe<'k> {
+    lane: Lane<HookRecord>,
+    keys: &'k KeyBits,
+    /// Acceptance mode, fixed at startup (reading it may allocate).
+    test_mode: bool,
+}
+impl<'k> HookPipe<'k> {
+    pub(super) fn new(keys: &'k KeyBits, capacity: usize, test_mode: bool, wake: fn()) -> Self {
+        Self {
+            lane: Lane::new(capacity, wake),
+            keys,
+            test_mode,
+        }
     }
-    let event = &*(l as *const KBDLLHOOKSTRUCT);
-    if event.dwExtraInfo == MARK {
-        return CallNextHookEx(std::ptr::null_mut(), code, w, l);
+    pub(super) fn lane(&self) -> &Lane<HookRecord> {
+        &self.lane
     }
-    let Some(shared) = ENGINE.get() else {
-        return CallNextHookEx(std::ptr::null_mut(), code, w, l);
-    };
+}
+/// The production pipe over the global key mirror; created once, before the
+/// hooks are installed.
+pub(super) fn pipe(test_mode: bool) -> &'static HookPipe<'static> {
+    PIPE.get_or_init(|| HookPipe::new(&PHYSICAL, HOOK_QUEUE_CAPACITY, test_mode, input::wake))
+}
+
+#[cold]
+#[inline(never)]
+#[allow(clippy::panic, reason = "fault injection point HookPanic (B-52)")]
+fn injected_panic() -> ! {
+    panic!("injected fault: hook_panic")
+}
+
+/// Keyboard hook body: atomics and one lock-free push, nothing else.
+pub(super) fn on_key(
+    pipe: &HookPipe,
+    shared: &Shared,
+    probe: &impl ForegroundProbe,
+    msg: u32,
+    key: KeyInfo,
+) -> HookAction {
+    if key.extra == MARK {
+        return HookAction::Pass;
+    }
+    if fault::take(FaultPoint::HookPanic).is_some() {
+        injected_panic();
+    }
+    let injected = key.flags & LLKHF_INJECTED != 0;
     // no-regression #4: external injected input (LLKHF_INJECTED without MARK) invalidates the buffer.
-    if event.flags & LLKHF_INJECTED != 0 && !test_input_enabled() {
+    if injected && !pipe.test_mode {
         shared.generation.fetch_add(1, Ordering::SeqCst);
         observer::CARET_EPOCH.fetch_add(1, Ordering::SeqCst);
-        gate("External simulated input filtered; matching invalidated");
-        return CallNextHookEx(std::ptr::null_mut(), code, w, l);
+        pipe.lane.push(HookRecord::External);
+        return HookAction::Pass;
     }
-    let down = w as u32 == WM_KEYDOWN || w as u32 == WM_SYSKEYDOWN;
-    PHYSICAL.set(event.vkCode as u16, down);
-    if down && event.vkCode == VK_ESCAPE as u32 && physical(VK_CONTROL) && physical(VK_SHIFT) {
+    let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+    let keys = pipe.keys;
+    keys.set(key.vk, down);
+    if down && key.vk == VK_ESCAPE && keys.held(VK_CONTROL) && keys.held(VK_SHIFT) {
         shared.cancel.store(true, Ordering::SeqCst);
         shared.generation.fetch_add(1, Ordering::SeqCst);
         observer::CARET_EPOCH.fetch_add(1, Ordering::SeqCst);
-        stop_record_events(shared);
-        return 1;
+        pipe.lane.push(HookRecord::Cancel);
+        return HookAction::Swallow;
     }
-    record_event(
-        shared,
-        if down {
-            Operation::KeyDown {
-                key: Key::WindowsCode {
-                    code: event.vkCode as u16,
-                },
-            }
-        } else {
-            Operation::KeyUp {
-                key: Key::WindowsCode {
-                    code: event.vkCode as u16,
-                },
-            }
-        },
-    );
-    if !down {
-        return CallNextHookEx(std::ptr::null_mut(), code, w, l);
-    }
-    let generation = if event.flags & LLKHF_INJECTED != 0 || shared.busy.load(Ordering::SeqCst) {
-        shared.generation.fetch_add(1, Ordering::SeqCst) + 1
+    let generation = if down && (injected || shared.busy.load(Ordering::SeqCst)) {
+        shared
+            .generation
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1)
     } else {
         shared.generation.load(Ordering::SeqCst)
     };
-    // Only explicit acceptance mode adapts external SendInput into the dispatcher.
-    if event.flags & LLKHF_INJECTED != 0 && test_input_enabled() {
-        rawinput::acceptance_key(shared, event, generation);
-    }
-    gate(if shared.paused.load(Ordering::SeqCst) {
-        "Paused"
+    // Only explicit acceptance mode adapts external SendInput into the matcher.
+    let acceptance = if down && injected && pipe.test_mode {
+        probe.input_context().map(|context| Acceptance {
+            context,
+            shift: keys.held(VK_SHIFT),
+            modified: keys.modified(),
+            allowed: !shared.paused.load(Ordering::SeqCst) && !shared.busy.load(Ordering::SeqCst),
+        })
     } else {
-        "Espanso RawInput capture active"
-    });
-
+        None
+    };
+    pipe.lane.push(HookRecord::Key(KeyRecord {
+        vk: key.vk,
+        scan: key.scan,
+        down,
+        generation,
+        acceptance,
+    }));
+    HookAction::Pass
+}
+/// What the keyboard hook runs: [`on_key`] with panics contained.
+pub(super) fn handle_key(
+    pipe: &HookPipe,
+    shared: &Shared,
+    probe: &impl ForegroundProbe,
+    msg: u32,
+    key: KeyInfo,
+) -> HookAction {
+    pipe.lane
+        .contained(HookAction::Pass, || on_key(pipe, shared, probe, msg, key))
+}
+unsafe extern "system" fn keyboard(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
+    if code >= 0 {
+        if let (Some(pipe), Some(shared)) = (PIPE.get(), ENGINE.get()) {
+            // SAFETY: for HC_ACTION, lParam points to a KBDLLHOOKSTRUCT valid during this call.
+            let event = &*(l as *const KBDLLHOOKSTRUCT);
+            let key = KeyInfo {
+                vk: event.vkCode as u16,
+                scan: event.scanCode,
+                flags: event.flags,
+                extra: event.dwExtraInfo,
+            };
+            if handle_key(pipe, shared, &WinForeground, w as u32, key) == HookAction::Swallow {
+                return 1;
+            }
+        }
+    }
     CallNextHookEx(std::ptr::null_mut(), code, w, l)
 }
+
 /// The mouse button (as a virtual-key code) a low-level mouse message
 /// presses or releases, if any.
 fn mouse_button(msg: u32, data: u32) -> Option<(u16, bool)> {
@@ -120,93 +238,126 @@ fn mouse_button(msg: u32, data: u32) -> Option<(u16, bool)> {
         _ => None,
     }
 }
+/// Mouse hook body: atomics and one lock-free push.
+pub(super) fn on_mouse(pipe: &HookPipe, shared: &Shared, mouse: MouseInfo) {
+    if mouse.extra == MARK {
+        return;
+    }
+    if let Some((button, down)) = mouse_button(mouse.msg, mouse.data) {
+        pipe.keys.set(button, down);
+    }
+    if mouse.msg == WM_MOUSEMOVE {
+        pipe.lane.push(HookRecord::Move {
+            x: mouse.x,
+            y: mouse.y,
+        });
+        return;
+    }
+    // Pointer movement alone cannot move the caret; only clicks and
+    // wheel reset the typed-key buffer (as in espanso).
+    shared.generation.fetch_add(1, Ordering::SeqCst);
+    observer::CARET_EPOCH.fetch_add(1, Ordering::SeqCst);
+    pipe.lane.push(HookRecord::Mouse {
+        msg: mouse.msg,
+        data: mouse.data,
+        x: mouse.x,
+        y: mouse.y,
+    });
+}
+/// What the mouse hook runs: [`on_mouse`] with panics contained.
+pub(super) fn handle_mouse(pipe: &HookPipe, shared: &Shared, mouse: MouseInfo) {
+    pipe.lane.contained((), || on_mouse(pipe, shared, mouse));
+}
 unsafe extern "system" fn mouse(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     if code >= 0 {
-        let ev = &*(l as *const MSLLHOOKSTRUCT);
-        if ev.dwExtraInfo != MARK {
-            if let Some(s) = ENGINE.get() {
-                if let Some((button, down)) = mouse_button(w as u32, ev.mouseData) {
-                    PHYSICAL.set(button, down);
-                }
-                // Pointer movement alone cannot move the caret; only clicks and
-                // wheel reset the typed-key buffer (as in espanso).
-                if w as u32 != WM_MOUSEMOVE {
-                    s.generation.fetch_add(1, Ordering::SeqCst);
-                    observer::CARET_EPOCH.fetch_add(1, Ordering::SeqCst);
-                }
-                {
-                    let op = match w as u32 {
-                        WM_MOUSEMOVE => Some(Operation::MouseMove {
-                            x: ev.pt.x as f64,
-                            y: ev.pt.y as f64,
-                            relative: false,
-                            percent: false,
-                        }),
-                        WM_LBUTTONDOWN => Some(Operation::MouseButton {
-                            button: MouseButton::Left,
-                            state: ButtonState::Down,
-                        }),
-                        WM_LBUTTONUP => Some(Operation::MouseButton {
-                            button: MouseButton::Left,
-                            state: ButtonState::Up,
-                        }),
-                        WM_RBUTTONDOWN => Some(Operation::MouseButton {
-                            button: MouseButton::Right,
-                            state: ButtonState::Down,
-                        }),
-                        WM_RBUTTONUP => Some(Operation::MouseButton {
-                            button: MouseButton::Right,
-                            state: ButtonState::Up,
-                        }),
-                        WM_MBUTTONDOWN => Some(Operation::MouseButton {
-                            button: MouseButton::Middle,
-                            state: ButtonState::Down,
-                        }),
-                        WM_MBUTTONUP => Some(Operation::MouseButton {
-                            button: MouseButton::Middle,
-                            state: ButtonState::Up,
-                        }),
-                        WM_XBUTTONDOWN => Some(Operation::MouseButton {
-                            button: if ev.mouseData >> 16 == 1 {
-                                MouseButton::X1
-                            } else {
-                                MouseButton::X2
-                            },
-                            state: ButtonState::Down,
-                        }),
-                        WM_XBUTTONUP => Some(Operation::MouseButton {
-                            button: if ev.mouseData >> 16 == 1 {
-                                MouseButton::X1
-                            } else {
-                                MouseButton::X2
-                            },
-                            state: ButtonState::Up,
-                        }),
-                        WM_MOUSEWHEEL => Some(Operation::Wheel {
-                            axis: WheelAxis::Vertical,
-                            amount: (ev.mouseData >> 16) as i16 as i32,
-                            unit: WheelUnit::Delta,
-                        }),
-                        WM_MOUSEHWHEEL => Some(Operation::Wheel {
-                            axis: WheelAxis::Horizontal,
-                            amount: (ev.mouseData >> 16) as i16 as i32,
-                            unit: WheelUnit::Delta,
-                        }),
-                        _ => None,
-                    };
-                    if let Some(op) = op {
-                        let hovered = WindowFromPoint(ev.pt);
-                        let mut pid = 0;
-                        GetWindowThreadProcessId(hovered, &mut pid);
-                        if pid != GetCurrentProcessId() {
-                            record_event(s, op);
-                        }
-                    }
-                }
-            }
+        if let (Some(pipe), Some(shared)) = (PIPE.get(), ENGINE.get()) {
+            // SAFETY: for HC_ACTION, lParam points to an MSLLHOOKSTRUCT valid during this call.
+            let event = &*(l as *const MSLLHOOKSTRUCT);
+            let mouse = MouseInfo {
+                msg: w as u32,
+                data: event.mouseData,
+                x: event.pt.x,
+                y: event.pt.y,
+                extra: event.dwExtraInfo,
+            };
+            handle_mouse(pipe, shared, mouse);
         }
     }
     CallNextHookEx(std::ptr::null_mut(), code, w, l)
+}
+/// Consumer side: the macro-recording operation for a click or wheel message.
+pub(super) fn mouse_operation(msg: u32, data: u32) -> Option<Operation> {
+    let x = if data >> 16 == 1 {
+        MouseButton::X1
+    } else {
+        MouseButton::X2
+    };
+    let button = |button, state| Some(Operation::MouseButton { button, state });
+    let wheel = |axis| {
+        Some(Operation::Wheel {
+            axis,
+            amount: (data >> 16) as i16 as i32,
+            unit: WheelUnit::Delta,
+        })
+    };
+    match msg {
+        WM_LBUTTONDOWN => button(MouseButton::Left, ButtonState::Down),
+        WM_LBUTTONUP => button(MouseButton::Left, ButtonState::Up),
+        WM_RBUTTONDOWN => button(MouseButton::Right, ButtonState::Down),
+        WM_RBUTTONUP => button(MouseButton::Right, ButtonState::Up),
+        WM_MBUTTONDOWN => button(MouseButton::Middle, ButtonState::Down),
+        WM_MBUTTONUP => button(MouseButton::Middle, ButtonState::Up),
+        WM_XBUTTONDOWN => button(x, ButtonState::Down),
+        WM_XBUTTONUP => button(x, ButtonState::Up),
+        WM_MOUSEWHEEL => wheel(WheelAxis::Vertical),
+        WM_MOUSEHWHEEL => wheel(WheelAxis::Horizontal),
+        _ => None,
+    }
+}
+/// Consumer side: the macro-recording operation for a pointer position.
+pub(super) fn pointer_move(x: i32, y: i32) -> Operation {
+    Operation::MouseMove {
+        x: f64::from(x),
+        y: f64::from(y),
+        relative: false,
+        percent: false,
+    }
+}
+/// Acceptance mode only, on the consumer: the text an injected key types in
+/// `layout`. Preserves dead-key state (flag 4); hardware translation uses
+/// the vendored detector and its own upstream flags.
+pub(super) unsafe fn expected_key_text(
+    vk: u16,
+    scan: u32,
+    shift: bool,
+    layout: HKL,
+) -> Option<String> {
+    if vk == VK_PACKET {
+        return char::from_u32(scan).map(|ch| ch.to_string());
+    }
+    let mut state = [0u8; 256];
+    if shift {
+        if let Some(slot) = state.get_mut(usize::from(VK_SHIFT)) {
+            *slot = 0x80;
+        }
+    }
+    if GetKeyState(i32::from(VK_CAPITAL)) & 1 != 0 {
+        if let Some(slot) = state.get_mut(usize::from(VK_CAPITAL)) {
+            *slot = 1;
+        }
+    }
+    let mut units = [0u16; 8];
+    let len = ToUnicodeEx(
+        u32::from(vk),
+        scan,
+        state.as_ptr(),
+        units.as_mut_ptr(),
+        units.len() as i32,
+        4,
+        layout,
+    );
+    let len = usize::try_from(len).ok().filter(|len| *len > 0)?;
+    String::from_utf16(units.get(..len)?).ok()
 }
 unsafe extern "system" fn focus_event(
     _: windows_sys::Win32::UI::Accessibility::HWINEVENTHOOK,
@@ -255,7 +406,7 @@ pub(super) fn spawn_hooks() {
             }
             if let Some(s) = ENGINE.get() {
                 s.paused.store(true, Ordering::SeqCst);
-                *s.last.lock().unwrap() = Some(ExecutionResult {
+                *s.last.lock().unwrap_or_else(PoisonError::into_inner) = Some(ExecutionResult {
                     id: "engine".into(),
                     status: "failed".into(),
                     message: "Windows keyboard/mouse hook installation failed; automatic input remains paused".into(),
@@ -280,6 +431,7 @@ pub(super) fn spawn_hooks() {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -298,5 +450,28 @@ mod tests {
         );
         assert_eq!(mouse_button(WM_MOUSEMOVE, 0), None);
         assert_eq!(mouse_button(WM_MOUSEWHEEL, 120 << 16), None);
+    }
+
+    #[test]
+    fn every_click_and_wheel_message_has_a_recording_operation() {
+        for msg in [
+            WM_LBUTTONDOWN,
+            WM_LBUTTONUP,
+            WM_RBUTTONDOWN,
+            WM_RBUTTONUP,
+            WM_MBUTTONDOWN,
+            WM_MBUTTONUP,
+            WM_XBUTTONDOWN,
+            WM_XBUTTONUP,
+            WM_MOUSEWHEEL,
+            WM_MOUSEHWHEEL,
+        ] {
+            assert!(mouse_operation(msg, 1 << 16).is_some(), "{msg:#x}");
+        }
+        assert!(mouse_operation(WM_MOUSEMOVE, 0).is_none());
+        assert!(matches!(
+            mouse_operation(WM_MOUSEWHEEL, (-120i16 as u16 as u32) << 16),
+            Some(Operation::Wheel { amount: -120, .. })
+        ));
     }
 }

@@ -1,21 +1,33 @@
 //! Thin bridge around the vendored Espanso Windows RawInput detector/injector.
 //! Matching remains Quicker Text's domain compiler; UIA only supplies optional vetoes.
+//!
+//! B-02: the detector callback only reads atomics and the foreground input
+//! context, pushes one fixed-size [`RawRecord`] onto a bounded lock-free
+//! queue and returns. Text decoding and matching run on the input consumer.
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 use super::*;
 use super::{
-    executor::{enqueue, Candidate, CandidateProof},
+    executor::{Candidate, CandidateProof},
     foreground::WinForeground,
-    hook::expected_key_text,
+    hook::{expected_key_text, KeyRecord},
     ime::ime_active,
     inject::Erasure,
-    keystate::physical,
+    input::{self, Lane},
+    keystate::{KeyBits, PHYSICAL},
     protection::{protection_block, protection_worker},
 };
-use crate::traits::ForegroundProbe;
+use crate::traits::{ForegroundProbe, InputContext};
 use std::ffi::c_void;
+use std::sync::{atomic::AtomicUsize, PoisonError};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct InputEvent {
+pub(super) struct InputEvent {
     event_type: i32,
     buffer: [u16; 24],
     buffer_len: i32,
@@ -23,6 +35,28 @@ struct InputEvent {
     variant: i32,
     status: i32,
     has_known_source: i32,
+}
+impl InputEvent {
+    /// A key-down as the vendored detector reports it. `hardware` sets
+    /// `has_known_source` (a RawInput device handle was present).
+    #[cfg(test)]
+    pub(super) fn key_down(vk: u16, text: &str, hardware: bool) -> Self {
+        let mut buffer = [0u16; 24];
+        let mut len = 0;
+        for (slot, unit) in buffer.iter_mut().zip(text.encode_utf16()) {
+            *slot = unit;
+            len += 1;
+        }
+        Self {
+            event_type: 1,
+            buffer,
+            buffer_len: len,
+            key_code: i32::from(vk),
+            variant: 0,
+            status: 1,
+            has_known_source: i32::from(hardware),
+        }
+    }
 }
 #[repr(C)]
 struct InitOptions {
@@ -41,7 +75,16 @@ extern "C" {
     fn detect_destroy(window: *mut c_void) -> i32;
 }
 pub(super) static READY: AtomicBool = AtomicBool::new(false);
-static EVENTS: OnceLock<mpsc::SyncSender<Event>> = OnceLock::new();
+/// RawInput queue capacity in records. 待实测: about a second of fast typing
+/// plus autorepeat while the consumer is descheduled. A full queue drops the
+/// key; the generation it already took leaves a gap, so no later key joins
+/// the keys before it.
+pub(super) const RAW_QUEUE_CAPACITY: usize = 1024;
+/// no-regression #7: the detector re-reads the keyboard layout on every key.
+pub(super) const KEYBOARD_LAYOUT_CACHE_INTERVAL: i32 = 0;
+static RAW_LANE: OnceLock<Lane<RawRecord>> = OnceLock::new();
+/// The detector window while its event loop runs (0 otherwise).
+static RAW_WINDOW: AtomicUsize = AtomicUsize::new(0);
 static LAST_SOURCE: Mutex<&str> = Mutex::new("waiting_for_input");
 static LAST_PROCESS: Mutex<String> = Mutex::new(String::new());
 thread_local! { static PROOF: std::cell::RefCell<Option<Proof>> = const {std::cell::RefCell::new(None)}; }
@@ -113,8 +156,10 @@ impl Buffer {
             Kind::Reset => self.text.clear(),
         }
         while self.text.chars().count() > 1024 {
-            self.text
-                .drain(..self.text.chars().next().unwrap().len_utf8());
+            let Some(first) = self.text.chars().next() else {
+                break;
+            };
+            self.text.drain(..first.len_utf8());
         }
     }
 }
@@ -137,32 +182,103 @@ fn kind(vkey: u16, text: Option<String>, modified: bool) -> Kind {
 pub(super) fn stamp(shared: &Shared, probe: &impl ForegroundProbe) -> Option<Stamp> {
     let revision = shared.compiled.try_lock().ok()?.config.revision;
     let context = probe.input_context()?;
-    Some(Stamp {
+    Some(stamp_of(context, revision))
+}
+fn stamp_of(context: InputContext, revision: u64) -> Stamp {
+    Stamp {
         focus: context.focus,
         epoch: context.focus_epoch,
         caret: context.caret_epoch,
         revision,
         layout: context.layout as usize,
+    }
+}
+/// One hardware key-down, captured by the detector callback. Fixed size and
+/// `Copy`: building and queueing it never allocates.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RawRecord {
+    vk: u16,
+    text: [u16; 24],
+    len: usize,
+    context: InputContext,
+    pub(super) generation: u64,
+    modified: bool,
+    allowed: bool,
+}
+/// Callback body: filters the detector event and captures everything the
+/// consumer needs. Atomics plus the probe's input context only. Every
+/// accepted key takes the next generation, so a key that is later lost
+/// leaves a gap instead of joining its neighbours.
+pub(super) fn raw_record(
+    shared: &Shared,
+    keys: &KeyBits,
+    event: &InputEvent,
+    probe: &impl ForegroundProbe,
+) -> Option<RawRecord> {
+    if !hardware_keydown(event.event_type, event.status, event.has_known_source) {
+        return None;
+    }
+    let generation = shared
+        .generation
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1);
+    let context = probe.input_context()?;
+    Some(RawRecord {
+        vk: event.key_code as u16,
+        text: event.buffer,
+        len: usize::try_from(event.buffer_len.clamp(0, 24)).unwrap_or(0),
+        context,
+        generation,
+        modified: keys.modified(),
+        allowed: !shared.paused.load(Ordering::SeqCst) && !shared.busy.load(Ordering::SeqCst),
     })
 }
-fn submit(shared: &Shared, kind: Kind, generation: u64, source: &'static str) {
-    let Some(stamp) = stamp(shared, &WinForeground) else {
-        return;
+/// The RawInput lane; created once, before the detector starts.
+pub(super) fn lane() -> &'static Lane<RawRecord> {
+    RAW_LANE.get_or_init(|| Lane::new(RAW_QUEUE_CAPACITY, input::wake))
+}
+/// Consumer side: the matcher event for a captured hardware key. The
+/// configuration revision is read here; a poisoned compiler fails closed
+/// (the key is dropped and its generation gap clears the buffer).
+pub(super) fn event_from(shared: &Shared, record: &RawRecord) -> Option<Event> {
+    let revision = shared.compiled.lock().ok()?.config.revision;
+    let text = record
+        .text
+        .get(..record.len)
+        .and_then(|units| String::from_utf16(units).ok());
+    Some(Event {
+        kind: kind(record.vk, text, record.modified),
+        stamp: stamp_of(record.context, revision),
+        generation: record.generation,
+        source: "rawinput_hardware",
+        captured_allowed: record.allowed,
+    })
+}
+/// Consumer side, acceptance mode only: the matcher event for an injected
+/// key the hook captured.
+pub(super) fn acceptance_event(shared: &Shared, key: &KeyRecord) -> Option<Event> {
+    let acceptance = key.acceptance?;
+    let revision = shared.compiled.lock().ok()?.config.revision;
+    // SAFETY: keyboard-state reads and ToUnicodeEx on stack buffers.
+    let text = unsafe {
+        expected_key_text(
+            key.vk,
+            key.scan,
+            acceptance.shift,
+            acceptance.context.layout as usize as HKL,
+        )
     };
-    if EVENTS.get().is_none_or(|tx| {
-        tx.try_send(Event {
-            kind,
-            stamp,
-            generation,
-            source,
-            captured_allowed: !shared.paused.load(Ordering::SeqCst)
-                && !shared.busy.load(Ordering::SeqCst),
-        })
-        .is_err()
-    }) {
-        // A dropped event must break contiguity before another suffix can match.
-        shared.generation.fetch_add(1, Ordering::SeqCst);
-    }
+    Some(Event {
+        kind: kind(key.vk, text, acceptance.modified),
+        stamp: stamp_of(acceptance.context, revision),
+        generation: key.generation,
+        source: "acceptance_sendinput_hook",
+        captured_allowed: acceptance.allowed,
+    })
+}
+/// Records which source fed the matcher last (diagnostics only).
+pub(super) fn note_source(source: &'static str) {
+    *LAST_SOURCE.lock().unwrap_or_else(PoisonError::into_inner) = source;
 }
 fn hardware_keydown(event_type: i32, status: i32, known_source: i32) -> bool {
     event_type == 1 && status == 1 && known_source != 0
@@ -193,49 +309,22 @@ fn validate_stamp(original: &Stamp, current: Option<&Stamp>) -> Result<(), Strin
     }
 }
 extern "C" fn callback(context: *mut c_void, event: InputEvent) {
-    // No panic may unwind across the C ABI; no COM, output or provider read here.
-    let _ = std::panic::catch_unwind(|| {
-        let shared = unsafe { &*(context as *const Arc<Shared>) };
-        if !hardware_keydown(event.event_type, event.status, event.has_known_source) {
-            return;
-        }
-        let len = event.buffer_len.clamp(0, 24) as usize;
-        let text = String::from_utf16(&event.buffer[..len]).ok();
-        let modified =
-            (physical(VK_CONTROL) ^ physical(VK_MENU)) || physical(VK_LWIN) || physical(VK_RWIN);
-        submit(
-            shared,
-            kind(event.key_code as u16, text, modified),
-            shared.generation.fetch_add(1, Ordering::SeqCst) + 1,
-            "rawinput_hardware",
-        );
-    });
-}
-pub(super) unsafe fn acceptance_key(shared: &Shared, event: &KBDLLHOOKSTRUCT, generation: u64) {
-    let modified =
-        (physical(VK_CONTROL) ^ physical(VK_MENU)) || physical(VK_LWIN) || physical(VK_RWIN);
-    submit(
-        shared,
-        kind(event.vkCode as u16, expected_key_text(event), modified),
-        generation,
-        "acceptance_sendinput_hook",
-    );
-}
-fn dispatch(shared: Arc<Shared>, rx: mpsc::Receiver<Event>, probe: impl ForegroundProbe) {
-    let mut buffer = Buffer::default();
-    while !shared.shutdown.load(Ordering::SeqCst) {
-        let event = match rx.recv_timeout(Duration::from_millis(30)) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        *LAST_SOURCE.lock().unwrap() = event.source;
-        let Some(candidate) = detect_candidate(&shared, &mut buffer, event, &probe) else {
-            continue;
-        };
-        if enqueue(&shared, candidate) {
-            buffer.text.clear();
-        }
+    // No panic may unwind across the C ABI; no COM, output, lock or
+    // allocation here.
+    let Some(lane) = RAW_LANE.get() else {
+        return;
+    };
+    if context.is_null() {
+        return;
     }
+    // SAFETY: `context` is the boxed Arc<Shared> handed to detect_initialize;
+    // the detector thread keeps it alive until its event loop returns.
+    let shared = unsafe { &*(context as *const Arc<Shared>) };
+    lane.contained((), || {
+        if let Some(record) = raw_record(shared, &PHYSICAL, &event, &WinForeground) {
+            lane.push(record);
+        }
+    });
 }
 /// Match step: folds `event` into `buffer` and returns a candidate when a
 /// rule matches the current, unprotected target.
@@ -272,7 +361,7 @@ pub(super) fn detect_candidate(
         return None;
     }
     let target = probe.foreground();
-    *LAST_PROCESS.lock().unwrap() = target.process.clone();
+    *LAST_PROCESS.lock().unwrap_or_else(PoisonError::into_inner) = target.process.clone();
     if target.id != event.stamp.focus
         || target.process.is_empty()
         || target.process.eq_ignore_ascii_case("quicker-text.exe")
@@ -280,7 +369,9 @@ pub(super) fn detect_candidate(
     {
         return None;
     }
-    let compiler = shared.compiled.lock().unwrap();
+    let Ok(compiler) = shared.compiled.lock() else {
+        return None;
+    };
     if compiler.config.revision != event.stamp.revision {
         buffer.text.clear();
         return None;
@@ -318,20 +409,15 @@ pub(super) fn detect_candidate(
         terminator: terminator.map(str::to_owned),
     })
 }
+/// Starts the UIA protection sampler and the detector thread. The lane must
+/// exist (see [`lane`]) before keys can be captured.
 pub(super) fn start(shared: Arc<Shared>) -> Result<(), String> {
-    let (tx, rx) = mpsc::sync_channel(256);
-    EVENTS
-        .set(tx)
-        .map_err(|_| "Espanso dispatcher already started")?;
-    let dispatch_shared = shared.clone();
-    std::thread::spawn(move || dispatch(dispatch_shared, rx, WinForeground));
     protection_worker(shared.clone());
     let (startup_tx, startup_rx) = mpsc::sync_channel(1);
     std::thread::spawn(move || unsafe {
         let context = Box::new(shared);
         let mut options = InitOptions {
-            // no-regression #7: re-read the keyboard layout on every key.
-            keyboard_layout_cache_interval: 0,
+            keyboard_layout_cache_interval: KEYBOARD_LAYOUT_CACHE_INTERVAL,
         };
         let mut error = 0;
         let window = detect_initialize(
@@ -345,20 +431,12 @@ pub(super) fn start(shared: Arc<Shared>) -> Result<(), String> {
             )));
             return;
         }
+        RAW_WINDOW.store(window as usize, Ordering::SeqCst);
         READY.store(true, Ordering::SeqCst);
         let _ = startup_tx.send(Ok(()));
-        let shutdown_shared = context.clone();
-        let window_id = window as usize;
-        std::thread::spawn(move || {
-            while !shutdown_shared.shutdown.load(Ordering::SeqCst) && READY.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(30));
-            }
-            if shutdown_shared.shutdown.load(Ordering::SeqCst) {
-                PostMessageW(window_id as HWND, WM_CLOSE, 0, 0);
-            }
-        });
         detect_eventloop(window, callback);
         READY.store(false, Ordering::SeqCst);
+        RAW_WINDOW.store(0, Ordering::SeqCst);
         context.paused.store(true, Ordering::SeqCst);
         if IsWindow(window as HWND) != 0 {
             detect_destroy(window);
@@ -367,6 +445,16 @@ pub(super) fn start(shared: Arc<Shared>) -> Result<(), String> {
     startup_rx
         .recv_timeout(Duration::from_secs(3))
         .map_err(|_| "Espanso RawInput initialization timed out".to_string())?
+}
+/// Asks the detector window to close (engine shutdown).
+pub(super) fn close_window() {
+    let window = RAW_WINDOW.load(Ordering::SeqCst);
+    if window != 0 {
+        // SAFETY: posting to a stale handle fails harmlessly.
+        unsafe {
+            PostMessageW(window as HWND, WM_CLOSE, 0, 0);
+        }
+    }
 }
 pub(super) fn install(proof: Option<Proof>) {
     PROOF.with(|p| *p.borrow_mut() = proof);
@@ -382,14 +470,25 @@ pub(super) fn guard(shared: &Shared, probe: &impl ForegroundProbe) -> Result<(),
     })
 }
 pub(super) fn status() -> serde_json::Value {
-    serde_json::json!({"backend":"espanso_win32_v2.4.1", "source":*LAST_SOURCE.lock().unwrap(),
+    let source = *LAST_SOURCE.lock().unwrap_or_else(PoisonError::into_inner);
+    let process = LAST_PROCESS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    serde_json::json!({"backend":"espanso_win32_v2.4.1", "source":source,
         "ready":READY.load(Ordering::SeqCst), "available":READY.load(Ordering::SeqCst),
-        "process":*LAST_PROCESS.lock().unwrap(), "reason":protection_block().unwrap_or_else(||"RawInput capture; delivery and IME composition are unverified".into()),
+        "process":process, "reason":protection_block().unwrap_or_else(||"RawInput capture; delivery and IME composition are unverified".into()),
         "terminators":{"space":"post-input erasure; final IME consumption unknown","semicolon":"post-input erasure", "enter":"disabled","tab":"disabled"},
         "ime":"RawInput translated characters and backspace compatibility; composition and final delivery unverified"})
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     fn original() -> Stamp {

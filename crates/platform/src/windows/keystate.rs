@@ -69,6 +69,11 @@ impl KeyBits {
             _ => self.get(vk),
         }
     }
+    /// A shortcut chord is held: Ctrl or Alt alone, or either Windows key.
+    /// Ctrl+Alt together is AltGr and still types text.
+    pub(super) fn modified(&self) -> bool {
+        (self.held(VK_CONTROL) ^ self.held(VK_MENU)) || self.held(VK_LWIN) || self.held(VK_RWIN)
+    }
     pub(super) fn seeded(&self) -> bool {
         self.seeded.load(Ordering::SeqCst)
     }
@@ -179,6 +184,23 @@ mod tests {
             keys.set(left, false);
             assert!(!keys.held(generic));
         }
+    }
+
+    #[test]
+    fn shortcut_chords_are_modified_but_altgr_is_not() {
+        let keys = KeyBits::new();
+        assert!(!keys.modified());
+        keys.set(VK_LCONTROL, true);
+        assert!(keys.modified(), "Ctrl alone");
+        keys.set(VK_RMENU, true);
+        assert!(!keys.modified(), "AltGr arrives as Ctrl+Alt");
+        keys.set(VK_LCONTROL, false);
+        assert!(keys.modified(), "Alt alone");
+        keys.set(VK_RMENU, false);
+        keys.set(VK_LSHIFT, true);
+        assert!(!keys.modified(), "Shift types text");
+        keys.set(VK_RWIN, true);
+        assert!(keys.modified());
     }
 
     #[test]
