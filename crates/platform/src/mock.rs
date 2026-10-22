@@ -145,6 +145,8 @@ struct ClipboardModel {
     pauses: Vec<Duration>,
     read_delay: Duration,
     health: Option<(HealthState, Option<ReasonCode>)>,
+    /// Registered format names; ids start at 0xC000 like Win32's.
+    registry: Vec<String>,
 }
 
 /// In-memory clipboard following Win32 rules: clearing takes ownership and
@@ -177,6 +179,7 @@ impl MockClipboard {
                 pauses: vec![],
                 read_delay: Duration::ZERO,
                 health: None,
+                registry: vec![],
             })),
         }
     }
@@ -249,6 +252,12 @@ impl MockClipboard {
     /// Latest [`ClipboardBackend::report_health`] call, if any.
     pub fn health(&self) -> Option<(HealthState, Option<ReasonCode>)> {
         self.state.lock().health
+    }
+    /// Id [`ClipboardBackend::register_format`] returned for `name`.
+    pub fn registered(&self, name: &str) -> Option<u32> {
+        let state = self.state.lock();
+        let index = state.registry.iter().position(|known| known == name)?;
+        Some(0xC000 + index as u32)
     }
 }
 
@@ -349,6 +358,17 @@ impl ClipboardBackend for MockClipboard {
         let mut model = self.state.lock();
         assert!(!model.open, "health reported with the clipboard open");
         model.health = Some((state, reason));
+    }
+    fn register_format(&self, name: &str) -> u32 {
+        let mut state = self.state.lock();
+        let index = match state.registry.iter().position(|known| known == name) {
+            Some(index) => index,
+            None => {
+                state.registry.push(name.to_string());
+                state.registry.len() - 1
+            }
+        };
+        0xC000 + index as u32
     }
 }
 

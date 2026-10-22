@@ -126,6 +126,11 @@ pub trait ClipboardBackend {
     fn owner_hung(&self, _owner: u64) -> bool {
         false
     }
+    /// Not locked: the registered format id for `name`; 0 when it cannot be
+    /// registered (the default).
+    fn register_format(&self, _name: &str) -> u32 {
+        0
+    }
 }
 
 /// One format read for a clipboard backup (B-08).

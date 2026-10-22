@@ -29,6 +29,14 @@ const OWNER_PROBES: usize = 3;
 /// How long the hung-owner probe waits for the owner's message loop.
 /// 待实测: tune against slow-but-alive owners.
 const OWNER_PROBE_TIMEOUT_MS: u32 = 200;
+/// Registered formats every paste write adds as a DWORD 0 (B-08), so the
+/// expansion stays out of clipboard monitors, Win+V history and cloud sync
+/// ("Cloud Clipboard and Clipboard History Formats", learn.microsoft.com).
+pub(super) const EXCLUSION_FORMATS: [&str; 3] = [
+    "ExcludeClipboardContentFromMonitorProcessing",
+    "CanIncludeInClipboardHistory",
+    "CanUploadToCloudClipboard",
+];
 
 // Standard clipboard formats (windows-sys `System::Ole::CF_*`, as u32).
 const CF_TEXT: u32 = 1;
@@ -491,6 +499,9 @@ impl ClipboardBackend for WinClipboard {
                 && GetLastError() == ERROR_TIMEOUT
         }
     }
+    fn register_format(&self, name: &str) -> u32 {
+        unsafe { RegisterClipboardFormatW(wide(name).as_ptr()) }
+    }
     fn stage(&self, bytes: &[u8]) -> Result<(WinStaged, Vec<u8>), String> {
         unsafe {
             let handle = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes.len());
@@ -710,7 +721,23 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
         }
         Ok(())
     }
-    /// Allocates `formats` up front so allocation cannot fail after deletion.
+    /// The [`EXCLUSION_FORMATS`] markers. A name that cannot be registered is
+    /// logged and left out: the paste itself does not depend on it.
+    fn exclusion_markers(&self) -> ClipboardFormats {
+        EXCLUSION_FORMATS
+            .iter()
+            .filter_map(|name| match self.backend.register_format(name) {
+                0 => {
+                    tracing::warn!(event = "clipboard.exclusion_unregistered", format = name);
+                    None
+                }
+                format => Some((format, 0u32.to_le_bytes().to_vec())),
+            })
+            .collect()
+    }
+    /// Allocates `formats`, plus the exclusion markers, up front so
+    /// allocation cannot fail after deletion. Restores never add markers:
+    /// they bring back the original formats only.
     pub(super) fn prepare(
         &self,
         formats: ClipboardFormats,
@@ -719,7 +746,7 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
             handles: vec![],
             expected: vec![],
         };
-        for (format, bytes) in formats {
+        for (format, bytes) in formats.into_iter().chain(self.exclusion_markers()) {
             let (staged, reported) = self
                 .backend
                 .stage(&bytes)
@@ -1137,10 +1164,10 @@ mod tests {
         let mut lease = ClipboardLease::new(clipboard.clone()).unwrap();
         let mut prepared = lease.prepare(text("expansion")).unwrap();
         lease.write_prepared(&mut prepared).unwrap();
-        assert_eq!(clipboard.content(), text("expansion"));
+        assert_eq!(clipboard.content(), pasted(&clipboard, "expansion"));
         clipboard.set_busy(OPEN_ATTEMPTS);
         assert_eq!(lease.restore(), Err("Clipboard is busy".into()));
-        assert_eq!(clipboard.content(), text("expansion"));
+        assert_eq!(clipboard.content(), pasted(&clipboard, "expansion"));
         assert_eq!(clipboard.health(), BUSY);
         clipboard.set_busy(OPEN_ATTEMPTS - 1);
         drop(lease);
@@ -1198,8 +1225,17 @@ mod tests {
     fn paste_and_restore(mut lease: ClipboardLease<MockClipboard>, clipboard: &MockClipboard) {
         let mut prepared = lease.prepare(text("expansion")).unwrap();
         lease.write_prepared(&mut prepared).unwrap();
-        assert_eq!(clipboard.content(), text("expansion"));
+        assert_eq!(clipboard.content(), pasted(clipboard, "expansion"));
         lease.restore().unwrap();
+    }
+    /// What a paste write of `value` leaves: the text, then the exclusion
+    /// markers, each a DWORD 0.
+    fn pasted(clipboard: &MockClipboard, value: &str) -> ClipboardFormats {
+        let mut formats = text(value);
+        for name in EXCLUSION_FORMATS {
+            formats.push((clipboard.registered(name).unwrap(), vec![0; 4]));
+        }
+        formats
     }
     fn refusal_of(result: Result<ClipboardLease<MockClipboard>, LeaseError>) -> ReasonCode {
         match result {
@@ -1374,5 +1410,27 @@ mod tests {
         ]
         .map(|policy| serde_json::to_string(&policy).unwrap());
         assert_eq!(names, ["\"full\"", "\"best_effort\"", "\"text_only\""]);
+    }
+    #[test]
+    fn paste_write_carries_exclusion_markers_and_restore_does_not() {
+        let clipboard = MockClipboard::new(7, text("original"));
+        let mut lease = ClipboardLease::new(clipboard.clone()).unwrap();
+        let mut prepared = lease.prepare(text("expansion")).unwrap();
+        lease.write_prepared(&mut prepared).unwrap();
+        let written = clipboard.content();
+        assert_eq!(written.len(), 1 + EXCLUSION_FORMATS.len());
+        for name in [
+            "ExcludeClipboardContentFromMonitorProcessing",
+            "CanIncludeInClipboardHistory",
+            "CanUploadToCloudClipboard",
+        ] {
+            let id = clipboard.registered(name).unwrap();
+            assert!(
+                written.contains(&(id, 0u32.to_le_bytes().to_vec())),
+                "{name}"
+            );
+        }
+        lease.restore().unwrap();
+        assert_eq!(clipboard.content(), text("original"));
     }
 }

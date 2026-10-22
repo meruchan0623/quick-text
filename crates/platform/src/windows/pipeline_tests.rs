@@ -322,7 +322,7 @@ fn restore_never_overwrites_when_sequence_keeps_changing() {
         result.message,
         "Clipboard restore failed after input: Clipboard ownership could not be verified within the retry limit"
     );
-    assert_eq!(rig.clipboard.content(), clip(EXPANSION));
+    assert_eq!(rig.clipboard.content(), pasted(&rig.clipboard, EXPANSION));
     assert_eq!(rig.clipboard.clears(), 1, "only the paste write");
 }
 
@@ -647,4 +647,15 @@ fn proof_is_uninstalled_when_the_run_unwinds() {
     assert!(unwound.is_err());
     rig.foreground.update_input_context(|c| c.caret_epoch += 1);
     assert_eq!(rawinput::guard(&rig.shared, &rig.foreground), Ok(()));
+}
+
+/// What a paste write of `text` leaves on the clipboard: the payload, then
+/// the history/cloud exclusion markers (B-08), each a DWORD 0.
+fn pasted(clipboard: &MockClipboard, text: &str) -> Vec<(u32, Vec<u8>)> {
+    let mut formats = clip(text);
+    for name in super::clipboard::EXCLUSION_FORMATS {
+        let id = clipboard.registered(name).expect("marker registered");
+        formats.push((id, 0u32.to_le_bytes().to_vec()));
+    }
+    formats
 }
