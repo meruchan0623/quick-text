@@ -27,7 +27,14 @@ pub struct Store {
     pub pending_import: Option<(Config, Vec<MigrationItem>)>,
 }
 impl Store {
+    /// Writes the draft. A configuration with error-level diagnostics is
+    /// rejected with `Validation` and nothing is written (B-42).
     pub fn save(&mut self, config: Config) -> Result<(), CommandError> {
+        if let Err(diagnostics) = compile_config(&config) {
+            if diagnostics.iter().any(|d| d.severity == Severity::Error) {
+                return Err(CommandError::validation(diagnostics));
+            }
+        }
         let metadata = self
             .pending_import
             .as_ref()
@@ -132,6 +139,29 @@ mod tests {
         drop(store);
         let store = Store::load(dir.clone()).unwrap();
         assert_eq!(store.unresolved[0].original["synthetic_source"], "A");
+        fs::remove_dir_all(dir).unwrap();
+    }
+    /// B-42: `save_draft` validates first; an invalid draft is not written.
+    #[test]
+    fn save_rejects_drafts_with_error_diagnostics() {
+        let dir = std::env::temp_dir().join(format!("quicker-text-test-{}", uuid::Uuid::new_v4()));
+        let mut store = Store::load(dir.clone()).unwrap();
+        let valid = metadata_config(&["kept"]);
+        store.save(valid.clone()).unwrap();
+        let mut invalid = metadata_config(&["kept", "broken"]);
+        invalid.rules[1].match_spec.value.clear();
+        invalid.globals.terminators.push(String::new());
+        store.pending_import = Some((invalid.clone(), vec![original("broken", "pending")]));
+        let Err(CommandError::Validation { diagnostics }) = store.save(invalid) else {
+            panic!("an invalid draft must be rejected with Validation");
+        };
+        assert!(diagnostics.iter().any(|d| d.code == "match_empty"));
+        assert!(diagnostics.iter().any(|d| d.path == "globals.terminators"));
+        assert!(diagnostics.iter().all(|d| d.severity == Severity::Error));
+        assert_eq!(store.draft, valid);
+        assert!(store.pending_import.is_some());
+        drop(store);
+        assert_eq!(Store::load(dir.clone()).unwrap().draft, valid);
         fs::remove_dir_all(dir).unwrap();
     }
 }

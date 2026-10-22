@@ -4,14 +4,12 @@
 //! aliases that call the new implementations; 0.6 removes them.
 use crate::{
     app_state::{AppState, Managed},
+    commands::import_export::{dialog, CONFIG_FILTERS},
     error::{CommandError, IoOp},
     store::merge_import_metadata,
 };
 use quicker_domain::*;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{fs, path::PathBuf};
 use tauri::{Manager, State};
 
 #[tauri::command]
@@ -58,17 +56,23 @@ pub async fn get_foreground(
     }
     Ok(result)
 }
+/// Returns `Ok(None)` when the user cancels the save dialog (B-42).
 #[tauri::command]
-pub fn export_config(path: Option<String>, store: State<Managed>) -> Result<String, CommandError> {
+pub fn export_config(
+    path: Option<String>,
+    store: State<Managed>,
+) -> Result<Option<String>, CommandError> {
+    // Pick the target before taking the store lock: the dialog is modal and
+    // must not block other commands and the tray while it is open.
+    let target = path.map(PathBuf::from).or_else(|| {
+        dialog(CONFIG_FILTERS)
+            .set_file_name("quicker-text-package.json")
+            .save_file()
+    });
+    let Some(target) = target else {
+        return Ok(None);
+    };
     let s = store.lock();
-    let target = path
-        .map(PathBuf::from)
-        .or_else(|| {
-            rfd::FileDialog::new()
-                .set_file_name("quicker-text-package.json")
-                .save_file()
-        })
-        .ok_or(CommandError::Cancelled)?;
     let unresolved = s
         .unresolved
         .iter()
@@ -78,16 +82,24 @@ pub fn export_config(path: Option<String>, store: State<Managed>) -> Result<Stri
     let package =
         export_package_with_unresolved(&s.draft, unresolved).map_err(CommandError::validation)?;
     fs::write(&target, package).map_err(|e| CommandError::io(IoOp::Write, Some(&target), &e))?;
-    Ok(target.to_string_lossy().into_owned())
+    Ok(Some(target.to_string_lossy().into_owned()))
 }
+/// Without `path`, asks for a JSON package; `Ok(None)` when the user cancels.
 #[tauri::command]
 pub fn import_config(
-    path: String,
+    path: Option<String>,
     strategy: String,
     store: State<Managed>,
-) -> Result<serde_json::Value, CommandError> {
-    let source = fs::read_to_string(&path)
-        .map_err(|e| CommandError::io(IoOp::Read, Some(Path::new(&path)), &e))?;
+) -> Result<Option<serde_json::Value>, CommandError> {
+    let path = match path {
+        Some(path) => PathBuf::from(path),
+        None => match dialog(CONFIG_FILTERS).pick_file() {
+            Some(path) => path,
+            None => return Ok(None),
+        },
+    };
+    let source =
+        fs::read_to_string(&path).map_err(|e| CommandError::io(IoOp::Read, Some(&path), &e))?;
     let imported = import_package(&source).map_err(CommandError::validation)?;
     let mut incoming = imported.config;
     let mut s = store.lock();
@@ -173,5 +185,5 @@ pub fn import_config(
         &imported.unresolved,
     );
     s.pending_import = Some((draft.clone(), unresolved));
-    Ok(serde_json::json!({"config":draft,"report":report}))
+    Ok(Some(serde_json::json!({"config":draft,"report":report})))
 }
