@@ -6,7 +6,7 @@
 
 Quicker Text 0.3.1，即已经发布的 Windows x64 绿色包 `Quicker-Text-0.3.1-Windows-x64-Portable.zip`，以及用同一份源码构建的其他交付物【待核实：0.3.1 是否另发过单文件 exe 或安装包】。
 
-0.4.0 起的发布按 [发布清单](release-checklist.md) 的许可证核对项执行，每个发布都附带 GPL 全文、第三方声明和 `Quicker-Text-<版本>-Source.zip`；本文只处理已经发出去的 0.3.1。
+0.4.0 起的发布按 [发布清单](release-checklist.md) 的许可证核对项执行，每个发布都附带 GPL 全文、第三方声明、第三方版权与许可证文字（`THIRD-PARTY-LICENSES.txt`）、`Quicker-Text-<版本>-Source.zip` 和依赖源码包 `Quicker-Text-<版本>-Source-deps.zip`；本文只处理已经发出去的 0.3.1。
 
 ## 许可证声明
 
@@ -21,6 +21,8 @@ Quicker Text 0.3.1 的整个项目，包括自研代码和静态纳入的 espans
 
 其他依赖（Rust crates、npm 包）各自保留自己的许可证，不因本声明改变。仓库用 `cargo deny` 对 Rust 依赖的许可证做兼容性检查，说明见 [第三方声明](../THIRD_PARTY_NOTICES.md)。
 
+对 0.3.1 发布包的另一处更正：0.3.1 的包里只有 `THIRD_PARTY_NOTICES.md`（espanso 的声明），没有随包提供各个 Rust crate 与 npm 包的版权和许可证原文，而 MIT、BSD、Apache-2.0 等许可证要求这些声明随二进制文件一起分发。补救办法是补发 `THIRD-PARTY-LICENSES.txt`：用当前仓库的 `scripts/generate-third-party-licenses.ps1 -ProjectRoot <0.3.1 的快照目录>` 按 0.3.1 的锁文件生成（2026-10-22 试过：286 个 crate 加 5 个 npm 包，每个包都有许可证文字；同一快照的依赖源码包也试做过，约 104 MB），放在 0.3.1 的发布页面。步骤见发布清单第 3 节。
+
 ## 获取 0.3.1 的对应源码
 
 下面三种方式，核实完成前请以第一种为准。
@@ -29,7 +31,7 @@ Quicker Text 0.3.1 的整个项目，包括自研代码和静态纳入的 espans
 2. 单独发布的源码包 `Quicker-Text-0.3.1-Source.zip`【待核实：0.3.1 是否单独发布；发布位置；SHA256 `……`】。0.3.1 若没有单独发布源码包，把绿色包内 `source/` 目录另行打成 ZIP 放到发布页面即可，不需要重新构建。
 3. 版本库快照：提交 `b359598`（`chore: 0.3.1 baseline`，2026-10-22）的源码树。它与已发布包的差别应当只有 `LICENSE`、`README.md`、`THIRD_PARTY_NOTICES.md` 以及 `package.json` 的 `license` 字段，这几处在 2026-10-22 已改为 GPL-3.0-or-later 口径【待核实：把已发布包的 `source/` 与该提交逐文件比较，记录差异】。版本库目前没有 `v0.3.1` 标签；比较完成后建议在该提交上补打标签，让「0.3.1 的源码」有固定的指向。
 
-依赖的源码：crates.io 与 npm 的依赖没有复制进 `source/`。它们的确切版本和校验和由 `Cargo.lock` 与 `package-lock.json` 固定，构建时从 crates.io 与 npm 下载。要不要把这些依赖的源码也随包提供（例如 `cargo vendor`），是尚未做出的决定，见发布清单的「依赖源码的可获得性」一节。在做出决定之前，本文不声称依赖源码已随包提供。
+依赖的源码：0.3.1 的 `source/` 没有复制 crates.io 与 npm 的依赖，它们的确切版本和校验和由 `Cargo.lock` 与 `package-lock.json` 固定。GPL 的对应源码包括编进二进制文件的这些依赖，所以不能只靠锁文件：要为 0.3.1 补发依赖源码包 `Quicker-Text-0.3.1-Source-deps.zip`，与上面的源码一起构成完整的对应源码。生成方法：把 `b359598` 的快照解到新目录，运行 `npm ci`、`cargo fetch --locked`，再用当前仓库的 `scripts/package-dependency-sources.ps1 -ProjectRoot <快照目录> -OutputDirectory <新目录>`（步骤见发布清单第 3 节）。【待核实：包生成并上传到 0.3.1 的发布页面之前，本文不声称依赖源码已经提供；上传后在这里写上位置和 SHA256】
 
 ## 从源码重建 0.3.1
 
@@ -45,11 +47,13 @@ cargo build -p quicker-text --release
 
 得到 `target\release\quicker-text.exe`。重新生成绿色包：`./scripts/package-portable.ps1 -OutputDirectory <新目录>`（输出目录必须是新目录，脚本不会覆盖已有交付包）。更详细的步骤见 `docs/build-verification.md`。
 
-不承诺重建的 exe 与已发布的 exe 逐字节相同：编译器版本、构建路径和依赖下载时间都会影响结果。承诺的是：源码、构建脚本和依赖版本清单足以重新构建出功能相同的程序。
+注册中心上取不到依赖时，用 `Quicker-Text-0.3.1-Source-deps.zip`（补发之后）：与上面的源码解到同一个目录，按其中的 `README-OFFLINE-BUILD.md` 把 `cargo-vendor` 目录和 `cargo-config.toml` 接到工程上，Rust 部分用 `cargo build -p quicker-text --release --locked --offline` 完全离线构建。前端的运行时依赖在 `npm/node_modules`；TypeScript、React 插件、Tauri CLI 这些构建工具不属于程序本身，不在包内，仍需 `npm ci` 从 npm 获取。
+
+不承诺重建的 exe 与已发布的 exe 逐字节相同：编译器版本、构建路径和依赖下载时间都会影响结果。承诺的是：源码、依赖源码、构建脚本和依赖版本清单足以重新构建出功能相同的程序。
 
 ## 待办汇总（维护者）
 
 - 对照已发布的 0.3.1 文件，核实带【待核实】的条目，补上源码包的位置与 SHA256。
 - 把本文贴到 0.3.1 的发布页面，或在页面中链接到它。
 - 给版本库中对应的提交补打 `v0.3.1` 标签。
-- 决定依赖源码是否随发布提供（发布清单「依赖源码的可获得性」）。
+- 为 0.3.1 补发 `Source-deps.zip` 和 `THIRD-PARTY-LICENSES.txt`（发布清单第 3 节第一项），上传到 0.3.1 的发布页面，把位置和 SHA256 写进本文。
