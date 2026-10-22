@@ -26,7 +26,7 @@ use crate::{
         replace_file,
     },
 };
-use quicker_domain::{compile_config, Config, Severity};
+use quicker_domain::{compile_config, read_stored_config, Config, Severity, StoredConfigError};
 use quicker_platform::{
     health::{HealthSnapshot, PauseReasons},
     runtime::Runtime,
@@ -477,11 +477,19 @@ pub enum FileState {
         kind: String,
         os_code: Option<i32>,
     },
-    /// Position only: serde's message quotes the offending value.
+    /// Position only: the parser's message quotes the offending value.
+    /// `category` is serde's (`io`, `syntax`, `data`, `eof`) for prefs.json,
+    /// and the store loader's reason code (`config_malformed`,
+    /// `schema_version`) for active.json and draft.json.
     Unparsable {
         category: &'static str,
         line: usize,
         column: usize,
+    },
+    /// active.json or draft.json written by a newer release. It is not
+    /// damaged: the app opens read-only (SafeMode(NewerSchema)) and keeps it.
+    NewerSchema {
+        version: u64,
     },
 }
 
@@ -539,11 +547,38 @@ pub fn summarize(data_dir: &Path) -> ConfigSummary {
     }
 }
 
+/// active.json and draft.json are read by the store loader's own reader,
+/// `read_stored_config` (lenient, past a UTF-8 BOM), so the bundle shows
+/// what startup concludes about the same bytes. Only the reading is shared:
+/// nothing is migrated, written back or quarantined here.
 fn config_file(path: &Path) -> ConfigFile {
-    let (file, config) = read_json::<Config>(path);
+    let (file, config) = read_file(path, |bytes| {
+        read_stored_config(bytes)
+            .map(|stored| stored.config)
+            .map_err(|e| stored_config_error(&e))
+    });
     ConfigFile {
         file,
         counts: config.as_ref().map(count),
+    }
+}
+
+/// The loader's verdict under the code it logs (`store.corrupt`,
+/// `store.newer_schema`). A JSON error keeps the loader's line and column,
+/// which count from after a BOM.
+fn stored_config_error(e: &StoredConfigError) -> FileState {
+    match e {
+        StoredConfigError::NewerSchema { version } => FileState::NewerSchema { version: *version },
+        StoredConfigError::Malformed { span, .. } => FileState::Unparsable {
+            category: e.code(),
+            line: span.line,
+            column: span.column,
+        },
+        StoredConfigError::UnsupportedVersion => FileState::Unparsable {
+            category: e.code(),
+            line: 0,
+            column: 0,
+        },
     }
 }
 
@@ -551,16 +586,26 @@ fn config_file(path: &Path) -> ConfigFile {
 /// UTF-8 BOM), so the bundle and the app agree on whether it parses. As a
 /// `Value`, not `Prefs`: the bundle reports the file, it does not apply it.
 fn prefs_file(path: &Path) -> (FileState, Option<serde_json::Value>) {
-    read_json_with(path, parse_prefs)
+    read_file(path, |bytes| parse_prefs(bytes).map_err(|e| json_error(&e)))
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> (FileState, Option<T>) {
-    read_json_with(path, |bytes: &[u8]| serde_json::from_slice(bytes))
+fn json_error(e: &serde_json::Error) -> FileState {
+    let category = match e.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "eof",
+    };
+    FileState::Unparsable {
+        category,
+        line: e.line(),
+        column: e.column(),
+    }
 }
 
-fn read_json_with<T>(
+fn read_file<T>(
     path: &Path,
-    parse: impl FnOnce(&[u8]) -> serde_json::Result<T>,
+    parse: impl FnOnce(&[u8]) -> Result<T, FileState>,
 ) -> (FileState, Option<T>) {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -575,20 +620,7 @@ fn read_json_with<T>(
     };
     match parse(&bytes) {
         Ok(value) => (FileState::Ok, Some(value)),
-        Err(e) => {
-            let category = match e.classify() {
-                serde_json::error::Category::Io => "io",
-                serde_json::error::Category::Syntax => "syntax",
-                serde_json::error::Category::Data => "data",
-                serde_json::error::Category::Eof => "eof",
-            };
-            let state = FileState::Unparsable {
-                category,
-                line: e.line(),
-                column: e.column(),
-            };
-            (state, None)
-        }
+        Err(state) => (state, None),
     }
 }
 
@@ -1243,10 +1275,12 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// What Notepad puts at the start of a file it saves as UTF-8.
+    const BOM: &[u8] = b"\xEF\xBB\xBF";
+
     #[test]
     fn prefs_with_a_bom_parse_in_the_bundle_as_they_load() {
         use crate::store::prefs::{load_prefs, Prefs};
-        const BOM: &[u8] = b"\xEF\xBB\xBF";
         let mut prefs = Prefs::default();
         prefs.app.auto_listen_on_start = true;
         prefs.ui = serde_json::json!({ "theme": "dark" });
@@ -1273,6 +1307,122 @@ mod tests {
             let state = serde_json::to_value(summarize(&dir).prefs).unwrap();
             assert_eq!(state["status"], "unparsable", "{state}");
             assert_eq!(state["category"], "eof", "{state}");
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn configurations_with_a_bom_read_in_the_bundle_as_they_load() {
+        use crate::store::Store;
+        let active = sentinel_config();
+        let mut draft = sentinel_config();
+        draft.rules.push(Rule {
+            id: "third".into(),
+            ..Rule::default()
+        });
+        for bom in [BOM, &b""[..]] {
+            let with_bom = !bom.is_empty();
+            let dir = temp_dir();
+            for (name, config) in [("active.json", &active), ("draft.json", &draft)] {
+                let json = serde_json::to_vec_pretty(config).unwrap();
+                fs::write(dir.join(name), [bom, &json[..]].concat()).unwrap();
+            }
+            let summary = serde_json::to_value(summarize(&dir)).unwrap();
+            // Startup reads the same two files, uses both and keeps them.
+            let store = Store::load(dir.clone());
+            assert_eq!(store.safe_mode(), None, "BOM: {with_bom}");
+            assert_eq!(store.active.rules.len(), 2, "BOM: {with_bom}");
+            assert_eq!(store.draft.rules.len(), 3, "BOM: {with_bom}");
+            assert_eq!(summarize(&dir).quarantined_files, 0, "BOM: {with_bom}");
+            for (name, loaded) in [("active", &store.active), ("draft", &store.draft)] {
+                let entry = &summary[name];
+                assert_eq!(entry["file"]["status"], "ok", "{name}, BOM: {with_bom}");
+                assert_eq!(
+                    entry["counts"],
+                    serde_json::to_value(count(loaded)).unwrap(),
+                    "{name}, BOM: {with_bom}"
+                );
+            }
+            assert_eq!(summary["active"]["counts"]["rules"], 2);
+            assert_eq!(summary["draft"]["counts"]["rules"], 3);
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_field_startup_resets_does_not_make_the_configuration_unparsable() {
+        use crate::store::Store;
+        let mut config = serde_json::to_value(sentinel_config()).unwrap();
+        config["enabled"] = "yes".into();
+        let dir = temp_dir();
+        fs::write(dir.join("active.json"), config.to_string()).unwrap();
+        let summary = serde_json::to_value(summarize(&dir)).unwrap();
+        // Startup reads it leniently: the field takes its default.
+        let store = Store::load(dir.clone());
+        assert_eq!(store.safe_mode(), None);
+        assert_eq!(summarize(&dir).quarantined_files, 0);
+        assert_eq!(summary["active"]["file"]["status"], "ok");
+        assert_eq!(
+            summary["active"]["counts"],
+            serde_json::to_value(count(&store.active)).unwrap()
+        );
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn damaged_configurations_are_unparsable_where_the_loader_says() {
+        let damaged = &b"{\"version\":1,\n\"rules\":["[..];
+        for bom in [BOM, &b""[..]] {
+            let with_bom = !bom.is_empty();
+            let dir = temp_dir();
+            let bytes = [bom, damaged].concat();
+            fs::write(dir.join("active.json"), &bytes).unwrap();
+            fs::write(dir.join("draft.json"), &bytes).unwrap();
+            let loader = read_stored_config(&bytes).unwrap_err().diagnostic();
+            let summary = serde_json::to_value(summarize(&dir)).unwrap();
+            for name in ["active", "draft"] {
+                let file = &summary[name]["file"];
+                assert_eq!(file["status"], "unparsable", "{name}, BOM: {with_bom}");
+                assert_eq!(file["category"], loader.code, "{name}, BOM: {with_bom}");
+                assert_eq!(file["category"], "config_malformed");
+                // Counted after the BOM, as the loader counts.
+                assert_eq!(file["line"], loader.span.line, "{name}, BOM: {with_bom}");
+                assert_eq!(
+                    file["column"], loader.span.column,
+                    "{name}, BOM: {with_bom}"
+                );
+                assert_eq!(file["line"], 2, "{name}, BOM: {with_bom}");
+                assert_eq!(file["column"], 9, "{name}, BOM: {with_bom}");
+                assert!(summary[name].get("counts").is_none());
+            }
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_configuration_from_a_newer_release_shows_as_newer_not_damaged() {
+        use crate::{error::SafeModeReason, store::Store};
+        let version = u64::from(quicker_domain::SUPPORTED_SCHEMA_VERSION) + 1;
+        let mut newer = serde_json::to_value(sentinel_config()).unwrap();
+        newer["version"] = version.into();
+        let json = serde_json::to_vec(&newer).unwrap();
+        for bom in [BOM, &b""[..]] {
+            let with_bom = !bom.is_empty();
+            let dir = temp_dir();
+            fs::write(dir.join("active.json"), [bom, &json[..]].concat()).unwrap();
+            let summary = serde_json::to_value(summarize(&dir)).unwrap();
+            assert_eq!(
+                summary["active"],
+                serde_json::json!({ "file": { "status": "newer_schema", "version": version } }),
+                "BOM: {with_bom}"
+            );
+            // Startup opens read-only and leaves the file where it is.
+            let store = Store::load(dir.clone());
+            assert_eq!(store.safe_mode(), Some(SafeModeReason::NewerSchema));
+            assert!(dir.join("active.json").exists(), "BOM: {with_bom}");
+            drop(store);
             fs::remove_dir_all(dir).unwrap();
         }
     }

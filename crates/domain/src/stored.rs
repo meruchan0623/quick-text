@@ -66,7 +66,7 @@ impl std::error::Error for StoredConfigError {}
 /// does not read is kept verbatim in [`Config::unreadable_rules`], and unknown fields stay in
 /// `extra`; each of these is a warning. Writing the result back keeps everything it kept.
 pub fn read_stored_config(bytes: &[u8]) -> Result<StoredConfig, StoredConfigError> {
-    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let bytes = strip_utf8_bom(bytes);
     let text = std::str::from_utf8(bytes).map_err(|e| StoredConfigError::Malformed {
         message: e.to_string(),
         span: SourceSpan::default(),
@@ -100,6 +100,13 @@ pub fn read_stored_config(bytes: &[u8]) -> Result<StoredConfig, StoredConfigErro
         config,
         diagnostics,
     })
+}
+
+/// Skips a leading UTF-8 byte order mark (Notepad writes one). The one place that does so for
+/// every stored JSON file: [`read_stored_config`] here, and in the host the `prefs.json` reader
+/// that the diagnostics bundle shares. Error positions count from after the mark.
+pub fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

@@ -8,6 +8,7 @@
 
 use super::atomic::atomic_json;
 use crate::error::{file_label, CommandError, IoOp};
+use quicker_domain::strip_utf8_bom;
 use quicker_platform::{
     clipboard_options::set_lease_options,
     traits::{LeaseOptions, RestorePolicy, DEFAULT_RESTORE_DELAY},
@@ -282,10 +283,11 @@ fn load_unlocked(dir: &Path, after_read: impl FnOnce()) -> Result<Prefs, Command
 }
 
 /// Parses `prefs.json` as every load does: a leading UTF-8 BOM (Notepad
-/// writes one) is skipped. The diagnostics bundle parses with this too, so
-/// a file the app reads never shows there as unparsable.
+/// writes one) is skipped, by the same `strip_utf8_bom` the configuration
+/// reader uses. The diagnostics bundle parses with this too, so a file the
+/// app reads never shows there as unparsable.
 pub(crate) fn parse_prefs<T: DeserializeOwned>(bytes: &[u8]) -> serde_json::Result<T> {
-    serde_json::from_slice(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes))
+    serde_json::from_slice(strip_utf8_bom(bytes))
 }
 
 /// Writes `prefs.json` atomically (temp file + replace), unknown fields
