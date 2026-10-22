@@ -2155,14 +2155,3 @@ pub fn execute(
     *s.last.lock().unwrap() = Some(result.clone());
     Ok(result)
 }
-pub fn platform_capabilities() -> Vec<Capability> {
-    let ready = native_ready();
-    let reason=ready.as_ref().err().cloned().unwrap_or_else(||"macOS native adapter available; target consumption and real-device acceptance remain unverified".into());
-    ["keyboard_hook","keys","paste","html","file_clipboard","image_clipboard","mouse","recording","foreground","open"].into_iter().map(|id|Capability{id:id.into(),available:ready.is_ok(),reason:reason.clone()}).chain([
-        Capability{id:"ime_committed_text".into(),available:false,reason:"IME input sources are rejected; global committed CJK text is not observable safely".into()},
-        Capability{id:"wheel_delta".into(),available:false,reason:"Windows 1/120-click delta has no verified macOS mapping; choose clicks".into()},
-        Capability{id:"media_system_actions".into(),available:ready.is_ok(),reason:"NSEvent system-defined media/volume/brightness adapter; hardware/player response requires real-device acceptance".into()},
-        Capability{id:"window_ime_actions".into(),available:false,reason:"Arbitrary window management and IME switching require dedicated adapters".into()},
-        Capability{id:"quicker_private_action".into(),available:false,reason:"Requires explicit migration; no Quicker private protocol bridge".into()}
-    ]).collect()
-}
