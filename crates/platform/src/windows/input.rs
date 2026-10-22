@@ -614,6 +614,11 @@ pub(super) struct Sources<'a, P: SourcePorts, C: Clock> {
     /// The engine whose typed prefix a lost or reattached source
     /// invalidates (H3); bound once, before the sources start.
     engine: OnceLock<Arc<Shared>>,
+    /// Published by [`Liveness::tick`]: RawInput saw at least one physical
+    /// key the keyboard hook missed since the two last agreed on a key
+    /// ([`CrossCheck::missed`]), even if too few for a verdict. Read by the
+    /// `hook_heartbeat` self-test check without any lock (review A5).
+    hook_gap: AtomicBool,
 }
 impl<'a, P: SourcePorts, C: Clock> Sources<'a, P, C> {
     pub(super) const fn new(ports: &'a P, clock: &'a C, signals: &'a SessionSignals) -> Self {
@@ -626,7 +631,14 @@ impl<'a, P: SourcePorts, C: Clock> Sources<'a, P, C> {
             started: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
             engine: OnceLock::new(),
+            hook_gap: AtomicBool::new(false),
         }
+    }
+    /// Whether the cross-check holds evidence that the keyboard hook missed
+    /// a physical key since it last delivered one RawInput also saw (see
+    /// `hook_gap`). An atomic load: never waits for the consumer.
+    pub(super) fn hook_gap(&self) -> bool {
+        self.hook_gap.load(Ordering::SeqCst)
     }
     /// Binds the engine whose prefix a source loss invalidates.
     pub(super) fn bind(&self, shared: &Arc<Shared>) {
@@ -892,6 +904,11 @@ impl<'a, P: SourcePorts, C: Clock> Liveness<'a, P, C> {
         while let Some(verdict) = self.check.expire(now) {
             self.act(shared, verdict);
         }
+        // Published after the verdicts, which are unchanged: a verdict (and
+        // its reattach) starts the miss count again.
+        self.sources
+            .hook_gap
+            .store(self.check.missed(Source::Hook), Ordering::SeqCst);
         self.check.next_due()
     }
     fn inject_faults(&self) {
@@ -1060,6 +1077,11 @@ pub fn input_health() -> Vec<ComponentHealth> {
 /// while the health table is held elsewhere.
 pub fn try_input_health() -> Option<Vec<ComponentHealth>> {
     SOURCES.try_health()
+}
+/// [`Sources::hook_gap`] of the production sources, for the
+/// `hook_heartbeat` self-test check.
+pub(super) fn hook_gap() -> bool {
+    SOURCES.hook_gap()
 }
 /// Re-installs one input component (one attempt; blocks up to a few
 /// seconds). Errors for components that are not input sources and before

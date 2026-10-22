@@ -3420,3 +3420,84 @@ fn without_a_sink_busy_keys_have_no_effect() {
     rig.busy(false);
     assert_eq!(rig.enter("qzx").len(), 1);
 }
+
+/// The `hook_heartbeat` self-test check on these sources: the production
+/// decision, with the hook thread answering its ping.
+fn heartbeat(sources: &Sources<'_, FakeSources, FakeClock>) -> Result<(), ReasonCode> {
+    super::self_test_probes::hook_verdict(&sources.health(), sources.hook_gap(), || true)
+}
+
+/// Review A5: after the HookUnhook fault the health table still says
+/// Healthy and the hook thread still answers, until the cross-check reaches
+/// a verdict at K keys. One physical key RawInput saw and the hook missed
+/// is already enough for `hook_heartbeat` to fail with `hook_missing`. The
+/// verdict and the reinstall still come at K keys, and the reinstalled hook
+/// starts with no gap.
+#[test]
+fn hook_heartbeat_fails_once_raw_input_saw_a_key_the_removed_hook_missed() {
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    sources.start();
+    let mut liveness = Liveness::new(&sources);
+    let mut pipe = Pipeline::new();
+    pipe.type_keys(&fake, &clock, &mut liveness, 3);
+    pipe.settle(&clock, &mut liveness);
+    assert_eq!(heartbeat(&sources), Ok(()), "both sources agree");
+    break_source(
+        &mut pipe,
+        &mut liveness,
+        &fake,
+        crate::fault::FaultPoint::HookUnhook,
+    );
+    // One key, RawInput only. Inside the match window it is not missed yet.
+    pipe.press(&fake);
+    pipe.tick(&mut liveness);
+    assert_eq!(heartbeat(&sources), Ok(()), "not missed yet");
+    let (_, lines) = capture::logs(|| pipe.settle(&clock, &mut liveness));
+    assert_eq!(count_of(&lines, "input."), 0, "no verdict yet: {lines:?}");
+    assert!(sources.hooks_ready(), "the table still says healthy");
+    assert_eq!(heartbeat(&sources), Err(ReasonCode::HookMissing));
+    // Unchanged: the verdict and the reinstall come at K keys.
+    let (_, lines) = capture::logs(|| {
+        pipe.type_keys(&fake, &clock, &mut liveness, MISS_LIMIT - 1);
+        pipe.settle(&clock, &mut liveness)
+    });
+    assert_eq!(
+        count_of(
+            &lines,
+            r#"event="input.reattach" component="keyboard_hook" reason="hook_missing" ok=true"#
+        ),
+        1,
+        "{lines:?}"
+    );
+    assert!(fake.hooked(HookSet::KEYBOARD) && sources.hooks_ready());
+    assert_eq!(heartbeat(&sources), Ok(()), "the reinstalled hook");
+}
+
+/// Review A5, the limit of the check, pinned: a hook removed with no
+/// physical key since leaves no evidence. The table says Healthy, the hook
+/// thread answers and the cross-check has nothing to compare, so
+/// `hook_heartbeat` passes however long ago it happened. The cross-check
+/// finds the loss on the keys that follow (see the test above).
+#[test]
+fn hook_heartbeat_passes_for_a_removed_hook_with_no_key_since() {
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    sources.start();
+    let mut liveness = Liveness::new(&sources);
+    let mut pipe = Pipeline::new();
+    break_source(
+        &mut pipe,
+        &mut liveness,
+        &fake,
+        crate::fault::FaultPoint::HookUnhook,
+    );
+    pipe.tick(&mut liveness);
+    for _ in 0..4 {
+        pipe.settle(&clock, &mut liveness);
+    }
+    assert!(!fake.hooked(HookSet::KEYBOARD), "the hook is gone");
+    assert_eq!(heartbeat(&sources), Ok(()), "undetectable without input");
+}

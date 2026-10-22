@@ -80,17 +80,36 @@ fn raw_input() -> ProbeResult {
     }
 }
 
-/// Both low-level hooks are Healthy and the hook thread answers a message.
+/// Both low-level hooks are Healthy, the hook thread answers a message and
+/// the hook has not missed a physical key since the last one it delivered
+/// (see [`hook_verdict`]).
 fn hook_heartbeat() -> ProbeResult {
+    let table = input_table().ok_or(ReasonCode::HookMissing)?;
+    hook_verdict(&table, input::hook_gap(), || hook::ping(PROBE_WAIT))
+}
+
+/// The decision behind [`hook_heartbeat`], given the input health table,
+/// the cross-check's delivery-gap flag (`Sources::hook_gap`) and the hook
+/// thread ping. Fails with the component's reason, else `hook_missing`.
+///
+/// Review A5: a hook Windows removed silently stays Healthy in the table
+/// until the cross-check reaches a verdict (`MISS_LIMIT` keys), and the
+/// hook thread still answers. The gap flag catches it from the first
+/// physical key RawInput saw and the hook missed. A hook removed with no
+/// physical key since cannot be told apart from a working one: the check
+/// passes, and the cross-check finds it on the keys that follow.
+pub(super) fn hook_verdict(
+    table: &[ComponentHealth],
+    gap: bool,
+    ping: impl FnOnce() -> bool,
+) -> ProbeResult {
     let missing = ReasonCode::HookMissing;
-    let table = input_table().ok_or(missing)?;
-    healthy(&table, Component::KeyboardHook, missing)?;
-    healthy(&table, Component::MouseHook, missing)?;
-    if hook::ping(PROBE_WAIT) {
-        Ok(())
-    } else {
-        Err(missing)
+    healthy(table, Component::KeyboardHook, missing)?;
+    healthy(table, Component::MouseHook, missing)?;
+    if gap || !ping() {
+        return Err(missing);
     }
+    Ok(())
 }
 
 /// A foreground window exists and belongs to a process we can name by id.
