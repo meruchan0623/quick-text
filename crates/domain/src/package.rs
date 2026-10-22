@@ -425,7 +425,11 @@ fn import_quicker_commands(entries: &[serde_json::Value]) -> Result<ImportReport
             item.diagnostics.extend(diagnostics.iter().cloned());
             report.config.rules[index].enabled = false;
         }
-        if entries[index].get("BindingProcessName").and_then(|v| v.as_str()).is_some_and(|v| !v.is_empty()) {
+        if entries[index]
+            .get("BindingProcessName")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.is_empty())
+        {
             let mut warning = quicker_diagnostic("quicker_process_binding_ignored", "Program restrictions were removed; BindingProcessName is retained only as migration metadata");
             warning.severity = Severity::Warning;
             item.diagnostics.push(warning);

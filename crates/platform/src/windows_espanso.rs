@@ -723,8 +723,13 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-            let (matched, key) =
-                match_buffer(&compiler, "Qt12;", Some(("Qt12", "semicolon")), &foreground_context).unwrap();
+            let (matched, key) = match_buffer(
+                &compiler,
+                "Qt12;",
+                Some(("Qt12", "semicolon")),
+                &foreground_context,
+            )
+            .unwrap();
             assert_eq!(matched.rule_id, "terminated");
             assert_eq!(key, Some("semicolon"));
             assert_eq!(matched.consume_terminator, consume);
@@ -741,8 +746,13 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let (matched, key) =
-            match_buffer(&compiler, "Qt12;", Some(("Qt12", "semicolon")), &foreground_context).unwrap();
+        let (matched, key) = match_buffer(
+            &compiler,
+            "Qt12;",
+            Some(("Qt12", "semicolon")),
+            &foreground_context,
+        )
+        .unwrap();
         assert_eq!(matched.rule_id, "immediate");
         assert_eq!(matched.matched, "Qt12;");
         assert_eq!(matched.erase_chars, 5);
@@ -773,12 +783,23 @@ mod tests {
             process: "NOTEPAD.EXE".into(),
             ..Default::default()
         };
-        let (matched, term) =
-            match_buffer(&compiler, "Qt12; ", Some(("Qt12;", "space")), &foreground_context).unwrap();
+        let (matched, term) = match_buffer(
+            &compiler,
+            "Qt12; ",
+            Some(("Qt12;", "space")),
+            &foreground_context,
+        )
+        .unwrap();
         assert_eq!(term, Some("space"));
         assert!(!matched.consume_terminator);
         assert_eq!(matched.erase_chars, 5);
-        assert!(match_buffer(&compiler, "qt12; ", Some(("qt12;", "space")), &foreground_context).is_none());
+        assert!(match_buffer(
+            &compiler,
+            "qt12; ",
+            Some(("qt12;", "space")),
+            &foreground_context
+        )
+        .is_none());
         assert!(match_buffer(&compiler, "Qt12;", None, &foreground_context).is_none());
         assert!(match_buffer(
             &compiler,

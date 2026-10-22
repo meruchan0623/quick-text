@@ -210,7 +210,11 @@ fn legacy_program_restrictions_are_ignored_after_import_save_and_reload() {
     assert!(!saved.contains("scope"));
     let reloaded: Config = serde_json::from_str(&saved).unwrap();
     let package = export_package(&report.config).unwrap();
-    assert!(serde_json::from_str::<serde_json::Value>(&package).unwrap()["config"]["rules"][0].get("scope").is_none());
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&package).unwrap()["config"]["rules"][0]
+            .get("scope")
+            .is_none()
+    );
     let package_reloaded = import_package(&package).unwrap().config;
     let mac = ForegroundContext {
         platform: Platform::Macos,
@@ -220,12 +224,16 @@ fn legacy_program_restrictions_are_ignored_after_import_save_and_reload() {
     for mut config in [directly_loaded, reloaded, package_reloaded] {
         let compiler = compile_config(&config).unwrap();
         for foreground in [&context(), &mac] {
-            assert!(compiler.match_input("a", Some("space"), foreground).is_some());
+            assert!(compiler
+                .match_input("a", Some("space"), foreground)
+                .is_some());
         }
         config.globals.blacklist = vec!["TEST.EXE".into(), "COM.TEST".into()];
         let compiler = compile_config(&config).unwrap();
         for foreground in [&context(), &mac] {
-            assert!(compiler.match_input("a", Some("space"), foreground).is_none());
+            assert!(compiler
+                .match_input("a", Some("space"), foreground)
+                .is_none());
         }
     }
 }

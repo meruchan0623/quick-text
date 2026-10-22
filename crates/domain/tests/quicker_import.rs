@@ -295,17 +295,28 @@ fn removed_quicker_process_binding_is_metadata_only() {
         let report = import(vec![original.clone()]);
         assert!(report.config.rules[0].enabled);
         assert_eq!(report.items[0].status, MigrationStatus::Compatible);
-        assert!(report.items[0].diagnostics.iter().any(|d| d.code == "quicker_process_binding_ignored" && d.severity == Severity::Warning));
+        assert!(report.items[0].diagnostics.iter().any(|d| d.code
+            == "quicker_process_binding_ignored"
+            && d.severity == Severity::Warning));
         let package = export_package_with_unresolved(&report.config, report.unresolved).unwrap();
         let reimported = import_package(&package).unwrap();
         assert_eq!(reimported.unresolved[0].original, original);
         assert!(reimported.config.rules[0].enabled);
         let compiler = compile_config(&reimported.config).unwrap();
         for foreground in [
-            ForegroundContext { process: "test.exe".into(), ..Default::default() },
-            ForegroundContext { platform: Platform::Macos, bundle_id: "com.test".into(), ..Default::default() },
+            ForegroundContext {
+                process: "test.exe".into(),
+                ..Default::default()
+            },
+            ForegroundContext {
+                platform: Platform::Macos,
+                bundle_id: "com.test".into(),
+                ..Default::default()
+            },
         ] {
-            assert!(compiler.match_input("synthetic-trigger", None, &foreground).is_some());
+            assert!(compiler
+                .match_input("synthetic-trigger", None, &foreground)
+                .is_some());
         }
     }
 }

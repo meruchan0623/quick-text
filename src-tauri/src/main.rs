@@ -837,15 +837,14 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             // Release isolation is available only in the explicit input acceptance mode.
-            let acceptance_dir = if cfg!(debug_assertions)
-                || quicker_platform::acceptance_test_input_enabled()
-            {
-                std::env::var_os("QUICKER_TEXT_DATA_DIR")
-                    .filter(|value| !value.is_empty())
-                    .map(PathBuf::from)
-            } else {
-                None
-            };
+            let acceptance_dir =
+                if cfg!(debug_assertions) || quicker_platform::acceptance_test_input_enabled() {
+                    std::env::var_os("QUICKER_TEXT_DATA_DIR")
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                } else {
+                    None
+                };
             let dir = match acceptance_dir {
                 Some(dir) => dir,
                 None => app.path().app_data_dir()?,
