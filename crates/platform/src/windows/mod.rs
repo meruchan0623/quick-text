@@ -76,3 +76,4 @@ pub fn start_engine(shared: Arc<Shared>) -> Result<(), String> {
 pub use executor::{executor_control, ManualBusy};
 #[cfg(test)]
 mod pipeline_tests_executor;
+pub use input::try_input_health;

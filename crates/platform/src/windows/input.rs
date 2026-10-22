@@ -704,8 +704,22 @@ impl<'a, P: SourcePorts, C: Clock> Sources<'a, P, C> {
     /// `Starting` and no system call is made; afterwards a detector window
     /// that disappeared is reported at once.
     pub(super) fn health(&self) -> Vec<ComponentHealth> {
+        let table = self.table();
+        self.health_locked(table)
+    }
+    /// [`Sources::health`] without waiting for the table: `None` while
+    /// another thread holds it (the supervisor adapter then reuses the last
+    /// value, see the `InputSources` contract).
+    pub(super) fn try_health(&self) -> Option<Vec<ComponentHealth>> {
+        let table = match self.table.try_lock() {
+            Ok(table) => table,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(self.health_locked(table))
+    }
+    fn health_locked(&self, mut table: MutexGuard<'_, HealthTable>) -> Vec<ComponentHealth> {
         let now = self.clock.wall_ms();
-        let mut table = self.table();
         let raw_healthy = table
             .get(Component::RawInput)
             .is_some_and(|entry| entry.state == HealthState::Healthy);
@@ -1042,6 +1056,11 @@ pub(crate) fn start_input_sources(shared: Arc<Shared>) -> Result<(), String> {
 pub fn input_health() -> Vec<ComponentHealth> {
     SOURCES.health()
 }
+/// [`input_health`] for the supervisor's tick, which must not block: `None`
+/// while the health table is held elsewhere.
+pub fn try_input_health() -> Option<Vec<ComponentHealth>> {
+    SOURCES.try_health()
+}
 /// Re-installs one input component (one attempt; blocks up to a few
 /// seconds). Errors for components that are not input sources and before
 /// the engine starts.
@@ -1107,5 +1126,20 @@ mod tests {
         assert_eq!(delta(&mut seen, 3), 3);
         assert_eq!(delta(&mut seen, 3), 0);
         assert_eq!(delta(&mut seen, 5), 2);
+    }
+
+    /// The supervisor's read never waits for the health table (P5).
+    #[test]
+    fn try_input_health_does_not_wait_for_the_table() {
+        let held = SOURCES.table();
+        assert!(try_input_health().is_none());
+        drop(held);
+        let states = |health: Vec<ComponentHealth>| {
+            health
+                .into_iter()
+                .map(|h| (h.component, h.state, h.reason))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(try_input_health().map(states), Some(states(input_health())));
     }
 }

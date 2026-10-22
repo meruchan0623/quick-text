@@ -11,7 +11,6 @@ mod store;
 mod tray;
 
 use app_state::{DataDir, Managed};
-use quicker_platform::ExecutionResult;
 use std::{path::PathBuf, sync::Arc};
 use tauri::Manager;
 
@@ -63,15 +62,7 @@ fn main() {
             app.manage(Managed::new(store));
             startup::after_load(app.handle());
             tray::spawn_status_watcher(app.handle().clone(), engine.clone());
-            if let Err(message) = quicker_platform::start_engine(engine.clone()) {
-                *engine.last.lock().unwrap() = Some(ExecutionResult {
-                    id: "engine".into(),
-                    status: "blocked".into(),
-                    message,
-                    completed_steps: 0,
-                    side_effects: false,
-                });
-            }
+            startup::start_engine(engine);
             tray::build(app)?;
             if std::env::args().any(|x| x == "--background") {
                 if let Some(w) = app.get_webview_window("main") {

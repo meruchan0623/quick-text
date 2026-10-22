@@ -7,8 +7,13 @@ use crate::{
     error::SafeModeReason,
     store::{self, RecoverySource, Store, StoreEnv},
 };
+use quicker_platform::{runtime, supervisor_wiring, ExecutionResult, Shared};
 use serde::Serialize;
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{Arc, PoisonError},
+    time::Duration,
+};
 use tauri::{AppHandle, Manager, RunEvent};
 
 /// One problem found while starting: `{ kind, severity, args }`.
@@ -106,12 +111,51 @@ pub fn defer_autostart_repair(
     );
 }
 
+/// Starts the engine under supervision (B-03): attaches it to the runtime
+/// (its pause flag becomes the runtime's manual pause), starts the platform
+/// engine, and installs the supervisor on this platform's adapters, which
+/// publishes Health. Until then Health stays Starting and nothing can
+/// resume. The supervisor stops with the engine: at session end (Windows)
+/// and on `RunEvent::Exit` ([`on_run_event`]).
+///
+/// A failed start keeps the legacy `last` message; Health then ends in
+/// Failed (`engine_down`) after the startup attempts instead of staying
+/// Starting.
+pub fn start_engine(engine: Arc<Shared>) {
+    let runtime = runtime::current();
+    runtime.attach(&engine);
+    // Registered before the session window exists; runs on it at
+    // WM_ENDSESSION, so it only sets the shutdown flag.
+    #[cfg(windows)]
+    quicker_platform::on_session_end(Box::new(|| {
+        supervisor_wiring::begin_shutdown(&runtime::current());
+    }));
+    let started = quicker_platform::start_engine(engine.clone());
+    if let Err(message) = &started {
+        tracing::error!(event = "engine.start_failed", error = %message);
+        *engine.last.lock().unwrap_or_else(PoisonError::into_inner) = Some(ExecutionResult {
+            id: "engine".into(),
+            status: "blocked".into(),
+            message: message.clone(),
+            completed_steps: 0,
+            side_effects: false,
+        });
+    }
+    let (executor, inputs) = supervisor_wiring::platform_adapters(&started);
+    let clock = Arc::clone(runtime.clock());
+    supervisor_wiring::install_supervisor(clock, runtime, executor, inputs);
+}
+
 /// Clears the run marker when the event loop ends. tao turns
 /// `WM_ENDSESSION` (session really ending) into `LoopDestroyed`, which Tauri
 /// delivers as `RunEvent::Exit` before the process exits, so shutdown and
 /// Restart Manager are covered as well as `exit_app` and the tray.
+///
+/// The engine shuts down first: the supervisor stops and sees the engine's
+/// teardown as nothing (no rebuild, no Failed while exiting).
 pub fn on_run_event(_app: &AppHandle, event: RunEvent) {
     if let RunEvent::Exit = event {
+        supervisor_wiring::begin_shutdown(&runtime::current());
         store::clear_run_marker_on_session_end();
     }
 }
