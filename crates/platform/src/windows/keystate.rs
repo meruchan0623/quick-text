@@ -1,8 +1,9 @@
 //! Physical key state mirrored by the low-level hooks.
 //!
-//! B-05: the mirror is a 256-bit atomic bitmap, so the keyboard and mouse
-//! hooks update it without taking a lock and readers never observe a
-//! "contended" mirror. Until the mirror is seeded, readers fall back to the
+//! B-05: the mirror is one atomic state word per virtual-key code, so the
+//! keyboard and mouse hooks update it without taking a lock and readers
+//! never observe a "contended" mirror. H2: each word carries a version, so
+//! consumer-side corrections never overwrite a newer hook transition. Until the mirror is seeded, readers fall back to the
 //! asynchronous key state through [`AsyncKeyProbe`]; tests only use fakes.
 //!
 //! A key-up the hooks never see (secure desktop, a session switch, a hook
@@ -17,6 +18,7 @@
     clippy::indexing_slicing
 )]
 use super::*;
+use std::sync::atomic::AtomicU32;
 
 /// Reads the hardware (asynchronous) key state. The production
 /// implementation wraps `GetAsyncKeyState`; tests use fakes so no test reads
@@ -33,37 +35,71 @@ impl AsyncKeyProbe for SystemAsyncKeys {
     }
 }
 
-/// Virtual-key codes 0..=255 as four atomic words. Codes outside that range
-/// are ignored.
+/// Number of virtual-key codes the mirror tracks (0..=255).
+const KEY_CODES: usize = 256;
+/// Bit 0 of a key's state word: the key is down.
+const DOWN: u32 = 1;
+
+/// The state word after one more transition from `current`: the version
+/// (bits 1..) advances and bit 0 becomes `down`. 31 bits of version wrap
+/// only after 2^31 transitions of one key, far beyond any race window.
+const fn advance(current: u32, down: bool) -> u32 {
+    (current & !DOWN).wrapping_add(2) | down as u32
+}
+
+/// Virtual-key codes 0..=255, one atomic state word per code. Codes outside
+/// that range are ignored.
+///
+/// H2: each word packs the down bit with a version that every transition
+/// advances, so a consumer that sampled a key before probing the
+/// asynchronous state can apply the probe only when nothing happened since
+/// ([`KeyBits::replace_if`]), including a down→up→down (ABA) sequence.
 pub(super) struct KeyBits {
-    words: [AtomicU64; 4],
+    keys: [AtomicU32; KEY_CODES],
     seeded: AtomicBool,
 }
 impl KeyBits {
     pub(super) const fn new() -> Self {
         Self {
-            words: [const { AtomicU64::new(0) }; 4],
+            keys: [const { AtomicU32::new(0) }; KEY_CODES],
             seeded: AtomicBool::new(false),
         }
     }
-    fn slot(&self, vk: u16) -> Option<(&AtomicU64, u64)> {
-        self.words
-            .get(usize::from(vk >> 6))
-            .map(|word| (word, 1u64 << (vk & 63)))
+    fn slot(&self, vk: u16) -> Option<&AtomicU32> {
+        self.keys.get(usize::from(vk))
     }
-    /// Records a key transition. Lock-free; safe on the hook thread.
+    /// Records a key transition. Lock-free and allocation-free (one CAS
+    /// loop); safe on the hook thread. Every call advances the version, so a
+    /// repeated key-down still invalidates an older sample.
     pub(super) fn set(&self, vk: u16, down: bool) {
-        if let Some((word, bit)) = self.slot(vk) {
-            if down {
-                word.fetch_or(bit, Ordering::SeqCst);
-            } else {
-                word.fetch_and(!bit, Ordering::SeqCst);
-            }
+        if let Some(word) = self.slot(vk) {
+            // The closure never returns None, so the update cannot fail.
+            let _ = word.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(advance(current, down))
+            });
         }
     }
+    /// The full state word (down bit plus version) of `vk`; 0 for codes
+    /// outside the mirror.
+    pub(super) fn state(&self, vk: u16) -> u32 {
+        self.slot(vk).map_or(0, |word| word.load(Ordering::SeqCst))
+    }
+    /// Sets `vk` to `down` only if its state is still `seen` (no transition
+    /// since that sample). Returns whether the write happened; on `false`
+    /// the newer transition wins.
+    pub(super) fn replace_if(&self, vk: u16, seen: u32, down: bool) -> bool {
+        self.slot(vk).is_some_and(|word| {
+            word.compare_exchange(
+                seen,
+                advance(seen, down),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        })
+    }
     fn get(&self, vk: u16) -> bool {
-        self.slot(vk)
-            .is_some_and(|(word, bit)| word.load(Ordering::SeqCst) & bit != 0)
+        self.state(vk) & DOWN != 0
     }
     /// The hooks report sided codes, so a generic modifier is held when
     /// either side (or the generic code itself) is.
@@ -85,28 +121,18 @@ impl KeyBits {
     }
     /// Re-reads every code from `probe` and marks the mirror seeded.
     ///
-    /// A bit the hooks changed while its word was being probed keeps the
-    /// hook's value: that transition is newer than the probe sample.
+    /// Each key's state is sampled *before* it is probed, and the probe is
+    /// applied with [`KeyBits::replace_if`]: any hook transition after the
+    /// sample (even one that restores the sampled value) keeps the hook's
+    /// value, because it is newer than the probe.
     ///
     /// The generic Shift/Ctrl/Alt codes are not seeded: the asynchronous
     /// state of a generic code is "either side down", while the low-level
     /// hook reports the sided codes, so no key-up would ever clear a seeded
     /// generic bit. The sided bits already make [`KeyBits::held`] true.
     pub(super) fn resync(&self, probe: &impl AsyncKeyProbe) {
-        for (base, word) in (0u16..).step_by(64).zip(&self.words) {
-            let before = word.load(Ordering::SeqCst);
-            let probed = (0..64u16)
-                .filter(|bit| {
-                    let vk = base + bit;
-                    vk != 0 && !GENERIC_MODIFIERS.contains(&vk) && probe.down(vk)
-                })
-                .fold(0u64, |acc, bit| acc | 1 << bit);
-            // The closure never returns None, so the update cannot fail.
-            let _ = word.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                let changed = before ^ current;
-                Some((probed & !changed) | (current & changed))
-            });
-        }
+        let sample = Sample::take(self, probe);
+        sample.apply(self);
         self.seeded.store(true, Ordering::SeqCst);
     }
     /// Test rigs: treat the (empty) mirror as authoritative so readers never
@@ -114,6 +140,39 @@ impl KeyBits {
     #[cfg(test)]
     pub(super) fn mark_seeded(&self) {
         self.seeded.store(true, Ordering::SeqCst);
+    }
+}
+
+/// One resync pass: every key's state word, sampled before that key was
+/// probed, and the probe result. Lives on the stack; nothing is allocated.
+struct Sample {
+    seen: [u32; KEY_CODES],
+    down: [bool; KEY_CODES],
+}
+impl Sample {
+    fn take(keys: &KeyBits, probe: &impl AsyncKeyProbe) -> Self {
+        let mut sample = Self {
+            seen: [0; KEY_CODES],
+            down: [false; KEY_CODES],
+        };
+        for ((vk, seen), down) in (0u16..)
+            .zip(sample.seen.iter_mut())
+            .zip(sample.down.iter_mut())
+        {
+            // Sample first: a transition between this load and the probe
+            // advances the version and makes `apply` skip the key.
+            *seen = keys.state(vk);
+            *down = vk != 0 && !GENERIC_MODIFIERS.contains(&vk) && probe.down(vk);
+        }
+        sample
+    }
+    /// Writes every probed value whose key has not changed since sampled.
+    fn apply(&self, keys: &KeyBits) {
+        for ((vk, &seen), &down) in (0u16..).zip(&self.seen).zip(&self.down) {
+            if (seen & DOWN != 0) != down {
+                keys.replace_if(vk, seen, down);
+            }
+        }
     }
 }
 
@@ -167,8 +226,9 @@ impl ModifierWatch {
     /// restarts its timer, up clears the bit (`keystate.heal`). Returns when
     /// the next check is due, if any modifier is down.
     ///
-    /// A press landing between the probe and the clear is lost until the
-    /// key is released (a window of microseconds, once per 30 s at most).
+    /// H2: the clear is conditional on the key's state word sampled before
+    /// the probe, so a press (or any down/up/down sequence) landing between
+    /// the probe and the clear survives; the timer then restarts.
     pub(super) fn check(
         &mut self,
         keys: &KeyBits,
@@ -177,18 +237,20 @@ impl ModifierWatch {
     ) -> Option<Instant> {
         let mut next: Option<Instant> = None;
         for (&vk, since) in MODIFIERS.iter().zip(self.since.iter_mut()) {
-            if !keys.get(vk) {
+            let seen = keys.state(vk);
+            if seen & DOWN == 0 {
                 *since = None;
                 continue;
             }
             let start = *since.get_or_insert(now);
             if now.saturating_duration_since(start) >= MODIFIER_VERIFY_AFTER {
-                if !probe.down(vk) {
-                    keys.set(vk, false);
+                if !probe.down(vk) && keys.replace_if(vk, seen, false) {
                     *since = None;
                     tracing::warn!(event = "keystate.heal", modifier = modifier_name(vk));
                     continue;
                 }
+                // Really held, or a newer transition raced the probe and
+                // wins: check again later.
                 *since = Some(now);
             }
             let due = since.and_then(|start| start.checked_add(MODIFIER_VERIFY_AFTER));
@@ -340,6 +402,86 @@ mod tests {
         keys.resync(&Racing { keys: &keys });
         assert!(!keys.held(VK_LCONTROL), "the newer key-up wins");
         assert!(keys.held(VK_LSHIFT), "the newer key-down wins");
+    }
+
+    /// Replays hook transitions `race` on the mirror while `vk` is being
+    /// probed, then reports every key as up: a sample older than the race.
+    struct RaceOn<'a> {
+        keys: &'a KeyBits,
+        vk: u16,
+        race: &'a [bool],
+    }
+    impl AsyncKeyProbe for RaceOn<'_> {
+        fn down(&self, vk: u16) -> bool {
+            if vk == self.vk {
+                for &down in self.race {
+                    self.keys.set(vk, down);
+                }
+            }
+            false
+        }
+    }
+
+    #[test]
+    fn resync_keeps_a_press_that_lands_while_its_own_key_is_probed() {
+        let keys = KeyBits::new();
+        keys.resync(&RaceOn {
+            keys: &keys,
+            vk: 0x41,
+            race: &[true],
+        });
+        assert!(keys.held(0x41), "the press after the sample wins");
+        // ABA: down -> up -> down while probed leaves the same down bit as
+        // the sample, but a newer version, so the stale "up" is not applied.
+        let keys = KeyBits::new();
+        keys.set(VK_LCONTROL, true);
+        keys.resync(&RaceOn {
+            keys: &keys,
+            vk: VK_LCONTROL,
+            race: &[false, true],
+        });
+        assert!(keys.held(VK_CONTROL), "the re-press survives the resync");
+    }
+
+    #[test]
+    fn conditional_writes_only_apply_to_the_sampled_version() {
+        let keys = KeyBits::new();
+        keys.set(VK_LMENU, true);
+        let seen = keys.state(VK_LMENU);
+        keys.set(VK_LMENU, false);
+        keys.set(VK_LMENU, true);
+        assert_eq!(keys.state(VK_LMENU) & DOWN, seen & DOWN, "same bit (ABA)");
+        assert!(!keys.replace_if(VK_LMENU, seen, false), "stale version");
+        assert!(keys.held(VK_LMENU));
+        let fresh = keys.state(VK_LMENU);
+        assert!(keys.replace_if(VK_LMENU, fresh, false));
+        assert!(!keys.held(VK_LMENU));
+        assert!(!keys.replace_if(256, 0, true), "out of range");
+    }
+
+    #[test]
+    fn the_watch_never_clears_a_press_that_races_its_probe() {
+        for race in [&[true][..], &[false, true][..]] {
+            let keys = KeyBits::new();
+            let start = Instant::now();
+            let mut watch = ModifierWatch::default();
+            // A lost key-up left LCONTROL down; the user presses it again
+            // (or presses, releases, presses) after the probe said "up".
+            keys.set(VK_LCONTROL, true);
+            watch.check(&keys, &FakeKeys::new(&[]), start);
+            let due = start + MODIFIER_VERIFY_AFTER;
+            let probe = RaceOn {
+                keys: &keys,
+                vk: VK_LCONTROL,
+                race,
+            };
+            assert_eq!(
+                watch.check(&keys, &probe, due),
+                Some(due + MODIFIER_VERIFY_AFTER),
+                "the timer restarts instead of healing ({race:?})"
+            );
+            assert!(keys.held(VK_CONTROL), "the newer press is kept ({race:?})");
+        }
     }
 
     #[test]
