@@ -20,7 +20,7 @@ smallvec = "1"
 tracing = "0.1"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_UI_Input_Ime", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_Shell"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_UI_Input_Ime", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_Security", "Win32_System_Diagnostics_ToolHelp"] }
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_Accessibility", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant"] }
 
 [build-dependencies]
@@ -38,3 +38,9 @@ fault-injection = []
 
 [lints]
 workspace = true
+
+# S-29 spike: pure-computation example with unit tests (docs/spikes/s-29.md).
+[[example]]
+name = "spike_backspace"
+path = "examples/spike_backspace.rs"
+test = true
