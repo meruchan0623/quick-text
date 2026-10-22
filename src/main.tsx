@@ -1,5 +1,16 @@
 import React from 'react';
-import {createRoot} from 'react-dom/client';
+import { createRoot } from 'react-dom/client';
 import App from './App';
+import { ErrorBoundary } from './ErrorBoundary';
+import { installGlobalErrorHandlers, rootErrorOptions } from './errorLog';
 import './style.css';
-createRoot(document.getElementById('root')!).render(<React.StrictMode><App/></React.StrictMode>);
+installGlobalErrorHandlers();
+const root = document.getElementById('root');
+if (!root) throw new Error('index.html is missing #root');
+createRoot(root, rootErrorOptions()).render(
+  <React.StrictMode>
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
+  </React.StrictMode>,
+);

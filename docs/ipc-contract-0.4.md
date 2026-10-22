@@ -135,3 +135,16 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 | `debug_inject_fault` | `{ point: FaultPoint, param: number }` | `null`；只在 `fault-injection` feature 下注册，release 构建不存在 |
 
 `FaultPoint` 的取值见 `crates/platform/src/fault.rs`。
+
+## 6. 跨 IPC 的整数范围
+
+前端用 `JSON.parse` 把 IPC 的 JSON 变成 JavaScript 数值（IEEE 754 双精度）。绝对值超过 2^53−1 的整数在解析时就被舍入到最近的可表示值，前端代码拿到的已经不是原值，也无从还原。
+
+- 跨 IPC 的所有整数（命令参数、返回值、事件载荷，以及配置里的规则和未知字段）必须在 ±(2^53−1) 以内，即 `Number.MIN_SAFE_INTEGER` 到 `Number.MAX_SAFE_INTEGER`。
+- 以后新增的 64 位标识符一律以字符串传输，不用 `number`。
+- 现有的 64 位整数按构造都在范围内：`revision` 是后端计数器；`span.line`、`span.column`、`span.length` 受源码长度约束；`delay.ms` 不超过 `MAX_DELAY_MS`（3 600 000）。seq 与毫秒时间戳见 §1。
+- 应用自身不会产生超出范围的值，只有手改配置才会出现；规则中这样的值被舍入后，对后端同样不合法，或语义等价。前端的处理如下，都不阻止保存：
+  - 规则里任何位置出现超范围数值（已知字段、操作和步骤的 `reusable.parameters`、规则层未知字段，以及更深层的任意 JSON 值），整条规则判为无法读取（B-43），只读列表标出原因：「含超出可安全保存范围的数值，保存其他内容时该数值可能被改写。」这样编辑器不会把舍入后的值当成真值继续编辑。
+  - 配置层和 `globals` 层出现超范围数值时，配置照常读取，设置页给出一行提示：「配置中含超出可安全保存范围的数值，保存时可能被改写。」
+  - 检测是可靠的：任何超过 2^53−1 的原值解析后都不小于 2^53（或成为 `Infinity`），所以不会漏报；2^53 本身、`1e300` 这类恰好能还原的值也会被标出。
+- 前端对无法读取的规则和本版本不认识的字段的承诺是：保存时把收到的值放回原位提交，在本节的数值范围内值不变。它不承诺逐字节保留配置文件原文；数值写法（例如 `1.0` 写回为 `1`）、键顺序和空白由序列化决定。
