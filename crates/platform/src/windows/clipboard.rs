@@ -872,10 +872,33 @@ pub(super) struct ClipboardLease<C: ClipboardBackend> {
     /// Formats present at backup time that will not be restored.
     skipped: Vec<u32>,
     restore_delay: Duration,
-    /// Captured when the last paste write was verified. `None` until a
-    /// write is verified (and again once the lease clears the clipboard); a
-    /// restore then checks the clipboard the way a capture would.
-    baseline: Option<Baseline>,
+    /// What the verification of the last write established; every write
+    /// (each `EmptyClipboard`) starts over at [`Capture::Untried`].
+    baseline: Capture,
+}
+/// Trust in the clipboard the lease's last write left (B-08). It is
+/// established once, by the capture right after a paste write; a restore
+/// only compares against what that capture recorded and never establishes
+/// trust itself.
+#[derive(Debug, PartialEq)]
+enum Capture {
+    /// No capture since the lease last cleared the clipboard: nothing
+    /// written yet, or a write (paste or restore) whose `set` failed after
+    /// the clear, before any capture. A failed clear leaves the clipboard,
+    /// and this state, as they were. Its restore checks the clipboard the
+    /// way a capture would. Accepted residual risk, like the window between
+    /// a write's CloseClipboard and its capture: another process rewriting
+    /// a derived format in place in between is outside the threat model
+    /// (see [`HANDLE_FORMATS`]).
+    Untried,
+    /// Recorded by the capture: what every restore holds the clipboard to.
+    Captured(Baseline),
+    /// The capture refused or could not finish. Nothing establishes trust
+    /// later: a derived format the capture could not vouch for may have
+    /// been rewritten since, and checking it now would adopt that. Every
+    /// restore, explicit or on drop, refuses and the clipboard keeps the
+    /// paste.
+    Failed,
 }
 /// What a restore holds the clipboard to (B-08), captured in the section
 /// that verifies the paste write: its format set (the paste, the exclusion
@@ -984,6 +1007,9 @@ fn changed(message: &str) -> LeaseError {
 }
 fn unverifiable() -> LeaseError {
     LeaseError::new(ReasonCode::Internal, "Clipboard payload cannot be verified")
+}
+fn uncaptured() -> LeaseError {
+    changed("Clipboard payload was never verified after the paste write; clipboard preserved")
 }
 /// Locked: checks that `owner` still owns the clipboard, that its format set
 /// passes `formats_ok` and that it holds exactly `expected`; `expired` is
@@ -1146,15 +1172,22 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
     /// verified at is still current once the clipboard is closed. A sequence
     /// that moved since the write is not a refusal by itself: the format set
     /// and every byte decide. Returns that sequence, and the baseline
-    /// captured when there was none. Runs on the lease thread; the data is
-    /// the lease's own, so no read waits on another owner.
+    /// captured when there was none. Refuses without opening the clipboard
+    /// after a failed capture ([`Capture::Failed`]). Runs on the lease
+    /// thread; the data is the lease's own, so no read waits on another
+    /// owner.
     fn verify_owned(&self) -> Result<(u32, Option<Baseline>), LeaseError> {
         let backend = &self.backend;
         let owner = backend.identity();
+        let baseline = match &self.baseline {
+            Capture::Untried => None,
+            Capture::Captured(baseline) => Some(baseline),
+            Capture::Failed => return Err(uncaptured()),
+        };
         retry_clipboard_verification(
             || {
                 let (sequence, captured) = critical(backend, &self.degraded, || {
-                    check_owned(backend, owner, &self.owned_payload, self.baseline.as_ref())
+                    check_owned(backend, owner, &self.owned_payload, baseline)
                 })??;
                 Ok((backend.sequence() == sequence && backend.owner() == owner)
                     .then_some((sequence, captured)))
@@ -1228,7 +1261,7 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
             }
             *dirty = true;
             owned_payload.clear();
-            *baseline = None;
+            *baseline = Capture::Untried;
             mark_external_effect();
             while !prepared.handles.is_empty() {
                 let (f, h) = prepared.handles.remove(0);
@@ -1254,14 +1287,16 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
         // a format the system could synthesize, added or rewritten by another
         // process in the milliseconds between this write's CloseClipboard
         // and the capture, joins the baseline (outside the threat model for
-        // the reasons at HANDLE_FORMATS). A restore with no baseline (a write
-        // that failed before its capture) checks the same way.
+        // the reasons at HANDLE_FORMATS). A capture that refuses or cannot
+        // finish is final: every restore refuses ([`Capture::Failed`]).
         // 待实测: whether CF_LOCALE is listed after CF_UNICODETEXT alone, and
         // whether rendering a synthesized format advances the sequence (a
         // move after the capture fails `verify_current` before the paste).
-        let (sequence, captured) = self.verify_owned()?;
+        let (sequence, captured) = self
+            .verify_owned()
+            .inspect_err(|_| self.baseline = Capture::Failed)?;
         self.written = Some(sequence);
-        self.baseline = captured;
+        self.baseline = captured.map_or(Capture::Failed, Capture::Captured);
         Ok(())
     }
     /// [`ClipboardLease::open`] with the default options.
@@ -1323,7 +1358,7 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
             degraded,
             skipped: backup.skipped,
             restore_delay: options.restore_delay,
-            baseline: None,
+            baseline: Capture::Untried,
         };
         if !lease.skipped_formats().is_empty() {
             tracing::info!(
@@ -1371,7 +1406,7 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
             }
             mark_external_effect();
             owned_payload.clear();
-            *baseline = None;
+            *baseline = Capture::Untried;
             *written = Some(backend.sequence());
             for (format, handle, expected) in staged {
                 if !backend.set(format, handle) {
@@ -1397,7 +1432,9 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
         // previous one is no longer current. Another application adding or
         // rewriting a format without emptying the clipboard keeps the owner
         // and the payload but not the baseline: that refuses, and the
-        // clipboard stays as it is. Drop runs this same check.
+        // clipboard stays as it is. So does a failed capture: the restore
+        // compares, it never captures in its place. Drop runs this same
+        // check.
         self.written = Some(self.verify_owned()?.0);
         let result = self.write(self.backup.clone());
         finish_clipboard_restore(&mut self.backup, result)?;
@@ -2246,7 +2283,7 @@ mod tests {
             formats,
             derived: text_synthesized(),
         };
-        assert_eq!(lease.baseline, Some(baseline));
+        assert_eq!(lease.baseline, Capture::Captured(baseline));
         // A later read (a listener rendering CF_TEXT) advances the sequence;
         // the format set and every byte are unchanged.
         clipboard.bump_sequence();
@@ -2309,11 +2346,10 @@ mod tests {
         for (rewritten, refused) in [(CF_BITMAP, false), (CF_PALETTE, false), (CF_DIBV5, true)] {
             let clipboard = MockClipboard::new(7, text("original"));
             let mut lease = synthesized_lease(&clipboard, image.clone(), synthesized.clone());
-            let derived = lease
-                .baseline
-                .as_ref()
-                .map(|baseline| baseline.derived.clone());
-            assert_eq!(derived, Some(vec![dibv5.clone()]));
+            let Capture::Captured(baseline) = &lease.baseline else {
+                panic!("baseline captured");
+            };
+            assert_eq!(baseline.derived, vec![dibv5.clone()]);
             clipboard.add_format(rewritten, vec![0xEE]);
             if refused {
                 assert_eq!(lease.restore(), Err(payload_changed().message));
@@ -2367,7 +2403,7 @@ mod tests {
             lease.write_prepared(&mut prepared),
             Err(formats_changed().message)
         );
-        assert_eq!(lease.baseline, None);
+        assert_eq!(lease.baseline, Capture::Failed);
         assert!(lease.verify_current().is_err());
         drop(lease);
         let mut expected = pasted(&clipboard, "expansion");
@@ -2377,25 +2413,61 @@ mod tests {
     }
     #[test]
     fn paste_write_refuses_a_derived_format_it_cannot_read() {
-        let clipboard = MockClipboard::new(7, text("original"));
-        clipboard.fail_read(CF_TEXT);
-        let script = clipboard.clone();
-        clipboard.on_lock(move |index| {
-            if index == 3 {
-                script.add_format(CF_TEXT, b"expansion\0".to_vec());
+        for explicit in [true, false] {
+            let clipboard = MockClipboard::new(7, text("original"));
+            let script = clipboard.clone();
+            // Lock 2 writes the paste, lock 3 verifies it: CF_TEXT is listed
+            // but its data cannot be read.
+            clipboard.on_lock(move |index| {
+                if index == 3 {
+                    script.add_format(CF_TEXT, b"expansion\0".to_vec());
+                    script.fail_read(CF_TEXT);
+                }
+            });
+            let mut lease = ClipboardLease::new(clipboard.clone()).unwrap();
+            let mut prepared = lease.prepare(text("expansion")).unwrap();
+            assert_eq!(
+                lease.write_prepared(&mut prepared),
+                Err("Clipboard payload cannot be verified".into())
+            );
+            assert_eq!(lease.baseline, Capture::Failed);
+            // Another application then replaces CF_TEXT in place with data
+            // that reads, would pass the whitelist and is not the paste's.
+            clipboard.add_format(CF_TEXT, b"unrelated\0".to_vec());
+            let replaced = clipboard.content();
+            if explicit {
+                assert_eq!(lease.restore(), Err(uncaptured().message));
+                assert_eq!(clipboard.content(), replaced);
             }
-        });
-        let mut lease = ClipboardLease::new(clipboard.clone()).unwrap();
-        let mut prepared = lease.prepare(text("expansion")).unwrap();
-        assert_eq!(
-            lease.write_prepared(&mut prepared),
-            Err("Clipboard payload cannot be verified".into())
-        );
-        assert_eq!(lease.baseline, None);
-        // Nothing to hold a restore to: the clipboard is left as it is.
-        let expected = clipboard.content();
-        drop(lease);
-        assert_eq!(clipboard.content(), expected);
-        assert_eq!(clipboard.clears(), 1);
+            drop(lease);
+            assert_eq!(clipboard.content(), replaced, "explicit: {explicit}");
+            assert_eq!(clipboard.clears(), 1, "explicit: {explicit}");
+        }
+    }
+    #[test]
+    fn restore_after_a_partial_paste_write_checks_like_a_capture() {
+        // The write fails partway, before any capture: untried, not failed,
+        // and the restore still brings the original back.
+        for explicit in [true, false] {
+            let clipboard = MockClipboard::new(7, text("original"));
+            clipboard.fail_set(1);
+            let mut lease = ClipboardLease::new(clipboard.clone()).unwrap();
+            let mut prepared = lease.prepare(text("expansion")).unwrap();
+            assert_eq!(
+                lease.write_prepared(&mut prepared),
+                Err("Clipboard write failed".into())
+            );
+            assert_eq!(lease.baseline, Capture::Untried);
+            if explicit {
+                lease.restore().unwrap();
+            }
+            drop(lease);
+            assert_eq!(
+                clipboard.content(),
+                text("original"),
+                "explicit: {explicit}"
+            );
+            assert_eq!(clipboard.clears(), 2, "explicit: {explicit}");
+        }
     }
 }

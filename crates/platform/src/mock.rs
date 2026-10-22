@@ -263,9 +263,11 @@ impl MockClipboard {
     }
     /// A format joins the clipboard without an empty: another application's
     /// `SetClipboardData` without `EmptyClipboard`, or the system listing a
-    /// synthesized format. The owner and every other format stay.
+    /// synthesized format. The owner and every other format stay. The new
+    /// data reads: a `fail_read` of `format` held for the data it replaces.
     pub fn add_format(&self, format: u32, bytes: Vec<u8>) {
         let mut state = self.state.lock();
+        state.unreadable.retain(|f| *f != format);
         state.formats.retain(|(f, _)| *f != format);
         state.formats.push((format, bytes));
         state.sequence += 1;
