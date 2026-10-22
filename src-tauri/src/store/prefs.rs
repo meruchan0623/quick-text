@@ -120,14 +120,19 @@ impl ClipboardPrefs {
         };
         let restore_policy = match fields.remove("restore_policy") {
             None => RestorePolicy::default(),
-            Some(value) => RestorePolicy::deserialize(&value).unwrap_or_else(|_| {
-                let problem = match value {
-                    Value::String(_) => "unknown_value",
-                    _ => "wrong_type",
-                };
-                invalid("app.clipboard.restore_policy", &value, problem);
+            // Only a string names a policy: deserializing any `Value` would
+            // also take an externally tagged object such as
+            // `{"text_only": null}` (Codex B3).
+            Some(value @ Value::String(_)) => {
+                RestorePolicy::deserialize(&value).unwrap_or_else(|_| {
+                    invalid("app.clipboard.restore_policy", &value, "unknown_value");
+                    RestorePolicy::default()
+                })
+            }
+            Some(other) => {
+                invalid("app.clipboard.restore_policy", &other, "wrong_type");
                 RestorePolicy::default()
-            }),
+            }
         };
         let restore_delay_ms = match fields.remove("restore_delay_ms") {
             None => DEFAULT_RESTORE_DELAY_MS,
@@ -631,6 +636,23 @@ mod tests {
             ),
             (
                 json!({"restore_policy": 2, "restore_delay_ms": 500}),
+                (RestorePolicy::BestEffort, 500),
+                (policy, "wrong_type"),
+            ),
+            // Externally tagged objects name a policy to serde, not to prefs
+            // (Codex B3).
+            (
+                json!({"restore_policy": {"text_only": null}, "restore_delay_ms": 500}),
+                (RestorePolicy::BestEffort, 500),
+                (policy, "wrong_type"),
+            ),
+            (
+                json!({"restore_policy": {"full": SECRET}, "restore_delay_ms": 500}),
+                (RestorePolicy::BestEffort, 500),
+                (policy, "wrong_type"),
+            ),
+            (
+                json!({"restore_policy": ["text_only"], "restore_delay_ms": 500}),
                 (RestorePolicy::BestEffort, 500),
                 (policy, "wrong_type"),
             ),

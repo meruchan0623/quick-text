@@ -215,9 +215,16 @@ pub fn clipboard_health() -> ComponentHealth {
         .clone()
 }
 /// [`clipboard_health`] without waiting, for the executor's `probe` (A2):
-/// `None` while a lease is updating it.
+/// `None` while a lease is updating it, and before anything created it (no
+/// lease has published a health yet; the executor then keeps its last
+/// status, Ok at first).
 pub(super) fn try_clipboard_health() -> Option<ComponentHealth> {
-    match health_cell().try_lock() {
+    try_health(&HEALTH)
+}
+/// Only non-blocking steps: `get`, never `get_or_init`, which waits while
+/// another thread is initializing the cell; then `try_lock`.
+fn try_health(cell: &OnceLock<Mutex<ComponentHealth>>) -> Option<ComponentHealth> {
+    match cell.get()?.try_lock() {
         Ok(health) => Some(health.clone()),
         Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner().clone()),
         Err(TryLockError::WouldBlock) => None,
@@ -1964,6 +1971,32 @@ mod tests {
         drop(held);
         let read = try_clipboard_health().expect("free");
         assert_eq!(read.component, Component::Clipboard);
+    }
+    /// Before the health exists the probe's read is `None` without creating
+    /// it (Codex B1): `get`, not `get_or_init`. A cell of its own, since the
+    /// process-wide one is created by whichever test touches it first.
+    #[test]
+    fn try_health_never_creates_the_health() {
+        let cell = OnceLock::new();
+        assert!(try_health(&cell).is_none());
+        assert!(cell.get().is_none(), "the read left it uncreated");
+        let created = cell.get_or_init(|| {
+            Mutex::new(ComponentHealth {
+                component: Component::Clipboard,
+                state: HealthState::Degraded,
+                reason: Some(ReasonCode::ClipboardBusy),
+                since_ms: 1,
+            })
+        });
+        let read = try_health(&cell).expect("created and free");
+        assert_eq!(
+            (read.state, read.reason),
+            (HealthState::Degraded, Some(ReasonCode::ClipboardBusy))
+        );
+        let held = created.lock().unwrap();
+        let read = std::thread::scope(|scope| scope.spawn(|| try_health(&cell)).join().unwrap());
+        assert!(read.is_none(), "held by a lease");
+        drop(held);
     }
 
     fn open_with(

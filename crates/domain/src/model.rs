@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 // B-09: types holding abbreviations or phrase bodies print `<redacted len=N>` in Debug.
-use crate::{Redacted, RedactedLen, RedactedValue, RedactedValues};
+use crate::{Redacted, RedactedKey, RedactedLen, RedactedList, RedactedValue, RedactedValues};
 use std::fmt;
 /// Schema version this build writes.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -584,8 +584,9 @@ pub enum Action {
         parameter: String,
     },
 }
-/// HTML and plain-text bodies, parameter values and plans are redacted; kinds, methods,
-/// keys, targets and ids are shown.
+/// HTML and plain-text bodies, parameter values, plans and what an `Open` opens (target and
+/// arguments: paths, URLs and parameters can carry user data) are redacted; kinds, methods,
+/// hotkeys, working directories and ids are shown.
 impl fmt::Debug for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -621,8 +622,8 @@ impl fmt::Debug for Action {
                 working_directory,
             } => f
                 .debug_struct("Open")
-                .field("target", target)
-                .field("args", args)
+                .field("target", &Redacted(target))
+                .field("args", &RedactedList(args))
                 .field("working_directory", working_directory)
                 .finish(),
             Self::Reusable {
@@ -786,8 +787,10 @@ pub enum Operation {
         parameters: BTreeMap<String, serde_json::Value>,
     },
 }
-/// Text and HTML bodies and parameter values are redacted; keys, delays, pointer moves,
-/// paths, targets and ids are shown.
+/// Text and HTML bodies, parameter values, what an `Open` opens and the key of a key
+/// operation are redacted: a recorded macro (`Vec<Step>`) is the typed key sequence, one key
+/// operation per key, so each one hides its key, not only the enclosing [`ActionPlan`].
+/// Hotkeys, delays, pointer moves, paths, working directories and ids are shown.
 impl fmt::Debug for Operation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -796,9 +799,15 @@ impl fmt::Debug for Operation {
                 .field("text", &Redacted(text))
                 .field("method", method)
                 .finish(),
-            Self::KeyDown { key } => f.debug_struct("KeyDown").field("key", key).finish(),
-            Self::KeyUp { key } => f.debug_struct("KeyUp").field("key", key).finish(),
-            Self::KeyPress { key } => f.debug_struct("KeyPress").field("key", key).finish(),
+            Self::KeyDown { .. } => f
+                .debug_struct("KeyDown")
+                .field("key", &RedactedKey)
+                .finish(),
+            Self::KeyUp { .. } => f.debug_struct("KeyUp").field("key", &RedactedKey).finish(),
+            Self::KeyPress { .. } => f
+                .debug_struct("KeyPress")
+                .field("key", &RedactedKey)
+                .finish(),
             Self::Hotkey { keys } => f.debug_struct("Hotkey").field("keys", keys).finish(),
             Self::Delay { ms } => f.debug_struct("Delay").field("ms", ms).finish(),
             Self::MouseMove {
@@ -839,8 +848,8 @@ impl fmt::Debug for Operation {
                 working_directory,
             } => f
                 .debug_struct("Open")
-                .field("target", target)
-                .field("args", args)
+                .field("target", &Redacted(target))
+                .field("args", &RedactedList(args))
                 .field("working_directory", working_directory)
                 .finish(),
             Self::Common { function } => f

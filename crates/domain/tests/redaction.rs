@@ -5,7 +5,7 @@ use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
 /// Every sensitive string the fixtures below use. None may appear in any `Debug` output.
-const SECRETS: [&str; 14] = [
+const SECRETS: [&str; 16] = [
     "zqabbr",
     "phrase-body",
     "param-secret",
@@ -20,6 +20,8 @@ const SECRETS: [&str; 14] = [
     "unreadable-secret",
     "clip-secret",
     "selection-secret",
+    "open-secret",
+    "arg-secret",
 ];
 
 fn assert_redacted(shown: &str) {
@@ -213,10 +215,22 @@ fn actions_operations_and_plans_redact_their_text() {
             action_id: "quicker-1".into(),
             parameter: "quicker-secret".into(),
         },
+        Action::Open {
+            target: r"C:\Clients\open-secret.xlsx".into(),
+            args: vec!["--user=arg-secret".into()],
+            working_directory: Some(r"C:\Work".into()),
+        },
     ];
     for action in &actions {
         assert_redacted(&format!("{action:?}"));
+        assert_redacted(&format!("{action:#?}"));
     }
+    // What an Open opens is redacted, as a list for its arguments; the working directory
+    // stays visible (as a file source's path does).
+    assert_eq!(
+        format!("{:?}", actions[6]),
+        r#"Open { target: <redacted len=27>, args: [<redacted len=17>], working_directory: Some("C:\\Work") }"#
+    );
     let plan = plan();
     let shown = format!("{plan:?}");
     assert_redacted(&shown);
@@ -239,10 +253,17 @@ fn actions_operations_and_plans_redact_their_text() {
             action_id: "reusable-1".into(),
             parameters: parameters(),
         },
+        Operation::Open {
+            target: "https://example.com/?q=open-secret".into(),
+            args: vec!["arg-secret".into()],
+            working_directory: None,
+        },
     ] {
         assert_redacted(&format!("{operation:?}"));
+        assert_redacted(&format!("{operation:#?}"));
     }
     assert_redacted(&format!("{:?}", plan.steps));
+    // A key operation hides its key (see `recorded_key_sequences_never_show_their_keys`).
     assert_eq!(
         format!(
             "{:?}",
@@ -250,7 +271,7 @@ fn actions_operations_and_plans_redact_their_text() {
                 key: Key::named("enter")
             }
         ),
-        r#"KeyPress { key: Named { name: "enter" } }"#
+        "KeyPress { key: <redacted> }"
     );
 }
 
@@ -388,5 +409,72 @@ fn serde_shapes_are_unchanged() {
     assert_eq!(
         serde_json::to_value(&matched).unwrap()["matched"],
         json!("zqabbr")
+    );
+}
+
+/// A recorded macro is the typed key sequence, one key operation per key: here "SECRET" as
+/// the Windows recorder stores it (virtual-key codes 83 69 67 82 69 84) and as the macOS one
+/// does (key names). No single operation, step or list of steps shows a key.
+#[test]
+fn recorded_key_sequences_never_show_their_keys() {
+    const CODES: [u16; 6] = [83, 69, 67, 82, 69, 84];
+    let recorded = |key: fn(u16) -> Key| -> Vec<Step> {
+        CODES
+            .iter()
+            .flat_map(|&code| {
+                [
+                    Operation::KeyDown { key: key(code) },
+                    Operation::KeyUp { key: key(code) },
+                ]
+            })
+            .chain([Operation::KeyPress { key: key(CODES[0]) }])
+            .map(|operation| Step::new(operation, SourceSpan::default()))
+            .collect()
+    };
+    let by_code = recorded(|code| Key::WindowsCode { code });
+    let by_name = recorded(|code| Key::named(char::from(code as u8).to_string()));
+    for steps in [&by_code, &by_name] {
+        let mut shown = vec![format!("{steps:?}"), format!("{steps:#?}")];
+        for step in steps {
+            shown.extend([
+                format!("{step:?}"),
+                format!("{step:#?}"),
+                format!("{:?}", step.operation),
+                format!("{:#?}", step.operation),
+            ]);
+        }
+        let plan = ActionPlan {
+            dialect: Dialect::Replay,
+            steps: steps.clone(),
+            ..ActionPlan::default()
+        };
+        shown.extend([
+            format!("{plan:?}"),
+            format!("{plan:#?}"),
+            format!("{:?}", Action::Replay { plan, speed: 1.0 }),
+        ]);
+        for shown in &shown {
+            assert!(shown.contains("<redacted"), "{shown}");
+            for code in CODES {
+                assert!(!shown.contains(&code.to_string()), "{code} in {shown}");
+                let letter = format!("{:?}", char::from(code as u8).to_string());
+                assert!(!shown.contains(&letter), "{letter} in {shown}");
+            }
+            assert!(!shown.contains("WindowsCode"), "{shown}");
+            assert!(!shown.contains("Named"), "{shown}");
+        }
+    }
+    assert_eq!(
+        format!("{:?}", by_code[0]),
+        "Step { operation: KeyDown { key: <redacted> }, span: SourceSpan { line: 0, column: 0, \
+         length: 0 }, target: Locked }"
+    );
+    // A configured hotkey is not typed input: its keys stay visible.
+    let hotkey = Operation::Hotkey {
+        keys: vec![Key::named("ctrl"), Key::WindowsCode { code: 86 }],
+    };
+    assert_eq!(
+        format!("{hotkey:?}"),
+        r#"Hotkey { keys: [Named { name: "ctrl" }, WindowsCode { code: 86 }] }"#
     );
 }

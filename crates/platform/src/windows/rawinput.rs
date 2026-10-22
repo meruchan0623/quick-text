@@ -286,11 +286,12 @@ pub(super) struct RawRecord {
     /// its prefix there (S-19), as the generation gap breaks the matcher's.
     lost: u64,
 }
-/// The key's text is redacted (B-09), N in UTF-16 units.
+/// The key's text is redacted (B-09), N in UTF-16 units, and so is which key
+/// it was.
 impl std::fmt::Debug for RawRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RawRecord")
-            .field("vk", &self.vk)
+            .field("vk", &quicker_domain::RedactedKey)
             .field("down", &self.down)
             .field("text", &quicker_domain::RedactedLen(self.len))
             .field("context", &self.context)
@@ -1295,6 +1296,9 @@ mod tests {
         // Derived Debug would list the record's UTF-16 units ('z' 'q' = 122 113).
         assert!(!shown_record.contains("122, 113"), "{shown_record}");
         assert!(shown_shadow.contains("rule-a"), "{shown_shadow}");
-        assert!(shown_record.contains("vk: 90"), "{shown_record}");
+        // Which key it was is redacted too (vk 0x5A = 90, 'Z').
+        assert!(shown_record.contains("vk: <redacted>"), "{shown_record}");
+        assert!(!shown_record.contains("90"), "{shown_record}");
+        assert!(!format!("{record:#?}").contains("90"), "{record:#?}");
     }
 }
