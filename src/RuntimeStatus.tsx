@@ -1,21 +1,6 @@
 import { Fragment, type ReactNode } from 'react';
+import { capabilityNames, capabilityReasonText, label } from './ipc/labels';
 import { Data, State } from './model';
-const names: Record<string, string> = {
-  keyboard_hook: '键盘监听',
-  keys: '逐字键入',
-  paste: '粘贴文本',
-  html: '粘贴 HTML',
-  file_clipboard: '粘贴文件对象',
-  image_clipboard: '粘贴图片对象',
-  mouse: '鼠标操作',
-  recording: '键鼠录制',
-  foreground: '目标窗口识别',
-  open: '打开文件与应用',
-  ime_committed_text: '缩写与输入法候选识别',
-  quicker_private_action: 'Quicker 专有动作',
-  selection: '读取选中文本',
-  notification: '触发后提示',
-};
 const resultNames: Record<string, string> = {
   success: '执行成功',
   failed: '执行失败',
@@ -157,13 +142,13 @@ function CapabilityTable({ capabilities }: { capabilities: Data[] }) {
         <tbody>
           {capabilities.map((c: Data) => (
             <tr key={c.id}>
-              <td>{names[c.id] || c.id}</td>
+              <td>{label(capabilityNames, c.id)}</td>
               <td>
                 <span className={c.available ? 'available' : 'unavailable'}>
                   {c.available ? '可用' : '不可用'}
                 </span>
               </td>
-              <td>{c.reason || '暂无额外说明'}</td>
+              <td>{capabilityReasonText(c.reason) ?? '暂无额外说明'}</td>
             </tr>
           ))}
         </tbody>

@@ -1,6 +1,7 @@
 import { Fragment, useId, useRef, useState } from 'react';
 import { call } from './ipc/transport';
 import { diagnosticText, parseCommandError } from './ipc/errors';
+import { capabilityReasonText } from './ipc/labels';
 import { actionChoice, actionLabel, actionOptions, clone, Data, Rule } from './model';
 import { moveItem, withoutKey } from './lib/list';
 import {
@@ -515,7 +516,7 @@ export default function ActionEditor({
             <p>
               {c.id === 'quicker_private_action'
                 ? '当前版本不能执行原 Quicker 动作；请改成这里支持的操作。'
-                : c.reason}
+                : capabilityReasonText(c.reason)}
             </p>
           </div>
         ))}

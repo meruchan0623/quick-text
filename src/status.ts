@@ -4,7 +4,10 @@
 import type { HistoryRow, RuntimeView } from './ipc/events';
 import {
   componentNames,
+  healthNames,
   label,
+  logLevelNames,
+  other,
   outcomeNames,
   pauseNames,
   reasonNames,
@@ -85,7 +88,7 @@ export function statusText(
     case 'listening':
       return '监听中';
     case 'unknown':
-      return `引擎状态：${health?.state ?? '未知'}`;
+      return `引擎状态：${health ? label(healthNames, health.state) : '未知'}`;
   }
 }
 
@@ -129,12 +132,14 @@ function listIds(ids: string[], total: number): string {
   return shown.join('、') + (Math.max(total, ids.length) > shown.length ? ' 等' : '');
 }
 
-/** One sentence per startup-problem kind; unknown kinds keep their raw name (contract §3). */
+/** One sentence per startup-problem kind; an unknown kind is 「其他」 with its raw name (contract §1). */
 export function problemText(problem: StartupProblem): string {
   const a = problem.args;
   switch (problem.kind) {
-    case 'safe_mode':
-      return `已进入安全模式：${label(safeModeNames, str(a.reason) || '原因未知')}。输入监听已暂停，设置暂时不能修改；可以导入配置或打开数据目录检查。`;
+    case 'safe_mode': {
+      const reason = str(a.reason);
+      return `已进入安全模式：${reason ? label(safeModeNames, reason) : '原因未知'}。输入监听已暂停，设置暂时不能修改；可以导入配置或打开数据目录检查。`;
+    }
     case 'recovered': {
       const revision = num(a.revision);
       const from =
@@ -177,15 +182,15 @@ export function problemText(problem: StartupProblem): string {
     }
     case 'log_level_elevated': {
       const until = num(a.until_ms);
-      const level = str(a.level) || '详细';
+      const level = str(a.level) ? label(logLevelNames, str(a.level)) : '详细';
       return until === null
-        ? `日志已临时调为 ${level} 级别。`
-        : `日志已临时调为 ${level} 级别，将于 ${clock(until)} 自动恢复。`;
+        ? `日志已临时调为「${level}」级别。`
+        : `日志已临时调为「${level}」级别，将于 ${clock(until)} 自动恢复。`;
     }
     case 'store_meta_reset':
       return '启动记录文件无法读取，已重新建立；连续启动失败的计数已清零。';
     default:
-      return `启动时发现一个问题（${problem.kind}）。可在「运行状态与恢复」中导出诊断包了解详情。`;
+      return `启动时发现一个问题：${other(problem.kind)}。可在「运行状态与恢复」中导出诊断包了解详情。`;
   }
 }
 

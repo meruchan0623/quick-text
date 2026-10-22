@@ -68,7 +68,7 @@ describe('statusText', () => {
     expect(statusText('executing', [], null)).toBe('执行中');
     expect(statusText('listening', [], null)).toBe('监听中');
     expect(statusText('unknown', [], health('hibernating' as HealthState))).toBe(
-      '引擎状态：hibernating',
+      '引擎状态：其他（hibernating）',
     );
   });
 
@@ -79,9 +79,9 @@ describe('statusText', () => {
       component('clipboard', 'failed'),
       component('teleporter' as ComponentHealth['component'], 'degraded'),
     ]);
-    expect(affectedComponents(snapshot)).toEqual(['前台窗口跟踪', '剪贴板', 'teleporter']);
+    expect(affectedComponents(snapshot)).toEqual(['前台窗口跟踪', '剪贴板', '其他（teleporter）']);
     expect(statusText('degraded', [], snapshot)).toBe(
-      '部分功能降级：前台窗口跟踪、剪贴板、teleporter',
+      '部分功能降级：前台窗口跟踪、剪贴板、其他（teleporter）',
     );
     expect(statusText('degraded', [], health('degraded'))).toBe('部分功能降级');
   });
@@ -163,7 +163,7 @@ describe('problemText', () => {
         { checks: ['raw_input', 'hook_heartbeat'] },
         '启动自检未通过：原始键盘输入、键盘监听心跳。文本指令可能无法触发，可在「运行状态与恢复」中查看详情或导出诊断包。',
       ],
-      ['log_level_elevated', { level: 'debug', until_ms: null }, '日志已临时调为 debug 级别。'],
+      ['log_level_elevated', { level: 'debug', until_ms: null }, '日志已临时调为「调试」级别。'],
       ['store_meta_reset', {}, '启动记录文件无法读取，已重新建立；连续启动失败的计数已清零。'],
     ];
     for (const [kind, args, text] of cases)
@@ -178,7 +178,7 @@ describe('problemText', () => {
         severity: 'info',
         args: { level: 'debug', until_ms: until },
       }),
-    ).toBe('日志已临时调为 debug 级别，将于 14:05 自动恢复。');
+    ).toBe('日志已临时调为「调试」级别，将于 14:05 自动恢复。');
   });
 
   it('survives missing or malformed args', () => {
@@ -190,12 +190,12 @@ describe('problemText', () => {
     ).toBe('配置文件已损坏，已改名保留，可在数据目录中查看。');
     expect(
       problemText({ kind: 'safe_mode', severity: 'error', args: { reason: 'solar_flare' } }),
-    ).toMatch(/^已进入安全模式：solar_flare。/);
+    ).toMatch(/^已进入安全模式：其他（solar_flare）。/);
   });
 
   it('shows an unknown kind verbatim with a generic text', () => {
     expect(problemText({ kind: 'disk_almost_full', severity: 'warning', args: { free: 1 } })).toBe(
-      '启动时发现一个问题（disk_almost_full）。可在「运行状态与恢复」中导出诊断包了解详情。',
+      '启动时发现一个问题：其他（disk_almost_full）。可在「运行状态与恢复」中导出诊断包了解详情。',
     );
   });
 });
@@ -244,7 +244,7 @@ describe('history formatting', () => {
       '已跳过：目标是密码框或只读控件',
     );
     expect(outcomeText({ outcome: 'exploded' as 'failed', reason: 'gremlins' as 'internal' })).toBe(
-      'exploded：gremlins',
+      '其他（exploded）：其他（gremlins）',
     );
   });
 
@@ -276,6 +276,6 @@ describe('history formatting', () => {
     const at = new Date(2026, 0, 2, 3, 4, 5).getTime();
     expect(clock(at)).toBe('03:04');
     expect(clock(at, true)).toBe('03:04:05');
-    expect(pauseText(['safe_mode', 'manual', 'later'])).toBe('安全模式、手动暂停、later');
+    expect(pauseText(['safe_mode', 'manual', 'later'])).toBe('安全模式、手动暂停、其他（later）');
   });
 });
