@@ -54,6 +54,6 @@ Windows 输出检查焦点、配置版本和执行代次，使用带本程序标
 
 ## 许可与绿色包构建
 
-Windows 交付静态纳入 GPL-3.0-or-later 的 espanso 组件，整个项目（含自研代码）按 GPL-3.0-or-later 授权与分发，完整许可见 [LICENSE](LICENSE)。上游版权、完整许可和本地补丁清单见 [第三方声明](THIRD_PARTY_NOTICES.md)。绿色包附带当前对应源码，包括修改后的原生组件与构建脚本。
+Windows 交付静态纳入 GPL-3.0-or-later 的 espanso 组件，整个项目（含自研代码）按 GPL-3.0-or-later 授权与分发，完整许可见 [LICENSE](LICENSE)。上游版权、完整许可和本地补丁清单见 [第三方声明](THIRD_PARTY_NOTICES.md)。每个发布（安装包、单文件 exe、绿色包）都附带对应的完整源码：`Quicker-Text-<版本>-Source.zip`（绿色包为其 `source/` 目录），包括修改后的原生组件、`Cargo.lock`、`package-lock.json` 与构建、打包脚本，也可从版本库的发布标签获取。Rust 与前端依赖按各自的许可证使用，不随源码包复制：版本和校验和由两个锁文件固定，Rust 依赖的许可证由 `deny.toml` 对照与 GPL-3.0-or-later 兼容的清单检查，发布前的核对项见 [发布清单](docs/release-checklist.md)。已发布的 0.3.1 的许可证说明与源码获取方式见 [docs/licensing-0.3.1.md](docs/licensing-0.3.1.md)。
 
 使用 PowerShell 7：先运行 `npm ci`、`npm run build`、`cargo build -p quicker-text --release`，然后运行 `./scripts/package-portable.ps1 -OutputDirectory <新输出目录>`。构建需要 Rust、Node.js、MSVC C++ 工具和 Windows SDK。脚本会逐文件校验 ZIP 与源目录的 SHA256，不覆盖已有交付包。
