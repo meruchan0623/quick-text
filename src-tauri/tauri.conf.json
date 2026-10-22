@@ -3,8 +3,8 @@
   "productName": "Quicker Text",
   "version": "0.3.1",
   "identifier": "com.quickertext.desktop",
-  "build": { "beforeDevCommand": "npm run dev", "devUrl": "http://localhost:1420", "beforeBuildCommand": "npm run build", "frontendDist": "../dist" },
+  "build": { "beforeDevCommand": "npm run dev", "devUrl": "http://localhost:1420", "beforeBuildCommand": "npm run build", "beforeBundleCommand": "pwsh -NoProfile -File scripts/check-bundle-preconditions.ps1", "frontendDist": "../dist" },
   "app": { "windows": [{ "label": "main", "title": "文本指令 · Quicker Text", "width": 1240, "height": 840, "minWidth": 900, "minHeight": 650 }], "security": { "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data:; connect-src ipc: http://ipc.localhost" } },
-  "bundle": { "active": true, "targets": "all", "shortDescription": "跨平台文本指令管理", "category": "Utility", "windows": { "nsis": { "displayLanguageSelector": true, "languages": ["SimpChinese", "English"] } } }
+  "bundle": { "active": true, "targets": "all", "shortDescription": "跨平台文本指令管理", "category": "Utility", "license": "GPL-3.0-or-later", "licenseFile": "../LICENSE", "resources": { "resources/THIRD-PARTY-LICENSES.txt": "THIRD-PARTY-LICENSES.txt", "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md", "../LICENSE": "LICENSE.txt", "../vendor/espanso-win32/LICENSE": "LICENSE-ESPANSO-GPL-3.0.txt" }, "windows": { "nsis": { "displayLanguageSelector": true, "languages": ["SimpChinese", "English"] } } }
 }
 
