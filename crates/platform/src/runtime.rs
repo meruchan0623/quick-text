@@ -43,6 +43,11 @@ struct PauseState {
     written: Option<bool>,
 }
 
+/// Lock order, for every path that holds more than one of these at a time:
+/// `last_state` → `health` → `pause` → `events`. `process` is only taken
+/// with at most `last_state` held, and `history` alone. Listeners run on the
+/// event thread with none of these held; the process probe never runs with
+/// `health`, `pause` or `events` held.
 pub struct Runtime {
     clock: Arc<dyn Clock>,
     history: History,
@@ -163,21 +168,36 @@ impl Runtime {
     /// Stores a new snapshot (from the supervisor). ENGINE_DOWN follows the
     /// state: set in Recovering/Failed, cleared otherwise. Emits `Health`
     /// when the snapshot changed and `State` when the engine state changed.
+    ///
+    /// The snapshot, the ENGINE_DOWN bit and both events are updated in one
+    /// critical section (`last_state` → `health` → `pause`, see [`Runtime`]),
+    /// so concurrent publishers cannot leave ENGINE_DOWN disagreeing with
+    /// the stored health or enqueue their events out of order.
     pub fn publish_health(&self, snapshot: HealthSnapshot) {
         let engine_down = matches!(
             snapshot.state,
             HealthState::Recovering | HealthState::Failed
         );
-        {
-            // Emit under the lock so concurrent publishers cannot reorder.
+        let mut last = self.last_state.lock();
+        let (health, reasons) = {
             let mut health = self.health.lock();
+            let mut pause = self.pause.lock();
+            self.sync_legacy(&mut pause);
+            pause.reasons = if engine_down {
+                pause.reasons.with(PauseReasons::ENGINE_DOWN)
+            } else {
+                pause.reasons.without(PauseReasons::ENGINE_DOWN)
+            };
+            self.sync_legacy(&mut pause);
             if *health != snapshot {
                 *health = snapshot.clone();
                 self.emit(EngineEvent::Health(snapshot));
             }
-        }
-        self.set_engine_down(engine_down);
-        self.refresh_state();
+            (health.state, pause.reasons)
+        };
+        // `last_state` is still held: no other publish or refresh can slip
+        // a State between this Health and this State.
+        self.emit_state_if_changed(&mut last, self.state_from(health, reasons));
     }
 
     // ---- pause --------------------------------------------------------
@@ -202,16 +222,6 @@ impl Runtime {
         });
         self.refresh_state();
         reasons
-    }
-
-    pub(crate) fn set_engine_down(&self, on: bool) {
-        self.update_pause(|reasons| {
-            if on {
-                reasons.with(PauseReasons::ENGINE_DOWN)
-            } else {
-                reasons.without(PauseReasons::ENGINE_DOWN)
-            }
-        });
     }
 
     fn update_pause(&self, change: impl FnOnce(PauseReasons) -> PauseReasons) -> PauseReasons {
@@ -262,26 +272,46 @@ impl Runtime {
     // ---- engine state -------------------------------------------------
 
     pub fn engine_state(&self) -> EngineState {
-        let paused_reasons = self.pause_reasons();
-        let health = self.health.lock().state;
-        let busy = self
-            .shared
+        let (health, reasons) = self.health_and_pause();
+        self.state_from(health, reasons)
+    }
+
+    /// Health state and pause reasons read together (`health` → `pause`),
+    /// so the pair is one that `publish_health` actually left behind.
+    fn health_and_pause(&self) -> (HealthState, PauseReasons) {
+        let health = self.health.lock();
+        let mut pause = self.pause.lock();
+        self.sync_legacy(&mut pause);
+        (health.state, pause.reasons)
+    }
+
+    fn busy(&self) -> bool {
+        self.shared
             .load_full()
-            .is_some_and(|shared| shared.busy.load(Ordering::SeqCst));
+            .is_some_and(|shared| shared.busy.load(Ordering::SeqCst))
+    }
+
+    /// Builds the engine state; calls the process probe, so never call it
+    /// with `health` or `pause` held.
+    fn state_from(&self, health: HealthState, paused_reasons: PauseReasons) -> EngineState {
         let probe = self.process.read().clone();
         EngineState {
             listening: health.accepts_resume() && paused_reasons.is_empty(),
             paused_reasons,
-            busy,
+            busy: self.busy(),
             current_process: probe.and_then(|probe| probe()),
         }
     }
 
     /// Recomputes the engine state and emits `State` if it changed. The
-    /// emit happens under the lock so listeners see states in order.
+    /// emit happens under `last_state` so listeners see states in order.
     pub fn refresh_state(&self) {
         let mut last = self.last_state.lock();
-        let state = self.engine_state();
+        let (health, reasons) = self.health_and_pause();
+        self.emit_state_if_changed(&mut last, self.state_from(health, reasons));
+    }
+
+    fn emit_state_if_changed(&self, last: &mut Option<EngineState>, state: EngineState) {
         if last.as_ref() != Some(&state) {
             *last = Some(state.clone());
             self.emit(EngineEvent::State(state));
@@ -290,8 +320,8 @@ impl Runtime {
 
     /// The §7.2 mapping-table row for the current health, pause and busy.
     pub fn status_text(&self) -> StatusText {
-        let state = self.engine_state();
-        StatusText::resolve(self.health.lock().state, state.paused_reasons, state.busy)
+        let (health, reasons) = self.health_and_pause();
+        StatusText::resolve(health, reasons, self.busy())
     }
 
     // ---- history ------------------------------------------------------
@@ -459,6 +489,71 @@ mod tests {
         // Starting carries no pause reason (mapping table row 1).
         runtime.publish_health(snapshot(HealthState::Starting));
         assert_eq!(runtime.pause_reasons(), PauseReasons::MANUAL);
+    }
+
+    /// Two publishers alternate Recovering/Healthy while a reader samples
+    /// health and pause together: ENGINE_DOWN always matches the stored
+    /// health (during and after), and MANUAL never moves.
+    #[test]
+    fn concurrent_publishers_keep_engine_down_with_health() {
+        use std::sync::atomic::AtomicBool;
+        use HealthState::{Healthy, Recovering};
+        let (runtime, _) = runtime();
+        let _events = collect(&runtime);
+        for manual in [false, true] {
+            runtime.set_pause(PauseReasons::MANUAL, manual);
+            let stop = Arc::new(AtomicBool::new(false));
+            let reader = {
+                let (runtime, stop) = (Arc::clone(&runtime), Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    let mut reads = 0u64;
+                    while !stop.load(Ordering::SeqCst) || reads == 0 {
+                        let (health, reasons) = runtime.health_and_pause();
+                        assert_eq!(
+                            reasons.contains(PauseReasons::ENGINE_DOWN),
+                            health == Recovering,
+                            "{health:?} {reasons:?}"
+                        );
+                        assert_eq!(reasons.contains(PauseReasons::MANUAL), manual);
+                        reads += 1;
+                    }
+                    reads
+                })
+            };
+            let publishers: Vec<_> = [(Recovering, Healthy), (Healthy, Recovering)]
+                .into_iter()
+                .map(|(even, odd)| {
+                    let runtime = Arc::clone(&runtime);
+                    std::thread::spawn(move || {
+                        for i in 0..2000 {
+                            let state = if i % 2 == 0 { even } else { odd };
+                            runtime.publish_health(snapshot(state));
+                        }
+                    })
+                })
+                .collect();
+            for publisher in publishers {
+                publisher.join().unwrap();
+            }
+            stop.store(true, Ordering::SeqCst);
+            assert!(reader.join().unwrap() > 0);
+            let last = runtime.health().state;
+            let reasons = runtime.pause_reasons();
+            assert_eq!(
+                reasons.contains(PauseReasons::ENGINE_DOWN),
+                last == Recovering,
+                "final {last:?} {reasons:?}"
+            );
+            assert_eq!(reasons.contains(PauseReasons::MANUAL), manual);
+            assert_eq!(
+                runtime.status_text(),
+                match (last, manual) {
+                    (Recovering, _) => StatusText::Recovering,
+                    (_, true) => StatusText::Paused,
+                    _ => StatusText::Listening,
+                }
+            );
+        }
     }
 
     #[test]
