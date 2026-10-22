@@ -67,6 +67,8 @@ const stale = (shown: number | undefined, caught: number | null) =>
   shown !== undefined && caught !== null && shown < caught;
 /** Commands that write the store and answer with the whole state. */
 type StoreWrite = 'save_draft' | 'apply_settings' | 'discard_draft' | 'rollback';
+/** How a save changes the config it is given (review C7 §4, see `conclude`). */
+type Change = (c: Config) => Config;
 /** The writes that publish a revision of their own, and how a notice about it names them. */
 const MADE_BY = { rollback: '恢复上一个版本', apply_settings: '应用设置' } as const;
 type Own = keyof typeof MADE_BY;
@@ -247,16 +249,27 @@ export default function App() {
     shown.current = s;
     setState(s);
   };
+  // So is the editor's config: a save's change is made again on it (review C7 §4, `conclude`), and
+  // an edit made after an await changes the config as it is then (`change`).
+  const editorConfig = useRef(config);
+  const putConfig = (c: Config) => {
+    editorConfig.current = c;
+    setConfig(c);
+  };
+  // Where the view the editor's config was taken from stands in the order of `install`.
+  const adopted = useRef({ revision: -1, request: 0 });
   const receive = (s: State) => {
     show(s);
     // A rule field with a serde default may be absent; the editor reads it filled in, as Rust does.
     const draft = completeConfig(s.draft);
-    setConfig(draft);
+    putConfig(draft);
     // Rules removed by a delete, rollback or import must not stay selected (F-04).
     setSelected((current) => pruneSelection(current, draft.rules));
     setLocalDirty(false);
     edited.current = false;
     editorRevision.current = s.revision;
+    // The view received is the one shown: the latest installed.
+    adopted.current = installed.current;
   };
   /** Say a store revision newer than the one the editor's unsaved edits are based on. */
   const sayNewer = (revision: number) => {
@@ -347,9 +360,24 @@ export default function App() {
    * answers in order would have: this answer, then that view.
    *
    * Edits made since the request was sent are kept, never replaced by an answer, as with a load;
-   * the editor stays dirty.
+   * the editor stays dirty. A save of a config other than the editor's (a rule committed, a list
+   * changed, 总开关, an import) has its change `op` made again on the editor's config, over those
+   * edits, installed or not (review C7 §4). The editor is the draft it took in and the edits made
+   * since; that draft was read before the save ran, so without the change the editor would lack
+   * what was saved, and its next save would undo it. Exact: edits change the globals alone (see
+   * `change`), these saves the rules or 总开关 (an import all of it, see there). Not over a view
+   * the editor took in that was read after the save ran (放弃未应用草稿 sent after the edits, say):
+   * that view has the save's outcome already, or what undid it. A save that failed is not concluded,
+   * so its change is not made again.
    */
-  const conclude = (command: StoreWrite, s: State, answerShown: boolean, untouched: boolean) => {
+  const conclude = (
+    command: StoreWrite,
+    s: State,
+    request: number,
+    answerShown: boolean,
+    untouched: boolean,
+    op?: Change,
+  ) => {
     const now = shown.current;
     // Never null: every write waits for the first snapshot.
     if (now === null) return;
@@ -368,9 +396,24 @@ export default function App() {
       editorRevision.current = Math.max(editorRevision.current ?? s.revision, s.revision);
       if (command === 'apply_settings')
         setNewer((n) => (n !== null && !n.saved && n.revision === s.revision ? null : n));
+      else if (op !== undefined) {
+        const taken = adopted.current;
+        if (
+          taken.revision < s.revision ||
+          (taken.revision === s.revision && taken.request < request)
+        ) {
+          const next = op(editorConfig.current);
+          // Not an edit: `edits` is for edits alone, and the editor holds what the store does not.
+          putConfig(next);
+          setSelected((current) => pruneSelection(current, next.rules));
+          setLocalDirty(true);
+          edited.current = true;
+        }
+      }
     } else if (answerShown) sayNewer(s.revision);
   };
-  const write = async (command: StoreWrite, args?: Record<string, unknown>) => {
+  /** Write `command`; `op`: how a save of a config other than the editor's changes it. */
+  const write = async (command: StoreWrite, args?: Record<string, unknown>, op?: Change) => {
     setWriting((n) => n + 1);
     // As the request is sent: the revision the editor's config is based on (review C6), and the
     // local edits so far (review C7). Applying publishes the store's draft, without the editor's
@@ -409,7 +452,7 @@ export default function App() {
         );
       }
       // After the notice about the save: the editor may take in the view that overtook it.
-      conclude(command, s, view !== null, !unsaved && edits.current === sent);
+      conclude(command, s, request, view !== null, !unsaved && edits.current === sent, op);
       return s;
     } finally {
       // In the same step as the answer, so no render sees the write done without its answer.
@@ -686,19 +729,28 @@ export default function App() {
       return;
     setEditing(null);
   };
-  const change = (c: Config) => {
+  // A local edit: the globals, given whole. Local edits change nothing else; the rules and 总开关
+  // change by saves alone (a rule committed, a list changed, 总开关, an import), whose change is made
+  // again on the editor after edits made while they ran (`conclude`). That is exact only because
+  // the two change different fields: should an edit come to change the rules or 总开关, think the
+  // replay through again.
+  const change = (globals: Config['globals']) => {
     // The settings fields are disabled through their fieldset, which React does not see: an input
     // event still reaches onChange. Before the first snapshot there is nothing to edit yet.
     if (!loaded.current) return;
-    setConfig(c);
+    putConfig({ ...editorConfig.current, globals });
     setLocalDirty(true);
     edited.current = true;
     edits.current += 1;
   };
-  const save = async (c = config) => {
-    // Every path that submits the config ends here (rules, settings, 总开关, import, export, apply).
+  /**
+   * Save the editor's config, or with `op` the config it makes of the editor's: its change, made
+   * again on the editor's config after edits made while it ran (`conclude`). Every path that
+   * submits the config ends here (rules, settings, 总开关, import, export, apply).
+   */
+  const save = async (op?: Change) => {
     requireReady();
-    return write('save_draft', { config: c });
+    return write('save_draft', { config: op ? op(config) : config }, op);
   };
   const selectedSet = new Set(selected);
   // Rules the UI can show and edit. Any other entry (one the backend could not read, B-43, or one
@@ -743,9 +795,15 @@ export default function App() {
   // Kept in place on save. Their numbers are within the IPC number contract (a rule holding one
   // past it is unreadable and never reaches the editor), so their values stay the same.
   const editingExtraKeys = editing ? unknownRuleKeys(editing) : [];
+  // `fn` may run again, on the rules then (see `save`): it sets what the click chose, from values
+  // taken at the click.
   const mutate = async (fn: (rs: Rule[]) => Rule[]) =>
     run(
-      () => save({ ...config, rules: replaceReadable(config.rules, fn(clone(readable))) }),
+      () =>
+        save((c) => ({
+          ...c,
+          rules: replaceReadable(c.rules, fn(clone(c.rules.filter(isRule)))),
+        })),
       '草稿已保存 · 请应用设置',
     );
   const choose = async (kind = 'file') => call<string[] | null>('choose_file', { kind });
@@ -795,18 +853,19 @@ export default function App() {
       if (!editing) return;
       const problems = editProblems(editing);
       if (problems.length > 0) throw reject(problems);
-      const found = indexOfRule(editing.id);
-      const c = {
-        ...config,
-        rules:
-          found >= 0
-            ? config.rules.map((r, i) => (i === found ? editing : r))
-            : [...config.rules, editing],
+      const rule = editing;
+      // Put in place by id, on the config given (see `save`).
+      const commit: Change = (c) => {
+        const found = c.rules.findIndex((r) => isRule(r) && r.id === rule.id);
+        return {
+          ...c,
+          rules: found >= 0 ? c.rules.map((r, i) => (i === found ? rule : r)) : [...c.rules, rule],
+        };
       };
-      const v = await call('validate_config', { config: c });
+      const v = await call('validate_config', { config: commit(config) });
       if (!v.valid) throw reject(v.errors);
       try {
-        await save(c);
+        await save(commit);
       } catch (e) {
         // save_draft validates too (B-42); its diagnostics go to the same place.
         const error = parseCommandError(e);
@@ -927,9 +986,12 @@ export default function App() {
                 type="checkbox"
                 checked={config.enabled}
                 disabled={!editable}
-                onChange={(e) =>
-                  run(() => save({ ...config, enabled: e.target.checked }), '总开关已保存到草稿')
-                }
+                onChange={(e) => {
+                  // Taken now: the change may be made again later (see `save`), when the box shows
+                  // config.enabled again. Set to it, not turned over.
+                  const on = e.target.checked;
+                  void run(() => save((c) => ({ ...c, enabled: on })), '总开关已保存到草稿');
+                }}
               />
               <span />
               启用文本指令
@@ -1093,13 +1155,12 @@ export default function App() {
                         type="checkbox"
                         checked={!r.enabled}
                         disabled={!editable}
-                        onChange={(e) =>
-                          mutate((rs) =>
-                            rs.map((x) =>
-                              x.id === r.id ? { ...x, enabled: !e.target.checked } : x,
-                            ),
-                          )
-                        }
+                        onChange={(e) => {
+                          const off = e.target.checked;
+                          void mutate((rs) =>
+                            rs.map((x) => (x.id === r.id ? { ...x, enabled: !off } : x)),
+                          );
+                        }}
                       />
                     </td>
                     <td className="row-tools">
@@ -1190,20 +1251,13 @@ export default function App() {
               <EndKeys
                 platform={platform}
                 value={config.globals.terminators}
-                onChange={(v) =>
-                  change({ ...config, globals: { ...config.globals, terminators: v } })
-                }
+                onChange={(v) => change({ ...config.globals, terminators: v })}
               />
             </Field>
             <Field label="词分隔符" hint="空格、Tab、换行用于确定触发边界。">
               <input
                 value={config.globals.word_separators}
-                onChange={(e) =>
-                  change({
-                    ...config,
-                    globals: { ...config.globals, word_separators: e.target.value },
-                  })
-                }
+                onChange={(e) => change({ ...config.globals, word_separators: e.target.value })}
               />
             </Field>
             {fixedImeErasure(platform) ? (
@@ -1222,12 +1276,7 @@ export default function App() {
               >
                 <select
                   value={config.globals.ime_erasure}
-                  onChange={(e) =>
-                    change({
-                      ...config,
-                      globals: { ...config.globals, ime_erasure: e.target.value },
-                    })
-                  }
+                  onChange={(e) => change({ ...config.globals, ime_erasure: e.target.value })}
                 >
                   <option value="escape">按 Esc 关闭选字框</option>
                   <option value="backspace">Backspace 删除已上屏字符</option>
@@ -1241,9 +1290,7 @@ export default function App() {
               <LinesInput
                 rows={5}
                 value={config.globals.blacklist}
-                onChange={(blacklist) =>
-                  change({ ...config, globals: { ...config.globals, blacklist } })
-                }
+                onChange={(blacklist) => change({ ...config.globals, blacklist })}
               />
             </Field>
           </fieldset>
@@ -1257,13 +1304,9 @@ export default function App() {
                 const identity =
                   platform === 'macos' ? w.bundle_id : platform === 'windows' ? w.process : '';
                 if (!identity) throw new Error('目标平台或应用标识未确认，黑名单未修改');
-                change({
-                  ...config,
-                  globals: {
-                    ...config.globals,
-                    blacklist: [...new Set([...config.globals.blacklist, identity])],
-                  },
-                });
+                // The globals as they are now, not as they were before the await.
+                const { globals } = editorConfig.current;
+                change({ ...globals, blacklist: [...new Set([...globals.blacklist, identity])] });
                 setDialog({ title: '窗口信息', data: w });
               })
             }
@@ -1747,12 +1790,17 @@ export default function App() {
               {dialog.importConfig && (
                 <button
                   className="primary"
-                  onClick={() =>
-                    run(async () => {
-                      await save(dialog.importConfig);
+                  onClick={() => {
+                    const imported = dialog.importConfig;
+                    if (!imported) return;
+                    void run(async () => {
+                      // The whole config replaced, the globals too, also when made again (see
+                      // `save`): no edit can be made meanwhile, as this dialog is modal and stays
+                      // open until the save is done.
+                      await save(() => imported);
                       setDialog(null);
-                    }, '导入草稿已保存，请应用设置')
-                  }
+                    }, '导入草稿已保存，请应用设置');
+                  }}
                 >
                   确认导入草稿
                 </button>

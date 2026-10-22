@@ -2048,13 +2048,17 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       const hold = holdAnswers('save_draft');
       const mounted = await mountReady(hold);
       const { container } = mounted;
-      await toggleHeld(mounted, hold);
+      const before = await toggleHeld(mounted, hold);
       await click(mounted, '文本指令参数设置');
       await type(mounted, field(container, '词分隔符'), ' |');
       await focusLoad(mounted);
       await answerHeld(mounted, hold, 0);
       expect(separators(container)).toBe(' |');
       expect(revisionText(container)).toContain('草稿待应用');
+      // With what 总开关 saved, under the edit (review C7 §4).
+      await click(mounted, '文本指令管理');
+      expect(enabled(container)).toBe(!before);
+      await click(mounted, '文本指令参数设置');
       // Still unsaved: a revision published elsewhere does not replace it.
       await publish(mounted, ',');
       await waitFor(mounted, () => {
@@ -2095,6 +2099,325 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       expect(separators(container)).toBe('|');
       expect(revisionText(container)).toContain('当前生效 v3');
       expect(notices(container)).toBe('');
+    });
+
+    describe("a save's change survives edits made while it ran (review C7 §4)", () => {
+      const FAILURE = '草稿文件无法写入';
+
+      /** 导出, which saves the editor's config first when it has unsaved edits: whether it did. */
+      async function exportSaves(mounted: Mounted): Promise<boolean> {
+        const { backend } = mounted;
+        const saves = callsOf(backend, 'save_draft').length;
+        const exports = callsOf(backend, 'export_config').length;
+        await click(mounted, '导出');
+        await waitFor(mounted, () => {
+          expect(callsOf(backend, 'export_config')).toHaveLength(exports + 1);
+        });
+        await settle(mounted);
+        return callsOf(backend, 'save_draft').length > saves;
+      }
+
+      /** The config the last save_draft sent. */
+      const sent = (backend: MockBackend) =>
+        callsOf(backend, 'save_draft').at(-1)?.args.config as
+          { rules: { match: { value: string } }[]; globals: { blacklist: string[] } } | undefined;
+      /** The abbreviations of the rules listed. */
+      const listed = (container: HTMLElement) =>
+        [...container.querySelectorAll('input[aria-label^="选择 "]')].map((box) =>
+          box.getAttribute('aria-label')?.slice('选择 '.length),
+        );
+      const batch = (container: HTMLElement) =>
+        container.querySelector('.batch span')?.textContent ?? '';
+      const toggle = (mounted: Mounted) =>
+        mounted.act(() => {
+          checkbox(mounted.container, '启用文本指令')?.click();
+        });
+
+      /** Each armed call of `name` runs nothing and fails with `failure`, on its `release()`. */
+      function holdFailures(name: string, failure: unknown): LoadHold {
+        let armed = 0;
+        const held: HeldLoad[] = [];
+        return {
+          held,
+          attach: (backend) => {
+            const handle = backend.handle.bind(backend);
+            backend.handle = async (...[command, args]: Parameters<MockBackend['handle']>) => {
+              if (command !== name || armed === 0) return handle(command, args);
+              armed -= 1;
+              const entry: HeldLoad = { read: true, answered: false, release: () => undefined };
+              held.push(entry);
+              await new Promise<void>((resolve) => {
+                entry.release = () => {
+                  resolve();
+                };
+              });
+              entry.answered = true;
+              throw failure;
+            };
+          },
+          arm: (count = 1) => {
+            armed += count;
+          },
+        };
+      }
+
+      it('puts what 总开关 saved under edits made while it ran, its answer installed', async () => {
+        const hold = holdAnswers('save_draft');
+        const mounted = await mountReady(hold);
+        const { backend, container } = mounted;
+        const before = await toggleHeld(mounted, hold);
+        await click(mounted, '文本指令参数设置');
+        await type(mounted, field(container, '词分隔符'), ' |');
+        await answerHeld(mounted, hold, 0);
+        expect(separators(container)).toBe(' |');
+        await click(mounted, '文本指令管理');
+        expect(enabled(container)).toBe(!before);
+        // The edit is still unsaved, and the editor's next save has both.
+        expect(await exportSaves(mounted)).toBe(true);
+        expect(sentEnabled(backend)).toBe(!before);
+        expect(sentSeparators(backend)).toBe(' |');
+      });
+
+      it('puts what 总开关 saved under edits made while it ran, its answer dropped', async () => {
+        const hold = holdAnswers('save_draft');
+        const mounted = await mountReady(hold);
+        const { backend, container } = mounted;
+        const before = await toggleHeld(mounted, hold);
+        await click(mounted, '文本指令参数设置');
+        await type(mounted, field(container, '词分隔符'), ' |');
+        await focusLoad(mounted);
+        await answerHeld(mounted, hold, 0);
+        expect(separators(container)).toBe(' |');
+        expect(notices(container)).toBe('');
+        await click(mounted, '文本指令管理');
+        expect(enabled(container)).toBe(!before);
+        expect(await exportSaves(mounted)).toBe(true);
+        expect(sentEnabled(backend)).toBe(!before);
+        expect(sentSeparators(backend)).toBe(' |');
+      });
+
+      it('sets 总开关 as each click chose when two saves of it are put under an edit', async () => {
+        const hold = holdAnswers('save_draft');
+        const mounted = await mountReady(hold);
+        const { backend, container } = mounted;
+        const before = await toggleHeld(mounted, hold);
+        // The box shows the editor's config until an answer: clicked again, it asks for the same.
+        expect(enabled(container)).toBe(before);
+        hold.arm();
+        await toggle(mounted);
+        await waitFor(mounted, () => {
+          expect(hold.held[1]?.read).toBe(true);
+        });
+        expect(sentEnabled(backend)).toBe(!before);
+        await click(mounted, '文本指令参数设置');
+        await type(mounted, field(container, '词分隔符'), ' |');
+        await answerHeld(mounted, hold, 0);
+        await answerHeld(mounted, hold, 1);
+        await click(mounted, '文本指令管理');
+        expect(enabled(container)).toBe(!before);
+        expect(await exportSaves(mounted)).toBe(true);
+        expect(sentEnabled(backend)).toBe(!before);
+        expect(sentSeparators(backend)).toBe(' |');
+      });
+
+      it('deletes the selected rules under edits made while the delete ran, and unselects them', async () => {
+        const hold = holdAnswers('save_draft');
+        const mounted = await mountReady(hold);
+        const { backend, container } = mounted;
+        for (const label of ['选择 ;s1', '选择 ;s3']) {
+          const box = container.querySelector<HTMLInputElement>(`input[aria-label="${label}"]`);
+          await mounted.act(() => {
+            box?.click();
+          });
+        }
+        expect(batch(container)).toBe('共 3 条 · 已选 2 条');
+        hold.arm();
+        await clickIn(mounted, container.querySelector('.batch'), '删除');
+        const question = '删除所选 2 条指令？';
+        await waitFor(mounted, () => {
+          expect(dialog(container, question)).not.toBeNull();
+        });
+        await clickIn(mounted, dialog(container, question), '删除');
+        await waitFor(mounted, () => {
+          expect(hold.held[0]?.read).toBe(true);
+        });
+        await click(mounted, '文本指令参数设置');
+        await type(mounted, field(container, '词分隔符'), ' |');
+        await answerHeld(mounted, hold, 0);
+        expect(separators(container)).toBe(' |');
+        await click(mounted, '文本指令管理');
+        expect(listed(container)).toEqual([';s2']);
+        expect(batch(container)).toBe('共 1 条 · 已选 0 条');
+        expect(await exportSaves(mounted)).toBe(true);
+        expect(sent(backend)?.rules.map((r) => r.match.value)).toEqual([';s2']);
+        expect(sentSeparators(backend)).toBe(' |');
+      });
+
+      it('puts a rule committed under edits made while it was saved', async () => {
+        const hold = holdAnswers('save_draft');
+        const mounted = await mountReady(hold);
+        const { backend, container } = mounted;
+        await click(mounted, '＋ 添加指令');
+        const editor = dialog(container, '编辑文本指令');
+        await type(mounted, field(editor ?? container, '缩写词'), ';new');
+        hold.arm();
+        await clickIn(mounted, editor, '保存');
+        await waitFor(mounted, () => {
+          expect(hold.held[0]?.read).toBe(true);
+        });
+        // In the app the dialog is modal; jsdom's is not, which lets the settings change meanwhile.
+        await click(mounted, '文本指令参数设置');
+        await type(mounted, field(container, '词分隔符'), ' |');
+        await answerHeld(mounted, hold, 0);
+        expect(dialog(container, '编辑文本指令')).toBeNull();
+        expect(separators(container)).toBe(' |');
+        await click(mounted, '文本指令管理');
+        expect(listed(container)).toContain(';new');
+        expect(await exportSaves(mounted)).toBe(true);
+        expect(sent(backend)?.rules.map((r) => r.match.value)).toEqual([
+          ';s1',
+          ';s2',
+          ';s3',
+          ';new',
+        ]);
+        expect(sentSeparators(backend)).toBe(' |');
+      });
+
+      it('makes nothing again of a save that failed, keeping edits made while it ran', async () => {
+        const hold = holdFailures('save_draft', FAILURE);
+        const mounted = await mountReady(hold);
+        const { backend, container } = mounted;
+        const before = await toggleHeld(mounted, hold);
+        await click(mounted, '文本指令参数设置');
+        await type(mounted, field(container, '词分隔符'), ' |');
+        await answerHeld(mounted, hold, 0);
+        expect(container.querySelector('.alert.error')?.textContent).toContain(FAILURE);
+        expect(separators(container)).toBe(' |');
+        await click(mounted, '文本指令管理');
+        expect(enabled(container)).toBe(before);
+        expect(await exportSaves(mounted)).toBe(true);
+        expect(sentEnabled(backend)).toBe(before);
+        expect(sentSeparators(backend)).toBe(' |');
+      });
+
+      it('makes nothing again over 放弃未应用草稿 sent after the edits, which ran after the save', async () => {
+        const hold = holdAnswers('save_draft');
+        const mounted = await mountReady(hold);
+        const { container } = mounted;
+        await click(mounted, '文本指令参数设置');
+        const original = separators(container);
+        const before = await toggleHeld(mounted, hold);
+        await click(mounted, '文本指令参数设置');
+        await type(mounted, field(container, '词分隔符'), ' |');
+        await confirmOnStatus(mounted, DISCARD);
+        await waitFor(mounted, () => {
+          expect(separators(container)).toBe(original);
+        });
+        // Dropped: the discard's answer is of a later request. The discarded draft stays.
+        await answerHeld(mounted, hold, 0);
+        expect(separators(container)).toBe(original);
+        await click(mounted, '文本指令管理');
+        expect(enabled(container)).toBe(before);
+        expect(await exportSaves(mounted)).toBe(false);
+      });
+
+      it('lets 放弃未应用草稿 sent after the edits take the editor once a save is made again', async () => {
+        const hold = holdAnswers('save_draft');
+        const mounted = await mountReady(hold);
+        const discard = holdAnswers('discard_draft');
+        discard.attach(mounted.backend);
+        const { container } = mounted;
+        await click(mounted, '文本指令参数设置');
+        const original = separators(container);
+        const before = await toggleHeld(mounted, hold);
+        await click(mounted, '文本指令参数设置');
+        await type(mounted, field(container, '词分隔符'), ' |');
+        discard.arm();
+        await confirmOnStatus(mounted, DISCARD);
+        await waitFor(mounted, () => {
+          expect(discard.held[0]?.read).toBe(true);
+        });
+        // The save's answer first: its change put under the edit, which is no edit itself.
+        await answerHeld(mounted, hold, 0);
+        expect(separators(container)).toBe(' |');
+        // Then the discard's, with no edit since it was sent: the editor takes the discarded draft.
+        await answerHeld(mounted, discard, 0);
+        expect(separators(container)).toBe(original);
+        await click(mounted, '文本指令管理');
+        expect(enabled(container)).toBe(before);
+        expect(await exportSaves(mounted)).toBe(false);
+      });
+
+      it('keeps the editor unsaved when a save is made again over a view read before it ran', async () => {
+        const hold = holdAnswers('save_draft');
+        const mounted = await mountReady(hold);
+        const { backend, container } = mounted;
+        await click(mounted, '文本指令参数设置');
+        await type(mounted, field(container, '词分隔符'), ' ;');
+        // v2, read over the edit before 总开关 saves.
+        await publish(mounted, ',');
+        await waitFor(mounted, () => {
+          expect(notices(container)).toContain(
+            '配置已在后台更新为 v2。编辑器中未保存的修改仍然保留',
+          );
+        });
+        await click(mounted, '文本指令管理');
+        const before = enabled(container);
+        hold.arm();
+        await toggle(mounted);
+        await waitFor(mounted, () => {
+          expect(hold.held[0]?.read).toBe(true);
+        });
+        await click(mounted, '文本指令参数设置');
+        await type(mounted, field(container, '词分隔符'), ' |');
+        // Another command done meanwhile leaves the notice's buttons usable.
+        await mounted.act(() => {
+          checkbox(container, '登录后自动启动')?.click();
+        });
+        await waitFor(mounted, () => {
+          expect(button(container, '放弃修改，载入新配置')?.disabled).toBe(false);
+        });
+        await click(mounted, '放弃修改，载入新配置');
+        expect(separators(container)).toBe(',');
+        await answerHeld(mounted, hold, 0);
+        // v2 with what 总开关 saved: not what the store has (the save replaced v2's draft).
+        expect(notices(container)).toContain('保存已用编辑器中的配置覆盖了它的草稿');
+        expect(separators(container)).toBe(',');
+        // Unsaved: a load does not replace it, and 导出 saves it first.
+        await focusLoad(mounted);
+        expect(separators(container)).toBe(',');
+        await click(mounted, '文本指令管理');
+        expect(enabled(container)).toBe(!before);
+        expect(await exportSaves(mounted)).toBe(true);
+        expect(sentEnabled(backend)).toBe(!before);
+        expect(sentSeparators(backend)).toBe(',');
+      });
+
+      it('adds the window to 黑名单 over what 总开关 saved while it was asked for', async () => {
+        // Edits change the globals alone, as they are when made (see `change` in App).
+        const foreground = holdAnswers('get_foreground');
+        const mounted = await mountReady(foreground);
+        const { backend, container } = mounted;
+        await click(mounted, '文本指令参数设置');
+        foreground.arm();
+        await click(mounted, '选择当前窗口加入黑名单');
+        await waitFor(mounted, () => {
+          expect(foreground.held[0]?.read).toBe(true);
+        });
+        await click(mounted, '文本指令管理');
+        const before = enabled(container);
+        await toggle(mounted);
+        // No edit yet: the editor takes the answer.
+        await waitFor(mounted, () => {
+          expect(enabled(container)).toBe(!before);
+        });
+        await answerHeld(mounted, foreground, 0);
+        await clickIn(mounted, dialog(container, '窗口信息'), '关闭');
+        expect(enabled(container)).toBe(!before);
+        expect(await exportSaves(mounted)).toBe(true);
+        expect(sentEnabled(backend)).toBe(!before);
+        expect(sent(backend)?.globals.blacklist).toContain('notepad.exe');
+      });
     });
   });
 });
