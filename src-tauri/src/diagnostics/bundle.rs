@@ -593,7 +593,55 @@ fn os_version() -> Option<String> {
 }
 
 #[cfg(test)]
+pub mod test_support {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Every entry of a zip, by name.
+    pub fn unzip(bytes: Vec<u8>) -> BTreeMap<String, String> {
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        (0..archive.len())
+            .map(|i| {
+                let mut file = archive.by_index(i).unwrap();
+                let mut text = String::new();
+                file.read_to_string(&mut text).unwrap();
+                (file.name().unwrap().into_owned(), text)
+            })
+            .collect()
+    }
+
+    /// The entries of a Summary bundle of `data_dir` built now (log files are
+    /// dated by the real clock), for privacy tests outside this module.
+    pub fn summary_entries(data_dir: &Path) -> BTreeMap<String, String> {
+        let snapshot = Snapshot {
+            now: SystemTime::now(),
+            health: HealthReport {
+                health: None,
+                engine_status: "listening",
+                paused: false,
+                busy: false,
+                revision: 0,
+                last_result: None,
+                capabilities: Vec::new(),
+                log_level: LevelState::default(),
+            },
+            system: SystemInfo::current(),
+            homes: Vec::new(),
+        };
+        let (cursor, _) = build_bundle(
+            data_dir,
+            Redaction::Summary,
+            Cursor::new(Vec::new()),
+            &snapshot,
+        )
+        .unwrap();
+        unzip(cursor.into_inner())
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::test_support::unzip;
     use super::*;
     use crate::diagnostics::level::LogLevel;
     use quicker_domain::{Action, ContentSource, MatchKind, MatchSpec, OutputMethod, Rule};
@@ -702,18 +750,6 @@ mod tests {
         fs::write(dir.join("crash-20261020-080000.txt"), "thread: main\n").unwrap();
         fs::write(dir.join("crash-20261021-080000.txt"), "thread: hook\n").unwrap();
         dir
-    }
-
-    fn unzip(bytes: Vec<u8>) -> BTreeMap<String, String> {
-        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
-        (0..archive.len())
-            .map(|i| {
-                let mut file = archive.by_index(i).unwrap();
-                let mut text = String::new();
-                file.read_to_string(&mut text).unwrap();
-                (file.name().unwrap().into_owned(), text)
-            })
-            .collect()
     }
 
     fn build(dir: &Path, redaction: Redaction, homes: &[&str]) -> BTreeMap<String, String> {

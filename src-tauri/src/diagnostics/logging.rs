@@ -39,7 +39,7 @@
 //! | `command.io` | warn | `CommandError::Io`; operation, file name, OS error |
 //! | `diagnostics.export` | info | a bundle was written; redaction, entry count, `elapsed_ms` |
 //! | `engine.unavailable` | warn | the platform refused to start or resume |
-//! | `frontend.error` | warn | `log_frontend_error`; message, source, stack (8 KiB in total) |
+//! | `frontend.error` | warn | `log_frontend_error`; error class, message length and fingerprint, source and stack frames as `function@basename:line:col` of the app's scripts, count of dropped lines; never the text |
 //! | `log.file_unavailable` | error | log files could not be opened; stderr only |
 //! | `log.level_set` | info | `set_log_level`; level and `until_ms` |
 //! | `log.level_restored` | info | a saved temporary level was re-applied at startup |

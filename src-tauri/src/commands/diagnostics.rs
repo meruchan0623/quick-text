@@ -13,7 +13,7 @@ use crate::{
         },
         level::{LevelState, LogLevel, LogLevelControl},
         logging::log_dir,
-        redact::{redact_user_paths, truncate_utf8, user_homes},
+        redact::{fingerprint, truncate_utf8, user_homes},
     },
     error::{CommandError, IoOp},
 };
@@ -24,12 +24,11 @@ use std::{
     time::{Instant, SystemTime},
 };
 use tauri::State;
-use tracing::field;
 
 /// Save dialog filter for `export_diagnostics`.
 const BUNDLE_FILTERS: &[Filter] = &[("诊断包", &["zip"])];
-/// Byte budget of one `log_frontend_error` report (contract: 8 KiB), shared
-/// by message, source and stack in that order.
+/// How much of a `log_frontend_error` stack is read (contract: 8 KiB). What
+/// is logged is shorter: only parts of the frames in it.
 pub const FRONTEND_ERROR_MAX_BYTES: usize = 8 * 1024;
 /// Metric names `report_metric` accepts (contract §5, 0.4).
 pub const METRICS: [&str; 2] = ["ui_first_paint_ms", "ui_event_lag_ms"];
@@ -150,55 +149,157 @@ fn reveal(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Logs a frontend error as `frontend.error` (warn), cut to
-/// [`FRONTEND_ERROR_MAX_BYTES`].
+/// Logs a frontend error as `frontend.error` (warn): its structure only,
+/// see [`FrontendError`].
 #[tauri::command(rename_all = "snake_case")]
 pub fn log_frontend_error(message: String, stack: Option<String>, source: Option<String>) {
-    let report = FrontendError::fit(&message, stack.as_deref(), source.as_deref(), &user_homes());
-    // Debug formatting keeps multi-line stacks on one log line.
+    let report = FrontendError::fit(&message, stack.as_deref(), source.as_deref());
     tracing::warn!(
         event = "frontend.error",
-        message = ?report.message,
-        source = report.source.as_deref().map(field::debug),
-        stack = report.stack.as_deref().map(field::debug),
+        class = report.class.as_deref(),
+        message_len = report.message_len,
+        message_hash = %report.message_hash,
+        source = report.source.as_deref(),
+        stack = ?report.frames,
+        dropped_lines = report.dropped_lines,
         truncated = report.truncated,
         "frontend error"
     );
 }
 
+/// What `log_frontend_error` keeps of a report. The text of a frontend error
+/// can carry phrase content (a message built from a rule, a query string in
+/// a frame's URL), so none of it is logged verbatim (S-08): only the error
+/// class, the message's length and fingerprint, and the app's own frames.
 #[derive(Debug, PartialEq, Eq)]
 struct FrontendError {
-    message: String,
+    /// The error class the message starts with (`TypeError`).
+    class: Option<String>,
+    /// Byte length of the whole message.
+    message_len: usize,
+    /// [`fingerprint`] of the whole message, to group repeated reports.
+    message_hash: String,
+    /// `basename:line:col` when `source` is a location in the app's assets.
     source: Option<String>,
-    stack: Option<String>,
+    /// Stack frames in the app's assets as `function@basename:line:col`;
+    /// the function is left out when its name is not an identifier.
+    frames: Vec<String>,
+    /// Stack lines left out: not a frame, or a frame outside the app's
+    /// assets (the first line of a V8 stack repeats the message).
+    dropped_lines: usize,
+    /// The stack was longer than [`FRONTEND_ERROR_MAX_BYTES`]; only the
+    /// complete lines of its head were read.
     truncated: bool,
 }
 impl FrontendError {
-    /// User names in paths replaced, then cut on char boundaries so that
-    /// message, source and stack together fit the byte budget.
-    fn fit(message: &str, stack: Option<&str>, source: Option<&str>, homes: &[String]) -> Self {
-        let mut budget = FRONTEND_ERROR_MAX_BYTES;
-        let mut truncated = false;
-        let mut take = |raw: &str| {
-            // Cut before redacting so a huge report costs no more than 8 KiB
-            // of work, and again after, as a replacement can be longer.
-            let head = truncate_utf8(raw, FRONTEND_ERROR_MAX_BYTES);
-            let text = redact_user_paths(head, homes);
-            let kept = truncate_utf8(&text, budget).to_string();
-            truncated |= head.len() < raw.len() || kept.len() < text.len();
-            budget -= kept.len();
-            kept
-        };
-        let message = take(message);
-        let source = source.map(&mut take);
-        let stack = stack.map(&mut take);
+    fn fit(message: &str, stack: Option<&str>, source: Option<&str>) -> Self {
+        let stack = stack.unwrap_or("");
+        let mut head = truncate_utf8(stack, FRONTEND_ERROR_MAX_BYTES);
+        let truncated = head.len() < stack.len();
+        if truncated {
+            // The cut line is incomplete: its line and column may be wrong.
+            head = head.rsplit_once('\n').map_or("", |(lines, _)| lines);
+        }
+        let mut frames = Vec::new();
+        let mut dropped_lines = 0;
+        for line in head.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            match stack_frame(line) {
+                Some(frame) => frames.push(frame),
+                None => dropped_lines += 1,
+            }
+        }
         Self {
-            message,
-            source,
-            stack,
+            class: error_class(message).map(str::to_string),
+            message_len: message.len(),
+            message_hash: fingerprint(message),
+            source: source.and_then(asset_location),
+            frames,
+            dropped_lines,
             truncated,
         }
     }
+}
+
+/// The class of `TypeError: ...` (also `Uncaught TypeError: ...`, as
+/// `window.onerror` reports it): an identifier ending in `Error` or
+/// `Exception` (`DOMException`), so that the start of a free-form message
+/// (`hello: ...`) does not pass as a class.
+fn error_class(message: &str) -> Option<&str> {
+    let message = message.trim_start();
+    let message = message.strip_prefix("Uncaught ").unwrap_or(message);
+    let head = message.split_once(':').map_or(message, |(head, _)| head);
+    (is_identifier(head) && (head.ends_with("Error") || head.ends_with("Exception")))
+        .then_some(head)
+}
+
+/// `^[A-Za-z_$][A-Za-z0-9_$]{0,63}$`.
+fn is_identifier(text: &str) -> bool {
+    let word = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$');
+    text.len() <= 64
+        && text.bytes().next().is_some_and(|b| !b.is_ascii_digit())
+        && text.as_bytes().iter().all(word)
+}
+
+/// One stack line as `function@basename:line:col` when it is a frame in the
+/// app's assets: V8 (`at fn (url:1:2)`, `at url:1:2`) or SpiderMonkey and
+/// JavaScriptCore (`fn@url:1:2`). V8 qualifies methods (`Object.render`),
+/// so a function name may be identifiers joined by dots.
+fn stack_frame(line: &str) -> Option<String> {
+    let (name, location) = match line.strip_prefix("at ") {
+        Some(rest) => rest
+            .strip_suffix(')')
+            .and_then(|inner| inner.split_once(" ("))
+            .unwrap_or(("", rest)),
+        None => line.split_once('@')?,
+    };
+    let location = asset_location(location)?;
+    let name = name.trim();
+    let name = name.strip_prefix("async ").unwrap_or(name);
+    let name = name.strip_prefix("new ").unwrap_or(name);
+    let named = name.len() <= 64 && name.split('.').all(is_identifier);
+    Some(format!("{}@{location}", if named { name } else { "" }))
+}
+
+/// `basename:line:col` of `url:line:col` when `url` is one of the app's
+/// bundled scripts, served from `tauri://localhost`, `http(s)://tauri.localhost`
+/// or the dev server `http://localhost:<port>`, or given as a relative path.
+/// The query string, fragment and directories are left out.
+fn asset_location(location: &str) -> Option<String> {
+    let (rest, col) = location.trim().rsplit_once(':')?;
+    let (url, line) = rest.rsplit_once(':')?;
+    if !is_number(line) || !is_number(col) {
+        return None;
+    }
+    let path = url.split(['?', '#']).next().unwrap_or_default();
+    let path = [
+        "tauri://localhost/",
+        "http://tauri.localhost/",
+        "https://tauri.localhost/",
+    ]
+    .into_iter()
+    .find_map(|origin| path.strip_prefix(origin))
+    .or_else(|| {
+        let (port, path) = path.strip_prefix("http://localhost:")?.split_once('/')?;
+        is_number(port).then_some(path)
+    })
+    .or_else(|| (!path.contains(':') && !path.starts_with("//")).then_some(path))?;
+    let name = path.rsplit('/').next().unwrap_or_default();
+    is_script_name(name).then(|| format!("{name}:{line}:{col}"))
+}
+
+/// A bundled script's file name: `index-4f2a.js`, `App.tsx`.
+fn is_script_name(name: &str) -> bool {
+    const EXTENSIONS: [&str; 8] = ["js", "mjs", "cjs", "jsx", "ts", "tsx", "mts", "html"];
+    let charset = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.');
+    name.len() <= 128
+        && name.bytes().all(charset)
+        && name
+            .rsplit_once('.')
+            .is_some_and(|(stem, ext)| !stem.is_empty() && EXTENSIONS.contains(&ext))
+}
+
+fn is_number(text: &str) -> bool {
+    (1..=10).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Logs a whitelisted UI metric as `ui.metric`; other names and values that
@@ -261,33 +362,172 @@ mod tests {
         fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
+    /// Only the head of a long stack is read, cut on a line (and so on a
+    /// char boundary); the message is measured and fingerprinted whole.
     #[test]
     fn frontend_errors_share_one_budget_and_cut_on_char_boundaries() {
-        let short = FrontendError::fit("boom", Some("at a.js:1"), Some("window.onerror"), &[]);
-        assert_eq!(
-            short,
-            FrontendError {
-                message: "boom".into(),
-                source: Some("window.onerror".into()),
-                stack: Some("at a.js:1".into()),
-                truncated: false,
-            }
-        );
-
+        let frame = "at render (http://tauri.localhost/assets/index-4f2a.js:12:345)\n";
+        let mut stack = frame.repeat(FRONTEND_ERROR_MAX_BYTES / frame.len() + 10);
+        stack.push_str(&"中".repeat(5000));
         let long = "中".repeat(5000); // 15 000 bytes
-        let cut = FrontendError::fit("message", Some(&long), Some(&long), &[]);
+        let cut = FrontendError::fit(&long, Some(&stack), Some(&long));
         assert!(cut.truncated);
-        let total = cut.message.len()
-            + cut.source.as_ref().map_or(0, String::len)
-            + cut.stack.as_ref().map_or(0, String::len);
-        assert!(total <= FRONTEND_ERROR_MAX_BYTES, "{total}");
-        assert!(total > FRONTEND_ERROR_MAX_BYTES - 3, "{total}");
-        assert_eq!(cut.message, "message");
-        assert_eq!(cut.stack.as_deref(), Some(""));
+        assert_eq!(cut.frames.len(), FRONTEND_ERROR_MAX_BYTES / frame.len());
+        assert!(cut
+            .frames
+            .iter()
+            .all(|f| f == "render@index-4f2a.js:12:345"));
+        assert_eq!(cut.dropped_lines, 0);
+        assert_eq!(cut.message_len, 15_000);
+        assert_eq!(cut.message_hash, fingerprint(&long));
+        assert_eq!((cut.class, cut.source), (None, None));
+        let logged: usize = cut.frames.iter().map(String::len).sum();
+        assert!(logged <= FRONTEND_ERROR_MAX_BYTES, "{logged}");
 
-        let paths = FrontendError::fit(r"failed at C:\Users\alice\x", None, None, &[]);
-        assert_eq!(paths.message, r"failed at C:\Users\%USERNAME%\x");
-        assert_eq!(paths.source, None);
+        let cjk = FrontendError::fit("boom", Some(&long), None);
+        assert!(cjk.truncated);
+        assert_eq!((cjk.frames.len(), cjk.dropped_lines), (0, 0));
+    }
+
+    #[test]
+    fn frontend_errors_keep_only_the_class_and_the_apps_frames() {
+        let stack = "TypeError: Cannot read properties of undefined (reading 'body')\n\
+            \x20   at RuleEditor (http://tauri.localhost/assets/index-4f2a.js:12:345)\n\
+            \x20   at async Object.save (tauri://localhost/assets/index-4f2a.js:3:4)\n\
+            \x20   at new Store (http://localhost:1420/src/store.ts?t=1729591293:7:8)\n\
+            \x20   at http://tauri.localhost/assets/vendor.js:1:2\n\
+            \x20   at Array.map (<anonymous>)\n\
+            \x20   at Object.<anonymous> (./src/main.tsx:9:10)\n\
+            \x20   at fn [as alias] (https://tauri.localhost/a/b/c.mjs:11:12)\n\
+            \x20   at eval (eval at run (http://tauri.localhost/x.js:1:2), <anonymous>:1:1)\n\
+            \x20   at load (https://example.com/evil.js:5:6)\n\
+            \x20   at load (http://tauri.localhost/assets/index.css:5:6)\n\
+            onClick@tauri://localhost/assets/index-4f2a.js:20:30\n\
+            global code@tauri://localhost/assets/index-4f2a.js:21:31\n\
+            @http://tauri.localhost/assets/index-4f2a.js:22:32#frag\n\
+            \n";
+        let report = FrontendError::fit(
+            "Uncaught TypeError: Cannot read properties of undefined (reading 'body')",
+            Some(stack),
+            Some("http://tauri.localhost/assets/index-4f2a.js?v=3:40:5"),
+        );
+        assert_eq!(report.class.as_deref(), Some("TypeError"));
+        assert_eq!(report.source.as_deref(), Some("index-4f2a.js:40:5"));
+        assert_eq!(
+            report.frames,
+            [
+                "RuleEditor@index-4f2a.js:12:345",
+                "Object.save@index-4f2a.js:3:4",
+                "Store@store.ts:7:8",
+                "@vendor.js:1:2",
+                "@main.tsx:9:10",
+                "@c.mjs:11:12",
+                "onClick@index-4f2a.js:20:30",
+                "@index-4f2a.js:21:31",
+            ]
+        );
+        // The message line, `<anonymous>`, eval, another host, a style sheet
+        // and the line whose column carries a fragment.
+        assert_eq!(report.dropped_lines, 6);
+        assert!(!report.truncated);
+
+        for (message, class) in [
+            ("RangeError: Invalid array length", Some("RangeError")),
+            (
+                "DOMException: The operation was aborted.",
+                Some("DOMException"),
+            ),
+            ("IpcError", Some("IpcError")),
+            ("hello: world", None),
+            ("Script error.", None),
+            ("Type Error: x", None),
+            ("", None),
+        ] {
+            let report = FrontendError::fit(message, None, None);
+            assert_eq!(report.class.as_deref(), class, "{message}");
+            assert_eq!(report.message_len, message.len());
+            assert_eq!((report.frames.len(), report.dropped_lines), (0, 0));
+        }
+        for source in [
+            "window.onerror",
+            "http://tauri.localhost/assets/index.js",
+            "https://example.com/a.js:1:2",
+            "file:///C:/Users/alice/a.js:1:2",
+            "http://localhost:1420/src/main.tsx:x:1",
+        ] {
+            assert_eq!(FrontendError::fit("e", None, Some(source)).source, None);
+        }
+    }
+
+    /// S-08 privacy test, frontend half: phrase content in every field of a
+    /// frontend error (after the class, a message without a class, a frame's
+    /// function name, URL path and query string, the source) reaches neither
+    /// the log nor a Summary bundle.
+    #[test]
+    fn frontend_error_text_never_reaches_the_log_or_the_summary_bundle() {
+        use crate::diagnostics::{
+            bundle::test_support::summary_entries,
+            logging::test_support::{read_logs, scoped},
+        };
+        use tracing::level_filters::LevelFilter;
+
+        const S: &str = "SENTINEL-frontend-91f3";
+        // An identifier, so it would pass a bare identifier check.
+        const IDENT: &str = "Sentinel91f3";
+        let reports = [
+            (
+                format!("TypeError: cannot expand {S}"),
+                Some(format!(
+                    "TypeError: cannot expand {S}\n\
+                     \x20   at {S} (http://tauri.localhost/assets/index-4f2a.js:1:2)\n\
+                     \x20   at render (http://localhost:1420/src/App.tsx?t={S}:3:4)\n\
+                     \x20   at load (http://tauri.localhost/{S}/chunk.js:5:6)\n\
+                     \x20   at load (http://tauri.localhost/assets/a.js#{S}:7:8)\n\
+                     {S}@tauri://localhost/assets/index-4f2a.js:9:10\n\
+                     \x20   at {S}"
+                )),
+                Some(format!(
+                    "http://tauri.localhost/assets/index-4f2a.js?q={S}:11:12"
+                )),
+            ),
+            (format!("{S} could not be typed"), None, Some(S.to_string())),
+            (format!("{IDENT}: {S}"), Some(format!("{IDENT}@{S}")), None),
+            (format!("Uncaught Error: {IDENT}"), None, Some(IDENT.into())),
+            (format!("{S}:{S}:{S}"), Some(format!("{S}:1:2")), None),
+        ];
+
+        let dir = std::env::temp_dir().join(format!("quicker-fe-test-{}", uuid::Uuid::new_v4()));
+        let built = scoped(&log_dir(&dir), LevelFilter::TRACE);
+        tracing::subscriber::with_default(built.subscriber, || {
+            for (message, stack, source) in reports {
+                log_frontend_error(message, stack, source);
+            }
+        });
+        drop(built.guard);
+
+        let log = read_logs(&log_dir(&dir));
+        assert_eq!(log.matches("frontend.error").count(), 5, "{log}");
+        for expected in [
+            r#"class="TypeError""#,
+            "index-4f2a.js:11:12",
+            "@index-4f2a.js:1:2",
+            "render@App.tsx:3:4",
+            "load@chunk.js:5:6",
+        ] {
+            assert!(log.contains(expected), "{expected} missing:\n{log}");
+        }
+        for sentinel in [S, IDENT] {
+            assert!(!log.contains(sentinel), "the log leaks {sentinel}:\n{log}");
+        }
+
+        let files = summary_entries(&dir);
+        assert!(files.keys().any(|name| name.starts_with("logs/")));
+        for (name, text) in &files {
+            for sentinel in [S, IDENT] {
+                assert!(!text.contains(sentinel), "{name} leaks {sentinel}:\n{text}");
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -5,6 +5,10 @@
 //!   offending string, e.g. a phrase body sliced at a bad index) are replaced
 //!   by their length.
 //! - [`truncate_utf8`]: byte budget on a char boundary.
+//! - [`fingerprint`]: an irreversible short hash that groups equal texts
+//!   without recording them.
+use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 
 /// What replaces the user name in a path.
 pub const USER_PLACEHOLDER: &str = "%USERNAME%";
@@ -30,6 +34,20 @@ pub fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &text[..end]
+}
+
+/// 8 hex digits of SHA-256 over a random per-process salt and `text`, so
+/// equal texts can be grouped without being recorded. The salt is never
+/// written down, so a fingerprint cannot be checked against guessed
+/// phrases; equal texts match within one run only.
+pub fn fingerprint(text: &str) -> String {
+    static SALT: OnceLock<[u8; 16]> = OnceLock::new();
+    let salt = SALT.get_or_init(|| uuid::Uuid::new_v4().into_bytes());
+    let digest = Sha256::new()
+        .chain_update(salt)
+        .chain_update(text.as_bytes())
+        .finalize();
+    digest[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Bytes that can appear inside a path segment name (no separators).
@@ -243,6 +261,19 @@ mod tests {
         assert_eq!(truncate_utf8("aé", 2), "a");
         assert_eq!(truncate_utf8("中文", 4), "中");
         assert_eq!(truncate_utf8("中文", 0), "");
+    }
+
+    #[test]
+    fn fingerprints_are_short_hex_and_group_equal_texts() {
+        let a = fingerprint("SENTINEL phrase");
+        assert_eq!(a.len(), 8);
+        assert!(a.bytes().all(|b| b.is_ascii_hexdigit()), "{a}");
+        assert_eq!(fingerprint("SENTINEL phrase"), a);
+        assert_ne!(fingerprint("SENTINEL phrase."), a);
+        // Salted: not the plain SHA-256 prefix of the text.
+        let plain = Sha256::digest(b"SENTINEL phrase");
+        let plain: String = plain[..4].iter().map(|b| format!("{b:02x}")).collect();
+        assert_ne!(a, plain);
     }
 
     #[test]
