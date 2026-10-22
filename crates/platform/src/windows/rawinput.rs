@@ -1,9 +1,15 @@
 //! Thin bridge around the vendored Espanso Windows RawInput detector/injector.
 //! Matching remains Quicker Text's domain compiler; UIA only supplies optional vetoes.
 use super::*;
-use ::windows::Win32::{
-    System::{Com::*, Variant::*},
-    UI::Accessibility::*,
+use super::{
+    actions::guarded,
+    executor::{enqueue, Candidate, CandidateProof},
+    foreground::focus_handle,
+    hook::expected_key_text,
+    ime::ime_active,
+    inject::{key, record_send_result},
+    keystate::physical,
+    protection::{native_input_protection, protection_block, protection_worker},
 };
 use std::ffi::c_void;
 
@@ -37,11 +43,10 @@ extern "C" {
     fn inject_separate_vkeys(keys: *const i32, len: i32) -> u32;
     fn inject_vkeys_combination(keys: *const i32, len: i32) -> u32;
 }
-static READY: AtomicBool = AtomicBool::new(false);
+pub(super) static READY: AtomicBool = AtomicBool::new(false);
 static EVENTS: OnceLock<mpsc::SyncSender<Event>> = OnceLock::new();
 static LAST_SOURCE: Mutex<&str> = Mutex::new("waiting_for_input");
 static LAST_PROCESS: Mutex<String> = Mutex::new(String::new());
-static PROTECTION: Mutex<Option<(u64, u64, String)>> = Mutex::new(None);
 thread_local! { static PROOF: std::cell::RefCell<Option<Proof>> = const {std::cell::RefCell::new(None)}; }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,6 +85,7 @@ struct Buffer {
     generation: u64,
 }
 impl Buffer {
+    // no-regression #3: stamp or generation discontinuity clears the buffer.
     fn push(&mut self, event: &Event, allowed: bool) {
         if !allowed
             || self.stamp.as_ref() != Some(&event.stamp)
@@ -238,6 +244,7 @@ fn dispatch(shared: Arc<Shared>, rx: mpsc::Receiver<Event>) {
             Kind::Text(value) if value == ";" => Some("semicolon"),
             _ => None,
         };
+        // no-regression #3: a terminator match needs the contiguous, same-stamp prefix.
         let previous = if terminator.is_some()
             && buffer.stamp.as_ref() == Some(&event.stamp)
             && buffer.generation.checked_add(1) == Some(event.generation)
@@ -327,6 +334,7 @@ pub(super) fn start(shared: Arc<Shared>) -> Result<(), String> {
     std::thread::spawn(move || unsafe {
         let context = Box::new(shared);
         let mut options = InitOptions {
+            // no-regression #7: re-read the keyboard layout on every key.
             keyboard_layout_cache_interval: 0,
         };
         let mut error = 0;
@@ -451,72 +459,6 @@ fn cleanup_submission(
     } else {
         Ok(())
     }
-}
-pub(super) fn protection_block() -> Option<String> {
-    let (focus, epoch, reason) = PROTECTION.try_lock().ok()?.clone()?;
-    (focus == focus_handle(unsafe { GetForegroundWindow() }) as u64
-        && epoch == observer::FOCUS_EPOCH.load(Ordering::SeqCst))
-    .then_some(reason)
-}
-unsafe fn text_readonly(element: &IUIAutomationElement) -> Option<&'static str> {
-    let pattern = element
-        .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
-        .ok()?;
-    let range = pattern.DocumentRange().ok()?;
-    let mut value = range.GetAttributeValue(UIA_IsReadOnlyAttributeId).ok()?;
-    let readonly = value.Anonymous.Anonymous.vt == VT_BOOL
-        && value.Anonymous.Anonymous.Anonymous.boolVal.0 != 0;
-    let _ = VariantClear(&mut value);
-    readonly.then_some("Read-only text control blocked")
-}
-fn protection_worker(shared: Arc<Shared>) {
-    std::thread::spawn(move || unsafe {
-        if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
-            return;
-        }
-        if let Ok(automation) =
-            CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
-        {
-            while !shared.shutdown.load(Ordering::SeqCst) {
-                let focus = focus_handle(GetForegroundWindow()) as u64;
-                let epoch = observer::FOCUS_EPOCH.load(Ordering::SeqCst);
-                if let Ok(element) = automation.GetFocusedElement() {
-                    let reason = if element.CurrentIsPassword().is_ok_and(|b| b.as_bool()) {
-                        Some("Password controls are blocked")
-                    } else if element.CurrentIsEnabled().is_ok_and(|b| !b.as_bool()) {
-                        Some("Disabled controls are blocked")
-                    } else if element
-                        .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
-                        .ok()
-                        .is_some_and(|p| p.CurrentIsReadOnly().is_ok_and(|b| b.as_bool()))
-                    {
-                        Some("Read-only ValuePattern control blocked")
-                    } else if element
-                        .GetCurrentPatternAs::<IUIAutomationLegacyIAccessiblePattern>(
-                            UIA_LegacyIAccessiblePatternId,
-                        )
-                        .ok()
-                        .is_some_and(|p| {
-                            p.CurrentState()
-                                .is_ok_and(|state| state & (0x40 | 0x20000000) != 0)
-                        })
-                    {
-                        Some("Read-only or protected accessibility control blocked")
-                    } else {
-                        text_readonly(&element)
-                    };
-                    if focus == focus_handle(GetForegroundWindow()) as u64
-                        && epoch == observer::FOCUS_EPOCH.load(Ordering::SeqCst)
-                    {
-                        *PROTECTION.lock().unwrap() =
-                            reason.map(|reason| (focus, epoch, reason.to_owned()));
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-        }
-        CoUninitialize();
-    });
 }
 pub(super) fn status() -> serde_json::Value {
     serde_json::json!({"backend":"espanso_win32_v2.4.1", "source":*LAST_SOURCE.lock().unwrap(),
