@@ -139,6 +139,25 @@ mod no_executor {
                     .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst);
         }
     }
+    /// The executor as the supervisor drives it, for `Supervisor::new`:
+    /// always `None`, there is no executor service on this platform.
+    pub fn executor_control() -> Option<Arc<dyn supervisor::ExecutorControl>> {
+        None
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn there_is_no_executor_and_manual_runs_claim_busy_directly() {
+            assert!(executor_control().is_none());
+            let shared = Shared::new();
+            let claim = ManualBusy::claim(&shared).expect("busy is free");
+            assert!(shared.busy.load(Ordering::SeqCst));
+            assert!(ManualBusy::claim(&shared).is_none(), "one claim at a time");
+            drop(claim);
+            assert!(!shared.busy.load(Ordering::SeqCst));
+        }
+    }
 }
 #[cfg(not(windows))]
 pub use no_executor::*;
