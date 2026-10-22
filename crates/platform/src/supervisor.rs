@@ -350,7 +350,11 @@ impl Supervisor {
         if machine.next_attempt.is_some_and(|due| now >= due) {
             machine.next_attempt = None;
             let forced = std::mem::take(&mut machine.forced);
-            match self.attempt(observed, forced, now) {
+            let outcome = self.attempt(observed, forced);
+            // The attempt can block for seconds (sequential reattach):
+            // backoff and the verification window start when it returned.
+            let now = self.clock.now();
+            match outcome {
                 Ok(after) => {
                     *observed = after;
                     if observed.required_down().is_empty() {
@@ -368,10 +372,10 @@ impl Supervisor {
     /// it. A panic anywhere in it (executor rebuild, input reattach, probe)
     /// is an attempt failure like any other, so it is counted, backed off
     /// and can open the circuit instead of silently ending the incident.
-    fn attempt(&self, observed: &Observed, forced: bool, now: Instant) -> Result<Observed, String> {
+    fn attempt(&self, observed: &Observed, forced: bool) -> Result<Observed, String> {
         catch_unwind(AssertUnwindSafe(|| {
             self.rebuild(observed, forced)?;
-            Ok(self.observe(now))
+            Ok(self.observe(self.clock.now()))
         }))
         .unwrap_or_else(|_| Err(ATTEMPT_PANICKED.into()))
     }
@@ -1293,6 +1297,52 @@ mod tests {
         rig.step(MS);
         assert_eq!(rig.executor.rebuild_count(), 2, "retried after BACKOFF[1]");
         assert_eq!(rig.state(), HealthState::Recovering);
+    }
+
+    /// A rebuild that takes longer than VERIFY_TIMEOUT and BACKOFF[1].
+    const SLOW_REBUILD: Duration = Duration::from_secs(4);
+
+    fn slow_rebuilds(rig: &Rig) {
+        let clock = Arc::clone(&rig.clock);
+        *rig.executor.on_rebuild.lock() = Some(Arc::new(move || clock.advance(SLOW_REBUILD)));
+    }
+
+    #[test]
+    fn backoff_counts_from_the_end_of_a_slow_rebuild() {
+        let rig = Rig::healthy();
+        slow_rebuilds(&rig);
+        *rig.executor.refuse.lock() = usize::MAX;
+        *rig.executor.status.lock() = Status::Down(ReasonCode::ExecutorTimeout);
+        rig.step(MS);
+        rig.step(BACKOFF[0]);
+        let mut expected = vec![rig.clock.elapsed() - SLOW_REBUILD];
+        for delay in &BACKOFF[1..] {
+            let ended = rig.clock.elapsed();
+            rig.step(*delay - MS);
+            assert_eq!(rig.executor.rebuild_count(), expected.len(), "early");
+            rig.step(MS);
+            expected.push(ended + *delay);
+            assert_eq!(*rig.executor.rebuilds.lock(), expected);
+        }
+        assert_eq!(rig.state(), HealthState::Failed);
+    }
+
+    #[test]
+    fn verification_window_starts_when_the_rebuild_returns() {
+        let rig = Rig::healthy();
+        slow_rebuilds(&rig);
+        *rig.executor.heals.lock() = false;
+        *rig.executor.status.lock() = Status::Down(ReasonCode::ExecutorTimeout);
+        rig.step(MS);
+        rig.step(BACKOFF[0]);
+        assert_eq!(rig.executor.rebuild_count(), 1);
+        rig.step(VERIFY_TIMEOUT - MS);
+        assert_eq!(rig.failures(), 0, "window not over");
+        rig.step(MS);
+        assert_eq!(rig.failures(), 1, "window over");
+        assert_eq!(rig.state(), HealthState::Recovering);
+        rig.step(BACKOFF[1]);
+        assert_eq!(rig.executor.rebuild_count(), 2);
     }
 
     #[test]
