@@ -127,26 +127,52 @@ impl InputSources for HealthyInputs {
     }
 }
 
+/// Hook run on every sleep of a task, after the fake time advanced.
+type SleepHook = Arc<Mutex<Option<Box<dyn FnMut(Duration) + Send>>>>;
+
+/// The tasks' clock: the rig's fake clock plus a sleep hook (`FakeClock`
+/// has none), so a test can act inside a delay of the action path.
+struct HookedClock {
+    inner: Arc<FakeClock>,
+    hook: SleepHook,
+}
+impl Clock for HookedClock {
+    fn now(&self) -> Instant {
+        self.inner.now()
+    }
+    fn wall_ms(&self) -> i64 {
+        self.inner.wall_ms()
+    }
+    fn sleep(&self, duration: Duration) {
+        self.inner.sleep(duration);
+        let mut hook = self.hook.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(hook) = hook.as_mut() {
+            hook(duration);
+        }
+    }
+}
+
 /// The executor runner on mock ports (production: `run_on_windows`).
 fn mock_runner(
     injector: &Arc<MockInjector>,
     foreground: &MockForeground,
     clock: &Arc<FakeClock>,
     clipboard: &MockClipboard,
+    sleeps: &SleepHook,
 ) -> Runner {
-    let (injector, foreground, clock, clipboard) = (
-        Arc::clone(injector),
-        foreground.clone(),
-        Arc::clone(clock),
-        clipboard.clone(),
-    );
+    let (injector, foreground, clipboard) =
+        (Arc::clone(injector), foreground.clone(), clipboard.clone());
+    let clock = HookedClock {
+        inner: Arc::clone(clock),
+        hook: Arc::clone(sleeps),
+    };
     Arc::new(move |candidate: &Candidate, scope: &TaskScope| {
         let fenced = scope.fence(&*injector);
         run_candidate(
             &Ports {
                 injector: &fenced,
                 foreground: &foreground,
-                clock: &*clock,
+                clock: &clock,
                 clipboard: || scope.claim_clipboard(|| Ok(clipboard.clone())),
             },
             scope.shared(),
@@ -168,6 +194,8 @@ struct ExecRig {
     foreground: MockForeground,
     clipboard: MockClipboard,
     clock: Arc<FakeClock>,
+    /// Sleep hook of the tasks' clock (see [`ExecRig::on_sleep`]).
+    sleeps: SleepHook,
     core: Arc<ExecutorCore>,
     runtime: Arc<Runtime>,
     supervisor: Arc<Supervisor>,
@@ -201,11 +229,12 @@ impl ExecRig {
         let foreground = MockForeground::new(MockForeground::window(FOCUS, APP));
         let clock = Arc::new(FakeClock::new());
         let clipboard = MockClipboard::new(7, vec![(13, utf16("original"))]);
+        let sleeps = SleepHook::default();
         let runtime = Arc::new(Runtime::new(clock.clone()));
         let core = ExecutorCore::new(
             Arc::clone(&shared),
             clock.clone(),
-            mock_runner(&injector, &foreground, &clock, &clipboard),
+            mock_runner(&injector, &foreground, &clock, &clipboard, &sleeps),
             release.clone(),
             STALL_BUDGET,
             Arc::clone(&runtime),
@@ -226,6 +255,7 @@ impl ExecRig {
             foreground,
             clipboard,
             clock,
+            sleeps,
             core,
             runtime,
             supervisor,
@@ -308,6 +338,10 @@ impl ExecRig {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
             .expect("the run published a result")
+    }
+    /// Runs `hook` on every sleep of a task (on the worker thread).
+    fn on_sleep(&self, hook: impl FnMut(Duration) + Send + 'static) {
+        *self.sleeps.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
     }
     /// Arms a real `ms` stall of the worker on the send after `after`.
     #[cfg(feature = "fault-injection")]
@@ -839,6 +873,15 @@ fn verdicts_follow_the_real_path() {
             ),
             (Outcome::Failed, ReasonCode::ProtectedControl),
         ),
+        // A cancel during erasure comes back as a failed result.
+        (
+            verdict(run("failed", "Cancelled", false), Stage::Erase, false),
+            (Outcome::Cancelled, ReasonCode::Cancelled),
+        ),
+        (
+            verdict(run("failed", "Cancelled", true), Stage::Erase, true),
+            (Outcome::Cancelled, ReasonCode::Cancelled),
+        ),
         (
             verdict(failed("no such snippet"), Stage::Resolve, false),
             (Outcome::Skipped, ReasonCode::ResolveFailed),
@@ -1356,4 +1399,415 @@ fn nothing_is_sent_without_the_send_lock() {
     assert_eq!(rig.injector.typed(), TYPED);
     assert_eq!(serialized.send_text("manual"), 12);
     assert_eq!(manual.calls(), vec![InjectCall::Text("manual".into())]);
+}
+
+/// Sources of the failure texts the executor's reason table maps.
+const INJECT_RS: &str = include_str!("inject.rs");
+const ACTIONS_RS: &str = include_str!("actions.rs");
+const CLIPBOARD_RS: &str = include_str!("clipboard.rs");
+const PROTECTION_RS: &str = include_str!("protection.rs");
+const RAWINPUT_RS: &str = include_str!("rawinput.rs");
+const EXECUTOR_RS: &str = include_str!("executor.rs");
+
+/// Every failure text the reason table maps, quoted verbatim (format
+/// arguments as written) with the file that produces it and the reason it
+/// must map to. A reworded text fails
+/// `every_mapped_failure_text_is_quoted_from_its_source` (the quote is gone
+/// from its source) instead of silently falling back to `Internal`. A new
+/// failure text that should not be `Internal` belongs here too.
+const ORIGINALS: &[(&str, &str, ReasonCode)] = &[
+    (
+        INJECT_RS,
+        "SendInput accepted {accepted}/{requested} events (possibly elevated target / UIPI); partial effects and target consumption unknown",
+        ReasonCode::InjectPartial,
+    ),
+    (
+        INJECT_RS,
+        "Physical key conflicts with release; action stopped",
+        ReasonCode::ModifierHeld,
+    ),
+    (
+        INJECT_RS,
+        "Physical key conflicts with requested hotkey; action stopped",
+        ReasonCode::ModifierHeld,
+    ),
+    (
+        ACTIONS_RS,
+        "Engine paused; input stopped",
+        ReasonCode::Paused,
+    ),
+    (ACTIONS_RS, "Cancelled", ReasonCode::Cancelled),
+    (
+        ACTIONS_RS,
+        "User input changed during action; stopped safely",
+        ReasonCode::StaleInput,
+    ),
+    (
+        ACTIONS_RS,
+        "Foreground window/process changed; stopped safely",
+        ReasonCode::FocusChanged,
+    ),
+    (
+        ACTIONS_RS,
+        "Physical modifier is held; input stopped",
+        ReasonCode::ModifierHeld,
+    ),
+    (ACTIONS_RS, "Execution timeout", ReasonCode::ExecutorTimeout),
+    (
+        ACTIONS_RS,
+        "Declared next target is not foreground",
+        ReasonCode::FocusChanged,
+    ),
+    (
+        ACTIONS_RS,
+        "Automatic shortcut action changed its declared target; stopped safely",
+        ReasonCode::FocusChanged,
+    ),
+    (
+        ACTIONS_RS,
+        "Requested key is physically held",
+        ReasonCode::ModifierHeld,
+    ),
+    (
+        ACTIONS_RS,
+        "Physical mouse button conflicts with action",
+        ReasonCode::ModifierHeld,
+    ),
+    (
+        RAWINPUT_RS,
+        "Focus, caret, layout or configuration changed; input stopped",
+        ReasonCode::StaleInput,
+    ),
+    (
+        PROTECTION_RS,
+        "Password controls are blocked",
+        ReasonCode::ProtectedControl,
+    ),
+    (
+        PROTECTION_RS,
+        "Read-only text control blocked",
+        ReasonCode::ProtectedControl,
+    ),
+    (
+        PROTECTION_RS,
+        "Disabled controls are blocked",
+        ReasonCode::ProtectedControl,
+    ),
+    (
+        PROTECTION_RS,
+        "Read-only ValuePattern control blocked",
+        ReasonCode::ProtectedControl,
+    ),
+    (
+        PROTECTION_RS,
+        "Read-only or protected accessibility control blocked",
+        ReasonCode::ProtectedControl,
+    ),
+    (CLIPBOARD_RS, "Clipboard is busy", ReasonCode::ClipboardBusy),
+    (
+        CLIPBOARD_RS,
+        "Clipboard is busy; trigger preserved",
+        ReasonCode::ClipboardBusy,
+    ),
+    (
+        CLIPBOARD_RS,
+        "Clipboard owner changed externally; clipboard preserved",
+        ReasonCode::ClipboardChanged,
+    ),
+    (
+        CLIPBOARD_RS,
+        "Clipboard formats changed externally; clipboard preserved",
+        ReasonCode::ClipboardChanged,
+    ),
+    (
+        CLIPBOARD_RS,
+        "Clipboard payload changed externally; clipboard preserved",
+        ReasonCode::ClipboardChanged,
+    ),
+    (
+        CLIPBOARD_RS,
+        "Clipboard changed externally before paste; no paste was sent",
+        ReasonCode::ClipboardChanged,
+    ),
+    (
+        CLIPBOARD_RS,
+        "Clipboard changed externally; stopped without overwriting it",
+        ReasonCode::ClipboardChanged,
+    ),
+    (
+        CLIPBOARD_RS,
+        "Existing clipboard contains handle-based rich formats that cannot be safely restored; trigger preserved",
+        ReasonCode::ClipboardFormatSkipped,
+    ),
+    (
+        CLIPBOARD_RS,
+        "Clipboard format cannot be safely backed up; trigger preserved",
+        ReasonCode::ClipboardFormatSkipped,
+    ),
+    (
+        CLIPBOARD_RS,
+        "Existing clipboard has an unsupported handle format",
+        ReasonCode::ClipboardFormatSkipped,
+    ),
+    (
+        EXECUTOR_RS,
+        "Executor task was fenced after a stall; stopped without further input",
+        ReasonCode::ExecutorTimeout,
+    ),
+    (
+        EXECUTOR_RS,
+        "Executor task panicked; stopped",
+        ReasonCode::ExecutorPanic,
+    ),
+    (
+        EXECUTOR_RS,
+        "Clipboard is still held by a stalled action; paste refused (no typing fallback)",
+        ReasonCode::ClipboardBusy,
+    ),
+];
+
+/// The reason table against the texts it depends on: each quoted text is
+/// still a whole string literal of its source and maps to its reason,
+/// whether it comes back as an error or as a failed result.
+#[test]
+fn every_mapped_failure_text_is_quoted_from_its_source() {
+    for (source, text, want) in ORIGINALS {
+        assert!(
+            source.contains(&format!("\"{text}\"")),
+            "{text:?} is no longer produced verbatim: reword the reason table and ORIGINALS with it"
+        );
+        assert_ne!(*want, ReasonCode::Internal, "{text:?}");
+        let failed = ExecutionResult {
+            id: String::new(),
+            status: "failed".into(),
+            message: (*text).into(),
+            completed_steps: 0,
+            side_effects: false,
+        };
+        assert_eq!(
+            classify(&Ok(failed), Stage::Done, false).reason,
+            *want,
+            "{text:?}"
+        );
+        assert_eq!(
+            classify(&Err((*text).into()), Stage::Output, false).reason,
+            *want,
+            "{text:?}"
+        );
+    }
+}
+
+/// A cancel landing in the delay before the first backspace: the erase
+/// stage returns a failed result ("Cancelled"); it is recorded as
+/// Cancelled, with nothing sent.
+#[test]
+fn a_cancel_in_the_delay_before_erasing_is_cancelled_with_nothing_sent() {
+    let mut rig = ExecRig::new(vec![text_rule("brb", OutputMethod::Keys, BODY)]);
+    let (shared, injector) = (Arc::clone(&rig.shared), Arc::clone(&rig.injector));
+    let in_delay = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&in_delay);
+    rig.on_sleep(move |_| {
+        if super::actions::current_stage() == Stage::Erase && injector.calls().is_empty() {
+            shared.cancel.store(true, Ordering::SeqCst);
+            flag.store(true, Ordering::SeqCst);
+        }
+    });
+    let result = rig.run("brb");
+    assert!(
+        in_delay.load(Ordering::SeqCst),
+        "the cancel landed in the delay"
+    );
+    assert_eq!(
+        (
+            result.status.as_str(),
+            result.message.as_str(),
+            result.side_effects
+        ),
+        ("failed", "Cancelled", false)
+    );
+    assert!(rig.injector.calls().is_empty(), "no backspace, no output");
+    let entry = rig.last_entry();
+    assert_eq!(
+        (entry.outcome, entry.reason),
+        (Outcome::Cancelled, ReasonCode::Cancelled)
+    );
+    assert!(!entry.side_effects);
+}
+
+/// A cancel landing between two backspaces: Cancelled as well, and the
+/// backspace already sent stays a side effect.
+#[test]
+fn a_cancel_between_backspaces_is_cancelled_and_keeps_its_side_effect() {
+    let mut rig = ExecRig::new(vec![text_rule("brb", OutputMethod::Keys, BODY)]);
+    let shared = Arc::clone(&rig.shared);
+    rig.injector.on_call(move |call| {
+        if *call == InjectCall::Keys(vec![VK_BACK]) {
+            shared.cancel.store(true, Ordering::SeqCst);
+        }
+    });
+    let result = rig.run("brb");
+    assert_eq!(
+        (
+            result.status.as_str(),
+            result.message.as_str(),
+            result.side_effects
+        ),
+        ("failed", "Cancelled", true)
+    );
+    assert_eq!(
+        rig.injector.calls(),
+        vec![InjectCall::Keys(vec![VK_BACK])],
+        "one backspace, then nothing"
+    );
+    let entry = rig.last_entry();
+    assert_eq!(
+        (entry.outcome, entry.reason),
+        (Outcome::Cancelled, ReasonCode::Cancelled)
+    );
+    assert!(entry.side_effects);
+}
+
+/// Sets `key` in the physical key mirror (the hooks' view of the user's
+/// keyboard).
+fn set_physical(key: u16, held: bool) {
+    let mirror = keystate::PHYSICAL
+        .get()
+        .expect("the rig installed the mirror");
+    let mut keys = mirror.lock().unwrap_or_else(PoisonError::into_inner);
+    if held {
+        keys.insert(key);
+    } else {
+        keys.remove(&key);
+    }
+}
+/// Lets go of a physical key when dropped, even when the test fails.
+struct LetGo(u16);
+impl Drop for LetGo {
+    fn drop(&mut self) {
+        set_physical(self.0, false);
+    }
+}
+fn ctrl_b() -> Operation {
+    Operation::Hotkey {
+        keys: vec![Key::named("CTRL"), code(KEY_B)],
+    }
+}
+
+/// inject.rs refuses a key the user holds ("Physical key conflicts with
+/// ..."): ModifierHeld on every real path. A manual hotkey refused before
+/// anything was sent is Skipped; automatic runs that already erased their
+/// trigger (or pressed a key) are Failed.
+#[test]
+fn physical_key_conflicts_are_modifier_held_on_the_real_paths() {
+    let mut rig = ExecRig::new(vec![
+        steps_rule("hk", vec![ctrl_b()]),
+        steps_rule(
+            "kr",
+            vec![
+                Operation::KeyDown { key: code(KEY_B) },
+                Operation::KeyUp { key: code(KEY_B) },
+            ],
+        ),
+    ]);
+    let _let_go = LetGo(KEY_B);
+    set_physical(KEY_B, true);
+
+    // Manual run (actions::execute without its Windows ports): the hotkey
+    // is refused before any input.
+    super::actions::begin_trace();
+    let manual = Serialized::new(&*rig.injector, Some(Arc::clone(&rig.core)));
+    let clipboard = rig.clipboard.clone();
+    let result = super::actions::execute_with_proof(
+        &Ports {
+            injector: &manual,
+            foreground: &rig.foreground,
+            clock: &*rig.clock,
+            clipboard: move || Ok(clipboard.clone()),
+        },
+        &rig.shared,
+        ActionPlan {
+            steps: vec![Step::new(ctrl_b(), SourceSpan::default())],
+            ..Default::default()
+        },
+        MockForeground::window(FOCUS, APP),
+        rig.shared.generation.load(Ordering::SeqCst),
+        None,
+        None,
+        1.0,
+    );
+    let before = crate::runtime::history_seq();
+    super::executor::record_manual(APP, &result, Instant::now());
+    let run = result.expect("the plan ran");
+    assert_eq!(
+        (run.status.as_str(), run.message.as_str(), run.side_effects),
+        (
+            "failed",
+            "Physical key conflicts with requested hotkey; action stopped",
+            false
+        )
+    );
+    assert!(rig.injector.calls().is_empty(), "nothing was sent");
+    let entry = crate::runtime::list_history(Some(before))
+        .pop()
+        .expect("the manual run was recorded");
+    assert_eq!(entry.trigger, TriggerKind::Manual);
+    assert_eq!(
+        (entry.outcome, entry.reason, entry.side_effects),
+        (Outcome::Skipped, ReasonCode::ModifierHeld, false)
+    );
+
+    // Automatic hotkey: the trigger was erased, then the chord refused.
+    let result = rig.run("hk");
+    assert!(
+        result.message.starts_with("Physical key conflicts"),
+        "{}",
+        result.message
+    );
+    assert_eq!(
+        rig.injector.calls(),
+        vec![InjectCall::Keys(vec![VK_BACK]); 2],
+        "no chord"
+    );
+    let entry = rig.last_entry();
+    assert_eq!(
+        (entry.outcome, entry.reason, entry.side_effects),
+        (Outcome::Failed, ReasonCode::ModifierHeld, true)
+    );
+
+    // Automatic release: the user takes over B after the plan pressed it,
+    // so neither the plan nor the executor releases it.
+    set_physical(KEY_B, false);
+    rig.injector.on_call(|call| {
+        if *call
+            == (InjectCall::Key {
+                key: KEY_B,
+                up: false,
+            })
+        {
+            set_physical(KEY_B, true);
+        }
+    });
+    let sent = rig.injector.calls().len();
+    let result = rig.run("kr");
+    assert_eq!(
+        result.message,
+        "Physical key conflicts with release; action stopped"
+    );
+    assert_eq!(
+        rig.injector.calls()[sent..],
+        [
+            InjectCall::Keys(vec![VK_BACK]),
+            InjectCall::Keys(vec![VK_BACK]),
+            InjectCall::Key {
+                key: KEY_B,
+                up: false
+            },
+        ],
+        "no key-up of the user's key"
+    );
+    let entry = rig.last_entry();
+    assert_eq!(
+        (entry.outcome, entry.reason, entry.side_effects),
+        (Outcome::Failed, ReasonCode::ModifierHeld, true)
+    );
 }

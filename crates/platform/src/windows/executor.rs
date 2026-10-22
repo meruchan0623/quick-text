@@ -116,6 +116,7 @@ const SEND_LOCK_WAIT: Duration = Duration::from_millis(250);
 const FENCED: &str = "Executor task was fenced after a stall; stopped without further input";
 const CLIPBOARD_HELD: &str =
     "Clipboard is still held by a stalled action; paste refused (no typing fallback)";
+const PANICKED: &str = "Executor task panicked; stopped";
 
 /// What one task produced.
 pub(super) struct RunReport {
@@ -193,15 +194,20 @@ impl Verdict {
     }
 }
 
-/// Reason codes recognised in run messages. The action pipeline reports
-/// failures as text; these fragments are the stable parts of those texts
-/// (inject.rs, clipboard.rs, protection.rs and the guards in actions.rs).
+/// Reason codes recognised in run messages; the first matching fragment
+/// wins. The action pipeline reports failures as text: the executor's own
+/// texts are matched whole (their constants), the others by a stable
+/// fragment of the text produced by inject.rs, clipboard.rs, protection.rs,
+/// rawinput.rs or the guards in actions.rs. Every text this table maps is
+/// quoted verbatim, with its source file, in the `ORIGINALS` table of
+/// `pipeline_tests_executor`: a reworded text fails that test instead of
+/// silently falling back to `Internal`.
 const REASONS: &[(&str, ReasonCode)] = &[
     ("SendInput accepted", ReasonCode::InjectPartial),
-    ("Executor task was fenced", ReasonCode::ExecutorTimeout),
-    ("Executor task panicked", ReasonCode::ExecutorPanic),
+    (FENCED, ReasonCode::ExecutorTimeout),
+    (PANICKED, ReasonCode::ExecutorPanic),
     ("Execution timeout", ReasonCode::ExecutorTimeout),
-    ("Clipboard is still held", ReasonCode::ClipboardBusy),
+    (CLIPBOARD_HELD, ReasonCode::ClipboardBusy),
     ("Clipboard is busy", ReasonCode::ClipboardBusy),
     ("changed externally", ReasonCode::ClipboardChanged),
     ("cannot be safely", ReasonCode::ClipboardFormatSkipped),
@@ -224,6 +230,8 @@ const REASONS: &[(&str, ReasonCode)] = &[
     ),
     ("modifier is held", ReasonCode::ModifierHeld),
     ("physically held", ReasonCode::ModifierHeld),
+    // inject::hotkey and inject::release_owned refusing a key the user holds.
+    ("Physical key conflicts with", ReasonCode::ModifierHeld),
     ("Physical mouse button", ReasonCode::ModifierHeld),
     ("blocked", ReasonCode::ProtectedControl),
 ];
@@ -240,9 +248,14 @@ fn reason_for(message: &str, stage: Stage) -> ReasonCode {
     }
 }
 
-/// Engine-side failures stay `Failed` even when nothing reached the screen;
-/// refusals (guards, preflight, clipboard safety) are `Skipped` then.
-fn failed_or_skipped(reason: ReasonCode, side_effects: bool) -> Outcome {
+/// The outcome of a run that stopped for `reason`; the one place that
+/// decides it, whichever way the run reported the stop (an error, a failed
+/// result or a cancelled result). A cancel is `Cancelled` wherever it
+/// landed: before the first backspace, between two of them or during the
+/// output. Engine-side failures stay `Failed` even when nothing reached the
+/// screen; refusals (guards, held keys, preflight, clipboard safety) are
+/// `Skipped` then and `Failed` once something was sent.
+fn outcome_for(reason: ReasonCode, side_effects: bool) -> Outcome {
     let engine_failure = matches!(
         reason,
         ReasonCode::InjectPartial
@@ -251,10 +264,10 @@ fn failed_or_skipped(reason: ReasonCode, side_effects: bool) -> Outcome {
             | ReasonCode::ExecutorTimeout
             | ReasonCode::Internal
     );
-    if side_effects || engine_failure {
-        Outcome::Failed
-    } else {
-        Outcome::Skipped
+    match reason {
+        ReasonCode::Cancelled => Outcome::Cancelled,
+        _ if side_effects || engine_failure => Outcome::Failed,
+        _ => Outcome::Skipped,
     }
 }
 
@@ -263,7 +276,8 @@ fn failed_or_skipped(reason: ReasonCode, side_effects: bool) -> Outcome {
 /// the system. The UI-facing `ExecutionResult.status` keeps saying
 /// `unknown`, because consumption by the target is still not verified.
 /// `stage` is where the run stopped; `sent` whether any input or clipboard
-/// effect happened (used when the run returned an error).
+/// effect happened (used when the run returned an error; a result carries
+/// its own `side_effects`, which the verdict keeps).
 pub(super) fn classify(
     result: &Result<ExecutionResult, String>,
     stage: Stage,
@@ -271,14 +285,15 @@ pub(super) fn classify(
 ) -> Verdict {
     match result {
         Ok(run) => {
-            let (outcome, reason) = match run.status.as_str() {
-                "cancelled" => (Outcome::Cancelled, ReasonCode::Cancelled),
-                "failed" => {
-                    let reason = reason_for(&run.message, stage);
-                    (failed_or_skipped(reason, run.side_effects), reason)
-                }
-                _ => (Outcome::Succeeded, ReasonCode::Ok),
+            let stopped = match run.status.as_str() {
+                "cancelled" => Some(ReasonCode::Cancelled),
+                "failed" => Some(reason_for(&run.message, stage)),
+                _ => None,
             };
+            let (outcome, reason) = stopped
+                .map_or((Outcome::Succeeded, ReasonCode::Ok), |reason| {
+                    (outcome_for(reason, run.side_effects), reason)
+                });
             Verdict {
                 outcome,
                 reason,
@@ -288,11 +303,7 @@ pub(super) fn classify(
         }
         Err(message) => {
             let reason = reason_for(message, stage);
-            let outcome = match reason {
-                ReasonCode::Cancelled => Outcome::Cancelled,
-                _ => failed_or_skipped(reason, sent),
-            };
-            Verdict::new(outcome, reason, sent)
+            Verdict::new(outcome_for(reason, sent), reason, sent)
         }
     }
 }
@@ -998,7 +1009,7 @@ impl ExecutorCore {
                 if self.epoch() == epoch {
                     *self.fault.lock() = Some(ReasonCode::ExecutorPanic);
                 }
-                Err("Executor task panicked; stopped".into())
+                Err(PANICKED.into())
             }
         };
         let released = guard.release();
@@ -1017,12 +1028,14 @@ impl ExecutorCore {
                 completed.id = id;
                 completed
             }
+            // The published result carries the same side effects as the
+            // verdict (a panic after a send was not effect-free).
             Err(message) => ExecutionResult {
                 id,
                 status: "failed".into(),
                 message,
                 completed_steps: 0,
-                side_effects: false,
+                side_effects: sent,
             },
         };
         guard.settle(verdict, Some(last), end);
