@@ -302,6 +302,20 @@ fn external_change_after_paste_is_never_overwritten() {
         assert_eq!(rig.clipboard.content(), expected, "{name}");
         assert_eq!(rig.clipboard.clears(), 1, "{name}: only the paste write");
     }
+    // Another application adds a format without emptying the clipboard: the
+    // owner and the paste stay, the format set does not.
+    let mut rig = rig_with(rich_text());
+    rig.on_paste(|c| c.add_format(0xC0B1, vec![1, 2, 3]));
+    let result = paste(&mut rig);
+    assert_eq!(result.status, "failed");
+    assert_eq!(
+        result.message,
+        "Clipboard restore failed after input: Clipboard formats changed externally; clipboard preserved"
+    );
+    let mut expected = pasted(&rig.clipboard, EXPANSION);
+    expected.push((0xC0B1, vec![1, 2, 3]));
+    assert_eq!(rig.clipboard.content(), expected, "added");
+    assert_eq!(rig.clipboard.clears(), 1, "added: only the paste write");
 }
 
 #[test]

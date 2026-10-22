@@ -114,6 +114,52 @@ fn handling(format: u32, policy: RestorePolicy) -> Handling {
     }
 }
 
+/// Formats the system lists by itself once a format is on the clipboard, so
+/// a lease may find them after its own write without anyone else writing
+/// (B-08). Source → formats, from the conversion table in "Synthesized
+/// Clipboard Formats" (learn.microsoft.com, clipboard-formats), plus
+/// CF_LOCALE for the text formats: "When you close the clipboard, if it
+/// contains CF_TEXT data but no CF_LOCALE data, the system automatically sets
+/// the CF_LOCALE format" (Standard Clipboard Formats), and CF_TEXT is
+/// synthesized from either of the others (待实测: CF_LOCALE after writing
+/// CF_UNICODETEXT alone). Formats a paste writes that nothing is synthesized
+/// from: CF_HDROP and registered formats ("HTML Format", the markers).
+const SYNTHESIZED: [(u32, &[u32]); 8] = [
+    (CF_BITMAP, &[CF_DIB, CF_DIBV5]),
+    (CF_DIB, &[CF_BITMAP, CF_PALETTE, CF_DIBV5]),
+    (CF_DIBV5, &[CF_BITMAP, CF_DIB, CF_PALETTE]),
+    (CF_ENHMETAFILE, &[CF_METAFILEPICT]),
+    (CF_METAFILEPICT, &[CF_ENHMETAFILE]),
+    (CF_OEMTEXT, &[CF_TEXT, CF_UNICODETEXT, CF_LOCALE]),
+    (CF_TEXT, &[CF_OEMTEXT, CF_UNICODETEXT, CF_LOCALE]),
+    (CF_UNICODETEXT, &[CF_OEMTEXT, CF_TEXT, CF_LOCALE]),
+];
+
+/// Whether the system lists `format` by itself once `written` is on the
+/// clipboard ([`SYNTHESIZED`]).
+fn synthesized_from(format: u32, written: &[(u32, Vec<u8>)]) -> bool {
+    SYNTHESIZED.iter().any(|(source, derived)| {
+        derived.contains(&format) && written.iter().any(|(written, _)| written == source)
+    })
+}
+
+/// Whether `formats`, found on a clipboard the lease wrote `written` to, is
+/// still `baseline`: no baseline format missing, and nothing added but
+/// formats the system synthesizes from `written`. Another application can
+/// add a format without emptying the clipboard, which keeps the owner and the
+/// lease's payload; any such addition counts as an external change.
+/// `written`'s own formats are left to the byte-for-byte check that follows
+/// (one missing is a changed payload).
+fn formats_unchanged(formats: &[u32], baseline: &[u32], written: &[(u32, Vec<u8>)]) -> bool {
+    let own = |format: &u32| written.iter().any(|(written, _)| written == format);
+    baseline
+        .iter()
+        .all(|format| own(format) || formats.contains(format))
+        && formats
+            .iter()
+            .all(|format| baseline.contains(format) || synthesized_from(*format, written))
+}
+
 /// Process-wide clipboard component health, published by every lease.
 static HEALTH: OnceLock<Mutex<ComponentHealth>> = OnceLock::new();
 fn health_cell() -> &'static Mutex<ComponentHealth> {
@@ -765,7 +811,8 @@ pub(super) struct PreparedClipboard<S> {
     handles: Vec<(u32, S)>,
     expected: ClipboardFormats,
 }
-// no-regression #1: restore only after sequence, owner and payload re-verify.
+// no-regression #1: restore only after sequence, owner, payload and format set
+// re-verify.
 pub(super) struct ClipboardLease<C: ClipboardBackend> {
     backend: C,
     backup: ClipboardFormats,
@@ -778,6 +825,17 @@ pub(super) struct ClipboardLease<C: ClipboardBackend> {
     /// Formats present at backup time that will not be restored.
     skipped: Vec<u32>,
     restore_delay: Duration,
+    /// Format set seen when the last paste write was verified: the paste,
+    /// the exclusion markers and what the system synthesized from them. A
+    /// restore must find exactly this, plus at most more synthesized formats.
+    /// `None` until a write is verified (and again once the lease clears the
+    /// clipboard); the restore then holds the clipboard to `owned_payload`'s
+    /// formats plus synthesized ones.
+    baseline: Option<Vec<u32>>,
+}
+/// Format ids of `payload`, in order.
+fn format_ids(payload: &[(u32, Vec<u8>)]) -> Vec<u32> {
+    payload.iter().map(|(format, _)| *format).collect()
 }
 /// What a lease read with the clipboard open.
 struct Backup {
@@ -869,29 +927,32 @@ fn take_backup<R: ClipboardRead>(
         skipped,
     })
 }
-/// Locked: checks that `owner` still owns the clipboard and that it holds
-/// exactly `expected` (and, with `formats`, exactly that format set);
-/// `expired` is checked after every read. Returns the sequence it saw.
+/// What a verification saw with the clipboard open.
+struct Checked {
+    sequence: u32,
+    formats: Vec<u32>,
+}
+/// Locked: checks that `owner` still owns the clipboard, that its format set
+/// passes `formats_ok` and that it holds exactly `expected`; `expired` is
+/// checked after every read. Returns the sequence and format set it saw.
 fn check_payload<R: ClipboardRead>(
     reader: &R,
     owner: u64,
     expected: &[(u32, Vec<u8>)],
-    formats: Option<&[u32]>,
+    formats_ok: impl Fn(&[u32]) -> bool,
     expired: impl Fn() -> bool,
-) -> Result<u32, LeaseError> {
+) -> Result<Checked, LeaseError> {
     let changed = |message| LeaseError::new(ReasonCode::ClipboardChanged, message);
     if reader.owner() != owner {
         return Err(changed(
             "Clipboard owner changed externally; clipboard preserved",
         ));
     }
-    if let Some(formats) = formats {
-        let now = reader.formats();
-        if now.len() != formats.len() || now.iter().any(|format| !formats.contains(format)) {
-            return Err(changed(
-                "Clipboard formats changed externally; clipboard preserved",
-            ));
-        }
+    let formats = reader.formats();
+    if !formats_ok(&formats) {
+        return Err(changed(
+            "Clipboard formats changed externally; clipboard preserved",
+        ));
     }
     for (format, bytes) in expected {
         let read = reader.read_format(*format, bytes.len());
@@ -913,7 +974,10 @@ fn check_payload<R: ClipboardRead>(
             }
         }
     }
-    Ok(reader.sequence())
+    Ok(Checked {
+        sequence: reader.sequence(),
+        formats,
+    })
 }
 fn unverified() -> LeaseError {
     LeaseError::new(
@@ -938,15 +1002,21 @@ fn verify_backup<C: ClipboardBackend>(
             degraded,
             (owner, backup),
             |reader, (owner, backup), section| {
-                let checked =
-                    check_payload(reader, owner, &backup.data, Some(&backup.formats), || {
-                        section.expired(reader)
-                    });
+                let checked = check_payload(
+                    reader,
+                    owner,
+                    &backup.data,
+                    |formats| {
+                        formats.len() == backup.formats.len()
+                            && formats.iter().all(|format| backup.formats.contains(format))
+                    },
+                    || section.expired(reader),
+                );
                 (backup, checked)
             },
         )?;
         backup = returned;
-        let sequence = checked?;
+        let sequence = checked?.sequence;
         if backend.sequence() == sequence && backend.owner() == owner {
             return Ok((backup, sequence));
         }
@@ -975,24 +1045,28 @@ fn retry_clipboard_verification<T>(
     Err(unverified())
 }
 impl<C: ClipboardBackend> ClipboardLease<C> {
-    /// Re-establishes the lease's own ownership after a write: `owner` still
-    /// owns the clipboard and it holds exactly `expected`. Runs on the lease
-    /// thread; the data is the lease's own, so no read waits on another
-    /// owner.
-    fn verified_sequence(
-        &self,
-        owner: u64,
-        expected: &[(u32, Vec<u8>)],
-    ) -> Result<u32, LeaseError> {
+    /// Re-establishes the lease's own ownership after a write: the lease
+    /// still owns the clipboard, it holds exactly `owned_payload`, and its
+    /// format set is still `baseline` (or, before a paste write is verified,
+    /// `owned_payload`'s formats) plus at most formats the system synthesizes
+    /// from `owned_payload`. Returns the sequence and format set it verified,
+    /// both read in one section. Runs on the lease thread; the data is the
+    /// lease's own, so no read waits on another owner.
+    fn verify_owned(&self) -> Result<Checked, LeaseError> {
         let backend = &self.backend;
+        let owner = backend.identity();
+        let owned = format_ids(&self.owned_payload);
+        let baseline = self.baseline.as_deref().unwrap_or(&owned);
+        let formats_ok =
+            |formats: &[u32]| formats_unchanged(formats, baseline, &self.owned_payload);
         retry_clipboard_verification(
             || {
-                let sequence = critical(backend, &self.degraded, || {
-                    check_payload(backend, owner, expected, None, || false)
+                let checked = critical(backend, &self.degraded, || {
+                    check_payload(backend, owner, &self.owned_payload, formats_ok, || false)
                 })??;
                 Ok(
-                    (backend.sequence() == sequence && backend.owner() == owner)
-                        .then_some(sequence),
+                    (backend.sequence() == checked.sequence && backend.owner() == owner)
+                        .then_some(checked),
                 )
             },
             || backend.pause(VERIFY_RETRY_INTERVAL),
@@ -1052,6 +1126,7 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
             written,
             dirty,
             degraded,
+            baseline,
             ..
         } = self;
         critical(backend, degraded, || -> Result<(), String> {
@@ -1063,6 +1138,7 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
             }
             *dirty = true;
             owned_payload.clear();
+            *baseline = None;
             mark_external_effect();
             while !prepared.handles.is_empty() {
                 let (f, h) = prepared.handles.remove(0);
@@ -1078,7 +1154,16 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
             *written = Some(backend.sequence());
             Ok(())
         })??;
-        self.written = Some(self.verified_sequence(self.backend.identity(), &prepared.expected)?);
+        // The baseline is read on the lease thread, in the section that
+        // verifies the write: the data is the lease's own, so no read waits
+        // on another owner (the backup worker only lives through `open`), and
+        // one section makes payload, sequence and format set one snapshot.
+        // Anything there but the paste, the markers and what the system
+        // synthesized from them was added by someone else: no paste is sent
+        // and the restore will refuse too.
+        let checked = self.verify_owned()?;
+        self.written = Some(checked.sequence);
+        self.baseline = Some(checked.formats);
         Ok(())
     }
     /// [`ClipboardLease::open`] with the default options.
@@ -1140,6 +1225,7 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
             degraded,
             skipped: backup.skipped,
             restore_delay: options.restore_delay,
+            baseline: None,
         };
         if !lease.skipped_formats().is_empty() {
             tracing::info!(
@@ -1171,6 +1257,7 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
             owned_payload,
             written,
             degraded,
+            baseline,
             ..
         } = self;
         critical(backend, degraded, || -> Result<(), String> {
@@ -1186,6 +1273,7 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
             }
             mark_external_effect();
             owned_payload.clear();
+            *baseline = None;
             *written = Some(backend.sequence());
             for (format, handle, expected) in staged {
                 if !backend.set(format, handle) {
@@ -1206,9 +1294,13 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
         }
         // Closing the clipboard or a listener requesting a synthesized
         // format can advance the sequence after our writes. Re-establish
-        // ownership from the exact payload under a lock; never adopt a new
-        // sequence solely because the previous one is no longer current.
-        self.written = Some(self.verified_sequence(self.backend.identity(), &self.owned_payload)?);
+        // ownership from the exact payload and format set under a lock; never
+        // adopt a new sequence solely because the previous one is no longer
+        // current. Another application adding a format without emptying the
+        // clipboard keeps the owner and the payload but not the format set:
+        // that refuses, and the clipboard stays as it is. Drop runs this
+        // same check.
+        self.written = Some(self.verify_owned()?.sequence);
         let result = self.write(self.backup.clone());
         finish_clipboard_restore(&mut self.backup, result)?;
         self.written = None;
@@ -1916,5 +2008,144 @@ mod tests {
         }
         lease.restore().unwrap();
         assert_eq!(clipboard.content(), text("original"));
+    }
+
+    fn formats_changed() -> LeaseError {
+        LeaseError::new(
+            ReasonCode::ClipboardChanged,
+            "Clipboard formats changed externally; clipboard preserved",
+        )
+    }
+    fn payload_changed() -> LeaseError {
+        LeaseError::new(
+            ReasonCode::ClipboardChanged,
+            "Clipboard payload changed externally; clipboard preserved",
+        )
+    }
+    /// A lease on `clipboard` that has written the paste of "expansion".
+    fn written_lease(clipboard: &MockClipboard) -> ClipboardLease<MockClipboard> {
+        let mut lease = ClipboardLease::new(clipboard.clone()).unwrap();
+        let mut prepared = lease.prepare(text("expansion")).unwrap();
+        lease.write_prepared(&mut prepared).unwrap();
+        lease
+    }
+    #[test]
+    fn synthesized_whitelist_covers_only_conversions_of_written_formats() {
+        let unicode = text("x");
+        for format in [CF_TEXT, CF_OEMTEXT, CF_LOCALE] {
+            assert!(synthesized_from(format, &unicode), "{format}");
+        }
+        for format in [CF_UNICODETEXT, CF_BITMAP, CF_DIB, 0xC000] {
+            assert!(!synthesized_from(format, &unicode), "{format}");
+        }
+        let dib = vec![(CF_DIB, vec![0; 40])];
+        for format in [CF_BITMAP, CF_PALETTE, CF_DIBV5] {
+            assert!(synthesized_from(format, &dib), "{format}");
+        }
+        // Nothing is synthesized from CF_HDROP or a registered format.
+        let files = vec![(15, vec![0; 22]), (0xC000, vec![0; 4])];
+        assert!(!(1..0x10000).any(|format| synthesized_from(format, &files)));
+    }
+    #[test]
+    fn restore_refuses_a_format_added_without_emptying_the_clipboard() {
+        // Explicit restore and then Drop, or Drop alone: neither overwrites.
+        for explicit in [true, false] {
+            let clipboard = MockClipboard::new(7, text("original"));
+            let mut lease = written_lease(&clipboard);
+            // Another application's SetClipboardData without EmptyClipboard:
+            // the owner and the lease's payload stay as they were.
+            let theirs = clipboard.register_format("Another application's format");
+            clipboard.add_format(theirs, vec![1, 2, 3]);
+            let mut expected = pasted(&clipboard, "expansion");
+            expected.push((theirs, vec![1, 2, 3]));
+            assert_eq!(clipboard.owner_now(), MockClipboard::LEASE);
+            if explicit {
+                assert_eq!(lease.verify_owned().err(), Some(formats_changed()));
+                assert_eq!(lease.restore(), Err(formats_changed().message));
+                assert_eq!(clipboard.content(), expected);
+            }
+            drop(lease);
+            assert_eq!(clipboard.content(), expected, "explicit: {explicit}");
+            assert_eq!(clipboard.clears(), 1, "explicit: {explicit}");
+        }
+    }
+    #[test]
+    fn restore_accepts_formats_the_system_synthesizes_from_the_paste() {
+        let clipboard = MockClipboard::new(7, text("original"));
+        let script = clipboard.clone();
+        // Lock 3 verifies the paste write, lock 4 the restore: CF_LOCALE is
+        // listed by the time the write is verified, the other text formats
+        // only before the restore, each advancing the sequence.
+        clipboard.on_lock(move |index| match index {
+            3 => script.add_format(CF_LOCALE, 0x0409u32.to_le_bytes().to_vec()),
+            4 => {
+                script.add_format(CF_TEXT, b"expansion\0".to_vec());
+                script.add_format(CF_OEMTEXT, b"expansion\0".to_vec());
+            }
+            _ => {}
+        });
+        let mut lease = written_lease(&clipboard);
+        let mut baseline = format_ids(&pasted(&clipboard, "expansion"));
+        baseline.push(CF_LOCALE);
+        assert_eq!(lease.baseline.as_deref(), Some(&baseline[..]));
+        lease.restore().unwrap();
+        assert_eq!(clipboard.content(), text("original"));
+        assert_eq!(clipboard.clears(), 2);
+    }
+    #[test]
+    fn restore_refuses_when_a_baseline_format_is_missing() {
+        // Each of the paste's own formats: the text and every marker.
+        for missing in 0..1 + EXCLUSION_FORMATS.len() {
+            let clipboard = MockClipboard::new(7, text("original"));
+            let mut lease = written_lease(&clipboard);
+            let mut left = pasted(&clipboard, "expansion");
+            left.remove(missing);
+            clipboard.tamper(left.clone());
+            assert_eq!(clipboard.owner_now(), MockClipboard::LEASE);
+            assert_eq!(lease.restore(), Err(payload_changed().message));
+            drop(lease);
+            assert_eq!(clipboard.content(), left, "missing #{missing}");
+            assert_eq!(clipboard.clears(), 1, "missing #{missing}");
+        }
+        // A synthesized format the baseline recorded.
+        let clipboard = MockClipboard::new(7, text("original"));
+        let script = clipboard.clone();
+        clipboard.on_lock(move |index| {
+            if index == 3 {
+                script.add_format(CF_LOCALE, 0x0409u32.to_le_bytes().to_vec());
+            }
+        });
+        let mut lease = written_lease(&clipboard);
+        let left = pasted(&clipboard, "expansion");
+        clipboard.tamper(left.clone());
+        assert_eq!(lease.restore(), Err(formats_changed().message));
+        drop(lease);
+        assert_eq!(clipboard.content(), left);
+        assert_eq!(clipboard.clears(), 1);
+    }
+    #[test]
+    fn paste_write_refuses_a_format_added_before_its_verification() {
+        let clipboard = MockClipboard::new(7, text("original"));
+        let theirs = clipboard.register_format("Another application's format");
+        let script = clipboard.clone();
+        // Lock 2 writes the paste, lock 3 verifies it.
+        clipboard.on_lock(move |index| {
+            if index == 3 {
+                script.add_format(theirs, vec![1, 2, 3]);
+            }
+        });
+        let mut lease = ClipboardLease::new(clipboard.clone()).unwrap();
+        let mut prepared = lease.prepare(text("expansion")).unwrap();
+        assert_eq!(
+            lease.write_prepared(&mut prepared),
+            Err(formats_changed().message)
+        );
+        assert_eq!(lease.baseline, None);
+        assert!(lease.verify_current().is_err());
+        drop(lease);
+        let mut expected = pasted(&clipboard, "expansion");
+        expected.push((theirs, vec![1, 2, 3]));
+        assert_eq!(clipboard.content(), expected);
+        assert_eq!(clipboard.clears(), 1);
     }
 }

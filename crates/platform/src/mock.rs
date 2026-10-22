@@ -261,6 +261,15 @@ impl MockClipboard {
         state.formats = formats;
         state.sequence += 1;
     }
+    /// A format joins the clipboard without an empty: another application's
+    /// `SetClipboardData` without `EmptyClipboard`, or the system listing a
+    /// synthesized format. The owner and every other format stay.
+    pub fn add_format(&self, format: u32, bytes: Vec<u8>) {
+        let mut state = self.state.lock();
+        state.formats.retain(|(f, _)| *f != format);
+        state.formats.push((format, bytes));
+        state.sequence += 1;
+    }
     /// While on, every lock release advances the sequence (never settles).
     pub fn churn_sequence(&self, on: bool) {
         self.state.lock().churn = on;
