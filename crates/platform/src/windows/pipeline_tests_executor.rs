@@ -1894,6 +1894,61 @@ fn a_partly_accepted_payment_keeps_the_refused_key_owed() {
         .contains(&InjectCall::Keys(vec![KEY_C])));
 }
 
+/// B-09 (TODO 17): the held set can contain keys a plan pressed, letters
+/// included, so a refused key-up is logged by key class only. With left
+/// Shift and A held and every key-up refused, each `executor.release_failed`
+/// carries `key` = `lshift` or `other` and no other field: never the vk.
+#[test]
+fn a_refused_key_up_is_logged_by_key_class_never_by_vk() {
+    const LSHIFT: u16 = 0xa0;
+    assert!(
+        capture::install(),
+        "test collector is the global subscriber"
+    );
+    let mut rig = ExecRig::with_release(vec![steps_rule(
+        "hold",
+        vec![
+            Operation::KeyDown { key: code(LSHIFT) },
+            Operation::KeyDown { key: code(KEY_A) },
+            Operation::KeyPress { key: code(KEY_C) },
+            Operation::KeyUp { key: code(KEY_A) },
+            Operation::KeyUp { key: code(LSHIFT) },
+        ],
+    )]);
+    rig.release.refuse_all(true);
+    let checked = hold_before_send_after(&rig, key_down(KEY_A));
+    let mark = capture::mark();
+    assert!(rig.trigger("hold"));
+    checked.wait_arrived("the task, Shift and A pressed");
+    assert!(rig.core.fence(rig.core.epoch()));
+    assert_eq!(rig.core.held_keys(), vec![KEY_A, LSHIFT]);
+
+    assert!(rig.core.rebuild().is_err(), "both key-ups refused");
+    assert!(ups(&rig.release, KEY_A) >= 1);
+    assert!(ups(&rig.release, LSHIFT) >= 1);
+    let failed: Vec<_> = capture::since(mark)
+        .into_iter()
+        .filter(|event| event.event == "executor.release_failed")
+        .collect();
+    let mut keys: Vec<_> = failed
+        .iter()
+        .filter_map(|event| event.field("key"))
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    assert_eq!(keys, ["lshift", "other"], "{failed:?}");
+    for event in &failed {
+        let names: Vec<_> = event.fields.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["event", "key"], "{event:?}");
+    }
+
+    rig.release.refuse_all(false);
+    rig.core.rebuild().expect("key-ups accepted: paid");
+    assert!(rig.core.held_keys().is_empty());
+    drop(checked);
+    assert!(rig.core.join_retired(Duration::from_secs(5)));
+}
+
 /// Round 2, issue 3: the supervisor's calls never reach the injector. With
 /// the release port blocking inside every key-up, `enforce_budget` (fencing
 /// a stalled task) and `probe` return within 50 ms on real threads, sending

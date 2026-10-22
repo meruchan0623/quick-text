@@ -495,7 +495,9 @@ const MODIFIERS: [u16; 11] = [
 /// key state is consulted (S-05: a lost key-up heals within 30 s).
 pub(super) const MODIFIER_VERIFY_AFTER: Duration = Duration::from_secs(30);
 
-fn modifier_name(vk: u16) -> &'static str {
+/// A modifier's log name; `other` for every other key (also what
+/// `executor.release_failed` records, so a letter's vk never reaches a log).
+pub(super) fn modifier_name(vk: u16) -> &'static str {
     match vk {
         VK_SHIFT => "shift",
         VK_CONTROL => "ctrl",

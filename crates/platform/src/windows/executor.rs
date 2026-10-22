@@ -150,7 +150,7 @@ use super::actions::{
 use super::clipboard::{try_clipboard_health, WinClipboard};
 use super::foreground::WinForeground;
 use super::inject::{WinInjector, SENT_EFFECT};
-use super::keystate::{own_input, physical, OwnInput};
+use super::keystate::{modifier_name, own_input, physical, OwnInput};
 use super::*;
 use crate::fault::{self, FaultPoint};
 use crate::health::{Component, ComponentHealth, Outcome, ReasonCode, StageTimings, TriggerKind};
@@ -666,6 +666,17 @@ fn mouse_button(flags: u32, data: u32) -> Option<(u16, bool)> {
     .into_iter()
     .find(|(flag, _, _)| flags & flag != 0)
     .map(|(_, vk, down)| (vk, down))
+}
+
+/// What `executor.release_failed` records of a refused release: the
+/// modifier's name, `mouse` for a mouse button, `other` for any other key.
+/// Never the vk: the held set can contain keys a recording plan pressed
+/// (letters, digits), and their codes would spell them out (B-09).
+fn release_key_class(vk: u16) -> &'static str {
+    match vk {
+        VK_LBUTTON | VK_RBUTTON | VK_MBUTTON | VK_XBUTTON1 | VK_XBUTTON2 => "mouse",
+        _ => modifier_name(vk),
+    }
 }
 
 /// The executor service: queue, worker thread, epoch, held-key bitmap and
@@ -1314,7 +1325,10 @@ impl ExecutorCore {
                 released += 1;
             } else {
                 refused += 1;
-                tracing::warn!(event = "executor.release_failed", vk);
+                tracing::warn!(
+                    event = "executor.release_failed",
+                    key = release_key_class(vk)
+                );
             }
         }
         (released, refused)
@@ -2251,6 +2265,40 @@ impl Drop for ManualBusy {
                     Ordering::SeqCst,
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B-09 (TODO 17): a refused release is logged by key class only:
+    /// modifiers by name, mouse buttons as `mouse`, every other key
+    /// (letters, digits, VK_CANCEL between the mouse buttons) as `other`.
+    #[test]
+    fn a_refused_release_is_logged_by_key_class_only() {
+        let modifiers = [
+            (VK_SHIFT, "shift"),
+            (VK_CONTROL, "ctrl"),
+            (VK_MENU, "alt"),
+            (VK_LSHIFT, "lshift"),
+            (VK_RSHIFT, "rshift"),
+            (VK_LCONTROL, "lctrl"),
+            (VK_RCONTROL, "rctrl"),
+            (VK_LMENU, "lalt"),
+            (VK_RMENU, "ralt"),
+            (VK_LWIN, "lwin"),
+            (VK_RWIN, "rwin"),
+        ];
+        for (vk, name) in modifiers {
+            assert_eq!(release_key_class(vk), name, "vk {vk:#x}");
+        }
+        for vk in [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2] {
+            assert_eq!(release_key_class(vk), "mouse", "vk {vk:#x}");
+        }
+        for vk in [0x41, 0x5a, 0x30, 0x39, VK_CANCEL, VK_RETURN, VK_SPACE, 0xff] {
+            assert_eq!(release_key_class(vk), "other", "vk {vk:#x}");
         }
     }
 }
