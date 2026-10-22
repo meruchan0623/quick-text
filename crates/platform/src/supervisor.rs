@@ -17,7 +17,10 @@
 //! reached through [`ExecutorControl`] and [`InputSources`], and all time
 //! decisions use the injected [`Clock`], so the machine is tested with a
 //! fake clock. `repair()` and automatic recovery share one rebuild path
-//! (executor worker rebuild plus input `reattach`).
+//! (executor worker rebuild plus input `reattach`). Adapter calls never run
+//! under the machine lock; a recovery attempt runs unlocked and commits by
+//! attempt number (see [`Supervisor::tick`]). Any panic or timeout inside an
+//! attempt is an attempt failure.
 use crate::health::{Component, ComponentHealth, HealthSnapshot, HealthState, ReasonCode};
 use crate::runtime::Runtime;
 use crate::traits::Clock;
@@ -51,9 +54,18 @@ pub const VERIFY_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long Starting waits for the input sources to come up before
 /// recovery attempts begin. 待基线确定.
 pub const STARTUP_GRACE: Duration = Duration::from_secs(10);
-/// `check_supervisor` respawns the driver when its heartbeat is older than
-/// this (real time; the driver sleeps in real time).
+/// `check_supervisor` respawns the driver when the machine has made no
+/// progress (no completed tick, no committed attempt) for longer than this,
+/// unless a recovery attempt is still within [`ATTEMPT_TIMEOUT`]. Measured on
+/// the injected clock (the system clock in production).
 pub const SUPERVISOR_STALE: Duration = Duration::from_secs(5);
+/// Longest a recovery attempt (executor rebuild plus the input reattaches,
+/// which run one after the other) may take. Past it the attempt counts as
+/// failed, its late result is discarded and the next attempt follows the
+/// backoff; within it `check()` does not treat the busy driver as stale.
+/// 待实测: real reattach upper bounds (hooks ≈2 s, RawInput ≈4 s, so ≈6 s
+/// in sequence) plus margin.
+pub const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Failure text for a recovery attempt that panicked (fixed text: panic
 /// payloads are never logged).
@@ -163,6 +175,33 @@ struct Machine {
     /// Set by `repair()`: rebuild the executor even if it looks healthy.
     forced: bool,
     published: Vec<ComponentHealth>,
+    /// Number of the last attempt started.
+    attempts: u64,
+    /// The attempt running outside the lock. At most one; only its result
+    /// is committed, and the machine makes no transition until it arrives,
+    /// times out or `repair()` abandons it.
+    in_flight: Option<InFlight>,
+}
+
+#[derive(Clone, Copy)]
+struct InFlight {
+    id: u64,
+    started: Instant,
+}
+
+/// An attempt the machine decided to run once its lock is released.
+struct Ticket {
+    id: u64,
+    forced: bool,
+}
+
+/// What `check()` judges the driver by (injected-clock times).
+struct Beat {
+    /// Last progress: a tick that advanced the machine, or a committed
+    /// attempt result. Skipped ticks and discarded results do not count.
+    progress: Instant,
+    /// The attempt a ticking thread is running (id, start).
+    attempt: Option<(u64, Instant)>,
 }
 
 fn prune(window: &mut VecDeque<Instant>, now: Instant) {
@@ -185,8 +224,8 @@ pub struct Supervisor {
     repair_requested: AtomicBool,
     /// Ticks are being skipped (logged once per stretch).
     skipping: AtomicBool,
-    /// Real-time heartbeat of the driver thread.
-    beat: Mutex<Instant>,
+    /// Progress heartbeat; taken after `machine` when both are held.
+    beat: Mutex<Beat>,
     wake: Mutex<bool>,
     wake_signal: Condvar,
     driver: Mutex<Option<JoinHandle<()>>>,
@@ -216,10 +255,15 @@ impl Supervisor {
                 verify_until: None,
                 forced: false,
                 published: vec![],
+                attempts: 0,
+                in_flight: None,
             }),
             repair_requested: AtomicBool::new(false),
             skipping: AtomicBool::new(false),
-            beat: Mutex::new(Instant::now()),
+            beat: Mutex::new(Beat {
+                progress: started,
+                attempt: None,
+            }),
             wake: Mutex::new(false),
             wake_signal: Condvar::new(),
             driver: Mutex::new(None),
@@ -240,27 +284,33 @@ impl Supervisor {
     }
 
     /// One supervision step: enforce the executor budget, read every
-    /// component, advance the machine and publish the snapshot.
+    /// component, advance the machine, publish the snapshot and, when an
+    /// attempt is due, run it and commit its result.
+    ///
+    /// No adapter call (`enforce_budget`, `probe`, `input_health`,
+    /// `rebuild`, `reattach`) runs under the machine lock, so an adapter that
+    /// blocks never stalls `repair()` or a replacement driver; the lock is
+    /// held only to decide and to commit. An attempt is identified by its
+    /// number: only the attempt in flight can commit, so a result that
+    /// arrives after the attempt timed out or was abandoned by `repair()` is
+    /// discarded. A driver blocked in an attempt is busy, not stale, until
+    /// ATTEMPT_TIMEOUT (see [`Self::check`]).
     pub fn tick(&self) {
-        *self.beat.lock() = Instant::now();
-        // Outside the machine lock: a hung task is fenced even while a
-        // rebuild is stuck holding the machine.
         self.executor.enforce_budget(self.clock.now());
+        let observed = catch_unwind(AssertUnwindSafe(|| self.observe(self.clock.now())));
         let Some(mut machine) = self.machine.try_lock_for(TICK) else {
             if !self.skipping.swap(true, Ordering::SeqCst) {
-                tracing::warn!(
-                    event = "supervisor.tick_skipped",
-                    "state machine busy (a rebuild is still running)"
-                );
+                tracing::warn!(event = "supervisor.tick_skipped", "state machine busy");
             }
-            return;
+            return; // not progress: the heartbeat is left alone
         };
         self.skipping.store(false, Ordering::SeqCst);
         let now = self.clock.now();
         if self.repair_requested.swap(false, Ordering::SeqCst) {
             Self::arm_repair(&mut machine, now);
         }
-        let mut observed = match catch_unwind(AssertUnwindSafe(|| self.observe(now))) {
+        Self::expire_attempt(&mut machine, now);
+        let observed = match observed {
             Ok(observed) => observed,
             Err(panic) => {
                 // A probe that panics while a rebuild is being verified
@@ -268,18 +318,42 @@ impl Supervisor {
                 if machine.verify_until.take().is_some() {
                     Self::failure(&mut machine, now, ATTEMPT_PANICKED);
                 }
+                drop(machine);
                 std::panic::resume_unwind(panic);
             }
         };
+        let ticket = self.advance(&mut machine, &observed, now);
+        self.publish(&mut machine, &observed);
+        {
+            let mut beat = self.beat.lock();
+            beat.progress = now;
+            if let Some(ticket) = &ticket {
+                beat.attempt = Some((ticket.id, now));
+            }
+        }
+        drop(machine);
+        if let Some(ticket) = ticket {
+            let outcome = self.attempt(&observed, ticket.forced);
+            self.commit(ticket.id, outcome, &observed);
+        }
+    }
+
+    /// Advances the machine on one observation (lock held, no adapter
+    /// calls). Returns the attempt to run once the lock is released.
+    fn advance(&self, machine: &mut Machine, observed: &Observed, now: Instant) -> Option<Ticket> {
+        if machine.in_flight.is_some() {
+            // Another thread is running an attempt; its result decides.
+            return None;
+        }
         match machine.state {
             HealthState::Starting => {
                 if observed.required_down().is_empty() {
-                    self.settle(&mut machine, &observed);
+                    self.settle(machine, observed);
                 } else if now.saturating_duration_since(machine.started) >= STARTUP_GRACE {
                     if machine.next_attempt.is_none() && machine.verify_until.is_none() {
                         machine.next_attempt = Some(now);
                     }
-                    self.recover(&mut machine, &mut observed, now);
+                    return self.recover(machine, observed, now);
                 }
             }
             HealthState::Healthy | HealthState::Degraded => {
@@ -287,13 +361,13 @@ impl Supervisor {
                 if down.is_empty() {
                     machine.state = observed.settled_state();
                 } else {
-                    Self::incident(&mut machine, &down, now);
+                    Self::incident(machine, &down, now);
                 }
             }
-            HealthState::Recovering => self.recover(&mut machine, &mut observed, now),
+            HealthState::Recovering => return self.recover(machine, observed, now),
             HealthState::Failed => {}
         }
-        self.publish(&mut machine, &observed);
+        None
     }
 
     /// [`Self::tick`] behind `catch_unwind`; false when the tick panicked.
@@ -327,7 +401,7 @@ impl Supervisor {
         machine.next_attempt = Some(now + BACKOFF[0]);
     }
 
-    fn recover(&self, machine: &mut Machine, observed: &mut Observed, now: Instant) {
+    fn recover(&self, machine: &mut Machine, observed: &Observed, now: Instant) -> Option<Ticket> {
         let healthy = observed.required_down().is_empty();
         if let Some(deadline) = machine.verify_until {
             if healthy {
@@ -340,31 +414,83 @@ impl Supervisor {
                     "components did not report healthy after rebuild",
                 );
             }
-            return;
+            return None;
         }
         if healthy && !machine.forced {
             // The fault cleared on its own (e.g. a hook came back).
             self.settle(machine, observed);
+            return None;
+        }
+        if machine.next_attempt.is_none_or(|due| now < due) {
+            return None;
+        }
+        machine.next_attempt = None;
+        machine.attempts += 1;
+        let id = machine.attempts;
+        machine.in_flight = Some(InFlight { id, started: now });
+        Some(Ticket {
+            id,
+            forced: std::mem::take(&mut machine.forced),
+        })
+    }
+
+    /// Commits the result of attempt `id` (`before` is the observation it
+    /// started from) if it is still the attempt in flight; otherwise it
+    /// timed out or was abandoned by `repair()` and the result is dropped.
+    fn commit(&self, id: u64, outcome: Result<Observed, String>, before: &Observed) {
+        let mut machine = self.machine.lock();
+        // The attempt can block for seconds (sequential reattach): backoff
+        // and the verification window start when it returned.
+        let now = self.clock.now();
+        let current = machine.in_flight.is_some_and(|attempt| attempt.id == id);
+        let mut beat = self.beat.lock();
+        if beat.attempt.is_some_and(|(running, _)| running == id) {
+            beat.attempt = None;
+        }
+        if !current {
+            tracing::warn!(
+                event = "supervisor.attempt_discarded",
+                attempt = id,
+                "result of an attempt that timed out or was superseded"
+            );
             return;
         }
-        if machine.next_attempt.is_some_and(|due| now >= due) {
-            machine.next_attempt = None;
-            let forced = std::mem::take(&mut machine.forced);
-            let outcome = self.attempt(observed, forced);
-            // The attempt can block for seconds (sequential reattach):
-            // backoff and the verification window start when it returned.
-            let now = self.clock.now();
-            match outcome {
-                Ok(after) => {
-                    *observed = after;
-                    if observed.required_down().is_empty() {
-                        self.settle(machine, observed);
-                    } else {
-                        machine.verify_until = Some(now + VERIFY_TIMEOUT);
-                    }
+        beat.progress = now;
+        drop(beat);
+        machine.in_flight = None;
+        let after;
+        let observed = match outcome {
+            Ok(observed) => {
+                after = observed;
+                if after.required_down().is_empty() {
+                    self.settle(&mut machine, &after);
+                } else {
+                    machine.verify_until = Some(now + VERIFY_TIMEOUT);
                 }
-                Err(error) => Self::failure(machine, now, &error),
+                &after
             }
+            Err(error) => {
+                Self::failure(&mut machine, now, &error);
+                before
+            }
+        };
+        self.publish(&mut machine, observed);
+    }
+
+    /// An attempt in flight for longer than ATTEMPT_TIMEOUT counts as one
+    /// failure and is abandoned: its result is discarded when it arrives,
+    /// and the next attempt follows the backoff.
+    fn expire_attempt(machine: &mut Machine, now: Instant) {
+        let Some(attempt) = machine.in_flight else {
+            return;
+        };
+        if now.saturating_duration_since(attempt.started) > ATTEMPT_TIMEOUT {
+            machine.in_flight = None;
+            Self::failure(
+                machine,
+                now,
+                "attempt did not return within ATTEMPT_TIMEOUT",
+            );
         }
     }
 
@@ -501,17 +627,21 @@ impl Supervisor {
     /// (woken immediately). Returns the Recovering snapshot; the outcome is
     /// published through the runtime's `Health` events.
     ///
-    /// Never blocks the caller behind a running rebuild for longer than one
-    /// TICK: if the machine stays locked, the request is left for the next
-    /// tick and the current snapshot is returned.
+    /// An attempt still in flight is abandoned (its result will be
+    /// discarded) so the forced rebuild does not wait for it. Never blocks
+    /// the caller for longer than one TICK: if the machine stays locked, the
+    /// request is left for the next tick and the current snapshot is
+    /// returned.
     pub fn repair(&self) -> HealthSnapshot {
         tracing::info!(event = "supervisor.repair");
+        // Probed before locking: the probe is an adapter call.
+        let observed = catch_unwind(AssertUnwindSafe(|| self.observe(self.clock.now())));
         match self.machine.try_lock_for(TICK) {
             Some(mut machine) => {
-                let now = self.clock.now();
-                Self::arm_repair(&mut machine, now);
-                let observed = self.observe(now);
-                self.publish(&mut machine, &observed);
+                Self::arm_repair(&mut machine, self.clock.now());
+                if let Ok(observed) = &observed {
+                    self.publish(&mut machine, observed);
+                }
             }
             None => {
                 self.repair_requested.store(true, Ordering::SeqCst);
@@ -526,6 +656,12 @@ impl Supervisor {
     }
 
     fn arm_repair(machine: &mut Machine, now: Instant) {
+        if let Some(attempt) = machine.in_flight.take() {
+            tracing::info!(
+                event = "supervisor.attempt_superseded",
+                attempt = attempt.id
+            );
+        }
         machine.failures.clear();
         machine.incidents.clear();
         machine.streak = 0;
@@ -562,7 +698,8 @@ impl Supervisor {
         let handle = std::thread::Builder::new()
             .name("qt-supervisor".into())
             .spawn(move || me.drive(generation))?;
-        *self.beat.lock() = Instant::now();
+        // A new driver gets SUPERVISOR_STALE to make its first progress.
+        self.beat.lock().progress = self.clock.now();
         *self.driver.lock() = Some(handle);
         Ok(())
     }
@@ -582,7 +719,11 @@ impl Supervisor {
     }
 
     /// Main-thread watchdog (call every 5 s): respawns the driver if its
-    /// thread ended or its heartbeat is stale. Returns false when it had to.
+    /// thread ended or the machine is stale: no progress for longer than
+    /// SUPERVISOR_STALE and no attempt that is still within ATTEMPT_TIMEOUT
+    /// (a driver blocked in a slow reattach is busy, not dead; one blocked
+    /// past the limit is replaced, and the new driver's tick counts the
+    /// attempt as failed). Returns false when it had to respawn.
     pub fn check(self: &Arc<Self>) -> bool {
         if self.runtime.shutting_down() {
             return true;
@@ -592,7 +733,14 @@ impl Supervisor {
             .lock()
             .as_ref()
             .is_none_or(JoinHandle::is_finished);
-        let stale = self.beat.lock().elapsed() > SUPERVISOR_STALE;
+        let now = self.clock.now();
+        let stale = {
+            let beat = self.beat.lock();
+            let busy = beat.attempt.is_some_and(|(_, started)| {
+                now.saturating_duration_since(started) <= ATTEMPT_TIMEOUT
+            });
+            !busy && now.saturating_duration_since(beat.progress) > SUPERVISOR_STALE
+        };
         if !finished && !stale {
             return true;
         }
@@ -636,6 +784,7 @@ mod tests {
     use crate::mock::FakeClock;
     use crate::Shared;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
 
     /// Test hook run inside an adapter call (may panic, block or move the
     /// fake clock).
@@ -1059,8 +1208,11 @@ mod tests {
             HealthState::Healthy,
             "returned without waiting"
         );
-        // A tick that cannot get the machine still fences the executor.
+        // A tick that cannot get the machine still fences the executor, but
+        // it is not progress: the heartbeat does not move.
         let budget_checks = rig.executor.budget_checks.load(Ordering::SeqCst);
+        let progress = rig.supervisor.beat.lock().progress;
+        rig.clock.advance(MS);
         let supervisor = Arc::clone(&rig.supervisor);
         std::thread::spawn(move || supervisor.tick())
             .join()
@@ -1069,6 +1221,7 @@ mod tests {
             rig.executor.budget_checks.load(Ordering::SeqCst),
             budget_checks + 1
         );
+        assert_eq!(rig.supervisor.beat.lock().progress, progress);
         drop(held);
         assert_eq!(rig.executor.rebuild_count(), 0);
         rig.supervisor.tick();
@@ -1343,6 +1496,190 @@ mod tests {
         assert_eq!(rig.state(), HealthState::Recovering);
         rig.step(BACKOFF[1]);
         assert_eq!(rig.executor.rebuild_count(), 2);
+    }
+
+    /// Puts a parked thread in the driver slot: `check()` sees a live
+    /// driver that never ticks. Dropping the sender ends the thread.
+    fn parked_driver(rig: &Rig) -> mpsc::Sender<()> {
+        let (tx, rx) = mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        *rig.supervisor.driver.lock() = Some(handle);
+        tx
+    }
+
+    /// Stops the driver `check()` spawned and waits for its thread.
+    fn retire_driver(rig: &Rig) {
+        rig.supervisor
+            .driver_generation
+            .fetch_add(1, Ordering::SeqCst);
+        rig.supervisor.wake();
+        let handle = rig.supervisor.driver.lock().take();
+        handle.unwrap().join().unwrap();
+    }
+
+    struct Gate {
+        entered: mpsc::Receiver<()>,
+        release: mpsc::Sender<()>,
+    }
+
+    /// The first rebuild signals `entered` and blocks until `release`;
+    /// later rebuilds run straight through.
+    fn block_first_rebuild(rig: &Rig) -> Gate {
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let (entered_tx, release_rx) = (Mutex::new(entered_tx), Mutex::new(release_rx));
+        let first = AtomicBool::new(true);
+        *rig.executor.on_rebuild.lock() = Some(Arc::new(move || {
+            if first.swap(false, Ordering::SeqCst) {
+                entered_tx.lock().send(()).unwrap();
+                let _ = release_rx.lock().recv();
+            }
+        }));
+        Gate { entered, release }
+    }
+
+    /// Runs one tick on another thread until it blocks in the first
+    /// rebuild; returns that thread and the fake time the attempt started.
+    fn tick_into_blocked_rebuild(rig: &Rig, gate: &Gate) -> (JoinHandle<()>, Duration) {
+        let supervisor = Arc::clone(&rig.supervisor);
+        let stuck = std::thread::spawn(move || supervisor.tick());
+        gate.entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("attempt started");
+        (stuck, rig.clock.elapsed())
+    }
+
+    #[test]
+    fn a_stuck_attempt_times_out_into_a_failure_and_its_late_result_is_discarded() {
+        let rig = Rig::healthy();
+        let driver = parked_driver(&rig);
+        let gate = block_first_rebuild(&rig);
+        *rig.executor.status.lock() = Status::Down(ReasonCode::ExecutorTimeout);
+        rig.step(MS);
+        rig.clock.advance(BACKOFF[0]);
+        let (stuck, started) = tick_into_blocked_rebuild(&rig, &gate);
+        assert!(
+            rig.supervisor.machine.try_lock().is_some(),
+            "the machine is not locked across the rebuild"
+        );
+
+        // Busy in an attempt within ATTEMPT_TIMEOUT: not stale, even with
+        // no progress for longer than SUPERVISOR_STALE.
+        let busy = SUPERVISOR_STALE + Duration::from_secs(1);
+        rig.clock.advance(busy);
+        assert!(rig.supervisor.check());
+        // Stuck past the limit: reported (and the driver replaced).
+        rig.clock.advance(ATTEMPT_TIMEOUT - busy + MS);
+        assert!(
+            !rig.supervisor.check(),
+            "a stuck attempt must not look alive"
+        );
+        retire_driver(&rig);
+        drop(driver);
+
+        // The next tick (whichever driver runs it) counts one failure.
+        rig.supervisor.tick();
+        let expired = rig.clock.elapsed();
+        assert_eq!(expired, started + ATTEMPT_TIMEOUT + MS);
+        assert_eq!(rig.failures(), 1);
+        assert_eq!(rig.state(), HealthState::Recovering);
+        assert!(rig.supervisor.machine.lock().in_flight.is_none());
+
+        // The late result (a failure, had it counted) is discarded.
+        *rig.executor.refuse.lock() = 1;
+        gate.release.send(()).unwrap();
+        stuck.join().unwrap();
+        assert_eq!(*rig.executor.refuse.lock(), 0, "the late rebuild returned");
+        assert_eq!(rig.failures(), 1, "late result discarded");
+        assert!(rig.supervisor.beat.lock().attempt.is_none());
+
+        // The retry follows the backoff from the timeout.
+        rig.step(BACKOFF[1] - MS);
+        assert_eq!(rig.executor.rebuild_count(), 1);
+        rig.step(MS);
+        assert_eq!(
+            *rig.executor.rebuilds.lock(),
+            [started, expired + BACKOFF[1]]
+        );
+        assert_eq!(rig.state(), HealthState::Healthy);
+    }
+
+    #[test]
+    fn one_attempt_at_a_time_and_repair_supersedes_a_stuck_one() {
+        let rig = Rig::healthy();
+        let gate = block_first_rebuild(&rig);
+        *rig.executor.status.lock() = Status::Down(ReasonCode::ExecutorPanic);
+        rig.step(MS);
+        rig.clock.advance(BACKOFF[0]);
+        let (stuck, _) = tick_into_blocked_rebuild(&rig, &gate);
+
+        // Another ticking thread (a second driver) neither starts a second
+        // attempt nor makes a transition while the first one runs.
+        for _ in 0..3 {
+            rig.step(Duration::from_secs(2));
+        }
+        assert_eq!(rig.executor.rebuild_count(), 1);
+        assert_eq!(rig.failures(), 0);
+        assert_eq!(rig.state(), HealthState::Recovering);
+
+        // repair() abandons it; the forced rebuild runs on the next tick.
+        assert_eq!(rig.supervisor.repair().state, HealthState::Recovering);
+        rig.supervisor.tick();
+        assert_eq!(rig.executor.rebuild_count(), 2);
+        assert_eq!(rig.state(), HealthState::Healthy);
+
+        // The abandoned attempt's late result (a failure) is discarded.
+        *rig.executor.refuse.lock() = 1;
+        gate.release.send(()).unwrap();
+        stuck.join().unwrap();
+        assert_eq!(*rig.executor.refuse.lock(), 0, "the late rebuild returned");
+        assert_eq!(rig.failures(), 0);
+        assert_eq!(rig.state(), HealthState::Healthy);
+    }
+
+    #[test]
+    fn a_six_second_sequential_reattach_does_not_replace_the_driver() {
+        let rig = Rig::healthy();
+        let _driver = parked_driver(&rig);
+        let calls = AtomicUsize::new(0);
+        let clock = Arc::clone(&rig.clock);
+        let supervisor = Arc::clone(&rig.supervisor);
+        let verdicts = Arc::new(Mutex::new(vec![]));
+        let seen = Arc::clone(&verdicts);
+        // Real upper bounds: a hook ≈2 s, then RawInput ≈4 s.
+        *rig.inputs.on_reattach.lock() = Some(Arc::new(move || {
+            let took = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                2
+            } else {
+                4
+            };
+            clock.advance(Duration::from_secs(took));
+            seen.lock().push(supervisor.check());
+        }));
+        rig.inputs.set(
+            Component::KeyboardHook,
+            HealthState::Failed,
+            ReasonCode::HookMissing,
+        );
+        rig.inputs.set(
+            Component::RawInput,
+            HealthState::Failed,
+            ReasonCode::RawInputMissing,
+        );
+        let generation = rig.supervisor.driver_generation.load(Ordering::SeqCst);
+        rig.step(MS);
+        rig.step(BACKOFF[0]);
+        assert_eq!(*verdicts.lock(), [true, true], "checked at +2 s and +6 s");
+        assert_eq!(
+            rig.supervisor.driver_generation.load(Ordering::SeqCst),
+            generation,
+            "driver not replaced"
+        );
+        assert_eq!(rig.state(), HealthState::Healthy);
+        assert!(rig.supervisor.check(), "the commit is progress");
+        *rig.inputs.on_reattach.lock() = None; // breaks the Arc cycle
     }
 
     #[test]
