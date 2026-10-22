@@ -252,6 +252,18 @@ impl Injector for ReleasePort {
     }
 }
 
+/// The clipboard component's health as the mock's leases last reported it
+/// (Healthy before any report), as `clipboard_health` is in production.
+fn mock_clipboard_health(clipboard: &MockClipboard) -> ComponentHealth {
+    let (state, reason) = clipboard.health().unwrap_or((HealthState::Healthy, None));
+    ComponentHealth {
+        component: Component::Clipboard,
+        state,
+        reason,
+        since_ms: 0,
+    }
+}
+
 /// One engine: a real executor service and supervisor over mock ports.
 struct ExecRig {
     shared: Arc<Shared>,
@@ -316,6 +328,10 @@ impl ExecRig {
             STALL_BUDGET,
             Arc::clone(&runtime),
         );
+        // The clipboard's own health comes from this rig's mock, never from
+        // the process-wide one other tests write.
+        let reported = clipboard.clone();
+        core.set_clipboard_probe(move || Some(mock_clipboard_health(&reported)));
         core.rebuild().expect("worker starts");
         let supervisor = Supervisor::new(
             clock.clone(),
@@ -2498,3 +2514,7 @@ fn physical_key_conflicts_are_modifier_held_on_the_real_paths() {
         (Outcome::Failed, ReasonCode::ModifierHeld, true)
     );
 }
+
+// P5-B: the clipboard path on this rig (probe, structured reasons).
+#[path = "pipeline_tests_executor_clipboard.rs"]
+mod clipboard_path;

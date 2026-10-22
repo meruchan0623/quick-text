@@ -141,13 +141,13 @@ use super::actions::{
     begin_trace, current_stage, execute_with_proof, set_stage, stage_marks, Ports, Stage,
     StageMarks,
 };
-use super::clipboard::WinClipboard;
+use super::clipboard::{try_clipboard_health, WinClipboard};
 use super::foreground::WinForeground;
 use super::inject::{WinInjector, SENT_EFFECT};
 use super::keystate::{own_input, physical, OwnInput};
 use super::*;
 use crate::fault::{self, FaultPoint};
-use crate::health::{Component, Outcome, ReasonCode, StageTimings, TriggerKind};
+use crate::health::{Component, ComponentHealth, Outcome, ReasonCode, StageTimings, TriggerKind};
 use crate::history::Record;
 use crate::runtime::Runtime;
 use crate::supervisor::{ExecutorControl, Status};
@@ -522,6 +522,49 @@ fn status_index(status: Status) -> u8 {
         .unwrap_or(EXECUTOR_STATUSES.len() - 1) as u8
 }
 
+/// Every clipboard status [`ExecutorCore::status`] caches, as for
+/// [`EXECUTOR_STATUSES`]. A lease only ever reports Healthy or
+/// Degraded(ClipboardBusy); any other status is cached as Degraded or Down
+/// with `Internal`. Clipboard is optional: the supervisor publishes it as
+/// Degraded at worst and never rebuilds for it.
+const CLIPBOARD_STATUSES: [Status; 4] = [
+    Status::Ok,
+    Status::Degraded(ReasonCode::ClipboardBusy),
+    Status::Degraded(ReasonCode::Internal),
+    Status::Down(ReasonCode::Internal),
+];
+
+/// The index of `status` in [`CLIPBOARD_STATUSES`].
+fn clipboard_index(status: Status) -> u8 {
+    CLIPBOARD_STATUSES
+        .iter()
+        .position(|known| *known == status)
+        .unwrap_or(match status {
+            Status::Ok => 0,
+            Status::Degraded(_) => 2,
+            Status::Down(_) => 3,
+        }) as u8
+}
+
+/// The worse of two statuses of one component; `a` on a tie.
+fn worse(a: Status, b: Status) -> Status {
+    let rank = |status: Status| match status {
+        Status::Ok => 0,
+        Status::Degraded(_) => 1,
+        Status::Down(_) => 2,
+    };
+    if rank(b) > rank(a) {
+        b
+    } else {
+        a
+    }
+}
+
+/// Reads the clipboard component's own health without waiting; `None`
+/// while it cannot be read now. Production reads the process-wide
+/// `clipboard_health` ([`try_clipboard_health`]); a test rig its mock's.
+struct ClipboardProbe(Box<dyn Fn() -> Option<ComponentHealth> + Send + Sync>);
+
 #[cfg(test)]
 type PauseHook = Arc<dyn Fn(Pause) + Send + Sync>;
 
@@ -645,6 +688,13 @@ pub(super) struct ExecutorCore {
     /// [`EXECUTOR_STATUSES`]: what `probe` returns while a lock it needs is
     /// held elsewhere (A2).
     last_status: AtomicU8,
+    /// Where `probe` reads the clipboard's own health; empty: the
+    /// process-wide one ([`try_clipboard_health`]).
+    clipboard_probe: ArcSwapOption<ClipboardProbe>,
+    /// The clipboard status last read, as an index into
+    /// [`CLIPBOARD_STATUSES`]: what `probe` returns while a lease is
+    /// updating it (A2).
+    last_clipboard: AtomicU8,
     /// Execution history (B-35); production uses `runtime::current()`.
     runtime: Arc<Runtime>,
     #[cfg(test)]
@@ -681,9 +731,22 @@ impl ExecutorCore {
             clipboard_holder: AtomicU64::new(0),
             fault: PlMutex::new(None),
             last_status: AtomicU8::new(0),
+            clipboard_probe: ArcSwapOption::empty(),
+            last_clipboard: AtomicU8::new(0),
             #[cfg(test)]
             pause_hook: PlMutex::new(None),
         })
+    }
+
+    /// Makes `probe` read the clipboard's own health from `probe` (tests:
+    /// the rig's mock clipboard instead of the process-wide health).
+    #[cfg(test)]
+    pub(super) fn set_clipboard_probe(
+        &self,
+        probe: impl Fn() -> Option<ComponentHealth> + Send + Sync + 'static,
+    ) {
+        self.clipboard_probe
+            .store(Some(Arc::new(ClipboardProbe(Box::new(probe)))));
     }
 
     pub(super) fn epoch(&self) -> u64 {
@@ -1236,7 +1299,9 @@ impl ExecutorCore {
 
     /// The components' status (`probe`). Never waits for a lock (A2): the
     /// fault and the worker are only try_locked, and while either is held
-    /// elsewhere the executor status last observed is returned.
+    /// elsewhere the executor status last observed is returned. The
+    /// clipboard is the worse of a lease held by a fenced task and the
+    /// clipboard's own health ([`Self::clipboard_reported`]).
     fn status(&self) -> Vec<(Component, Status)> {
         let fault = self.fault.try_lock().map(|fault| *fault);
         let alive = self.worker.try_lock().map(|worker| worker.alive());
@@ -1263,15 +1328,40 @@ impl ExecutorCore {
             }
         };
         let holder = self.clipboard_holder.load(Ordering::SeqCst);
-        let clipboard = if holder != 0 && holder - 1 < self.epoch() {
+        let held = if holder != 0 && holder - 1 < self.epoch() {
             Status::Degraded(ReasonCode::ClipboardBusy)
         } else {
             Status::Ok
         };
         vec![
             (Component::Executor, executor),
-            (Component::Clipboard, clipboard),
+            (Component::Clipboard, worse(held, self.clipboard_reported())),
         ]
+    }
+
+    /// The clipboard's own health (`clipboard_health`, B-08: Degraded after
+    /// a lease found it busy, held it too long or met a hung owner; Healthy
+    /// again after the next lease that kept every section in time) as a
+    /// status. Never waits (A2): while a lease is updating it, the status
+    /// last read is returned.
+    fn clipboard_reported(&self) -> Status {
+        let probe = self.clipboard_probe.load();
+        let health = match probe.as_deref() {
+            Some(probe) => (probe.0)(),
+            None => try_clipboard_health(),
+        };
+        match health {
+            Some(health) => {
+                let status = Status::from_health(&health);
+                self.last_clipboard
+                    .store(clipboard_index(status), Ordering::SeqCst);
+                status
+            }
+            None => {
+                tracing::debug!(event = "executor.clipboard_probe_cached");
+                CLIPBOARD_STATUSES[usize::from(self.last_clipboard.load(Ordering::SeqCst))]
+            }
+        }
     }
 
     /// Closes the queue so the worker exits (tests; production never stops).

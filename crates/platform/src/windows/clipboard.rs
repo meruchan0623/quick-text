@@ -7,7 +7,7 @@ use crate::health::{Component, ComponentHealth, HealthState, ReasonCode};
 use crate::traits::{ClipboardBackend, ClipboardRead, FormatRead, LeaseOptions, RestorePolicy};
 use std::cell::Cell;
 use std::sync::mpsc::RecvTimeoutError;
-use std::sync::PoisonError;
+use std::sync::{PoisonError, TryLockError};
 use windows_sys::Win32::Graphics::Gdi::{
     DeleteEnhMetaFile, GetEnhMetaFileBits, SetEnhMetaFileBits,
 };
@@ -212,6 +212,15 @@ pub fn clipboard_health() -> ComponentHealth {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .clone()
+}
+/// [`clipboard_health`] without waiting, for the executor's `probe` (A2):
+/// `None` while a lease is updating it.
+pub(super) fn try_clipboard_health() -> Option<ComponentHealth> {
+    match health_cell().try_lock() {
+        Ok(health) => Some(health.clone()),
+        Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner().clone()),
+        Err(TryLockError::WouldBlock) => None,
+    }
 }
 
 /// End of the `FaultPoint::ClipboardBusy` window (B-52).
@@ -1872,6 +1881,17 @@ mod tests {
             (HealthState::Healthy, None)
         );
         assert!(healthy.since_ms >= degraded.since_ms);
+    }
+    /// The probe's read never waits (A2): `None` while a lease holds the
+    /// health, the health itself otherwise.
+    #[test]
+    fn try_clipboard_health_never_waits_for_a_lease() {
+        let held = health_cell().lock().unwrap_or_else(PoisonError::into_inner);
+        let reader = std::thread::spawn(try_clipboard_health);
+        assert!(reader.join().unwrap().is_none(), "held by a lease");
+        drop(held);
+        let read = try_clipboard_health().expect("free");
+        assert_eq!(read.component, Component::Clipboard);
     }
 
     fn open_with(
