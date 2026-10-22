@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react';
 import { call } from './ipc/transport';
-import { parseCommandError } from './ipc/errors';
+import { diagnosticText, parseCommandError } from './ipc/errors';
 import { actionChoice, actionLabel, actionOptions, clone, Data, Rule } from './model';
 import { moveItem, withoutKey } from './lib/list';
 import { LinesInput } from './LinesInput';
@@ -442,7 +442,7 @@ export default function ActionEditor({
                 {step ? `步骤 ${Number(step[1]) + 1}` : '操作设置'}
                 {d.span?.line > 0
                   ? ` · 第 ${d.span.line} 行 / ${d.span.column || 1} 列`
-                  : ''} · {d.message}
+                  : ''} · {diagnosticText(d)}
               </button>
             );
           })}

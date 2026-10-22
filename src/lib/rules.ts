@@ -8,27 +8,119 @@ export const DEFAULT_GROUP = '默认';
 export const groupKey = (group: unknown): string =>
   typeof group === 'string' && group !== '' ? group : DEFAULT_GROUP;
 
-/** Rule count per group key, in order of first appearance. */
-export function countByGroup(rules: readonly { group?: unknown }[]): Map<string, number> {
+/** Rule count per group key, in order of first appearance; unreadable entries are not counted. */
+export function countByGroup(rules: readonly unknown[]): Map<string, number> {
   const counts = new Map<string, number>();
   for (const rule of rules) {
+    if (!isReadableRule(rule)) continue;
     const key = groupKey(rule.group);
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
   return counts;
 }
 
-/** Drop selected ids whose rule no longer exists; returns the same array when nothing changed. */
-export function pruneSelection(selected: string[], rules: readonly { id?: unknown }[]): string[] {
-  const ids = new Set(rules.map((r) => r.id));
+/**
+ * Drop selected ids whose rule no longer exists; returns the same array when nothing changed.
+ * Only readable rules count: an unreadable entry cannot be selected.
+ */
+export function pruneSelection(selected: string[], rules: readonly unknown[]): string[] {
+  const ids = new Set(rules.filter(isReadableRule).map((r) => r.id));
   return selected.every((id) => ids.has(id)) ? selected : selected.filter((id) => ids.has(id));
 }
 
-const record = (value: unknown): Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : {};
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+const record = (value: unknown): Record<string, unknown> => (isRecord(value) ? value : {});
 const text = (value: unknown): string => (typeof value === 'string' ? value : '');
+
+// ---- B-43 tolerant reading -----------------------------------------------------------------
+// The backend keeps a `rules` entry it cannot read as the raw JSON value (any shape, even not an
+// object) and unknown fields as extra keys. The UI lists such an entry read-only and writes every
+// entry and key back unchanged.
+
+/** The fields the UI reads from a rule; the backend sends all of them for a readable rule. */
+export interface ReadableRule {
+  id: string;
+  enabled: boolean;
+  group: string;
+  description: string;
+  match: { value: string };
+  trigger_mode: string;
+  action: Record<string, unknown>;
+  parameter: Record<string, unknown>;
+  notification: Record<string, unknown>;
+}
+
+/** Whether a `rules` entry is a rule the UI can show and edit, or a raw unreadable entry. */
+export function isReadableRule(entry: unknown): entry is ReadableRule {
+  if (!isRecord(entry)) return false;
+  const { id, enabled, group, description, match, trigger_mode, action, parameter, notification } =
+    entry;
+  return (
+    typeof id === 'string' &&
+    typeof enabled === 'boolean' &&
+    typeof group === 'string' &&
+    typeof description === 'string' &&
+    isRecord(match) &&
+    typeof match.value === 'string' &&
+    typeof trigger_mode === 'string' &&
+    isRecord(action) &&
+    typeof action.type === 'string' &&
+    isRecord(parameter) &&
+    isRecord(notification)
+  );
+}
+
+/** The id of an unreadable entry, when it has a usable one. */
+export function unreadableId(entry: unknown): string | null {
+  const id = record(entry).id;
+  return typeof id === 'string' && id !== '' ? id : null;
+}
+
+export interface UnreadableEntry {
+  /** Position in `rules` (diagnostic paths use it). */
+  index: number;
+  id: string | null;
+}
+
+/** The unreadable entries of `rules`, in order. */
+export const unreadableEntries = (rules: readonly unknown[]): UnreadableEntry[] =>
+  rules.flatMap((entry, index) =>
+    isReadableRule(entry) ? [] : [{ index, id: unreadableId(entry) }],
+  );
+
+/**
+ * Put an edited list of readable rules back into `rules`: unreadable entries stay where they were,
+ * the readable slots take `next` in order, extra rules go to the end and missing ones are dropped.
+ */
+export function replaceReadable(rules: readonly unknown[], next: readonly unknown[]): unknown[] {
+  const result: unknown[] = [];
+  let taken = 0;
+  for (const entry of rules) {
+    if (!isReadableRule(entry)) result.push(entry);
+    else if (taken < next.length) result.push(next[taken++]);
+  }
+  return [...result, ...next.slice(taken)];
+}
+
+const RULE_KEYS = new Set([
+  'id',
+  'enabled',
+  'group',
+  'description',
+  'ignore_case',
+  'match',
+  'trigger_mode',
+  'terminator',
+  'ime_erasure',
+  'action',
+  'parameter',
+  'notification',
+]);
+
+/** Keys of a rule this version does not know (a newer version's fields, kept on save). */
+export const unknownRuleKeys = (rule: object): string[] =>
+  Object.keys(rule).filter((key) => !RULE_KEYS.has(key));
 
 function keyName(key: unknown): string {
   const k = record(key);

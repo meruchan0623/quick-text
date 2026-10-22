@@ -485,3 +485,118 @@ describe('rule list, editor and settings (F-04)', () => {
     expect(callsOf(backend, 'exit_app')).toHaveLength(0);
   });
 });
+
+describe('tolerant reading (B-43)', () => {
+  // Rules are [;s1 (with an unknown field), unreadable with id, ;s2, ;s3, 'not a rule', null].
+  type Saved = Record<string, unknown> & {
+    globals: Record<string, unknown>;
+    rules: unknown[];
+  };
+  const lastSaved = (backend: MockBackend) =>
+    callsOf(backend, 'save_draft').at(-1)?.args.config as Saved;
+
+  async function mountSample(): Promise<Mounted> {
+    const mounted = await mount({ unreadable: true });
+    await waitFor(mounted, () => {
+      expect(mounted.container.querySelectorAll('tbody tr')).toHaveLength(6);
+    });
+    return mounted;
+  }
+
+  it('lists unreadable entries read-only without crashing', async () => {
+    const mounted = await mountSample();
+    const { container } = mounted;
+    const rows = [...container.querySelectorAll('tbody tr.unreadable-row')];
+    expect(rows.map((r) => r.querySelector('strong')?.textContent)).toEqual([
+      '无法读取的规则',
+      '无法读取的规则',
+      '无法读取的规则',
+    ]);
+    expect(rows.map((r) => r.querySelector('.unreadable-id')?.textContent ?? null)).toEqual([
+      'mock-unreadable-1',
+      null,
+      null,
+    ]);
+    // Nothing to select, edit or delete on them.
+    expect(rows.every((r) => !r.querySelector('input, button'))).toBe(true);
+    expect(container.querySelector('.batch span')?.textContent).toBe(
+      '共 6 条（3 条无法读取） · 已选 0 条',
+    );
+    // Only readable rules belong to a group.
+    await click(mounted, '问候1');
+    expect(container.querySelectorAll('tbody tr')).toHaveLength(1);
+    expect(container.querySelectorAll('tbody tr.unreadable-row')).toHaveLength(0);
+  });
+
+  it('writes raw entries and unknown keys back unchanged when rules change', async () => {
+    const mounted = await mountSample();
+    const { backend, container } = mounted;
+    const before = structuredClone(backend.draft);
+    const toggle = container.querySelector<HTMLInputElement>('input[aria-label="停用 ;s2"]');
+    await mounted.act(() => {
+      toggle?.click();
+    });
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+    });
+    const saved = lastSaved(backend);
+    expect(saved.rules).toHaveLength(6);
+    expect([saved.rules[1], saved.rules[4], saved.rules[5]]).toEqual([
+      before.rules[1],
+      'not a rule',
+      null,
+    ]);
+    expect(saved.rules[2]).toMatchObject({ id: 'mock-rule-2', enabled: false });
+    expect(saved.rules[0]).toHaveProperty('future_rule_field', [1, 2]);
+    expect(saved.future_setting).toEqual({ sample: true });
+    expect(saved.globals.future_global).toBe('kept');
+
+    // Deleting a rule keeps every raw entry, in order and where it was.
+    const remove = [...container.querySelectorAll('tbody tr')]
+      .find((r) => r.querySelector('strong')?.textContent === ';s1')
+      ?.querySelector<HTMLButtonElement>('.row-tools button:last-child');
+    await mounted.act(() => {
+      remove?.click();
+    });
+    const question = '删除指令“;s1”？';
+    await waitFor(mounted, () => {
+      expect(dialog(container, question)).not.toBeNull();
+    });
+    await clickIn(mounted, dialog(container, question), '删除');
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'save_draft')).toHaveLength(2);
+    });
+    const ids = lastSaved(backend).rules.map((r) =>
+      typeof r === 'object' && r !== null ? (r as { id?: unknown }).id : r,
+    );
+    expect(ids).toEqual(['mock-rule-2', 'mock-unreadable-1', 'mock-rule-3', 'not a rule', null]);
+  });
+
+  it('keeps unknown keys of the edited rule, the globals and the config', async () => {
+    const mounted = await mountSample();
+    const { backend, container } = mounted;
+    const before = structuredClone(backend.draft);
+    await click(mounted, '编辑');
+    expect(container.querySelector('.extra-keys')?.textContent).toBe(
+      '含有本版本不认识的字段（future_rule_field），保存时会原样保留。',
+    );
+    await type(mounted, field(container, '说明'), '新说明');
+    await clickIn(mounted, dialog(container, '编辑文本指令'), '保存');
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+    });
+    // Warnings about the unreadable entries do not show up as the edit's field errors.
+    expect(container.querySelector('.field-errors')).toBeNull();
+    const saved = lastSaved(backend);
+    expect(saved.rules[0]).toMatchObject({ description: '新说明', future_rule_field: [1, 2] });
+    expect(saved.rules.slice(1)).toEqual(before.rules.slice(1));
+
+    await click(mounted, '文本指令参数设置');
+    await click(mounted, '保存参数草稿');
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'save_draft')).toHaveLength(2);
+    });
+    expect(lastSaved(backend).globals.future_global).toBe('kept');
+    expect(lastSaved(backend).future_setting).toEqual({ sample: true });
+  });
+});

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   COMMAND_ERROR_CODES,
   describeError,
+  diagnosticText,
   errorText,
   isMissingCommand,
   parseCommandError,
@@ -127,6 +128,25 @@ describe('parseCommandError', () => {
     );
     expect(error.code).toBe('validation');
     expect(describeError(error)).toBe('有 2 处内容需要修改，第一处：缩写不能为空');
+  });
+
+  it('shows the B-43 diagnostics in Chinese and other codes by message', () => {
+    expect(diagnosticText({ code: 'rule_unreadable', message: 'Rule could not be read' })).toBe(
+      '这条规则的内容无法读取，已原样保留，暂不生效。',
+    );
+    for (const code of [
+      'field_reset',
+      'terminator_unsupported',
+      'schema_newer',
+      'config_malformed',
+    ])
+      expect(diagnosticText({ code, message: 'English' })).not.toBe('English');
+    expect(diagnosticText(diagnostic)).toBe(diagnostic.message);
+    const error = parseCommandError({
+      code: 'validation',
+      detail: { diagnostics: [{ ...diagnostic, code: 'config_malformed', message: 'bad' }] },
+    });
+    expect(describeError(error)).toBe('内容没有通过检查：配置文件格式有误，无法读取。');
   });
 
   it('counts only errors when warnings are mixed in', () => {

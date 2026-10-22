@@ -4,10 +4,31 @@ import {
   countByGroup,
   diagnosticField,
   groupKey,
+  isReadableRule,
   pruneSelection,
+  replaceReadable,
   ruleDiagnostics,
   summarizeAction,
+  unknownRuleKeys,
+  unreadableEntries,
+  unreadableId,
 } from './rules';
+
+/** A readable rule as the backend sends it. */
+const rule = (id: string, group = '默认') => ({
+  id,
+  enabled: true,
+  group,
+  description: '',
+  ignore_case: false,
+  match: { kind: 'literal', value: `;${id}` },
+  trigger_mode: 'immediate',
+  terminator: null,
+  ime_erasure: null,
+  action: { type: 'none' },
+  parameter: { type: 'default_match' },
+  notification: { enabled: false, message: '' },
+});
 
 describe('groupKey / countByGroup', () => {
   it('lists a rule without a group under 「默认」', () => {
@@ -19,7 +40,13 @@ describe('groupKey / countByGroup', () => {
   });
 
   it('counts "" and 「默认」 together, in order of first appearance', () => {
-    const counts = countByGroup([{ group: '工作' }, { group: '' }, { group: '默认' }, {}]);
+    const counts = countByGroup([
+      rule('a', '工作'),
+      rule('b', ''),
+      rule('c', '默认'),
+      { group: '工作' }, // unreadable: not counted
+      rule('d', ''),
+    ]);
     expect([...counts]).toEqual([
       ['工作', 1],
       ['默认', 3],
@@ -28,7 +55,7 @@ describe('groupKey / countByGroup', () => {
 });
 
 describe('pruneSelection', () => {
-  const rules = [{ id: 'a' }, { id: 'b' }];
+  const rules = [rule('a'), { id: 'raw' }, rule('b')];
 
   it('keeps the same array when every selected rule still exists', () => {
     const selected = ['a', 'b'];
@@ -38,6 +65,8 @@ describe('pruneSelection', () => {
   it('drops ids of deleted rules', () => {
     expect(pruneSelection(['a', 'gone', 'b'], rules)).toEqual(['a', 'b']);
     expect(pruneSelection(['gone'], [])).toEqual([]);
+    // An unreadable entry's id is not selectable.
+    expect(pruneSelection(['raw', 'a'], rules)).toEqual(['a']);
   });
 });
 
@@ -125,5 +154,58 @@ describe('ruleDiagnostics / diagnosticField', () => {
     expect(diagnosticField('globals.blacklist', 0)).toBe('文本指令参数设置');
     expect(diagnosticField('', 0)).toBe('配置');
     expect(diagnosticField(undefined, 0)).toBe('配置');
+  });
+});
+
+describe('tolerant reading (B-43)', () => {
+  const raw1 = { id: 'broken', match: 42, from_the_future: true };
+  const rules: unknown[] = [rule('a'), raw1, rule('b'), 'not a rule', rule('c'), null];
+
+  it('tells readable rules from raw entries', () => {
+    expect(rules.map(isReadableRule)).toEqual([true, false, true, false, true, false]);
+    expect(isReadableRule({ ...rule('x'), action: { type: 7 } })).toBe(false);
+    expect(isReadableRule({ ...rule('x'), notification: null })).toBe(false);
+    expect(isReadableRule([rule('x')])).toBe(false);
+  });
+
+  it('lists unreadable entries with their position and id, if any', () => {
+    expect(unreadableEntries(rules)).toEqual([
+      { index: 1, id: 'broken' },
+      { index: 3, id: null },
+      { index: 5, id: null },
+    ]);
+    expect(unreadableId({ id: '' })).toBeNull();
+    expect(unreadableId({ id: 3 })).toBeNull();
+  });
+
+  it('writes edits back without moving or dropping raw entries', () => {
+    const edited = { ...rule('b'), enabled: false };
+    expect(replaceReadable(rules, [rule('a'), edited, rule('c')])).toEqual([
+      rule('a'),
+      raw1,
+      edited,
+      'not a rule',
+      rule('c'),
+      null,
+    ]);
+    // Deleting: readable slots close up, raw entries keep their order.
+    expect(replaceReadable(rules, [rule('a'), rule('c')])).toEqual([
+      rule('a'),
+      raw1,
+      rule('c'),
+      'not a rule',
+      null,
+    ]);
+    // Adding: new rules go to the end.
+    expect(replaceReadable([raw1], [rule('n')])).toEqual([raw1, rule('n')]);
+    expect(replaceReadable(rules, [])).toEqual([raw1, 'not a rule', null]);
+  });
+
+  it('finds the keys of a newer version', () => {
+    expect(unknownRuleKeys(rule('a'))).toEqual([]);
+    expect(unknownRuleKeys({ ...rule('a'), word_start_only: true, sensitive: false })).toEqual([
+      'word_start_only',
+      'sensitive',
+    ]);
   });
 });

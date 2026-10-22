@@ -5,9 +5,11 @@ import { isMissingCommand, parseCommandError } from './errors';
 import { RuntimeSync } from './events';
 import {
   createMockTransport,
+  isMockRule,
   MockBackend,
   mockOptionsFromQuery,
   syntheticRules,
+  validate,
   type MockConfig,
 } from './mock';
 import { call, createTauriTransport, invoke, setTransport } from './transport';
@@ -191,5 +193,28 @@ describe('synthetic data', () => {
       mockOptionsFromQuery('?mock-safe-mode=crash_loop&mock-platform=macos&mock-dialog=cancel'),
     ).toEqual({ safeMode: 'crash_loop', platform: 'macos', dialog: 'cancel' });
     expect(mockOptionsFromQuery('?mock=99999999&mock-health=bogus')).toEqual({ rules: 10_000 });
+  });
+});
+
+describe('B-43 sample', () => {
+  it('mixes unreadable entries and unknown keys into the config', () => {
+    const backend = new MockBackend({ rules: 2, unreadable: true });
+    const { rules } = backend.draft;
+    expect(rules.map(isMockRule)).toEqual([true, false, true, false, false]);
+    expect(rules[1]).toEqual({ id: 'mock-unreadable-1', match: 42, future_kind: 'from 0.6' });
+    expect(backend.draft.future_setting).toEqual({ sample: true });
+    expect(backend.draft.globals.future_global).toBe('kept');
+    expect(rules[0]).toHaveProperty('future_rule_field');
+    expect(mockOptionsFromQuery('?mock-unreadable=1')).toEqual({ unreadable: true });
+  });
+
+  it('reports unreadable entries as warnings that do not block saving', () => {
+    const backend = new MockBackend({ rules: 2, unreadable: true });
+    expect(validate(backend.draft).map((d) => [d.code, d.path, d.severity])).toEqual([
+      ['rule_unreadable', 'rules[1]', 'warning'],
+      ['rule_unreadable', 'rules[3]', 'warning'],
+      ['rule_unreadable', 'rules[4]', 'warning'],
+    ]);
+    return expect(backend.handle('save_draft', { config: backend.draft })).resolves.toBeDefined();
   });
 });

@@ -2,6 +2,7 @@
 // Errors carry no Chinese text; this module translates `code` + `detail` for display.
 import {
   capabilityNames,
+  diagnosticTexts,
   entityNames,
   healthNames,
   ioOpNames,
@@ -170,14 +171,19 @@ export function isMissingCommand(value: unknown): boolean {
   return typeof text === 'string' && /^Command \S+ not found/.test(text);
 }
 
+/** Display text of a diagnostic: Chinese for the B-43 codes, otherwise the backend's message. */
+export const diagnosticText = (d: { code?: unknown; message?: unknown }): string =>
+  (typeof d.code === 'string' ? diagnosticTexts[d.code] : undefined) ??
+  (typeof d.message === 'string' ? d.message : '');
+
 function describeValidation(diagnostics: Diagnostic[]): string {
   const errors = diagnostics.filter((d) => d.severity === 'error');
   const list = errors.length > 0 ? errors : diagnostics;
   const first = list[0];
   if (!first) return '内容没有通过检查，请修改后再试。';
   return list.length === 1
-    ? `内容没有通过检查：${first.message}`
-    : `有 ${list.length} 处内容需要修改，第一处：${first.message}`;
+    ? `内容没有通过检查：${diagnosticText(first)}`
+    : `有 ${list.length} 处内容需要修改，第一处：${diagnosticText(first)}`;
 }
 
 /** Chinese text for an error. `null` means "show nothing" (the user cancelled). */

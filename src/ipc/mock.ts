@@ -4,7 +4,8 @@
 //
 // Preview switches (query string): ?mock=empty|200|10000 (rule count, default 200),
 // &mock-legacy=1 (behave like a 0.3 backend), &mock-health=<HealthState>,
-// &mock-safe-mode=<SafeModeReason>, &mock-platform=windows|macos|linux, &mock-dialog=cancel.
+// &mock-safe-mode=<SafeModeReason>, &mock-platform=windows|macos|linux, &mock-dialog=cancel,
+// &mock-unreadable=1 (B-43 sample: rules entries the backend could not read, unknown fields).
 // In the preview the backend is also reachable as `globalThis.quickerMock` for manual pokes
 // (e.g. `quickerMock.recordExecution({ outcome: 'dropped_busy' })`).
 import type { CommandError } from './errors';
@@ -43,6 +44,7 @@ export interface MockRule {
   notification: { enabled: boolean; message: string };
 }
 
+/** A config as the tolerant reader (B-43) hands it out: unknown keys survive as extra keys. */
 export interface MockConfig {
   version: number;
   revision: number;
@@ -52,8 +54,42 @@ export interface MockConfig {
     word_separators: string;
     blacklist: string[];
     ime_erasure: string;
+    [extra: string]: unknown;
   };
-  rules: MockRule[];
+  /** Rules, and raw entries the backend could not read, kept as they are (any JSON value). */
+  rules: unknown[];
+  [extra: string]: unknown;
+}
+
+/** Whether a `rules` entry deserialises as a rule (the mock's stand-in for serde). */
+export function isMockRule(entry: unknown): entry is MockRule {
+  if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) return false;
+  const rule = entry as Partial<Record<keyof MockRule, unknown>>;
+  const match = rule.match as { value?: unknown } | null | undefined;
+  return (
+    typeof rule.id === 'string' &&
+    typeof rule.enabled === 'boolean' &&
+    typeof match === 'object' &&
+    match !== null &&
+    typeof match.value === 'string'
+  );
+}
+
+/**
+ * B-43 sample: an unreadable entry with an id between the rules, two without one at the end, and
+ * fields from a newer version on the config, the globals and the first rule.
+ */
+function addTolerantSample(config: MockConfig): void {
+  config.future_setting = { sample: true };
+  config.globals.future_global = 'kept';
+  const [first] = config.rules;
+  if (isMockRule(first)) Object.assign(first, { future_rule_field: [1, 2] });
+  config.rules.splice(Math.min(1, config.rules.length), 0, {
+    id: 'mock-unreadable-1',
+    match: 42,
+    future_kind: 'from 0.6',
+  });
+  config.rules.push('not a rule', null);
 }
 
 export interface MockOptions {
@@ -67,6 +103,8 @@ export interface MockOptions {
   problems?: StartupProblem[];
   /** How file dialogs answer. Default `accept`. */
   dialog?: 'accept' | 'cancel';
+  /** Mix in the B-43 sample (unreadable entries, unknown fields). Default false. */
+  unreadable?: boolean;
 }
 
 const COMPONENTS: ComponentHealth['component'][] = [
@@ -155,6 +193,7 @@ export class MockBackend {
       platform: options.platform ?? 'windows',
       health: options.health ?? 'healthy',
       dialog: options.dialog ?? 'accept',
+      unreadable: options.unreadable ?? false,
     };
     const config: MockConfig = {
       version: 1,
@@ -168,6 +207,7 @@ export class MockBackend {
       },
       rules: syntheticRules(this.options.rules),
     };
+    if (this.options.unreadable) addTolerantSample(config);
     this.active = config;
     this.draft = clone(config);
     this.safeMode = options.safeMode ?? null;
@@ -292,7 +332,7 @@ export class MockBackend {
     },
     apply_settings: () => {
       this.#guardSafeMode();
-      const errors = validate(this.draft);
+      const errors = validate(this.draft).filter((d) => d.severity === 'error');
       if (errors.length > 0)
         this.#fail({ code: 'validation', detail: { diagnostics: errors } }, JSON.stringify(errors));
       this.previous.push(this.active);
@@ -324,7 +364,7 @@ export class MockBackend {
     },
     validate_config: (args) => {
       const errors = validate(args.config as MockConfig);
-      return { valid: errors.length === 0, errors };
+      return { valid: !errors.some((d) => d.severity === 'error'), errors };
     },
     test_rule: (args) => {
       const rule = args.rule as MockRule;
@@ -606,6 +646,13 @@ export function validate(config: MockConfig): Diagnostic[] {
   const ids = new Set<string>();
   config.rules.forEach((rule, i) => {
     const base = `rules[${i}]`;
+    if (!isMockRule(rule)) {
+      errors.push({
+        ...diagnostic('rule_unreadable', 'Rule could not be read and is kept as is', base),
+        severity: 'warning',
+      });
+      return;
+    }
     if (!rule.id.trim() || ids.has(rule.id))
       errors.push(diagnostic('rule_id', 'Rule ID must be nonempty and unique', `${base}.id`));
     ids.add(rule.id);
@@ -664,6 +711,7 @@ export function mockOptionsFromQuery(search: string): MockOptions {
   if (platform === 'windows' || platform === 'macos' || platform === 'linux')
     options.platform = platform;
   if (q.get('mock-dialog') === 'cancel') options.dialog = 'cancel';
+  if (q.get('mock-unreadable') === '1') options.unreadable = true;
   return options;
 }
 

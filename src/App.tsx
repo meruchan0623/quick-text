@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import { call } from './ipc/transport';
-import { errorText as describe, parseCommandError } from './ipc/errors';
+import { errorText as describe, diagnosticText, parseCommandError } from './ipc/errors';
 import {
   actionLabel,
   clone,
   Config,
   Data,
   emptyConfig,
+  isRule,
   keyNames,
   keys,
   newRule,
@@ -27,8 +28,11 @@ import {
   diagnosticField,
   groupKey,
   pruneSelection,
+  replaceReadable,
   ruleDiagnostics,
   summarizeAction,
+  unknownRuleKeys,
+  unreadableEntries,
 } from './lib/rules';
 import { effectiveTerminators, unsupportedTerminators } from './lib/terminators';
 
@@ -301,13 +305,17 @@ export default function App() {
     return s;
   };
   const selectedSet = new Set(selected);
-  const ruleNames = new Map<string, string>(config.rules.map((r) => [r.id, r.match.value || r.id]));
+  // Rules the UI can show and edit. An entry the backend could not read (B-43) is listed read-only
+  // and written back unchanged, in place; so are keys this version does not know.
+  const readable = config.rules.filter(isRule);
+  const unreadable = unreadableEntries(config.rules);
+  const ruleNames = new Map<string, string>(readable.map((r) => [r.id, r.match.value || r.id]));
   const ruleName = (id: string) => ruleNames.get(id) ?? id;
   // An empty group is listed, counted and filtered as 「默认」 (F-04).
   const groupCounts = countByGroup(config.rules);
   const groups = ['全部', ...groupCounts.keys()];
   const needle = search.toLowerCase();
-  const rows = config.rules
+  const rows = readable
     .filter(
       (r) =>
         (group === '全部' || groupKey(r.group) === group) &&
@@ -320,12 +328,26 @@ export default function App() {
         sort === 'match' ? b.match.value : groupKey(b.group),
       ),
     );
+  const unreadableRows =
+    group === '全部'
+      ? unreadable.filter((u) => `无法读取的规则 ${u.id ?? ''}`.toLowerCase().includes(needle))
+      : [];
   // Diagnostics refer to the whole config; split out the ones about the rule being edited.
-  const editingFound = editing ? config.rules.findIndex((r) => r.id === editing.id) : -1;
+  const indexOfRule = (id: string) => config.rules.findIndex((r) => isRule(r) && r.id === id);
+  const editingFound = editing ? indexOfRule(editing.id) : -1;
   const editingIndex = editingFound >= 0 ? editingFound : config.rules.length;
   const editingDiagnostics = ruleDiagnostics(editingErrors, editingIndex);
+  // Warnings about other rules (an unreadable entry, say) are not this edit's business.
+  const editingFieldErrors = [
+    ...editingDiagnostics.rule,
+    ...editingDiagnostics.other.filter((d) => d.severity !== 'warning'),
+  ];
+  const editingExtraKeys = editing ? unknownRuleKeys(editing) : [];
   const mutate = async (fn: (rs: Rule[]) => Rule[]) =>
-    run(() => save({ ...config, rules: fn(clone(config.rules)) }), '草稿已保存 · 请应用设置');
+    run(
+      () => save({ ...config, rules: replaceReadable(config.rules, fn(clone(readable))) }),
+      '草稿已保存 · 请应用设置',
+    );
   const choose = async (kind = 'file') => call<string[] | null>('choose_file', { kind });
   const exportData = () =>
     run(async () => {
@@ -360,7 +382,7 @@ export default function App() {
   const commitEdit = () =>
     run(async () => {
       if (!editing) return;
-      const found = config.rules.findIndex((r) => r.id === editing.id);
+      const found = indexOfRule(editing.id);
       const c = {
         ...config,
         rules:
@@ -471,7 +493,9 @@ export default function App() {
 
           <div className="batch">
             <span>
-              共 {config.rules.length} 条 · 已选 {selected.length} 条
+              共 {config.rules.length} 条
+              {unreadable.length > 0 && `（${unreadable.length} 条无法读取）`} · 已选{' '}
+              {selected.length} 条
             </span>
             <button
               disabled={!selected.length}
@@ -626,10 +650,22 @@ export default function App() {
                     </td>
                   </tr>
                 ))}
+                {unreadableRows.map((u) => (
+                  <tr key={`unreadable-${u.index}`} className="unreadable-row">
+                    <td />
+                    <td colSpan={hide ? 7 : 8}>
+                      <strong>无法读取的规则</strong>
+                      {u.id && <span className="unreadable-id">{u.id}</span>}
+                      <small className="muted">
+                        这条规则的内容当前版本无法读取，暂不生效；已原样保留在配置中，保存时不会改动它。
+                      </small>
+                    </td>
+                  </tr>
+                ))}
               </tbody>
             </table>
             {/* No empty state before the first load_state answer (F-04). */}
-            {state && !rows.length && (
+            {state && !rows.length && !unreadableRows.length && (
               <div className="empty">
                 <div aria-hidden="true">⌨</div>
                 <strong>{search ? '没有匹配的指令' : '建立你的第一条文本指令'}</strong>
@@ -842,26 +878,29 @@ export default function App() {
         <Modal title="编辑文本指令" className="overlay" onClose={() => void closeEditor()}>
           <div className="editor">
             <div className="modal-title">
-              <h2>
-                {config.rules.some((r) => r.id === editing.id) ? '编辑文本指令' : '添加文本指令'}
-              </h2>
+              <h2>{editingFound >= 0 ? '编辑文本指令' : '添加文本指令'}</h2>
               <button aria-label="关闭编辑" onClick={() => void closeEditor()}>
                 ×
               </button>
             </div>
             <div className="edit-grid">
               <div className="trigger-panel">
-                {(editingDiagnostics.rule.length > 0 || editingDiagnostics.other.length > 0) && (
+                {editingFieldErrors.length > 0 && (
                   <div className="field-errors" role="alert">
                     <strong>需要修改的设置</strong>
                     <ul>
-                      {[...editingDiagnostics.rule, ...editingDiagnostics.other].map((d, i) => (
+                      {editingFieldErrors.map((d, i) => (
                         <li key={i}>
-                          {diagnosticField(d.path, editingIndex)}：{d.message}
+                          {diagnosticField(d.path, editingIndex)}：{diagnosticText(d)}
                         </li>
                       ))}
                     </ul>
                   </div>
+                )}
+                {editingExtraKeys.length > 0 && (
+                  <p className="muted extra-keys">
+                    含有本版本不认识的字段（{editingExtraKeys.join('、')}），保存时会原样保留。
+                  </p>
                 )}
                 <h3>什么时候执行</h3>
                 <Field
@@ -1086,7 +1125,7 @@ export default function App() {
                   platform={state?.platform ?? state?.engine_detail?.platform}
                   diagnostics={editingDiagnostics.action}
                   capabilities={state?.capabilities ?? []}
-                  rules={config.rules.filter((r) => r.id !== editing.id)}
+                  rules={readable.filter((r) => r.id !== editing.id)}
                   action={editing.action}
                   onChange={(a) => setEditing({ ...editing, action: a })}
                   run={run}

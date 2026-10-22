@@ -1,3 +1,4 @@
+import { isReadableRule } from './lib/rules';
 import { DEFAULT_TERMINATORS } from './lib/terminators';
 export type Data = Record<string, any>;
 export interface Config extends Data {
@@ -5,7 +6,8 @@ export interface Config extends Data {
   revision: number;
   enabled: boolean;
   globals: Data;
-  rules: Rule[];
+  /** Rules, and raw entries the backend could not read (B-43): narrow with `isRule`. */
+  rules: unknown[];
 }
 export interface Rule extends Data {
   id: string;
@@ -21,6 +23,8 @@ export interface Rule extends Data {
   parameter: Data;
   notification: { enabled: boolean; message: string };
 }
+/** A `rules` entry the UI can show and edit (B-43). */
+export const isRule = (entry: unknown): entry is Rule => isReadableRule(entry);
 export interface State extends Data {
   draft: Config;
   active: Config;
