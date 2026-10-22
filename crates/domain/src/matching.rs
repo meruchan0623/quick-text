@@ -305,6 +305,11 @@ pub fn compile_config_lenient(config: &Config) -> Result<LenientCompile, Vec<Dia
         diagnostics,
     })
 }
+/// Whether `rule` would be among the compiled rules when it is the first with its ID:
+/// enabled, with a nonempty ID, and compiling on its own.
+pub(crate) fn rule_compiles(rule: &Rule) -> bool {
+    matches!(compile_rule(rule, 0, 0, &mut BTreeSet::new()), Ok(Some(_)))
+}
 /// Errors that concern the whole configuration rather than one rule.
 fn config_errors(config: &Config) -> Vec<Diagnostic> {
     let mut errors = vec![];
