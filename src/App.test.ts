@@ -317,7 +317,7 @@ const settle = (mounted: Pick<Mounted, 'act'>) =>
   mounted.act(() => new Promise((resolve) => setTimeout(resolve, 20)));
 
 interface HeldLoad {
-  /** The backend has read the state this load_state answers with. */
+  /** The backend has run the call: read (or changed) the state it answers with. */
   read: boolean;
   /** The answer has been sent back. */
   answered: boolean;
@@ -327,15 +327,15 @@ interface HeldLoad {
 interface LoadHold {
   held: HeldLoad[];
   attach: (backend: MockBackend) => void;
-  /** Hold the next `count` load_state calls. */
+  /** Hold the next `count` calls. */
   arm: (count?: number) => void;
 }
 
 /**
- * Once attached, each armed load_state reads the state at once, as the backend would, but answers
- * only on its `release()`: a load overtaken by a command's answer (review C2).
+ * Once attached, each armed call of command `name` runs at once, as the backend would, but answers
+ * only on its `release()`: an answer overtaken by others (reviews C2, C6).
  */
-function holdLoads(): LoadHold {
+function holdAnswers(name: string): LoadHold {
   let armed = 0;
   const held: HeldLoad[] = [];
   return {
@@ -343,7 +343,7 @@ function holdLoads(): LoadHold {
     attach: (backend) => {
       const handle = backend.handle.bind(backend);
       backend.handle = async (...[command, args]: Parameters<MockBackend['handle']>) => {
-        if (command !== 'load_state' || armed === 0) return handle(command, args);
+        if (command !== name || armed === 0) return handle(command, args);
         armed -= 1;
         let release: () => void = () => undefined;
         const released = new Promise<void>((resolve) => {
@@ -372,7 +372,10 @@ function holdLoads(): LoadHold {
   };
 }
 
-/** Release held load `index` and let its answer reach the app. */
+/** Held load_state calls: a load overtaken by a command's answer (review C2). */
+const holdLoads = () => holdAnswers('load_state');
+
+/** Release held call `index` and let its answer reach the app. */
 async function answerHeld(mounted: Mounted, hold: LoadHold, index: number): Promise<void> {
   hold.held[index]?.release();
   await waitFor(mounted, () => {
@@ -1323,6 +1326,10 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
     expect(notices(container)).toBe('');
     expect(revisionText(container)).toContain('当前生效 v2');
     expect(callsOf(backend, 'load_state')).toHaveLength(5);
+    // Said of the button pressed (review C6).
+    await waitFor(mounted, () => {
+      expect(statusText(container)).toBe('已重新读取配置');
+    });
   });
 
   it('reads a bounded number of times while load_state answers an earlier revision', async () => {
@@ -1477,6 +1484,182 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
     expect(callsOf(backend, 'load_state')).toHaveLength(3);
     await click(mounted, '知道了');
     expect(notices(container)).toBe('');
+  });
+
+  describe('one install rule for load and write answers (review C6)', () => {
+    /**
+     * 总开关 saves while v1 is shown, and its answer (v1) is held while another window publishes
+     * v2 and a focus load shows it. Then the save answers.
+     */
+    async function answerSaveLate(): Promise<Mounted> {
+      const hold = holdAnswers('save_draft');
+      const mounted = await mountReady(hold);
+      const { backend, container } = mounted;
+      hold.arm();
+      await mounted.act(() => {
+        checkbox(container, '启用文本指令')?.click();
+      });
+      await waitFor(mounted, () => {
+        expect(hold.held[0]?.read).toBe(true);
+      });
+      await publish(mounted, ',');
+      await focus(mounted);
+      await waitFor(mounted, () => {
+        expect(revisionText(container)).toContain('当前生效 v2');
+      });
+      expect(callsOf(backend, 'load_state')).toHaveLength(2);
+      expect(statusText(container)).toBe('正在处理…');
+      await answerHeld(mounted, hold, 0);
+      await click(mounted, '文本指令参数设置');
+      return mounted;
+    }
+
+    it('keeps showing v2 when a save sent at v1 answers after a load showed v2', async () => {
+      const mounted = await answerSaveLate();
+      const { backend, container } = mounted;
+      // Long enough for a read the late answer would have caused.
+      await outwait(mounted);
+      expect(separators(container)).toBe(',');
+      expect(revisionText(container)).toContain('当前生效 v2');
+      expect(notices(container)).toBe('');
+      // Nothing to read again: v2 was never replaced by v1.
+      expect(callsOf(backend, 'load_state')).toHaveLength(2);
+    });
+
+    it('ends the save as usual when its late answer is dropped', async () => {
+      const mounted = await answerSaveLate();
+      const { container } = mounted;
+      // The caller had its result: busy ended with the success message, and no error.
+      expect(statusText(container)).toBe('总开关已保存到草稿');
+      expect(container.querySelector('.alert.error')).toBeNull();
+      // The write is no longer in flight: the next revision published elsewhere is read.
+      await publish(mounted, '|');
+      await waitFor(mounted, () => {
+        expect(separators(container)).toBe('|');
+      });
+      expect(revisionText(container)).toContain('当前生效 v3');
+    });
+
+    it('says a save sent at v1 overwrote v2, though a load showed v2 before it answered', async () => {
+      const hold = holdAnswers('save_draft');
+      const mounted = await mountReady(hold);
+      const { backend, container } = mounted;
+      // Another window publishes v2 between the save being sent and its running.
+      const handle = backend.handle.bind(backend);
+      let published = false;
+      backend.handle = (...[command, args]: Parameters<MockBackend['handle']>) => {
+        if (command === 'save_draft' && !published) {
+          published = true;
+          backend.publishExternally((config) => {
+            config.globals.word_separators = ',';
+          });
+        }
+        return handle(command, args);
+      };
+      hold.arm();
+      await mounted.act(() => {
+        checkbox(container, '启用文本指令')?.click();
+      });
+      await waitFor(mounted, () => {
+        expect(hold.held[0]?.read).toBe(true);
+      });
+      await focus(mounted);
+      await waitFor(mounted, () => {
+        expect(revisionText(container)).toContain('当前生效 v2');
+      });
+      await answerHeld(mounted, hold, 0);
+      // The editor's config was of v1 when the save was sent: it replaced the draft of v2.
+      expect(notices(container)).toContain(OVERWRITTEN);
+      expect(revisionText(container)).toContain('当前生效 v2');
+    });
+
+    it('shows the later of two saves of one revision when the earlier one answers last', async () => {
+      const hold = holdAnswers('save_draft');
+      const mounted = await mountReady(hold);
+      const { backend, container } = mounted;
+      await click(mounted, '文本指令参数设置');
+      hold.arm(2);
+      await type(mounted, field(container, '词分隔符'), ' ;');
+      await click(mounted, '保存参数草稿');
+      await waitFor(mounted, () => {
+        expect(hold.held[0]?.read).toBe(true);
+      });
+      await type(mounted, field(container, '词分隔符'), ' |');
+      await click(mounted, '保存参数草稿');
+      await waitFor(mounted, () => {
+        expect(hold.held[1]?.read).toBe(true);
+      });
+      await answerHeld(mounted, hold, 1);
+      expect(separators(container)).toBe(' |');
+      await answerHeld(mounted, hold, 0);
+      expect(separators(container)).toBe(' |');
+      expect(backend.draft.globals.word_separators).toBe(' |');
+      expect(revisionText(container)).toContain('当前生效 v1');
+      expect(statusText(container)).toBe('参数已保存到草稿');
+      expect(notices(container)).toBe('');
+    });
+
+    it('keeps a setting changed after a save was sent when the save answers', async () => {
+      const hold = holdAnswers('save_draft');
+      const mounted = await mountReady(hold);
+      const { backend, container } = mounted;
+      await click(mounted, '文本指令参数设置');
+      const before = checkbox(container, '登录后自动启动')?.checked;
+      hold.arm();
+      await click(mounted, '保存参数草稿');
+      await waitFor(mounted, () => {
+        expect(hold.held[0]?.read).toBe(true);
+      });
+      await mounted.act(() => {
+        checkbox(container, '登录后自动启动')?.click();
+      });
+      await waitFor(mounted, () => {
+        expect(callsOf(backend, 'set_autostart')).toHaveLength(1);
+      });
+      await settle(mounted);
+      expect(checkbox(container, '登录后自动启动')?.checked).toBe(!before);
+      // Answered with the autostart of before: the save ran first.
+      await answerHeld(mounted, hold, 0);
+      expect(checkbox(container, '登录后自动启动')?.checked).toBe(!before);
+      expect(backend.autostart).toBe(!before);
+    });
+
+    it('says 「重新读取」, not 「刷新状态」, when commands overtake every load of 重新读取', async () => {
+      const hold = holdLoads();
+      const mounted = await mountReady(hold);
+      const { backend, container } = mounted;
+      await click(mounted, '文本指令参数设置');
+      failLoads(backend, 3);
+      await publish(mounted, ',');
+      await waitFor(
+        mounted,
+        () => {
+          expect(notices(container)).toContain(UNREAD);
+        },
+        3000,
+      );
+      hold.arm(3);
+      await click(mounted, '重新读取');
+      for (let i = 0; i < 3; i++) {
+        await waitFor(mounted, () => {
+          expect(hold.held[i]?.read).toBe(true);
+        });
+        await mounted.act(() => {
+          checkbox(container, '登录后自动启动')?.click();
+        });
+        await waitFor(mounted, () => {
+          expect(callsOf(backend, 'set_autostart')).toHaveLength(i + 1);
+        });
+        await settle(mounted);
+        await answerHeld(mounted, hold, i);
+      }
+      const alert = () => container.querySelector('.alert.error')?.textContent ?? '';
+      await waitFor(mounted, () => {
+        expect(alert()).toContain('这次没有读取到。请再点一次「重新读取」');
+      });
+      expect(alert()).not.toContain('刷新');
+      expect(statusText(container)).not.toContain('已重新读取配置');
+    });
   });
 });
 

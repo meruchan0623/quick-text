@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type SetStateAction } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { call } from './ipc/transport';
 import {
   errorText as describe,
@@ -51,15 +51,25 @@ const errorText = (e: unknown) => describe(e) ?? '';
 // How many times one load_state is asked for while commands keep overtaking it (review C2).
 const LOAD_ATTEMPTS = 3;
 const OVERTAKEN = '读取期间状态一再变化，读到的内容已过时';
-const REFRESH_OVERTAKEN = `${OVERTAKEN}，这次没有刷新。请再点一次「刷新状态」。`;
+/** What 「刷新状态」 and the notice's 「重新读取」 say when they read, and when every load was overtaken. */
+const REFRESHED = {
+  refresh: ['状态已刷新', `${OVERTAKEN}，这次没有刷新。请再点一次「刷新状态」。`],
+  reread: ['已重新读取配置', `${OVERTAKEN}，这次没有读取到。请再点一次「重新读取」。`],
+} as const;
 const NOT_READY = '还没有读取到当前配置，暂时不能修改指令和设置。';
 // A store revision this window has not read yet is read this many times in all, the retries
 // RECONCILE_RETRY_MS apart and doubling, before a notice offers 「重新读取」 (review C5).
 const RECONCILE_ATTEMPTS = 3;
 const RECONCILE_RETRY_MS = 400;
 const STALE_READ = '读到的仍是较早的版本';
+/** A view shown of an older revision than the one caught up with (review C6). */
+const stale = (shown: number | undefined, caught: number | null) =>
+  shown !== undefined && caught !== null && shown < caught;
 /** Commands that write the store and answer with the whole state. */
 type StoreWrite = 'save_draft' | 'apply_settings' | 'discard_draft' | 'rollback';
+/** State fields a command answers alone, without the state around them. */
+const SETTINGS = ['autostart', 'auto_listen_on_start'] as const;
+type Setting = (typeof SETTINGS)[number];
 function Field({
   label,
   children,
@@ -228,22 +238,53 @@ export default function App() {
     edited.current = false;
     editorRevision.current = s.revision;
   };
-  // Review C2: counts the times state was set from a command's answer (set_paused, set_autostart,
-  // set_auto_listen, save_draft, discard_draft, rollback, apply_settings). A load_state sent before
-  // the latest of them may have been read before that change; applying it would undo the change.
-  const answers = useRef(0);
-  const receiveAnswer = (s: State) => {
-    answers.current += 1;
-    receive(s);
+  // Review C6: one rule installs every answer that carries the state: load_state, save_draft,
+  // apply_settings, discard_draft, rollback, set_paused. Each request takes the next request id as
+  // it is sent (Tauri may run commands concurrently, so answers can arrive in any order); its answer
+  // is installed only over an earlier view: a later store revision, or the same revision and a
+  // later request. The revision is the authority: while the app runs the backend never lowers it
+  // (a publish, a rollback too, takes one above every revision on disk; the SafeMode(Locked) retry
+  // starts from the 0 of the read-only state), so an answer with a lower one read the store before
+  // the view shown did. Within a revision, the order sent stands for the order run. An answer not
+  // installed leaves everything shown as it is (the editor's unsaved edits too); its command still
+  // succeeded and resolves as usual.
+  const requests = useRef(0);
+  const installed = useRef({ revision: -1, request: 0 });
+  // set_autostart and set_auto_listen answer with the value alone, without a revision; it is
+  // ordered by request id against the view that set it (review C2). A state answer sent before
+  // such a command keeps the value it answered (a load_state is asked again instead, see `load`);
+  // one sent after it takes over.
+  const settings = useRef<Record<Setting, { request: number; value: boolean } | null>>({
+    autostart: null,
+    auto_listen_on_start: null,
+  });
+  /** The view to show for state answer `s` to request `request`, or null when it is not installed. */
+  const install = (s: State, request: number): State | null => {
+    const shown = installed.current;
+    if (s.revision < shown.revision || (s.revision === shown.revision && request <= shown.request))
+      return null;
+    installed.current = { revision: s.revision, request };
+    let view = s;
+    for (const field of SETTINGS) {
+      const setting = settings.current[field];
+      if (setting === null) continue;
+      if (setting.request > request) view = { ...view, [field]: setting.value };
+      else settings.current[field] = null;
+    }
+    return view;
   };
-  const patchState = (update: SetStateAction<State | null>) => {
-    answers.current += 1;
-    setState(update);
+  /** Show what set_autostart or set_auto_listen (request `request`) answered, unless overtaken. */
+  const installSetting = (field: Setting, value: boolean, request: number) => {
+    if (request <= (settings.current[field]?.request ?? installed.current.request)) return;
+    settings.current[field] = { request, value };
+    setState((s) => (s ? { ...s, [field]: value } : s));
   };
   // Review C5: the store revision this window has caught up with, by an installed load_state or by
-  // the answer of a write that made that revision (apply_settings, rollback) or took the active one
-  // in (discard_draft). Not by save_draft or set_paused: they answer with the active revision, but
-  // the editor has not taken its config in, so a revision published elsewhere would pass as read.
+  // the installed answer of a write that made that revision (apply_settings, rollback) or took the
+  // active one in (discard_draft). Not by save_draft or set_paused: they answer with the active
+  // revision, but the editor has not taken its config in, so a revision published elsewhere would
+  // pass as read. Only installed answers count, and the installed revision never goes down, so
+  // neither does this; should a view older than it ever be shown, `behind` reads again.
   const [reconciled, setReconciled] = useState<number | null>(null);
   const reconciledRef = useRef<number | null>(null);
   const reconcileTo = (revision: number) => {
@@ -256,21 +297,28 @@ export default function App() {
   const [writing, setWriting] = useState(0);
   const write = async (command: StoreWrite, args?: Record<string, unknown>) => {
     setWriting((n) => n + 1);
+    // Both as the request is sent: the revision the editor's config is based on (review C6).
+    const request = ++requests.current;
+    const base = editorRevision.current;
     try {
       const s = await call<State>(command, args);
-      const base = editorRevision.current;
-      receiveAnswer(s);
+      const view = install(s, request);
+      if (view !== null) receive(view);
       if (command === 'save_draft') {
         // Active revision newer than the editor's config: the save replaced the draft of a revision
-        // this window never took in. Said until acknowledged, as is a save over a notice standing.
+        // this window never took in. Said until acknowledged, as is a save over a notice standing,
+        // whether or not the answer is shown. A save that ran before the notice's revision was
+        // published did not overwrite it: that publish replaced the save.
         setNewer((n) =>
           n !== null
-            ? { revision: Math.max(n.revision, s.revision), saved: true }
+            ? s.revision >= n.revision
+              ? { revision: s.revision, saved: true }
+              : n
             : base !== null && s.revision > base
               ? { revision: s.revision, saved: true }
               : null,
         );
-      } else {
+      } else if (view !== null) {
         reconcileTo(s.revision);
         // Rollback and discard_draft put the store's config in the editor, applying keeps it.
         if (command !== 'apply_settings') setNewer(null);
@@ -328,30 +376,29 @@ export default function App() {
     setMessage('已连接 · 保存写入草稿，应用设置后生效');
   };
   /**
-   * load_state, applied; resolves whether it was. An answer overtaken by a command's answer is not
-   * applied but asked for again, at most LOAD_ATTEMPTS times in all: the fields only load_state
-   * carries would otherwise stay stale until the next focus. A load sent after a command answered
-   * reads that command's change, so the next answer applies. The check and the apply run in one
-   * step after the answer arrives, with nothing in between.
+   * load_state, applied; resolves whether it was. Its answer is installed by the rule above. One
+   * overtaken by a command's answer (installed over it, or a setting answered since it was sent)
+   * is not applied but asked for again, at most LOAD_ATTEMPTS times in all: the fields only
+   * load_state carries would otherwise stay stale until the next focus. A load sent after a command
+   * answered reads that command's change, so the next answer applies. The check and the apply run
+   * in one step after the answer arrives, with nothing in between.
    *
-   * Loads overlap (start, focus, 「刷新状态」, a revision read): each load_state takes the next read
-   * id. One answering after a later one was applied read the store before that one did: it is
-   * dropped, and resolves as applied, the later one standing for it (review C5).
+   * Loads overlap (start, focus, 「刷新状态」, a revision read). One not installed after a later one
+   * was is dropped, and resolves as applied, the later one standing for it (review C5).
    */
-  const reads = useRef(0);
-  const appliedRead = useRef(0);
+  const lastLoad = useRef(0);
   const load = async (): Promise<boolean> => {
     for (let attempt = 0; attempt < LOAD_ATTEMPTS; attempt++) {
-      reads.current += 1;
-      const read = reads.current;
-      const generation = answers.current;
+      const request = ++requests.current;
       const s = await call<State>('load_state');
-      if (read < appliedRead.current) return true;
-      if (generation === answers.current) {
-        appliedRead.current = read;
-        applySnapshot(s);
+      const overtaken = SETTINGS.some((field) => (settings.current[field]?.request ?? 0) > request);
+      const view = overtaken ? null : install(s, request);
+      if (view !== null) {
+        lastLoad.current = Math.max(lastLoad.current, request);
+        applySnapshot(view);
         return true;
       }
+      if (request < lastLoad.current) return true;
     }
     // Overtaken every time: keep what the commands answered; the caller says so.
     return false;
@@ -416,9 +463,13 @@ export default function App() {
   // after a pause; after RECONCILE_ATTEMPTS a notice says so until a load catches up (「重新读取」,
   // focus) or a write of this window makes a revision as new. Never a loop: each read is sent for
   // a target and either reaches it or counts as failed. A backend without store-state moves
-  // runtime.revision only with a snapshot.
+  // runtime.revision only with a snapshot. A view older than `reconciled` (the install rule never
+  // shows one) counts as behind too: read again, and say so if that fails, never silently (C6).
   const target = runtime.revision;
-  const behind = ready && target !== null && (reconciled === null || reconciled < target);
+  const behind =
+    ready &&
+    target !== null &&
+    (reconciled === null || reconciled < target || stale(state?.revision, reconciled));
   // Why the last read for the target failed, once the retries ran out; cleared when caught up.
   const [readFailure, setReadFailure] = useState<string | null>(null);
   if (readFailure !== null && !behind) setReadFailure(null);
@@ -445,7 +496,9 @@ export default function App() {
       )
       .then((failure) => {
         r.reading = false;
-        const reached = reconciledRef.current !== null && reconciledRef.current >= target;
+        const caught = reconciledRef.current;
+        const reached =
+          caught !== null && caught >= target && !stale(installed.current.revision, caught);
         if (failure === null && reached) r.failures = 0;
         else {
           r.failures += 1;
@@ -469,12 +522,15 @@ export default function App() {
   }, []);
   // The revision the notice says could not be read.
   const unread = readFailure !== null && behind ? target : null;
-  const refresh = () =>
-    run(async () => {
+  /** 「刷新状态」, or the notice's 「重新读取」 (`reread`): the messages name the button pressed. */
+  const refresh = (source: keyof typeof REFRESHED) => {
+    const [done, overtaken] = REFRESHED[source];
+    return run(async () => {
       const applied = await reload();
       if (runtime.status !== 'unsupported') await sync.resync();
-      if (!applied) throw new Error(REFRESH_OVERTAKEN);
-    }, '状态已刷新');
+      if (!applied) throw new Error(overtaken);
+    }, done);
+  };
   const repair = () =>
     run(async () => {
       await call('repair_engine');
@@ -484,7 +540,9 @@ export default function App() {
     run(async () => {
       const manual = live ? live.manualPause : !!state?.paused;
       // set_paused only toggles the manual reason; the unsaved draft in the editor stays untouched.
-      patchState(await call<State>('set_paused', { paused: !manual }));
+      const request = ++requests.current;
+      const view = install(await call<State>('set_paused', { paused: !manual }), request);
+      if (view !== null) setState(view);
     });
   const exportDiagnostics = () =>
     run(async () => {
@@ -516,8 +574,12 @@ export default function App() {
     run(async () => {
       requireReady();
       try {
-        const value = await call<boolean>('set_auto_listen', { enabled });
-        patchState((s) => (s ? { ...s, auto_listen_on_start: value } : s));
+        const request = ++requests.current;
+        installSetting(
+          'auto_listen_on_start',
+          await call<boolean>('set_auto_listen', { enabled }),
+          request,
+        );
       } catch (e) {
         // A backend that reports the setting but lacks the command: say so once, then disable.
         if (isMissingCommand(e)) setAutoListenMissing(true);
@@ -731,7 +793,7 @@ export default function App() {
         // the editor. Saving is not silent: the notice stands until a load catches up.
         <div className="alert notice" role="status">
           {`后台配置已更新为 v${unread}，但未能读取最新配置（${readFailure ?? ''}）。此时保存会以编辑器中的配置覆盖后台较新的配置。`}
-          <button disabled={busy} onClick={refresh}>
+          <button disabled={busy} onClick={() => refresh('reread')}>
             重新读取
           </button>
         </div>
@@ -1134,9 +1196,13 @@ export default function App() {
                     requireReady();
                     const enabled = e.target.checked;
                     // Show what the backend set (Rust returns the resulting value), not the request.
+                    const request = ++requests.current;
                     const value = await call<unknown>('set_autostart', { enabled });
-                    const autostart = typeof value === 'boolean' ? value : enabled;
-                    patchState((s) => (s ? { ...s, autostart } : s));
+                    installSetting(
+                      'autostart',
+                      typeof value === 'boolean' ? value : enabled,
+                      request,
+                    );
                   })
                 }
               />
@@ -1195,7 +1261,7 @@ export default function App() {
             <dd>{state?.dirty || localDirty ? '存在未应用的设置' : '与生效版本一致'}</dd>
           </dl>
           <div className="inline">
-            <button onClick={refresh}>刷新状态</button>
+            <button onClick={() => refresh('refresh')}>刷新状态</button>
             <button
               disabled={!editable}
               onClick={async () => {
