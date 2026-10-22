@@ -1,6 +1,7 @@
 use crate::*;
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 #[derive(Debug, Clone)]
 pub struct CompiledRule {
@@ -8,6 +9,53 @@ pub struct CompiledRule {
     regex: Option<Regex>,
     literal: Option<Regex>,
     order: usize,
+}
+impl CompiledRule {
+    /// Position of the rule in the configured list.
+    pub fn order(&self) -> usize {
+        self.order
+    }
+    pub fn priority(&self) -> MatchPriority {
+        MatchPriority::of(&self.rule, self.order)
+    }
+}
+/// S-17 priority between rules that match the same input; the smallest value wins.
+///
+/// Three tiers, as in Quicker 2.3.1: literal triggers before regex triggers; within a kind,
+/// the longer configured trigger (literal text or regex source, in characters) first;
+/// then the earlier rule in the list. `order` is unique per rule, so this is a total order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MatchPriority {
+    pub regex: bool,
+    pub length: usize,
+    pub order: usize,
+}
+impl MatchPriority {
+    pub fn of(rule: &Rule, order: usize) -> Self {
+        Self {
+            regex: rule.match_spec.kind == MatchKind::Regex,
+            length: rule.match_spec.value.chars().count(),
+            order,
+        }
+    }
+    /// Same kind and same configured length: only the list order separates the two rules,
+    /// which is the conflict reported through `MatchResult::tied_rule_ids`.
+    pub fn ties_with(&self, other: &Self) -> bool {
+        self.regex == other.regex && self.length == other.length
+    }
+}
+impl Ord for MatchPriority {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.regex
+            .cmp(&other.regex)
+            .then(other.length.cmp(&self.length))
+            .then(self.order.cmp(&other.order))
+    }
+}
+impl PartialOrd for MatchPriority {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 #[derive(Debug, Clone)]
 pub struct CompiledConfig {
@@ -23,6 +71,10 @@ pub struct MatchResult {
     pub parameter: Option<String>,
     pub consume_terminator: bool,
     pub revision: u64,
+    /// Other rules that matched in the same priority tier and lost only on list order
+    /// (S-17), in list order. The runtime records these as a conflict for the health page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tied_rule_ids: Vec<String>,
 }
 fn diag(code: &str, message: impl Into<String>, path: &str) -> Diagnostic {
     Diagnostic::error(code, message, SourceSpan::default()).at(path)
@@ -114,7 +166,7 @@ impl CompiledConfig {
         {
             return None;
         }
-        let mut matches: Vec<(usize, usize, MatchResult)> = vec![];
+        let mut matches: Vec<(MatchPriority, MatchResult)> = vec![];
         for compiled in &self.rules {
             let rule = &compiled.rule;
             match rule.trigger_mode {
@@ -156,8 +208,7 @@ impl CompiledConfig {
                 };
                 let erase_chars = full.as_str().chars().count();
                 matches.push((
-                    erase_chars,
-                    compiled.order,
+                    compiled.priority(),
                     MatchResult {
                         rule_id: rule.id.clone(),
                         matched: full.as_str().into(),
@@ -170,12 +221,19 @@ impl CompiledConfig {
                             .map(|t| t.consume)
                             .unwrap_or(true),
                         revision: self.config.revision,
+                        tied_rule_ids: vec![],
                     },
                 ));
             }
         }
-        matches.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        matches.into_iter().next().map(|(_, _, r)| r)
+        matches.sort_by_key(|(priority, _)| *priority);
+        let mut ranked = matches.into_iter();
+        let (best, mut result) = ranked.next()?;
+        result.tied_rule_ids = ranked
+            .take_while(|(priority, _)| priority.ties_with(&best))
+            .map(|(_, r)| r.rule_id)
+            .collect();
+        Some(result)
     }
     pub fn rule(&self, id: &str) -> Option<&Rule> {
         self.rules.iter().find(|r| r.rule.id == id).map(|r| &r.rule)
