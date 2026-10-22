@@ -952,6 +952,70 @@ fn nothing_from_a_finished_recording_reaches_the_next_one() {
     }
 }
 
+/// A probe that ends the current recording and starts the next the first
+/// time it is asked for the input context. In acceptance mode the keyboard
+/// hook asks mid-callback, after it read the session and before it tagged
+/// the key: the app switching recordings while the hook runs.
+struct SwitchesRecording {
+    shared: Arc<Shared>,
+    /// What the ended recording held, once it was switched.
+    ended: Mutex<Option<Vec<Operation>>>,
+}
+impl ForegroundProbe for SwitchesRecording {
+    fn foreground(&self) -> Foreground {
+        window()
+    }
+    fn protection(&self) -> Option<String> {
+        None
+    }
+    fn input_context(&self) -> Option<InputContext> {
+        let mut ended = self.ended.lock().unwrap();
+        if ended.is_none() {
+            let plan = finish_and_take(&self.shared).unwrap();
+            *ended = Some(operations(plan.steps));
+            begin_recording(&self.shared);
+        }
+        Some(context())
+    }
+}
+
+/// M2: an event belongs to the recording session current when its hook
+/// callback started. The app ends recording A and starts B while the hook
+/// is still handling a key pressed during A; the key is A's, so B never
+/// takes it (nor a release of it when B ends), and B takes what follows.
+#[test]
+fn a_key_belongs_to_the_recording_current_when_its_callback_started() {
+    let _serial = serial();
+    let shared = engine("btw");
+    let hooks = HookPipe::new(leaked_keys(), 32, true, nothing);
+    let raw = Lane::new(4, nothing);
+    let probe = SwitchesRecording {
+        shared: Arc::clone(&shared),
+        ended: Mutex::new(None),
+    };
+    let mut consumer = Consumer::with_windows(NOT_OURS);
+    let at = |vk, time| KeyInfo {
+        time,
+        ..injected(vk)
+    };
+    begin_recording(&shared);
+    handle_key(&hooks, &shared, &probe, WM_KEYDOWN, at(0x41, 0));
+    assert_eq!(
+        probe.ended.lock().unwrap().clone(),
+        Some(vec![]),
+        "A ended while its key was in the hook"
+    );
+    handle_key(&hooks, &shared, &probe, WM_KEYDOWN, at(0x42, 40));
+    handle_key(&hooks, &shared, &probe, WM_KEYUP, at(0x42, 90));
+    drain(&mut consumer, &shared, &hooks, &raw, &probe);
+    assert_eq!(hooks.lane().dropped(), 0);
+    assert_eq!(
+        recorded(&shared),
+        [key_down(0x42), delay(50), key_up(0x42)],
+        "B holds only its own key"
+    );
+}
+
 /// What the active recording holds so far, without ending it.
 fn pending(shared: &Shared) -> Vec<Operation> {
     let recording = shared.recording.lock().unwrap();

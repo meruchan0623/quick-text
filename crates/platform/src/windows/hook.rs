@@ -207,6 +207,12 @@ pub(super) fn on_key(
     if origin == Origin::Own {
         return HookAction::Pass;
     }
+    // M2: the event belongs to the recording session current when this
+    // callback started. Read once, before anything is handled, and every
+    // record of this event (key, stop gesture) carries it: if the app ends
+    // that recording and starts another while the callback runs, the
+    // consumer drops the event as stale instead of giving it to the new one.
+    let session = recording_session();
     if fault::take(FaultPoint::HookPanic).is_some() {
         injected_panic();
     }
@@ -230,9 +236,8 @@ pub(super) fn on_key(
         shared.cancel.store(true, Ordering::SeqCst);
         shared.generation.fetch_add(1, Ordering::SeqCst);
         observer::CARET_EPOCH.fetch_add(1, Ordering::SeqCst);
-        // M2: the stop belongs to the recording session current now; the
+        // M2: the stop belongs to the session read at callback start; the
         // consumer drops it if another recording has started since.
-        let session = recording_session();
         if !pipe.lane.push(HookRecord::Cancel { session }) {
             // A full queue must not swallow the stop. Set before any later
             // record is pushed, so the consumer sees it no later than the
@@ -269,7 +274,7 @@ pub(super) fn on_key(
         generation,
         acceptance,
         time: key.time,
-        session: recording_session(),
+        session,
     }));
     HookAction::Pass
 }
@@ -331,6 +336,9 @@ pub(super) fn on_mouse(pipe: &HookPipe, shared: &Shared, mouse: MouseInfo) {
     if classify(mouse.flags & LLMHF_INJECTED != 0, mouse.extra) == Origin::Own {
         return;
     }
+    // M2: as for keys, the event belongs to the recording session current
+    // when this callback started, read before anything is handled.
+    let session = recording_session();
     if let Some((button, down)) = mouse_button(mouse.msg, mouse.data) {
         if !down {
             // H1: as for keys, a button-up not ours ends our hold.
@@ -338,8 +346,6 @@ pub(super) fn on_mouse(pipe: &HookPipe, shared: &Shared, mouse: MouseInfo) {
         }
         pipe.keys.set(button, down);
     }
-    // M2: stamped like keys, so only the recording current now takes it.
-    let session = recording_session();
     if mouse.msg == WM_MOUSEMOVE {
         pipe.lane.push(HookRecord::Move {
             x: mouse.x,
