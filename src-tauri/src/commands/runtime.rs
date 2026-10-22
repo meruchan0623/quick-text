@@ -1,7 +1,7 @@
 //! Engine runtime: state snapshot, pause, manual execution and recording.
 use crate::{
     app_state::{AppState, Managed},
-    error::diagnostics,
+    error::CommandError,
 };
 use quicker_domain::*;
 use quicker_platform::ExecutionResult;
@@ -9,20 +9,23 @@ use std::sync::atomic::Ordering;
 use tauri::{Manager, State};
 
 #[tauri::command]
-pub fn load_state(store: State<Managed>) -> Result<AppState, String> {
-    Ok(store.lock().map_err(|_| "Store lock")?.state())
+pub fn load_state(store: State<Managed>) -> Result<AppState, CommandError> {
+    Ok(store.lock().state())
 }
 #[tauri::command]
-pub fn set_paused(paused: bool, store: State<Managed>) -> Result<AppState, String> {
-    let s = store.lock().map_err(|_| "Store lock")?;
+pub fn set_paused(paused: bool, store: State<Managed>) -> Result<AppState, CommandError> {
+    let s = store.lock();
     if !paused {
         if s.engine.recording.lock().unwrap().is_some() {
-            return Err("Stop recording before resuming automatic matching".into());
+            // Recording owns the input until it stops.
+            return Err(CommandError::Busy);
         }
-        quicker_platform::native_ready()?;
+        quicker_platform::native_ready().map_err(CommandError::engine_unavailable)?;
     }
     if !paused && !quicker_platform::engine_ready() {
-        return Err("This platform input adapter is not ready; engine remains paused".into());
+        return Err(CommandError::engine_unavailable(
+            "This platform input adapter is not ready; engine remains paused",
+        ));
     }
     s.engine.paused.store(paused, Ordering::SeqCst);
     s.engine.generation.fetch_add(1, Ordering::SeqCst);
@@ -33,7 +36,7 @@ pub fn set_paused(paused: bool, store: State<Managed>) -> Result<AppState, Strin
 }
 #[tauri::command]
 pub fn cancel_execution(store: State<Managed>) -> bool {
-    let s = store.lock().unwrap();
+    let s = store.lock();
     s.engine.cancel.store(true, Ordering::SeqCst);
     true
 }
@@ -41,12 +44,12 @@ pub fn cancel_execution(store: State<Managed>) -> bool {
 pub async fn execute_action(
     action: Action,
     app: tauri::AppHandle,
-) -> Result<ExecutionResult, String> {
+) -> Result<ExecutionResult, CommandError> {
     let (engine, config, action, speed) = {
         let state = app.state::<Managed>();
-        let s = state.lock().unwrap();
+        let s = state.lock();
         if s.engine.busy.swap(true, Ordering::SeqCst) {
-            return Err("An action is already running".into());
+            return Err(CommandError::Busy);
         }
         s.engine.cancel.store(false, Ordering::SeqCst);
         (
@@ -63,7 +66,7 @@ pub async fn execute_action(
     if let Some(w) = &window {
         if let Err(e) = w.hide() {
             engine.busy.store(false, Ordering::SeqCst);
-            return Err(e.to_string());
+            return Err(CommandError::internal(e));
         }
     }
     let e = engine.clone();
@@ -87,26 +90,27 @@ pub async fn execute_action(
         if needs_selection {
             context.selection = quicker_platform::capture_selection().ok();
         }
-        let plan = expand_reusable(&action, &config, &context).map_err(diagnostics)?;
+        let plan = expand_reusable(&action, &config, &context).map_err(CommandError::validation)?;
         quicker_platform::execute(e, plan, target, generation, 0, None, speed)
+            .map_err(CommandError::internal)
     })
     .await;
     engine.busy.store(false, Ordering::SeqCst);
     if let Some(w) = window {
         let _ = w.show();
     }
-    result.map_err(|e| e.to_string())?
+    result.map_err(CommandError::internal)?
 }
 #[tauri::command]
-pub fn start_recording(store: State<Managed>) -> Result<(), String> {
-    if store.lock().unwrap().engine.busy.load(Ordering::SeqCst) {
-        return Err("Stop the current action before starting recording".into());
+pub fn start_recording(store: State<Managed>) -> Result<(), CommandError> {
+    if store.lock().engine.busy.load(Ordering::SeqCst) {
+        return Err(CommandError::Busy);
     }
-    quicker_platform::start_recording(&store.lock().unwrap().engine)
+    quicker_platform::start_recording(&store.lock().engine).map_err(CommandError::internal)
 }
 #[tauri::command]
-pub fn stop_recording(store: State<Managed>) -> Result<ActionPlan, String> {
+pub fn stop_recording(store: State<Managed>) -> Result<ActionPlan, CommandError> {
     #[cfg(windows)]
-    quicker_platform::finish_recording(&store.lock().unwrap().engine);
-    quicker_platform::stop_recording(&store.lock().unwrap().engine)
+    quicker_platform::finish_recording(&store.lock().engine);
+    quicker_platform::stop_recording(&store.lock().engine).map_err(CommandError::internal)
 }

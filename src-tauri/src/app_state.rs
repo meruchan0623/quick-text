@@ -3,9 +3,11 @@ use crate::{autostart, store::Store};
 use quicker_domain::Config;
 use quicker_platform::ExecutionResult;
 use serde::Serialize;
-use std::sync::{atomic::Ordering, Mutex};
+use std::sync::atomic::Ordering;
 
-pub type Managed = Mutex<Store>;
+/// The store lock is `parking_lot` so a panic while it is held cannot poison
+/// it for every later command (B-01).
+pub type Managed = parking_lot::Mutex<Store>;
 
 #[derive(Clone, Serialize)]
 pub struct AppState {

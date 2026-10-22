@@ -4,49 +4,54 @@
 //! aliases that call the new implementations; 0.6 removes them.
 use crate::{
     app_state::{AppState, Managed},
-    error::diagnostics,
+    error::{CommandError, IoOp},
     store::merge_import_metadata,
 };
 use quicker_domain::*;
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 use tauri::{Manager, State};
 
 #[tauri::command]
-pub fn save_draft(config: Config, store: State<Managed>) -> Result<AppState, String> {
-    let mut s = store.lock().map_err(|_| "Store lock")?;
+pub fn save_draft(config: Config, store: State<Managed>) -> Result<AppState, CommandError> {
+    let mut s = store.lock();
     s.save(config)?;
     Ok(s.state())
 }
 #[tauri::command]
-pub fn apply_settings(store: State<Managed>) -> Result<AppState, String> {
-    let mut s = store.lock().map_err(|_| "Store lock")?;
+pub fn apply_settings(store: State<Managed>) -> Result<AppState, CommandError> {
+    let mut s = store.lock();
     let c = s.draft.clone();
     s.publish(c)?;
     Ok(s.state())
 }
 #[tauri::command]
-pub fn discard_draft(store: State<Managed>) -> Result<AppState, String> {
-    let mut s = store.lock().map_err(|_| "Store lock")?;
+pub fn discard_draft(store: State<Managed>) -> Result<AppState, CommandError> {
+    let mut s = store.lock();
     s.discard()?;
     Ok(s.state())
 }
 #[tauri::command]
-pub fn rollback(store: State<Managed>) -> Result<AppState, String> {
-    let mut s = store.lock().map_err(|_| "Store lock")?;
+pub fn rollback(store: State<Managed>) -> Result<AppState, CommandError> {
+    let mut s = store.lock();
     s.rollback_previous()?;
     Ok(s.state())
 }
 #[tauri::command]
-pub async fn get_foreground(app: tauri::AppHandle) -> Result<quicker_platform::Foreground, String> {
+pub async fn get_foreground(
+    app: tauri::AppHandle,
+) -> Result<quicker_platform::Foreground, CommandError> {
     if let Some(w) = app.get_webview_window("main") {
-        w.hide().map_err(|e| e.to_string())?;
+        w.hide().map_err(CommandError::internal)?;
     }
     let result = tauri::async_runtime::spawn_blocking(|| {
         std::thread::sleep(std::time::Duration::from_secs(3));
         quicker_platform::foreground()
     })
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(CommandError::internal)?;
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.set_focus();
@@ -54,8 +59,8 @@ pub async fn get_foreground(app: tauri::AppHandle) -> Result<quicker_platform::F
     Ok(result)
 }
 #[tauri::command]
-pub fn export_config(path: Option<String>, store: State<Managed>) -> Result<String, String> {
-    let s = store.lock().map_err(|_| "Store lock")?;
+pub fn export_config(path: Option<String>, store: State<Managed>) -> Result<String, CommandError> {
+    let s = store.lock();
     let target = path
         .map(PathBuf::from)
         .or_else(|| {
@@ -63,15 +68,16 @@ pub fn export_config(path: Option<String>, store: State<Managed>) -> Result<Stri
                 .set_file_name("quicker-text-package.json")
                 .save_file()
         })
-        .ok_or("Export cancelled")?;
+        .ok_or(CommandError::Cancelled)?;
     let unresolved = s
         .unresolved
         .iter()
         .filter(|x| s.draft.rules.iter().any(|r| r.id == x.rule_id))
         .cloned()
         .collect();
-    let package = export_package_with_unresolved(&s.draft, unresolved).map_err(diagnostics)?;
-    fs::write(&target, package).map_err(|e| e.to_string())?;
+    let package =
+        export_package_with_unresolved(&s.draft, unresolved).map_err(CommandError::validation)?;
+    fs::write(&target, package).map_err(|e| CommandError::io(IoOp::Write, Some(&target), &e))?;
     Ok(target.to_string_lossy().into_owned())
 }
 #[tauri::command]
@@ -79,11 +85,12 @@ pub fn import_config(
     path: String,
     strategy: String,
     store: State<Managed>,
-) -> Result<serde_json::Value, String> {
-    let source = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let imported = import_package(&source).map_err(diagnostics)?;
+) -> Result<serde_json::Value, CommandError> {
+    let source = fs::read_to_string(&path)
+        .map_err(|e| CommandError::io(IoOp::Read, Some(Path::new(&path)), &e))?;
+    let imported = import_package(&source).map_err(CommandError::validation)?;
     let mut incoming = imported.config;
-    let mut s = store.lock().map_err(|_| "Store lock")?;
+    let mut s = store.lock();
     let mut draft = s.draft.clone();
     let mut report: Vec<String> = imported
         .items
@@ -140,7 +147,7 @@ pub fn import_config(
             },
             ConflictStrategy::KeepBoth,
         )
-        .map_err(diagnostics)?;
+        .map_err(CommandError::validation)?;
     } else if strategy == "replace" {
         incoming.revision = s.active.revision;
         draft = incoming.clone();

@@ -7,6 +7,7 @@ mod revisions;
 
 pub use metadata::merge_import_metadata;
 
+use crate::error::CommandError;
 use atomic::atomic_json;
 use metadata::metadata_for_config;
 use quicker_domain::*;
@@ -26,7 +27,7 @@ pub struct Store {
     pub pending_import: Option<(Config, Vec<MigrationItem>)>,
 }
 impl Store {
-    pub fn save(&mut self, config: Config) -> Result<(), String> {
+    pub fn save(&mut self, config: Config) -> Result<(), CommandError> {
         let metadata = self
             .pending_import
             .as_ref()
@@ -40,7 +41,7 @@ impl Store {
         self.draft = config;
         Ok(())
     }
-    pub fn discard(&mut self) -> Result<(), String> {
+    pub fn discard(&mut self) -> Result<(), CommandError> {
         atomic_json(&self.dir.join("draft.json"), &self.active)?;
         atomic_json(
             &self.dir.join("migration-unresolved.json"),

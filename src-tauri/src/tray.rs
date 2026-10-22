@@ -90,7 +90,7 @@ pub fn build(app: &tauri::App) -> tauri::Result<()> {
             }
             "pause" => {
                 let state = app.state::<Managed>();
-                let s = state.lock().unwrap();
+                let s = state.lock();
                 let old = s.engine.paused.load(Ordering::SeqCst);
                 if old
                     && (quicker_platform::native_ready().is_err()
@@ -104,7 +104,7 @@ pub fn build(app: &tauri::App) -> tauri::Result<()> {
             }
             "quit" => {
                 let state = app.state::<Managed>();
-                let s = state.lock().unwrap();
+                let s = state.lock();
                 s.engine.cancel.store(true, Ordering::SeqCst);
                 s.engine.paused.store(true, Ordering::SeqCst);
                 app.exit(0)

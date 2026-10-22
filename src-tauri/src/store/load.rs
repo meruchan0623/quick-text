@@ -4,7 +4,7 @@ use super::{
     metadata::{metadata_for_config, read_metadata},
     Store,
 };
-use crate::error::diagnostics;
+use crate::error::{file_label, CommandError, IoOp};
 use quicker_domain::*;
 use quicker_platform::Shared;
 use sha2::{Digest, Sha256};
@@ -14,15 +14,15 @@ use std::{
 };
 
 impl Store {
-    pub fn load(dir: PathBuf) -> Result<Self, String> {
-        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    pub fn load(dir: PathBuf) -> Result<Self, CommandError> {
+        fs::create_dir_all(&dir).map_err(|e| CommandError::io(IoOp::CreateDir, Some(&dir), &e))?;
         let path = dir.join("active.json");
         let active = if path.exists() {
             read_config(&path)?
         } else {
             Config::default()
         };
-        compile_config(&active).map_err(diagnostics)?;
+        compile_config(&active).map_err(CommandError::validation)?;
         let draft = if dir.join("draft.json").exists() {
             read_config(&dir.join("draft.json"))?
         } else {
@@ -40,7 +40,8 @@ impl Store {
         };
         let engine = Shared::new();
         *engine.config.lock().unwrap() = active.clone();
-        *engine.compiled.lock().unwrap() = compile_config(&active).map_err(diagnostics)?;
+        *engine.compiled.lock().unwrap() =
+            compile_config(&active).map_err(CommandError::validation)?;
         let disk_hash = hash_file(&path)?;
         let unresolved = read_metadata(&dir.join("migration-unresolved.json"));
         let active_metadata_path = dir
@@ -54,7 +55,9 @@ impl Store {
             metadata_for_config(&active, &unresolved)
         };
         // Persist the legacy fallback before a later draft import can replace it.
-        fs::create_dir_all(dir.join("revisions")).map_err(|e| e.to_string())?;
+        let revisions = dir.join("revisions");
+        fs::create_dir_all(&revisions)
+            .map_err(|e| CommandError::io(IoOp::CreateDir, Some(&revisions), &e))?;
         atomic_json(&active_metadata_path, &active_unresolved)?;
         let previous_unresolved = previous
             .as_ref()
@@ -83,17 +86,29 @@ impl Store {
         })
     }
 }
-pub(super) fn read_config(path: &Path) -> Result<Config, String> {
-    let bytes = fs::read(path).map_err(|e| e.to_string())?;
-    serde_json::from_slice(&bytes).map_err(|e| format!("Configuration read failed: {e}"))
+/// Unreadable files are `Io`; unparsable ones are `Validation` with a
+/// `config_parse` diagnostic pointing at the JSON line and column.
+pub(super) fn read_config(path: &Path) -> Result<Config, CommandError> {
+    let bytes = fs::read(path).map_err(|e| CommandError::io(IoOp::Read, Some(path), &e))?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        CommandError::validation(vec![Diagnostic::error(
+            "config_parse",
+            format!("Configuration read failed: {e}"),
+            SourceSpan {
+                line: e.line(),
+                column: e.column(),
+                length: 0,
+            },
+        )
+        .at(file_label(path).unwrap_or_default())])
+    })
 }
-pub(super) fn hash_file(path: &Path) -> Result<Option<Vec<u8>>, String> {
+pub(super) fn hash_file(path: &Path) -> Result<Option<Vec<u8>>, CommandError> {
     if !path.exists() {
         return Ok(None);
     }
-    Ok(Some(
-        Sha256::digest(fs::read(path).map_err(|e| e.to_string())?).to_vec(),
-    ))
+    let bytes = fs::read(path).map_err(|e| CommandError::io(IoOp::Read, Some(path), &e))?;
+    Ok(Some(Sha256::digest(bytes).to_vec()))
 }
 
 #[cfg(test)]
