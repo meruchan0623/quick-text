@@ -34,6 +34,7 @@ mod rawinput;
 mod recording;
 mod selection;
 pub use actions::{execute, preflight};
+pub use clipboard::clipboard_health;
 pub use foreground::{cursor, foreground};
 pub use input::{engine_ready, input_status, native_ready};
 pub use recording::finish_recording;

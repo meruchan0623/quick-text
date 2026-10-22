@@ -302,7 +302,7 @@ fn clipboard_write_failure_fails_without_typing_fallback() {
 fn busy_clipboard_rejects_paste_before_erasure() {
     let mut rig = Rig::new(rule(None, OutputMethod::Paste));
     let candidate = rig.type_str("btw").unwrap();
-    rig.clipboard.set_busy(1);
+    rig.clipboard.set_busy(super::clipboard::OPEN_ATTEMPTS);
     assert_eq!(
         rig.execute(&candidate).unwrap_err(),
         "Clipboard is busy; trigger preserved"
@@ -322,7 +322,7 @@ fn restore_never_overwrites_when_sequence_keeps_changing() {
         result.message,
         "Clipboard restore failed after input: Clipboard ownership could not be verified within the retry limit"
     );
-    assert_eq!(rig.clipboard.content(), clip(EXPANSION));
+    assert_eq!(rig.clipboard.content(), pasted(&rig.clipboard, EXPANSION));
     assert_eq!(rig.clipboard.clears(), 1, "only the paste write");
 }
 
@@ -546,10 +546,17 @@ fn assert_stamp_change_fails_stop(moment: Moment, field: StampField) {
         vec![InjectCall::Keys(vec![VK_BACK]); backspaces],
         "{case}"
     );
-    // #1: the lease never wrote, so sequence, owner and content are intact.
-    assert_eq!(rig.clipboard.clears(), 0, "{case}");
-    assert_eq!(rig.clipboard.sequence_now(), sequence, "{case}");
-    assert_eq!(rig.clipboard.owner_now(), 7, "{case}");
+    match moment {
+        // #1: the lease never wrote, so sequence, owner and content are intact.
+        Moment::BeforeErase => {
+            assert_eq!(rig.clipboard.clears(), 0, "{case}");
+            assert_eq!(rig.clipboard.sequence_now(), sequence, "{case}");
+            assert_eq!(rig.clipboard.owner_now(), 7, "{case}");
+        }
+        // The paste was written before erasure (plan §5.4 principle 4) and
+        // is restored: paste write plus restore write.
+        Moment::AfterBackspace(_) => assert_eq!(rig.clipboard.clears(), 2, "{case}"),
+    }
     assert_eq!(rig.clipboard.content(), clip("original"), "{case}");
 }
 
@@ -589,10 +596,10 @@ fn stamp_change_after_paste_write_restores_clipboard_without_paste() {
     let result = rig.execute(&candidate).unwrap();
     assert_eq!(result.status, "failed");
     assert_eq!(result.message, STAMP_CHANGED);
-    assert_eq!(
-        rig.injector.calls(),
-        vec![InjectCall::Keys(vec![VK_BACK]); 3],
-        "no paste chord after the change"
+    // The paste is written before erasure (plan §5.4 principle 4).
+    assert!(
+        rig.injector.calls().is_empty(),
+        "trigger preserved, no paste chord after the change"
     );
     // #1: our payload re-verified under our ownership, then the original
     // was written back.
@@ -610,8 +617,8 @@ fn unchanged_stamp_passes_guard_and_completes() {
     assert_eq!(rig.injector.taps(VK_BACK), 3);
     assert_eq!(rig.chords(), 1);
     assert_eq!(rig.clipboard.content(), clip("original"));
-    // The guard compared live stamps: 2 pre-erase checks, 3 backspaces, the
-    // step check and 2 paste checks.
+    // The guard compared live stamps: 3 pre-erase checks (one after the
+    // paste write), 3 backspaces, the step check and the paste check.
     let compared = rig.foreground.input_context_reads() - reads;
     assert!(compared >= 8, "stamp read {compared} times");
 }
@@ -648,3 +655,17 @@ fn proof_is_uninstalled_when_the_run_unwinds() {
     rig.foreground.update_input_context(|c| c.caret_epoch += 1);
     assert_eq!(rawinput::guard(&rig.shared, &rig.foreground), Ok(()));
 }
+
+/// What a paste write of `text` leaves on the clipboard: the payload, then
+/// the history/cloud exclusion markers (B-08), each a DWORD 0.
+fn pasted(clipboard: &MockClipboard, text: &str) -> Vec<(u32, Vec<u8>)> {
+    let mut formats = clip(text);
+    for name in super::clipboard::EXCLUSION_FORMATS {
+        let id = clipboard.registered(name).expect("marker registered");
+        formats.push((id, 0u32.to_le_bytes().to_vec()));
+    }
+    formats
+}
+
+#[path = "pipeline_tests_clipboard.rs"]
+mod clipboard_cases;

@@ -740,8 +740,9 @@ mod tests {
                 })),
                 capabilities: vec![Capability {
                     id: "keys".into(),
+                    status: quicker_platform::CapabilityStatus::Available,
+                    reason: None,
                     available: true,
-                    reason: "ready".into(),
                 }],
                 log_level: LevelState {
                     level: LogLevel::Debug,

@@ -1,9 +1,14 @@
 //! Test doubles for the platform ports (S-23). Built for unit tests and, with
 //! `--features mock`, for downstream pipeline tests. Never touches the OS.
-use crate::traits::{ClipboardBackend, Clock, ForegroundProbe, Injector, InputContext};
+use crate::health::{HealthState, ReasonCode};
+use crate::traits::{
+    ClipboardBackend, ClipboardRead, Clock, ForegroundProbe, FormatRead, Injector, InputContext,
+};
 use crate::Foreground;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
+use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
 /// One recorded [`Injector`] call.
@@ -131,13 +136,57 @@ struct ClipboardModel {
     owner: u64,
     sequence: u32,
     formats: ClipboardFormats,
-    open: bool,
+    /// Thread holding the clipboard open: Win32 ties an open clipboard to
+    /// the thread that opened it.
+    open_by: Option<ThreadId>,
     busy: usize,
     fail_set: usize,
     churn: bool,
     clears: usize,
     locks: usize,
     lock_hook: Option<LockHook>,
+    /// Virtual time: advanced by `pause` and by slow reads, never by the OS.
+    base: Instant,
+    elapsed: Duration,
+    pauses: Vec<Duration>,
+    read_delay: Duration,
+    health: Option<(HealthState, Option<ReasonCode>)>,
+    /// Registered format names; ids start at 0xC000 like Win32's.
+    registry: Vec<String>,
+    /// Sizes formats report instead of their byte count (virtual size).
+    sizes: Vec<(u32, usize)>,
+    /// The current owner stopped pumping messages.
+    owner_hung: bool,
+    /// The next read parks, clipboard open, until this gate opens.
+    gate: Option<Receiver<()>>,
+    /// A read is parked on the gate.
+    parked: bool,
+    /// Every `wait_for` timeout, in order.
+    waits: Vec<Duration>,
+    /// Format reads started.
+    reads: usize,
+    /// Formats whose memory cannot be locked.
+    unreadable: Vec<u32>,
+}
+
+/// Formats whose data is a GDI or owner-defined handle, never bytes.
+fn handle_format(format: u32) -> bool {
+    matches!(format, 2 | 3 | 9 | 0x80..=0x8F | 0x200..=0x3FF)
+}
+
+impl ClipboardModel {
+    /// Asserts a backup could read `format` on Windows without blocking or
+    /// misreading a handle as memory.
+    fn assert_readable(&self, format: u32) {
+        assert!(
+            !(self.owner_hung && self.owner != MockClipboard::LEASE),
+            "clipboard read from a hung owner (would block on delayed rendering)"
+        );
+        assert!(
+            !handle_format(format),
+            "handle format {format:#x} read as bytes"
+        );
+    }
 }
 
 /// In-memory clipboard following Win32 rules: clearing takes ownership and
@@ -158,13 +207,26 @@ impl MockClipboard {
                 owner,
                 sequence: 1,
                 formats,
-                open: false,
+                open_by: None,
                 busy: 0,
                 fail_set: 0,
                 churn: false,
                 clears: 0,
                 locks: 0,
                 lock_hook: None,
+                base: Instant::now(),
+                elapsed: Duration::ZERO,
+                pauses: vec![],
+                read_delay: Duration::ZERO,
+                health: None,
+                registry: vec![],
+                sizes: vec![],
+                owner_hung: false,
+                gate: None,
+                parked: false,
+                waits: vec![],
+                reads: 0,
+                unreadable: vec![],
             })),
         }
     }
@@ -191,11 +253,23 @@ impl MockClipboard {
         state.owner = owner;
         state.formats = formats;
         state.sequence += 2;
+        state.owner_hung = false;
     }
     /// The payload changes without an owner change.
     pub fn tamper(&self, formats: ClipboardFormats) {
         let mut state = self.state.lock();
         state.formats = formats;
+        state.sequence += 1;
+    }
+    /// A format joins the clipboard without an empty: another application's
+    /// `SetClipboardData` without `EmptyClipboard`, or the system listing a
+    /// synthesized format. The owner and every other format stay. The new
+    /// data reads: a `fail_read` of `format` held for the data it replaces.
+    pub fn add_format(&self, format: u32, bytes: Vec<u8>) {
+        let mut state = self.state.lock();
+        state.unreadable.retain(|f| *f != format);
+        state.formats.retain(|(f, _)| *f != format);
+        state.formats.push((format, bytes));
         state.sequence += 1;
     }
     /// While on, every lock release advances the sequence (never settles).
@@ -215,18 +289,116 @@ impl MockClipboard {
     pub fn on_lock(&self, hook: impl FnMut(usize) + Send + 'static) {
         self.state.lock().lock_hook = Some(Box::new(hook));
     }
-    fn open(&self) -> parking_lot::MutexGuard<'_, ClipboardModel> {
+    /// The model, for a call only valid with the clipboard open on this
+    /// thread.
+    fn open(&self) -> MutexGuard<'_, ClipboardModel> {
         let state = self.state.lock();
-        assert!(state.open, "clipboard accessed outside locked()");
+        assert!(
+            state.open_by == Some(thread::current().id()),
+            "clipboard accessed outside locked()"
+        );
         state
+    }
+    /// The model, for a call `doing` that must not run with the clipboard
+    /// open on this thread.
+    fn closed(&self, doing: &str) -> MutexGuard<'_, ClipboardModel> {
+        let state = self.state.lock();
+        assert!(
+            state.open_by != Some(thread::current().id()),
+            "{doing} with the clipboard open"
+        );
+        state
+    }
+    /// Whether any thread holds the clipboard open: a lease, or its backup
+    /// worker (e.g. checked from an injector hook: input must never be sent
+    /// inside a critical section).
+    pub fn is_open(&self) -> bool {
+        self.state.lock().open_by.is_some()
+    }
+    /// Every [`ClipboardBackend::pause`] request, in order.
+    pub fn pauses(&self) -> Vec<Duration> {
+        self.state.lock().pauses.clone()
+    }
+    /// Each read with the clipboard open takes `delay` of virtual time (a
+    /// slow owner rendering data), to exercise the lock-hold budget.
+    pub fn set_read_delay(&self, delay: Duration) {
+        self.state.lock().read_delay = delay;
+    }
+    /// Latest [`ClipboardBackend::report_health`] call, if any.
+    pub fn health(&self) -> Option<(HealthState, Option<ReasonCode>)> {
+        self.state.lock().health
+    }
+    /// Id [`ClipboardBackend::register_format`] returned for `name`.
+    pub fn registered(&self, name: &str) -> Option<u32> {
+        let state = self.state.lock();
+        let index = state.registry.iter().position(|known| known == name)?;
+        Some(0xC000 + index as u32)
+    }
+    /// `format` reports `size` bytes without allocating them, so a read
+    /// limited below `size` sees it as too large. Meant for sizes above every
+    /// limit a lease uses: such a format is never read in full.
+    pub fn report_size(&self, format: u32, size: usize) {
+        self.state.lock().sizes.push((format, size));
+    }
+    /// The current owner stops (or resumes) pumping messages. Reading any
+    /// format while it owns the clipboard panics: on Windows a delay-rendered
+    /// format would block on it. Cleared when another owner takes over.
+    pub fn set_owner_hung(&self, hung: bool) {
+        self.state.lock().owner_hung = hung;
+    }
+    /// The next format read parks with the clipboard open until the returned
+    /// sender sends or is dropped, like `GetClipboardData` waiting for an
+    /// owner to render a delay-rendered format. While it is parked,
+    /// [`ClipboardBackend::wait_for`] times out.
+    pub fn block_next_read(&self) -> Sender<()> {
+        let (release, gate) = mpsc::channel();
+        self.state.lock().gate = Some(gate);
+        release
+    }
+    /// Whether a read is parked on [`MockClipboard::block_next_read`].
+    pub fn read_parked(&self) -> bool {
+        self.state.lock().parked
+    }
+    /// Every [`ClipboardBackend::wait_for`] timeout, in order.
+    pub fn waits(&self) -> Vec<Duration> {
+        self.state.lock().waits.clone()
+    }
+    /// Format reads started so far.
+    pub fn reads(&self) -> usize {
+        self.state.lock().reads
+    }
+    /// Reading `format` fails as if its memory could not be locked.
+    pub fn fail_read(&self, format: u32) {
+        self.state.lock().unreadable.push(format);
+    }
+    /// Waits in real time, up to `within`, until no thread holds the
+    /// clipboard open (an abandoned backup worker closes it late).
+    pub fn await_closed(&self, within: Duration) -> bool {
+        let start = Instant::now();
+        while self.is_open() {
+            if start.elapsed() > within {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        true
     }
 }
 
-impl ClipboardBackend for MockClipboard {
-    type Staged = Vec<u8>;
-    fn identity(&self) -> u64 {
-        Self::LEASE
+/// Closes the mock clipboard when a `locked` section ends, also when it
+/// unwinds.
+struct Close<'a>(&'a Mutex<ClipboardModel>);
+impl Drop for Close<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.lock();
+        state.open_by = None;
+        if state.churn {
+            state.sequence += 1;
+        }
     }
+}
+
+impl ClipboardRead for MockClipboard {
     fn owner(&self) -> u64 {
         self.state.lock().owner
     }
@@ -234,10 +406,16 @@ impl ClipboardBackend for MockClipboard {
         self.state.lock().sequence
     }
     fn locked<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
+        let me = thread::current().id();
         let (index, hook) = {
             let mut state = self.state.lock();
+            assert!(state.open_by != Some(me), "clipboard opened twice");
             if state.busy > 0 {
                 state.busy -= 1;
+                return None;
+            }
+            if state.open_by.is_some() {
+                // Another thread holds it open: OpenClipboard fails.
                 return None;
             }
             state.locks += 1;
@@ -250,16 +428,13 @@ impl ClipboardBackend for MockClipboard {
         }
         {
             let mut state = self.state.lock();
-            assert!(!state.open, "clipboard opened twice");
-            state.open = true;
+            if state.open_by.is_some() {
+                return None;
+            }
+            state.open_by = Some(me);
         }
-        let result = f();
-        let mut state = self.state.lock();
-        state.open = false;
-        if state.churn {
-            state.sequence += 1;
-        }
-        Some(result)
+        let _close = Close(&self.state);
+        Some(f())
     }
     fn formats(&self) -> Vec<u32> {
         self.open()
@@ -268,13 +443,55 @@ impl ClipboardBackend for MockClipboard {
             .map(|(format, _)| *format)
             .collect()
     }
-    fn read(&self, format: u32, limit: usize) -> Result<Option<Vec<u8>>, String> {
-        Ok(self
-            .open()
-            .formats
+    fn read_format(&self, format: u32, limit: usize) -> FormatRead {
+        let gate = {
+            let mut state = self.open();
+            state.assert_readable(format);
+            state.reads += 1;
+            let delay = state.read_delay;
+            state.elapsed += delay;
+            state.gate.take()
+        };
+        if let Some(gate) = gate {
+            self.state.lock().parked = true;
+            // A dropped sender releases it too.
+            let _ = gate.recv();
+            self.state.lock().parked = false;
+        }
+        let state = self.open();
+        if state.unreadable.contains(&format) {
+            return FormatRead::Unreadable;
+        }
+        let Some((_, bytes)) = state.formats.iter().find(|(f, _)| *f == format) else {
+            return FormatRead::Missing;
+        };
+        let size = state
+            .sizes
             .iter()
-            .find(|(f, bytes)| *f == format && !bytes.is_empty() && bytes.len() <= limit)
-            .map(|(_, bytes)| bytes.clone()))
+            .find(|(f, _)| *f == format)
+            .map_or(bytes.len(), |(_, size)| *size);
+        if bytes.is_empty() {
+            FormatRead::Missing
+        } else if size > limit {
+            FormatRead::TooLarge
+        } else {
+            FormatRead::Data(bytes.clone())
+        }
+    }
+    fn now(&self) -> Instant {
+        let state = self.state.lock();
+        state.base + state.elapsed
+    }
+}
+
+impl ClipboardBackend for MockClipboard {
+    type Staged = Vec<u8>;
+    type Reader = MockClipboard;
+    fn identity(&self) -> u64 {
+        Self::LEASE
+    }
+    fn reader(&self) -> MockClipboard {
+        self.clone()
     }
     fn clear(&self) -> bool {
         let mut state = self.open();
@@ -285,6 +502,8 @@ impl ClipboardBackend for MockClipboard {
         true
     }
     fn stage(&self, bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+        // Allocation belongs before the critical section, never inside it.
+        drop(self.closed("payload staged"));
         Ok((bytes.to_vec(), bytes.to_vec()))
     }
     fn set(&self, format: u32, staged: Vec<u8>) -> bool {
@@ -297,6 +516,54 @@ impl ClipboardBackend for MockClipboard {
         state.formats.push((format, staged));
         state.sequence += 1;
         true
+    }
+    fn pause(&self, duration: Duration) {
+        let mut state = self.closed("paused");
+        state.elapsed += duration;
+        state.pauses.push(duration);
+    }
+    /// Polls `rx` in real time. While a read is parked on
+    /// [`MockClipboard::block_next_read`] the wait times out at once, taking
+    /// `timeout` of virtual time.
+    fn wait_for<T>(&self, rx: &Receiver<T>, timeout: Duration) -> Result<T, RecvTimeoutError> {
+        self.closed("waited for the backup worker")
+            .waits
+            .push(timeout);
+        let start = Instant::now();
+        loop {
+            match rx.recv_timeout(Duration::from_millis(1)) {
+                Err(RecvTimeoutError::Timeout) => {}
+                answer => return answer,
+            }
+            let mut state = self.state.lock();
+            if state.parked {
+                state.elapsed += timeout;
+                return Err(RecvTimeoutError::Timeout);
+            }
+            drop(state);
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "backup worker never answered"
+            );
+        }
+    }
+    fn report_health(&self, state: HealthState, reason: Option<ReasonCode>) {
+        self.closed("health reported").health = Some((state, reason));
+    }
+    fn owner_hung(&self, owner: u64) -> bool {
+        let state = self.closed("hung-owner probe");
+        state.owner_hung && owner == state.owner && owner != Self::LEASE
+    }
+    fn register_format(&self, name: &str) -> u32 {
+        let mut state = self.state.lock();
+        let index = match state.registry.iter().position(|known| known == name) {
+            Some(index) => index,
+            None => {
+                state.registry.push(name.to_string());
+                state.registry.len() - 1
+            }
+        };
+        0xC000 + index as u32
     }
 }
 
@@ -387,7 +654,10 @@ impl ForegroundProbe for MockForeground {
 pub struct FakeClock {
     base: Instant,
     state: Mutex<(Duration, Vec<Duration>)>,
+    sleep_hook: Mutex<Option<SleepHook>>,
 }
+
+type SleepHook = Box<dyn FnMut(Duration) + Send>;
 
 impl FakeClock {
     /// Wall time at creation: 2026-01-01T00:00:00Z.
@@ -397,6 +667,7 @@ impl FakeClock {
         Self {
             base: Instant::now(),
             state: Mutex::new((Duration::ZERO, vec![])),
+            sleep_hook: Mutex::new(None),
         }
     }
     pub fn advance(&self, by: Duration) {
@@ -409,6 +680,11 @@ impl FakeClock {
     /// Every `sleep` request, in order.
     pub fn sleeps(&self) -> Vec<Duration> {
         self.state.lock().1.clone()
+    }
+    /// Runs `hook` with each `sleep` request, before time advances (e.g. to
+    /// check that nothing waits with the clipboard open).
+    pub fn on_sleep(&self, hook: impl FnMut(Duration) + Send + 'static) {
+        *self.sleep_hook.lock() = Some(Box::new(hook));
     }
 }
 
@@ -426,6 +702,12 @@ impl Clock for FakeClock {
         Self::WALL_START_MS + self.state.lock().0.as_millis() as i64
     }
     fn sleep(&self, duration: Duration) {
+        // Run the hook unlocked so it may read this clock.
+        let hook = self.sleep_hook.lock().take();
+        if let Some(mut hook) = hook {
+            hook(duration);
+            self.sleep_hook.lock().get_or_insert(hook);
+        }
         let mut state = self.state.lock();
         state.0 += duration;
         state.1.push(duration);
@@ -463,6 +745,74 @@ mod tests {
             clipboard.locked(|| clipboard.read(13, 1)).unwrap(),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn clipboard_open_on_one_thread_is_busy_for_others_until_closed() {
+        let clipboard = MockClipboard::new(7, vec![(13, vec![1, 0])]);
+        let release = clipboard.block_next_read();
+        let reader = clipboard.clone();
+        let worker = thread::spawn(move || reader.locked(|| reader.read_format(13, 64)));
+        while !clipboard.read_parked() {
+            thread::yield_now();
+        }
+        assert!(clipboard.is_open());
+        assert!(clipboard.locked(|| ()).is_none(), "OpenClipboard fails");
+        release.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), Some(FormatRead::Data(vec![1, 0])));
+        assert!(!clipboard.is_open());
+        assert_eq!(clipboard.reads(), 1);
+        assert!(clipboard.locked(|| ()).is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "paused with the clipboard open")]
+    fn clipboard_rejects_waiting_inside_the_critical_section() {
+        let clipboard = MockClipboard::new(7, vec![]);
+        clipboard.locked(|| clipboard.pause(Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn clipboard_reports_virtual_sizes_and_registers_formats() {
+        let clipboard = MockClipboard::new(7, vec![(0xC000, vec![1, 2])]);
+        clipboard.report_size(0xC000, 64);
+        let reads = clipboard
+            .locked(|| {
+                [
+                    clipboard.read_format(0xC000, 63),
+                    clipboard.read_format(0xC000, 64),
+                    clipboard.read_format(13, 64),
+                ]
+            })
+            .unwrap();
+        assert_eq!(
+            reads,
+            [
+                FormatRead::TooLarge,
+                FormatRead::Data(vec![1, 2]),
+                FormatRead::Missing
+            ]
+        );
+        let id = clipboard.register_format("Preferred DropEffect");
+        assert_eq!(clipboard.register_format("Preferred DropEffect"), id);
+        assert_eq!(clipboard.registered("Preferred DropEffect"), Some(id));
+        assert_eq!(clipboard.registered("HTML Format"), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "handle format 0x9 read as bytes")]
+    fn clipboard_rejects_reading_a_handle_format_as_bytes() {
+        let clipboard = MockClipboard::new(7, vec![(9, vec![1])]);
+        clipboard.locked(|| clipboard.read_format(9, 64));
+    }
+
+    #[test]
+    #[should_panic(expected = "clipboard read from a hung owner")]
+    fn clipboard_rejects_reading_from_a_hung_owner() {
+        let clipboard = MockClipboard::new(7, vec![(13, vec![1, 0])]);
+        clipboard.set_owner_hung(true);
+        assert!(clipboard.owner_hung(7));
+        clipboard.locked(|| clipboard.read(13, 64)).unwrap().ok();
     }
 
     #[test]

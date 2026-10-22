@@ -63,12 +63,6 @@ pub struct ExecutionResult {
     pub completed_steps: usize,
     pub side_effects: bool,
 }
-#[derive(Clone, Debug, Serialize)]
-pub struct Capability {
-    pub id: String,
-    pub available: bool,
-    pub reason: String,
-}
 pub struct Shared {
     pub config: Mutex<Config>,
     pub compiled: Mutex<CompiledConfig>,
@@ -113,33 +107,10 @@ mod unsupported;
 #[cfg(not(any(windows, target_os = "macos")))]
 pub use unsupported::*;
 
-#[cfg(not(target_os = "macos"))]
-pub fn capabilities() -> Vec<Capability> {
-    #[cfg(windows)]
-    let native = engine_ready();
-    #[cfg(not(windows))]
-    let native = false;
-    let reason = if native {
-        "Windows 输入功能已就绪；发送后仍需查看目标程序是否收到"
-    } else if cfg!(windows) {
-        "Windows 键盘监听暂不可用，软件保持暂停"
-    } else {
-        "当前系统尚不支持自动输入"
-    };
-    #[cfg(windows)]
-    let target_status = input_status();
-    #[cfg(windows)]
-    let ime_observable = target_status["espanso_input"]["ready"]
-        .as_bool()
-        .unwrap_or(false);
-    #[cfg(not(windows))]
-    let ime_observable = false;
-    ["keyboard_hook","keys","paste","html","file_clipboard","image_clipboard","mouse","recording","foreground","open"].into_iter().map(|id|Capability{id:id.into(),available:native,reason:reason.into()}).chain([Capability{id:"ime_committed_text".into(),available:native && ime_observable,reason:"Windows 使用 Espanso RawInput 监听与原生注入，保留当前输入法翻译出的字符并按匹配字符数退格。支持立即触发与空格或分号触发；回车和 Tab 触发停用。组合候选和目标收到的结果未知，不依赖 UIA 逐字读回。当前后端按退格处理，Esc 偏好配置保留但暂未应用".into()},Capability{id:"quicker_private_action".into(),available:false,reason:"当前版本不能执行原 Quicker 动作，仅保留导入信息；请改成支持的操作".into()}]).collect()
-}
-#[cfg(target_os = "macos")]
-pub fn capabilities() -> Vec<Capability> {
-    platform_capabilities()
-}
+mod capabilities;
+pub use capabilities::{
+    capabilities, capabilities_for, Capability, CapabilityReason, CapabilityStatus, PlatformReason,
+};
 pub fn start_recording(shared: &Arc<Shared>) -> Result<(), String> {
     #[cfg(any(windows, target_os = "macos"))]
     native_ready()?;
