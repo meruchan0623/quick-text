@@ -52,7 +52,10 @@ fn default_model_roundtrip() {
 }
 #[test]
 fn unknown_fields_rejected() {
-    assert!(serde_json::from_str::<Config>(r#"{"garbage":true}"#).is_err());
+    // B-43: stored configuration keeps unknown fields in `extra` (tests/lenient_read.rs);
+    // importing, which brings in external data, still rejects them (plan §9).
+    assert!(import_package(r#"{"garbage":true}"#).is_err());
+    assert!(import_package(r#"{"globals":{"garbage":true}}"#).is_err());
 }
 #[test]
 fn immediate_regex_rejected() {
@@ -242,7 +245,16 @@ fn ignoring_legacy_scope_keeps_unknown_rule_fields_strict() {
     let mut raw = serde_json::to_value(literal("r", "a")).unwrap();
     raw["scope"] = serde_json::json!({"windows_processes": ["other.exe"]});
     raw["future_unknown"] = serde_json::json!(true);
-    assert!(serde_json::from_value::<Rule>(raw).is_err());
+    // B-43: reading keeps the unknown field in `extra` but never the legacy scope.
+    let rule: Rule = serde_json::from_value(raw.clone()).unwrap();
+    assert_eq!(rule.extra.keys().collect::<Vec<_>>(), ["future_unknown"]);
+    let written = serde_json::to_value(&rule).unwrap();
+    assert!(written.get("scope").is_none());
+    assert_eq!(written["future_unknown"], serde_json::json!(true));
+    // Importing stays strict: the entry needs rewriting and stays off.
+    let report = import_package(&serde_json::json!({ "rules": [raw] }).to_string()).unwrap();
+    assert_eq!(report.items[0].status, MigrationStatus::NeedsRewrite);
+    assert!(!report.config.rules[0].enabled);
 }
 #[test]
 fn duplicate_ids_fail() {

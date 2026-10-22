@@ -1188,7 +1188,7 @@ mod tests {
         let built = scoped(&log_dir(&dir), LevelFilter::TRACE);
         tracing::subscriber::with_default(built.subscriber, || {
             tracing::info!(event = "test.start", "privacy test");
-            let mut store = Store::load(dir.clone()).unwrap();
+            let mut store = Store::load(dir.clone());
             let mut config = sentinel_config();
             config.rules[0].enabled = true;
             config.rules[0].notification.enabled = true;

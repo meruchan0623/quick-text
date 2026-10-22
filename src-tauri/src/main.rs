@@ -5,6 +5,8 @@ mod commands;
 mod diagnostics;
 mod error;
 mod events;
+mod faults;
+mod startup;
 mod store;
 mod tray;
 
@@ -56,9 +58,10 @@ fn main() {
                 Arc::new(quicker_platform::traits::SystemClock),
                 Arc::new(diagnostics::logging::apply_level),
             ));
-            let store = store::Store::load(dir).map_err(std::io::Error::other)?;
+            let store = store::Store::load(dir);
             let engine = store.engine.clone();
             app.manage(Managed::new(store));
+            startup::after_load(app.handle());
             tray::spawn_status_watcher(app.handle().clone(), engine.clone());
             if let Err(message) = quicker_platform::start_engine(engine.clone()) {
                 *engine.last.lock().unwrap() = Some(ExecutionResult {
@@ -112,12 +115,17 @@ fn main() {
             commands::diagnostics::open_log_dir,
             commands::diagnostics::open_data_dir,
             commands::diagnostics::log_frontend_error,
-            commands::diagnostics::report_metric
+            commands::diagnostics::report_metric,
+            commands::runtime::startup_problems
         ])
         .build(tauri::generate_context!())
         .expect("Quicker Text startup failed")
-        .run(|_, event| {
-            if let tauri::RunEvent::Exit = event {
+        .run(|app, event| {
+            let exiting = matches!(event, tauri::RunEvent::Exit);
+            // Clears the run marker (safe mode, B-04) before the exit is logged,
+            // so the final flush also covers anything it logs.
+            startup::on_run_event(app, event);
+            if exiting {
                 tracing::info!(event = "app.exit", "Quicker Text exiting");
                 diagnostics::logging::flush();
             }

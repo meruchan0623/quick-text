@@ -16,7 +16,6 @@ pub enum CommandError {
     RuleConflict { id: String, current: String },
     #[error("revision conflict; current revision is {current}")]
     RevisionConflict { current: u64 },
-    #[allow(dead_code)] // Safe mode (B-04).
     #[error("safe mode is active ({reason:?})")]
     SafeMode { reason: SafeModeReason },
     #[error("{op:?} failed (path: {path:?}, os error: {os_code:?})")]
@@ -49,7 +48,6 @@ pub enum CommandError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code)] // Safe mode (B-04).
 pub enum SafeModeReason {
     CrashLoop,
     Locked,

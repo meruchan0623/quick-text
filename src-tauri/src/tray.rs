@@ -92,8 +92,10 @@ pub fn build(app: &tauri::App) -> tauri::Result<()> {
                 let state = app.state::<Managed>();
                 let s = state.lock();
                 let old = s.engine.paused.load(Ordering::SeqCst);
+                // Safe mode keeps the engine paused (B-04).
                 if old
-                    && (quicker_platform::native_ready().is_err()
+                    && (s.safe_mode().is_some()
+                        || quicker_platform::native_ready().is_err()
                         || s.engine.recording.lock().unwrap().is_some())
                 {
                     return;
@@ -107,6 +109,7 @@ pub fn build(app: &tauri::App) -> tauri::Result<()> {
                 let s = state.lock();
                 s.engine.cancel.store(true, Ordering::SeqCst);
                 s.engine.paused.store(true, Ordering::SeqCst);
+                crate::store::clear_run_marker_on_session_end();
                 app.exit(0)
             }
             _ => {}

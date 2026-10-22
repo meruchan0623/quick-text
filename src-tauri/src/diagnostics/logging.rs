@@ -296,7 +296,7 @@ mod tests {
         let dir = temp_dir();
         let built = test_support::scoped(&log_dir(&dir), DEFAULT_LEVEL);
         let err = tracing::subscriber::with_default(built.subscriber, || {
-            let mut store = Store::load(dir.clone()).unwrap();
+            let mut store = Store::load(dir.clone());
             store.active.revision = u64::MAX;
             store.publish(Config::default()).unwrap_err()
         });

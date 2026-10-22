@@ -349,97 +349,140 @@ fn parameter_text(value: &serde_json::Value) -> Result<String, Vec<Diagnostic>> 
         )),
     }
 }
-/// Resolve portable action IDs to existing enabled rules, preserving typed parameters and preventing cycles.
+/// Why `action_id` does not resolve to a rule that is on at runtime.
+fn unavailable(config: &Config, action_id: &str) -> Vec<Diagnostic> {
+    match config.rules.iter().find(|r| r.id == action_id) {
+        Some(rule) if !rule.enabled => content_error(
+            "action_disabled",
+            "Referenced action is disabled; explicitly enable it before execution",
+        ),
+        Some(_) => content_error(
+            "action_skipped",
+            "Referenced action did not compile and is off at runtime",
+        ),
+        None if config
+            .unreadable_rules
+            .iter()
+            .any(|entry| entry.id() == Some(action_id)) =>
+        {
+            content_error(
+                "action_unreadable",
+                "Referenced action could not be read by this version and is off at runtime",
+            )
+        }
+        None => content_error("action_unknown", "Reusable action ID is not registered"),
+    }
+}
+/// Resolve portable action IDs to rules that are on at runtime, preserving typed parameters
+/// and preventing cycles. A referenced rule must be enabled and compile (B-43: a rule that
+/// does not compile, or an entry this version cannot read, never runs, not even by
+/// reference). [`CompiledConfig::expand_reusable`] resolves against the compiled rules
+/// directly instead of compiling each referenced rule again.
 pub fn expand_reusable(
     action: &Action,
     config: &Config,
     context: &VariableContext,
 ) -> Result<ActionPlan, Vec<Diagnostic>> {
-    fn expand(
+    expand(
+        action,
+        &|action_id: &str| match config.rules.iter().find(|r| r.id == action_id) {
+            Some(rule) if rule_compiles(rule) => Ok(rule),
+            _ => Err(unavailable(config, action_id)),
+        },
+        context,
+        &mut vec![],
+    )
+}
+impl CompiledConfig {
+    /// [`expand_reusable`] against the rules that compiled: references to disabled rules,
+    /// rules that did not compile and unreadable entries are refused, however deeply nested.
+    pub fn expand_reusable(
+        &self,
         action: &Action,
-        config: &Config,
         context: &VariableContext,
-        stack: &mut Vec<String>,
     ) -> Result<ActionPlan, Vec<Diagnostic>> {
-        if stack.len() >= 16 {
+        expand(
+            action,
+            &|action_id: &str| {
+                self.rule(action_id)
+                    .ok_or_else(|| unavailable(&self.config, action_id))
+            },
+            context,
+            &mut vec![],
+        )
+    }
+}
+fn expand<'a>(
+    action: &Action,
+    resolve: &dyn Fn(&str) -> Result<&'a Rule, Vec<Diagnostic>>,
+    context: &VariableContext,
+    stack: &mut Vec<String>,
+) -> Result<ActionPlan, Vec<Diagnostic>> {
+    if stack.len() >= 16 {
+        return Err(content_error(
+            "action_depth",
+            "Reusable action nesting exceeds 16",
+        ));
+    }
+    if let Action::Reusable {
+        action_id,
+        parameters,
+    } = action
+    {
+        if stack.contains(action_id) {
             return Err(content_error(
-                "action_depth",
-                "Reusable action nesting exceeds 16",
+                "action_cycle",
+                "Reusable action reference contains a cycle",
             ));
         }
-        if let Action::Reusable {
+        let rule = resolve(action_id)?;
+        let mut child = context.clone();
+        for (name, value) in parameters {
+            parameter_text(value)?;
+            child.parameters.insert(name.clone(), value.clone());
+        }
+        stack.push(action_id.clone());
+        let result = expand(&rule.action, resolve, &child, stack);
+        stack.pop();
+        return result;
+    }
+    let mut plan = preflight_action(action, context)?;
+    let mut steps = vec![];
+    for step in plan.steps {
+        if let Operation::Reusable {
             action_id,
             parameters,
-        } = action
+        } = &step.operation
         {
-            if stack.contains(action_id) {
-                return Err(content_error(
-                    "action_cycle",
-                    "Reusable action reference contains a cycle",
-                ));
-            }
-            let rule = config
-                .rules
-                .iter()
-                .find(|r| r.id == *action_id)
-                .ok_or_else(|| {
-                    content_error("action_unknown", "Reusable action ID is not registered")
-                })?;
-            if !rule.enabled {
-                return Err(content_error(
-                    "action_disabled",
-                    "Referenced action is disabled; explicitly enable it before execution",
-                ));
-            }
-            let mut child = context.clone();
-            for (name, value) in parameters {
-                parameter_text(value)?;
-                child.parameters.insert(name.clone(), value.clone());
-            }
-            stack.push(action_id.clone());
-            let result = expand(&rule.action, config, &child, stack);
-            stack.pop();
-            return result;
-        }
-        let mut plan = preflight_action(action, context)?;
-        let mut steps = vec![];
-        for step in plan.steps {
-            if let Operation::Reusable {
-                action_id,
-                parameters,
-            } = &step.operation
-            {
-                let nested = expand(
-                    &Action::Reusable {
-                        action_id: action_id.clone(),
-                        parameters: parameters.clone(),
-                    },
-                    config,
-                    context,
-                    stack,
-                )?;
-                for mut nested_step in nested.steps {
-                    if nested_step.target == TargetPolicy::Locked {
-                        nested_step.target = step.target.clone();
-                    }
-                    steps.push(nested_step);
+            let nested = expand(
+                &Action::Reusable {
+                    action_id: action_id.clone(),
+                    parameters: parameters.clone(),
+                },
+                resolve,
+                context,
+                stack,
+            )?;
+            for mut nested_step in nested.steps {
+                if nested_step.target == TargetPolicy::Locked {
+                    nested_step.target = step.target.clone();
                 }
-            } else {
-                steps.push(step);
+                steps.push(nested_step);
             }
-            if steps.len() > MAX_STEPS {
-                return Err(content_error(
-                    "step_limit",
-                    "Expanded action exceeds 10000 steps",
-                ));
-            }
+        } else {
+            steps.push(step);
         }
-        plan.steps = steps;
-        let diagnostics = validate_plan(&plan);
-        if !diagnostics.is_empty() {
-            return Err(diagnostics);
+        if steps.len() > MAX_STEPS {
+            return Err(content_error(
+                "step_limit",
+                "Expanded action exceeds 10000 steps",
+            ));
         }
-        Ok(plan)
     }
-    expand(action, config, context, &mut vec![])
+    plan.steps = steps;
+    let diagnostics = validate_plan(&plan);
+    if !diagnostics.is_empty() {
+        return Err(diagnostics);
+    }
+    Ok(plan)
 }
