@@ -50,7 +50,8 @@ pub type ReadyProbe = Box<dyn Fn() -> Result<(), String> + Send + Sync>;
 /// and `check_supervisor`), then starts its driver (`qt-supervisor`) and the
 /// `qt-watchdog` thread, which checks the driver every [`WATCHDOG_INTERVAL`].
 /// Both are threads of their own: the caller (the Tauri main thread) never
-/// blocks on them. A thread that cannot be spawned is logged (see [`run`]).
+/// blocks on them. A driver that cannot be spawned is reported Failed at
+/// once, a watchdog that cannot be spawned is logged (see [`run`]).
 pub fn install_supervisor(
     clock: Arc<dyn Clock>,
     runtime: Arc<Runtime>,
@@ -91,36 +92,67 @@ pub fn build(
     Supervisor::new(clock, runtime, executor, inputs)
 }
 
+/// Consecutive watchdog checks that find no working driver (respawned or
+/// hung, see [`Supervisor::check`]) after which the engine is reported
+/// Failed without a supervisor: at [`WATCHDOG_INTERVAL`] about 15 s.
+pub const UNSUPERVISED_AFTER: u32 = 3;
+
 /// Starts the driver and the watchdog (checking every `interval`); returns
 /// the watchdog's handle. Both end once `runtime` is shutting down.
 ///
-/// A driver that could not be spawned is spawned again by the watchdog's
-/// first check. Only when neither thread starts would nothing ever publish:
-/// Health is then reported Failed (supervisor `internal`) rather than left
-/// Starting, and the error returned.
+/// Health never waits in Starting for a driver that does not run:
+/// - a driver that could not be spawned is reported at once: Health Failed
+///   with the supervisor component `internal` ([`unsupervised`]);
+/// - `check()` respawns a driver whose thread ended, but a respawn that
+///   fails is only logged (`supervisor.respawn_failed`) and latches
+///   nothing, so after [`UNSUPERVISED_AFTER`] failed checks in a row the
+///   watchdog reports the same Failed. A hung driver is already Failed
+///   (`supervisor.driver_hung`, latched); that snapshot is left alone.
+///
+/// That Failed is not latched: a driver the watchdog manages to start
+/// later publishes the machine's state at its first tick and replaces it.
 pub fn run(
     supervisor: &Arc<Supervisor>,
     runtime: Arc<Runtime>,
     interval: Duration,
 ) -> std::io::Result<JoinHandle<()>> {
     let driver = supervisor.spawn_driver();
-    if let Err(error) = &driver {
+    let supervisor = Arc::clone(supervisor);
+    start(runtime, interval, driver, move || supervisor.check())
+}
+
+/// [`run`] once the driver was spawned (or not): reports a driver that did
+/// not start and starts the watchdog on `check`.
+fn start(
+    runtime: Arc<Runtime>,
+    interval: Duration,
+    driver: std::io::Result<()>,
+    check: impl Fn() -> bool + Send + 'static,
+) -> std::io::Result<JoinHandle<()>> {
+    if let Err(error) = driver {
         tracing::error!(
             event = "supervisor.driver_spawn_failed",
             %error,
-            "the watchdog retries"
-        );
-    }
-    let watchdog = spawn_watchdog(supervisor, Arc::clone(&runtime), interval);
-    if let (Err(_), Err(error)) = (&driver, &watchdog) {
-        tracing::error!(
-            event = "supervisor.start_failed",
-            %error,
-            "no supervisor thread could start; engine failed"
+            "engine failed until the watchdog starts the driver"
         );
         runtime.publish_health(unsupervised(runtime.clock().wall_ms()));
     }
-    watchdog
+    spawn_watchdog(runtime, interval, check)
+}
+
+/// The watchdog found no working driver [`UNSUPERVISED_AFTER`] times in a
+/// row: Failed without a supervisor, unless Health is Failed already (a
+/// hung driver, an open circuit), whose components say more.
+fn report_unsupervised(runtime: &Runtime) {
+    if runtime.health().state == HealthState::Failed {
+        return;
+    }
+    tracing::error!(
+        event = "supervisor.unsupervised",
+        checks = UNSUPERVISED_AFTER,
+        "no supervisor driver runs; engine failed"
+    );
+    runtime.publish_health(unsupervised(runtime.clock().wall_ms()));
 }
 
 /// Health when no supervisor runs at all.
@@ -136,22 +168,27 @@ fn unsupervised(wall_ms: i64) -> HealthSnapshot {
     }
 }
 
+/// The `qt-watchdog` thread: `check` every `interval` (in production the
+/// installed supervisor's `check()`, the same as `check_supervisor()`).
 fn spawn_watchdog(
-    supervisor: &Arc<Supervisor>,
     runtime: Arc<Runtime>,
     interval: Duration,
+    check: impl Fn() -> bool + Send + 'static,
 ) -> std::io::Result<JoinHandle<()>> {
-    let supervisor = Arc::clone(supervisor);
     std::thread::Builder::new()
         .name("qt-watchdog".into())
         .spawn(move || {
+            let mut failed_checks = 0;
             while !runtime.shutting_down() {
                 std::thread::sleep(interval);
                 if runtime.shutting_down() {
                     break;
                 }
-                // The installed instance: the same as `check_supervisor()`.
-                supervisor.check();
+                failed_checks = if check() { 0 } else { failed_checks + 1 };
+                // Once per stretch: nothing else publishes while it lasts.
+                if failed_checks == UNSUPERVISED_AFTER {
+                    report_unsupervised(&runtime);
+                }
             }
             tracing::info!(
                 event = "supervisor.watchdog_stopped",
@@ -462,6 +499,7 @@ mod tests {
     use crate::supervisor::{BACKOFF, CIRCUIT_FAILURES, STARTUP_GRACE, TICK};
     use crate::Shared;
     use parking_lot::Mutex;
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::mpsc;
 
@@ -709,6 +747,112 @@ mod tests {
         let runtime = Runtime::new(Arc::new(FakeClock::new()));
         assert!(!begin_shutdown(&runtime));
         assert!(!runtime.shutting_down());
+    }
+
+    fn assert_unsupervised(rig: &Rig) {
+        let health = rig.runtime.health();
+        assert_eq!(health.state, HealthState::Failed);
+        let components: Vec<_> = health
+            .components
+            .iter()
+            .map(|c| (c.component, c.state, c.reason))
+            .collect();
+        assert_eq!(
+            components,
+            [(
+                Component::Supervisor,
+                HealthState::Failed,
+                Some(ReasonCode::Internal)
+            )]
+        );
+        assert!(rig
+            .runtime
+            .pause_reasons()
+            .contains(PauseReasons::ENGINE_DOWN));
+        assert!(!rig.runtime.engine_state().listening);
+    }
+
+    /// A driver that could not be spawned is reported Failed before the
+    /// watchdog's first check instead of leaving Health in Starting; the
+    /// driver the watchdog starts later replaces it with the machine's
+    /// state (not latched).
+    #[test]
+    fn a_driver_that_cannot_be_spawned_is_reported_failed_at_once() {
+        let rig = Rig::new();
+        let supervisor = rig.build(Executor::new(), Inputs::new());
+        let checks_on = Arc::new(AtomicBool::new(false));
+        let no_thread = Err(std::io::Error::other("no thread"));
+        let watchdog = start(rig.runtime.clone(), Duration::from_millis(5), no_thread, {
+            let checks_on = Arc::clone(&checks_on);
+            let supervisor = Arc::clone(&supervisor);
+            move || !checks_on.load(Ordering::SeqCst) || supervisor.check()
+        })
+        .unwrap();
+        // Nothing else publishes until the checks are turned on.
+        assert_unsupervised(&rig);
+
+        checks_on.store(true, Ordering::SeqCst);
+        wait_until("the respawned driver publishes", || {
+            rig.state() == HealthState::Healthy
+        });
+        begin_shutdown(&rig.runtime);
+        wait_until("watchdog stopped", || watchdog.is_finished());
+        watchdog.join().unwrap();
+    }
+
+    /// `check()` only logs a respawn that fails and latches nothing, so the
+    /// watchdog reports Failed after UNSUPERVISED_AFTER failed checks in a
+    /// row, not before; a passing check starts the count again.
+    #[test]
+    fn the_watchdog_reports_failed_after_repeated_failed_checks() {
+        let rig = Rig::new();
+        let script = Arc::new(Mutex::new(VecDeque::from([
+            false, false, true, false, false, false,
+        ])));
+        let seen = Arc::new(Mutex::new(vec![]));
+        let watchdog = start(rig.runtime.clone(), Duration::from_millis(1), Ok(()), {
+            let (script, seen) = (Arc::clone(&script), Arc::clone(&seen));
+            let runtime = rig.runtime.clone();
+            move || {
+                seen.lock().push(runtime.health().state);
+                script.lock().pop_front().unwrap_or(false)
+            }
+        })
+        .unwrap();
+        wait_until("Failed reported", || rig.state() == HealthState::Failed);
+        begin_shutdown(&rig.runtime);
+        wait_until("watchdog stopped", || watchdog.is_finished());
+        watchdog.join().unwrap();
+
+        // Check k sees the state left by checks 1..k-1: the 6th reported.
+        let seen = seen.lock();
+        assert!(seen.len() >= 6, "{seen:?}");
+        assert!(
+            seen[..6]
+                .iter()
+                .all(|&state| state == HealthState::Starting),
+            "{seen:?}"
+        );
+        assert_unsupervised(&rig);
+    }
+
+    /// An engine that is Failed already (hung driver, open circuit) keeps
+    /// its snapshot when the watchdog reports.
+    #[test]
+    fn the_watchdog_report_keeps_an_existing_failed_snapshot() {
+        let rig = Rig::new();
+        let failed = HealthSnapshot {
+            state: HealthState::Failed,
+            components: vec![ComponentHealth {
+                component: Component::Executor,
+                state: HealthState::Failed,
+                reason: Some(ReasonCode::EngineDown),
+                since_ms: 1,
+            }],
+        };
+        rig.runtime.publish_health(failed.clone());
+        report_unsupervised(&rig.runtime);
+        assert_eq!(rig.runtime.health(), failed);
     }
 
     /// The engine's teardown makes its components look down. While
