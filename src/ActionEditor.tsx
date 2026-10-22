@@ -1,7 +1,7 @@
 import { Fragment, useId, useRef, useState } from 'react';
 import { call } from './ipc/transport';
 import { diagnosticText, parseCommandError } from './ipc/errors';
-import { choiceCapability, findCapability } from './lib/capabilities';
+import { choiceCapability, choiceOffer, findCapability } from './lib/capabilities';
 import { actionChoice, actionLabel, actionOptions, clone, Data, Rule } from './model';
 import { moveItem, withoutKey } from './lib/list';
 import {
@@ -476,11 +476,14 @@ export default function ActionEditor({
       const p = await call<string[] | null>('choose_file', { kind });
       if (p?.length) fn(p);
     });
-  // Principle 5 (S-16): the capability the chosen action needs, and the action types this platform
-  // can never run, which are not offered (an action of such a type keeps its own entry).
+  // Principle 5 (S-16): the capability the chosen action needs, and how every action type is
+  // offered by the capability it needs (the type the action has keeps a selectable entry).
   const needed = findCapability(capabilities, choiceCapability(actionChoice(a)), platform);
-  const neverProvided = (choice: string) =>
-    findCapability(capabilities, choiceCapability(choice), platform)?.presentation === 'hidden';
+  const offer = (choice: string) =>
+    choiceOffer(
+      findCapability(capabilities, choiceCapability(choice), platform),
+      choice === actionChoice(a),
+    );
   return (
     <>
       <p className="muted">{actionHelp[actionChoice(a)]}</p>
@@ -544,13 +547,16 @@ export default function ActionEditor({
             setHistory([]);
           }}
         >
-          {actionOptions
-            .filter(([k]) => k === actionChoice(a) || !neverProvided(k))
-            .map(([k, v]) => (
-              <option key={k} value={k}>
-                {v}
-              </option>
-            ))}
+          {actionOptions.flatMap(([k, v]) => {
+            const { hidden, disabled, note } = offer(k);
+            return hidden
+              ? []
+              : [
+                  <option key={k} value={k} disabled={disabled}>
+                    {`${v}${note}`}
+                  </option>,
+                ];
+          })}
         </select>
       </label>
       {(a.type === 'text' || a.type === 'send_keys') && (

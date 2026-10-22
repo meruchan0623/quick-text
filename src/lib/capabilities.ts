@@ -98,6 +98,41 @@ const choiceCapabilities: Readonly<Record<string, string>> = {
 export const choiceCapability = (choice: string): string | null =>
   (Object.hasOwn(choiceCapabilities, choice) ? choiceCapabilities[choice] : undefined) ?? null;
 
+/** How one entry of a choice list is offered, by the capability it needs. */
+export interface ChoiceOffer {
+  /** Not listed: the platform never provides it. */
+  hidden: boolean;
+  /** Listed but cannot be picked: unavailable for now. */
+  disabled: boolean;
+  /** Appended to the entry's text: 「（暂不可用：原因）」, 「（降级：原因）」, 「（实验性）」 or ''. */
+  note: string;
+}
+
+/**
+ * Principle 5 for a choice list (S-16): never provided is hidden; unavailable for now is listed
+ * but disabled, with the reason; degraded stays selectable with its reason (a rule is lasting
+ * configuration, not held back by a passing run-time state); experimental stays selectable with
+ * its tag. The value the edited rule holds (`current`) is always listed and selectable, so opening
+ * and saving a rule never rewrites it. `view` null: nothing is known, offered plainly.
+ */
+export function choiceOffer(view: CapabilityView | null, current: boolean): ChoiceOffer {
+  const plain: ChoiceOffer = { hidden: false, disabled: false, note: '' };
+  if (!view) return plain;
+  const because = (what: string) => `（${what}${view.reason ? `：${view.reason}` : ''}）`;
+  switch (view.presentation) {
+    case 'hidden':
+      return { ...plain, hidden: !current };
+    case 'unavailable':
+      return { ...plain, disabled: !current, note: because('暂不可用') };
+    case 'degraded':
+      return { ...plain, note: because(view.tag) };
+    case 'experimental':
+      return { ...plain, note: `（${view.tag}）` };
+    case 'available':
+      return plain;
+  }
+}
+
 /**
  * The only IME erasure method the platform runs, when it ignores the setting: the Windows input
  * backend always erases by Backspace, so its 「按 Esc 关闭选字框」 is not offered (S-16, R-07).

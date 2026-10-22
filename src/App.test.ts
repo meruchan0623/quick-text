@@ -2,6 +2,8 @@
 // line, repair, banners, history, diagnostics export and a 0.3 backend without the new commands.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MockBackend, MockOptions } from './ipc/mock';
+import type { Component, HealthState, ReasonCode } from './ipc/types';
+import { reasonNames } from './ipc/labels';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -609,6 +611,128 @@ describe('启动时自动开始监听 (S-09)', () => {
     // The rest of the page still works.
     await click(mounted, '文本指令管理');
     expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
+  });
+});
+
+describe('action types by capability status (S-16, principle 5)', () => {
+  const EDITOR = '编辑文本指令';
+  const rule = (action: Record<string, unknown>) => ({
+    id: 'rule-a-capability',
+    enabled: true,
+    group: '默认',
+    description: '',
+    ignore_case: false,
+    match: { kind: 'literal', value: ';a-capability' },
+    trigger_mode: 'immediate',
+    terminator: null,
+    ime_erasure: null,
+    action,
+    parameter: { type: 'default_match' },
+    notification: { enabled: false, message: '' },
+  });
+  const component = (name: Component, state: HealthState, reason: ReasonCode) => ({
+    component: name,
+    state,
+    reason,
+    since_ms: 0,
+  });
+  // Lowered like capabilities.rs: executor degraded makes keys / open degraded, clipboard failed
+  // makes paste / html unavailable (the worse one wins).
+  const lowered = {
+    state: 'degraded' as const,
+    components: [
+      component('executor', 'degraded', 'executor_timeout'),
+      component('clipboard', 'failed', 'clipboard_busy'),
+    ],
+  };
+
+  /** Mount with the rule (listed first) and the lowered health, and open the rule. */
+  async function editRule(platform: 'windows' | 'macos', action: Record<string, unknown>) {
+    const mounted = await mount({ platform }, (backend) => {
+      backend.draft.rules.push(structuredClone(rule(action)));
+      backend.health = structuredClone(lowered);
+    });
+    await waitFor(mounted, () => {
+      expect(mounted.container.querySelectorAll('tbody tr')).toHaveLength(4);
+    });
+    await click(mounted, '编辑');
+    return mounted;
+  }
+
+  const typeSelect = (mounted: Mounted) => {
+    const select = dialog(mounted.container, EDITOR)?.querySelector<HTMLSelectElement>(
+      'select[aria-label="操作类型"]',
+    );
+    if (!select) throw new Error('no select 「操作类型」');
+    return select;
+  };
+  const offered = (mounted: Mounted) =>
+    Object.fromEntries(
+      [...typeSelect(mounted).options].map((o) => [
+        o.value,
+        { text: o.textContent, disabled: o.disabled },
+      ]),
+    );
+
+  /** 保存 goes through; the action saved for the rule. */
+  async function save(mounted: Mounted): Promise<unknown> {
+    await clickIn(mounted, dialog(mounted.container, EDITOR), '保存');
+    await waitFor(mounted, () => {
+      expect(callsOf(mounted.backend, 'save_draft')).toHaveLength(1);
+      expect(dialog(mounted.container, EDITOR)).toBeNull();
+    });
+    const { rules } = callsOf(mounted.backend, 'save_draft')[0]?.args.config as {
+      rules: { id: string; action: unknown }[];
+    };
+    return rules.find((r) => r.id === 'rule-a-capability')?.action;
+  }
+
+  it('offers every action type by the status of the capability it needs', async () => {
+    const mounted = await editRule('macos', {
+      type: 'text',
+      method: 'keys',
+      source: { type: 'inline', value: 'hi' },
+    });
+    const options = offered(mounted);
+    const degraded = `（降级：${reasonNames.executor_timeout ?? ''}）`;
+    const unavailable = `（暂不可用：${reasonNames.clipboard_busy ?? ''}）`;
+    // Degraded: selectable, with the reason.
+    expect(options.text_keys).toEqual({ text: `键入纯文本${degraded}`, disabled: false });
+    expect(options.hotkey).toEqual({ text: `按快捷键${degraded}`, disabled: false });
+    expect(options.open).toEqual({ text: `打开网页、文件或程序${degraded}`, disabled: false });
+    // Unavailable for now: listed, disabled, with the reason.
+    expect(options.text_paste).toEqual({ text: `粘贴纯文本${unavailable}`, disabled: true });
+    expect(options.html).toEqual({ text: `粘贴带格式的文字${unavailable}`, disabled: true });
+    // Experimental (macOS): selectable, tagged.
+    expect(options.replay).toEqual({ text: '重放鼠标和键盘操作（实验性）', disabled: false });
+    // Never provided: not listed.
+    expect(options.quicker).toBeUndefined();
+    // Needing no capability: plain.
+    expect(options.steps).toEqual({ text: '按顺序执行多个操作', disabled: false });
+    expect(typeSelect(mounted).value).toBe('text_keys');
+  });
+
+  it('keeps an action type that is unavailable for now when the rule is opened and saved', async () => {
+    const action = { type: 'text', method: 'paste', source: { type: 'inline', value: 'hi' } };
+    const mounted = await editRule('windows', action);
+    const select = typeSelect(mounted);
+    expect(select.value).toBe('text_paste');
+    expect(offered(mounted).text_paste?.disabled).toBe(false);
+    expect(offered(mounted).text_paste?.text).toMatch(/^粘贴纯文本（暂不可用：.+）$/);
+    expect(offered(mounted).html?.disabled).toBe(true);
+    expect(dialog(mounted.container, EDITOR)?.querySelector('.capability-warning')).not.toBeNull();
+    expect(await save(mounted)).toEqual(action);
+  });
+
+  it('keeps an action type the platform never provides when the rule is opened and saved', async () => {
+    const action = { type: 'quicker', action_id: 'abc', parameter: '' };
+    const mounted = await editRule('windows', action);
+    expect(typeSelect(mounted).value).toBe('quicker');
+    expect(offered(mounted).quicker).toEqual({
+      text: '保留 Quicker 动作信息（暂不能执行）',
+      disabled: false,
+    });
+    expect(await save(mounted)).toEqual(action);
   });
 });
 

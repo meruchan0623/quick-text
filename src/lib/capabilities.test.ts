@@ -3,6 +3,7 @@ import {
   capabilityView,
   capabilityViews,
   choiceCapability,
+  choiceOffer,
   findCapability,
   fixedImeErasure,
 } from './capabilities';
@@ -130,6 +131,59 @@ describe('choiceCapability', () => {
     expect(choiceCapability('quicker')).toBe('quicker_private_action');
     for (const none of ['none', 'steps', 'reusable', 'constructor', 'toString'])
       expect(choiceCapability(none)).toBeNull();
+  });
+});
+
+describe('choiceOffer', () => {
+  const offer = (raw: unknown, current = false) => choiceOffer(capabilityView(raw), current);
+
+  it('offers an entry by the status of the capability it needs (principle 5)', () => {
+    const plain = { hidden: false, disabled: false, note: '' };
+    expect(offer(entry('keys', 'available'))).toEqual(plain);
+    expect(offer(entry('paste', 'unavailable', 'clipboard_busy'))).toEqual({
+      hidden: false,
+      disabled: true,
+      note: `（暂不可用：${reasonNames.clipboard_busy}）`,
+    });
+    expect(offer(entry('keys', 'degraded', 'engine_down'))).toEqual({
+      hidden: false,
+      disabled: false,
+      note: `（降级：${reasonNames.engine_down}）`,
+    });
+    expect(offer(entry('recording', 'experimental', 'experimental_platform'))).toEqual({
+      hidden: false,
+      disabled: false,
+      note: '（实验性）',
+    });
+    expect(offer(entry('quicker_private_action', 'unavailable', 'not_implemented'))).toEqual({
+      hidden: true,
+      disabled: false,
+      note: '',
+    });
+    // Nothing reported, nothing known: offered plainly.
+    expect(choiceOffer(null, false)).toEqual(plain);
+  });
+
+  it('says only the status when there is no reason', () => {
+    expect(offer({ id: 'paste', status: 'unavailable', reason: null, available: false }).note).toBe(
+      '（暂不可用）',
+    );
+    expect(offer({ id: 'paste', status: 'degraded', reason: null, available: true }).note).toBe(
+      '（降级）',
+    );
+  });
+
+  it('keeps the value the rule holds listed and selectable', () => {
+    expect(offer(entry('paste', 'unavailable', 'clipboard_busy'), true)).toEqual({
+      hidden: false,
+      disabled: false,
+      note: `（暂不可用：${reasonNames.clipboard_busy}）`,
+    });
+    expect(offer(entry('quicker_private_action', 'unavailable', 'not_implemented'), true)).toEqual({
+      hidden: false,
+      disabled: false,
+      note: '',
+    });
   });
 });
 
