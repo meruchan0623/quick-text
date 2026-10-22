@@ -933,7 +933,7 @@ enum Capture {
 /// `owned_payload`) nor a [`HANDLE_FORMATS`] handle: CF_LOCALE, CF_TEXT,
 /// CF_OEMTEXT, CF_DIBV5. A restore needs exactly this format set and these
 /// bytes; the sequence may have moved.
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 struct Baseline {
     formats: Vec<u32>,
     derived: ClipboardFormats,
@@ -944,6 +944,37 @@ struct Backup {
     formats: Vec<u32>,
     data: ClipboardFormats,
     skipped: Vec<u32>,
+}
+/// Clipboard bytes in `Debug` (B-09): each format with `<redacted len=N>`, N
+/// its byte count, never the content.
+struct RedactedFormats<'a>(&'a ClipboardFormats);
+impl std::fmt::Debug for RedactedFormats<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(
+                self.0
+                    .iter()
+                    .map(|(format, bytes)| (format, quicker_domain::RedactedLen(bytes.len()))),
+            )
+            .finish()
+    }
+}
+impl std::fmt::Debug for Baseline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Baseline")
+            .field("formats", &self.formats)
+            .field("derived", &RedactedFormats(&self.derived))
+            .finish()
+    }
+}
+impl std::fmt::Debug for Backup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Backup")
+            .field("formats", &self.formats)
+            .field("data", &RedactedFormats(&self.data))
+            .field("skipped", &self.skipped)
+            .finish()
+    }
 }
 fn refusal(too_large: bool) -> LeaseError {
     if too_large {
@@ -2772,5 +2803,33 @@ mod tests {
             let clears = if rewritten { 1 } else { 2 };
             assert_eq!(clipboard.clears(), clears, "rewritten: {rewritten}");
         }
+    }
+    #[test]
+    fn debug_never_shows_clipboard_bytes() {
+        // B-09: a backup, a baseline and a format read print each format with
+        // `<redacted len=N>` (N bytes), never the clipboard content.
+        let secret = b"zqsecret\0".to_vec();
+        let backup = Backup {
+            formats: vec![CF_TEXT, CF_UNICODETEXT],
+            data: vec![(CF_TEXT, secret.clone())],
+            skipped: vec![CF_UNICODETEXT],
+        };
+        let baseline = Baseline {
+            formats: vec![CF_TEXT],
+            derived: vec![(CF_TEXT, secret.clone())],
+        };
+        let shown_backup = format!("{backup:?}");
+        let shown_baseline = format!("{baseline:?}");
+        let shown_capture = format!("{:?}", Capture::Captured(baseline));
+        let shown_read = format!("{:?}", FormatRead::Data(secret));
+        for shown in [&shown_backup, &shown_baseline, &shown_capture, &shown_read] {
+            // Derived Debug would list the bytes ('z' 'q' = 122 113).
+            assert!(!shown.contains("122, 113"), "{shown}");
+            assert!(shown.contains("<redacted len=9>"), "{shown}");
+        }
+        let entry = format!("({CF_TEXT}, <redacted len=9>)");
+        assert!(shown_backup.contains(&entry), "{shown_backup}");
+        assert!(shown_backup.contains("skipped: [13]"), "{shown_backup}");
+        assert_eq!(format!("{:?}", FormatRead::TooLarge), "TooLarge");
     }
 }

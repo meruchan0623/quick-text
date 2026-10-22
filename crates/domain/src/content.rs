@@ -1,15 +1,28 @@
 use crate::*;
 use chrono::{DateTime, Datelike, FixedOffset, Timelike};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::Path;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VariableContext {
     pub clipboard: Option<String>,
     pub selection: Option<String>,
     pub now: DateTime<FixedOffset>,
     pub syntax_variables: BTreeSet<String>,
     pub parameters: BTreeMap<String, serde_json::Value>,
+}
+/// Clipboard text, selection and parameter values are redacted (B-09).
+impl fmt::Debug for VariableContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VariableContext")
+            .field("clipboard", &self.clipboard.as_deref().map(Redacted))
+            .field("selection", &self.selection.as_deref().map(Redacted))
+            .field("now", &self.now)
+            .field("syntax_variables", &self.syntax_variables)
+            .field("parameters", &RedactedValues(&self.parameters))
+            .finish()
+    }
 }
 impl Default for VariableContext {
     fn default() -> Self {

@@ -1,7 +1,8 @@
 //! Real target text evidence. Keyboard virtual keys are deliberately absent from this contract.
-use crate::ImeErasure;
+use crate::{ImeErasure, Redacted};
+use std::fmt;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum CompositionEvidence {
     Inactive,
     /// The provider must prove this whole range is uncommitted and does not overlap body text.
@@ -11,8 +12,25 @@ pub enum CompositionEvidence {
     },
     Unknown,
 }
+/// The composition text is redacted (B-09).
+impl fmt::Debug for CompositionEvidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inactive => f.write_str("Inactive"),
+            Self::Active {
+                text,
+                body_unchanged,
+            } => f
+                .debug_struct("Active")
+                .field("text", &Redacted(text))
+                .field("body_unchanged", body_unchanged)
+                .finish(),
+            Self::Unknown => f.write_str("Unknown"),
+        }
+    }
+}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TextObservation {
     pub revision: u64,
     pub focus_id: String,
@@ -26,6 +44,24 @@ pub struct TextObservation {
     pub composition: CompositionEvidence,
     pub observed_at_ms: u64,
     pub self_injected: bool,
+}
+
+/// The observed body before the caret is redacted (B-09); target ids are shown.
+impl fmt::Debug for TextObservation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TextObservation")
+            .field("revision", &self.revision)
+            .field("focus_id", &self.focus_id)
+            .field("process", &self.process)
+            .field("control_id", &self.control_id)
+            .field("caret_anchor", &self.caret_anchor)
+            .field("selection_collapsed", &self.selection_collapsed)
+            .field("committed_suffix", &Redacted(&self.committed_suffix))
+            .field("composition", &self.composition)
+            .field("observed_at_ms", &self.observed_at_ms)
+            .field("self_injected", &self.self_injected)
+            .finish()
+    }
 }
 
 impl TextObservation {
@@ -48,15 +84,32 @@ impl TextObservation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ObservationDelta {
     Reset,
     Unchanged,
     CommittedAppend(String),
     CompositionUpdated(String),
 }
+/// The appended or composed text is redacted (B-09).
+impl fmt::Debug for ObservationDelta {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Reset => f.write_str("Reset"),
+            Self::Unchanged => f.write_str("Unchanged"),
+            Self::CommittedAppend(text) => f
+                .debug_tuple("CommittedAppend")
+                .field(&Redacted(text))
+                .finish(),
+            Self::CompositionUpdated(text) => f
+                .debug_tuple("CompositionUpdated")
+                .field(&Redacted(text))
+                .finish(),
+        }
+    }
+}
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct InputSession {
     generation: u64,
     last: Option<TextObservation>,
@@ -64,6 +117,22 @@ pub struct InputSession {
     composition_body: Option<String>,
     max_chars: usize,
     observation_timeout_ms: u64,
+}
+/// The detection buffer and the composition body are redacted (B-09).
+impl fmt::Debug for InputSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InputSession")
+            .field("generation", &self.generation)
+            .field("last", &self.last)
+            .field("buffer", &Redacted(&self.buffer))
+            .field(
+                "composition_body",
+                &self.composition_body.as_deref().map(Redacted),
+            )
+            .field("max_chars", &self.max_chars)
+            .field("observation_timeout_ms", &self.observation_timeout_ms)
+            .finish()
+    }
 }
 
 impl InputSession {

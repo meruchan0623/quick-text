@@ -151,7 +151,7 @@ pub trait ClipboardBackend: ClipboardRead {
 }
 
 /// One format read for a clipboard backup (B-08).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum FormatRead {
     Data(Vec<u8>),
     /// Enumerated but no data (rendering failed or empty).
@@ -160,6 +160,20 @@ pub enum FormatRead {
     TooLarge,
     /// Present but its data cannot be read.
     Unreadable,
+}
+/// Clipboard bytes are redacted (B-09): `Data(<redacted len=N>)`, N bytes.
+impl std::fmt::Debug for FormatRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Data(bytes) => f
+                .debug_tuple("Data")
+                .field(&quicker_domain::RedactedLen(bytes.len()))
+                .finish(),
+            Self::Missing => f.write_str("Missing"),
+            Self::TooLarge => f.write_str("TooLarge"),
+            Self::Unreadable => f.write_str("Unreadable"),
+        }
+    }
 }
 
 /// What a clipboard lease does with formats it cannot back up (B-08). Under

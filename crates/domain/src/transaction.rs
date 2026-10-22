@@ -309,11 +309,22 @@ impl ClipboardLease {
     }
 }
 /// Configuration transaction in memory; the host performs durable pointer publishing through `publish`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DraftStore {
     pub active: Config,
     pub draft: Config,
     pub base_serialized: String,
+}
+/// The serialized base configuration holds every abbreviation and phrase, so it is
+/// redacted (B-09); the two configurations print through their own redacting `Debug`.
+impl std::fmt::Debug for DraftStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DraftStore")
+            .field("active", &self.active)
+            .field("draft", &self.draft)
+            .field("base_serialized", &Redacted(&self.base_serialized))
+            .finish()
+    }
 }
 impl DraftStore {
     pub fn new(active: Config) -> Self {

@@ -150,12 +150,26 @@ impl Proof {
         }
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(super) enum Kind {
     Text(String),
     Backspace,
     Neutral,
     Reset,
+}
+/// The typed text is redacted (B-09).
+impl std::fmt::Debug for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text(text) => f
+                .debug_tuple("Text")
+                .field(&quicker_domain::Redacted(text))
+                .finish(),
+            Self::Backspace => f.write_str("Backspace"),
+            Self::Neutral => f.write_str("Neutral"),
+            Self::Reset => f.write_str("Reset"),
+        }
+    }
 }
 pub(super) struct Event {
     pub(super) kind: Kind,
@@ -169,6 +183,16 @@ pub(super) struct Buffer {
     pub(super) text: String,
     stamp: Option<Stamp>,
     generation: u64,
+}
+/// The detection buffer is redacted (B-09).
+impl std::fmt::Debug for Buffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Buffer")
+            .field("text", &quicker_domain::Redacted(&self.text))
+            .field("stamp", &self.stamp)
+            .field("generation", &self.generation)
+            .finish()
+    }
 }
 impl Buffer {
     // no-regression #3: stamp or generation discontinuity clears the buffer.
@@ -237,7 +261,7 @@ fn stamp_of(context: InputContext, revision: u64) -> Stamp {
 }
 /// One hardware key transition, captured by the detector callback. Fixed
 /// size and `Copy`: building and queueing it never allocates.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub(super) struct RawRecord {
     vk: u16,
     /// A key-up only tells the hook cross-check (B-06, H4) that the next
@@ -261,6 +285,22 @@ pub(super) struct RawRecord {
     /// records means a key between them is missing; the busy shadow breaks
     /// its prefix there (S-19), as the generation gap breaks the matcher's.
     lost: u64,
+}
+/// The key's text is redacted (B-09), N in UTF-16 units.
+impl std::fmt::Debug for RawRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawRecord")
+            .field("vk", &self.vk)
+            .field("down", &self.down)
+            .field("text", &quicker_domain::RedactedLen(self.len))
+            .field("context", &self.context)
+            .field("generation", &self.generation)
+            .field("modified", &self.modified)
+            .field("paused", &self.paused)
+            .field("busy", &self.busy)
+            .field("lost", &self.lost)
+            .finish()
+    }
 }
 impl RawRecord {
     /// The detector's virtual-key code (generic Shift/Ctrl/Alt).
@@ -537,6 +577,17 @@ pub(super) struct Shadow {
     lost: u64,
     /// The rules already reported since the shadow last reset.
     reported: Vec<String>,
+}
+/// The shadow's typed text is redacted (B-09); reported rule ids are shown.
+impl std::fmt::Debug for Shadow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shadow")
+            .field("text", &quicker_domain::Redacted(&self.text))
+            .field("stamp", &self.stamp)
+            .field("lost", &self.lost)
+            .field("reported", &self.reported)
+            .finish()
+    }
 }
 impl Shadow {
     /// The prefix broke or the busy period ended: the next key starts a
@@ -1206,5 +1257,44 @@ mod tests {
         for key in [VK_TAB, VK_RETURN] {
             assert!(matches!(kind(key, Some(" ".into()), false), Kind::Reset));
         }
+    }
+    #[test]
+    fn debug_never_shows_the_typed_text() {
+        // B-09: the detection buffer, the busy shadow, a key's text and a
+        // captured record print `<redacted len=N>`, never what was typed.
+        let mut buffer = Buffer::default();
+        buffer.push(&event("zqsecret", 1), true);
+        assert_eq!(buffer.text, "zqsecret");
+        let mut shadow = Shadow::default();
+        edit(&mut shadow.text, &Kind::Text("zqsecret".into()));
+        shadow.reported.push("rule-a".into());
+        let mut text = [0u16; 24];
+        for (slot, unit) in text.iter_mut().zip("zqsecret".encode_utf16()) {
+            *slot = unit;
+        }
+        let record = RawRecord {
+            vk: 0x5A,
+            down: true,
+            text,
+            len: 8,
+            context: None,
+            generation: 1,
+            modified: false,
+            paused: false,
+            busy: false,
+            lost: 0,
+        };
+        let shown_buffer = format!("{buffer:?}");
+        let shown_shadow = format!("{shadow:?}");
+        let shown_kind = format!("{:?}", event("zqsecret", 2).kind);
+        let shown_record = format!("{record:?}");
+        for shown in [&shown_buffer, &shown_shadow, &shown_kind, &shown_record] {
+            assert!(!shown.contains("secret"), "{shown}");
+            assert!(shown.contains("<redacted len=8>"), "{shown}");
+        }
+        // Derived Debug would list the record's UTF-16 units ('z' 'q' = 122 113).
+        assert!(!shown_record.contains("122, 113"), "{shown_record}");
+        assert!(shown_shadow.contains("rule-a"), "{shown_shadow}");
+        assert!(shown_record.contains("vk: 90"), "{shown_record}");
     }
 }
