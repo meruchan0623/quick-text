@@ -195,13 +195,14 @@ pub enum StartupListen {
     /// The user paused or resumed while startup waited: left as they set it.
     UserDecided,
     /// These checks failed: `self_test_failed` was reported and the pause
-    /// state was left alone. `listening`: the user resumed while startup
-    /// waited and that resume stands (MANUAL clear, review A6-2), so the
-    /// engine listens although a check failed (whenever no other reason
-    /// holds it); otherwise it stays paused.
+    /// state was left alone. `resumed`: the user resumed while startup
+    /// waited and that resume still stands (MANUAL clear, review A6-2, R3).
+    /// It records the user's action, not the engine's state: another reason
+    /// (e.g. RECORDING, ENGINE_DOWN) may still keep the engine from
+    /// listening. Otherwise MANUAL holds and the engine stays paused.
     Failed {
         checks: Vec<CheckName>,
-        listening: bool,
+        resumed: bool,
     },
     /// The resume was refused (the engine is no longer up).
     Refused(CommandError),
@@ -214,12 +215,8 @@ impl StartupListen {
             Self::AutoListenOff => "auto_listen_off",
             Self::SafeMode => "safe_mode",
             Self::UserDecided => "user_decided",
-            Self::Failed {
-                listening: false, ..
-            } => "failed",
-            Self::Failed {
-                listening: true, ..
-            } => "failed_user_listening",
+            Self::Failed { resumed: false, .. } => "failed",
+            Self::Failed { resumed: true, .. } => "failed_user_resumed",
             Self::Refused(_) => "refused",
         }
     }
@@ -246,7 +243,7 @@ pub fn startup_failures(report: &SelfTestReport) -> Vec<CheckName> {
 /// and with auto-listen off) and never changes the pause state: the engine
 /// stays paused, unless the user resumed since `manual_seen` (read before
 /// the wait) and that resume still stands, which is kept and only told
-/// apart (`Failed { listening: true }`, review A6-2). Otherwise the engine
+/// apart (`Failed { resumed: true }`, review A6-2). Otherwise the engine
 /// starts listening only when auto-listen is on, the store is not in safe
 /// mode, the user has not paused or resumed since `manual_seen` and the
 /// resume itself is accepted (`ready` as for `set_paused`).
@@ -268,11 +265,11 @@ pub fn finish_self_test(
         store.add_problem(ProblemKind::SelfTestFailed {
             checks: failed.clone(),
         });
-        let listening = store.manual_changes() != manual_seen
+        let resumed = store.manual_changes() != manual_seen
             && !store.runtime.pause_reasons().contains(PauseReasons::MANUAL);
         return StartupListen::Failed {
             checks: failed,
-            listening,
+            resumed,
         };
     }
     if store.safe_mode().is_some() {
@@ -347,11 +344,11 @@ fn startup_self_test(app: &AppHandle) {
 }
 
 /// The system notification for a startup outcome: a failed check (with
-/// what it means for listening) or a refused resume.
+/// the way back, or the user's own resume) or a refused resume.
 fn outcome_notice(outcome: &StartupListen) -> Option<(&'static str, String)> {
     match outcome {
-        StartupListen::Failed { checks, listening } => {
-            Some(("启动自检未通过", failed_notice(checks, *listening)))
+        StartupListen::Failed { checks, resumed } => {
+            Some(("启动自检未通过", failed_notice(checks, *resumed)))
         }
         StartupListen::Refused(error) => {
             Some(("无法自动开始监听", tray::resume_refused(error).to_owned()))
@@ -369,14 +366,16 @@ fn check_label(check: CheckName) -> &'static str {
     }
 }
 
-/// The notification body for a failed startup self-test. `listening`: the
+/// The notification body for a failed startup self-test. `resumed`: the
 /// user resumed during startup and it was kept (review A6-2), so it must
-/// not claim the engine stayed paused.
-fn failed_notice(checks: &[CheckName], listening: bool) -> String {
+/// not claim the engine stayed paused; it states what the user did, not
+/// that the engine listens, which another pause reason may prevent
+/// (review R3).
+fn failed_notice(checks: &[CheckName], resumed: bool) -> String {
     let names: Vec<_> = checks.iter().map(|check| check_label(*check)).collect();
     let names = names.join("、");
-    if listening {
-        format!("未通过：{names}。输入监听已由你手动开启，可能无法正常工作；可打开管理界面查看引擎状态。")
+    if resumed {
+        format!("未通过：{names}。你已在启动期间手动恢复监听，监听可能无法正常工作；可在「运行状态与恢复」中查看详情。")
     } else {
         format!("未通过：{names}。输入监听保持暂停，可从托盘菜单选择「恢复监听」，或打开管理界面查看引擎状态。")
     }
@@ -574,11 +573,11 @@ mod tests {
         for auto_listen in [true, false] {
             let mut store = healthy_store(&dir.join(format!("failed-{auto_listen}")));
             let outcome = finish_self_test(&mut store, &failed, auto_listen, 0, || true);
-            let StartupListen::Failed { checks, listening } = outcome else {
+            let StartupListen::Failed { checks, resumed } = outcome else {
                 panic!("{outcome:?}");
             };
             assert_eq!(checks, [CheckName::HookHeartbeat]);
-            assert!(!listening);
+            assert!(!resumed);
             assert!(manual_paused(&store));
             assert_eq!(
                 store.startup_problems().last().map(|p| &p.kind),
@@ -638,13 +637,7 @@ mod tests {
         let failed = report([Err(ReasonCode::RawInputMissing), Ok(()), Ok(()), Ok(())]);
         let outcome = finish_self_test(&mut store, &failed, true, 0, || true);
         assert!(
-            matches!(
-                outcome,
-                StartupListen::Failed {
-                    listening: false,
-                    ..
-                }
-            ),
+            matches!(outcome, StartupListen::Failed { resumed: false, .. }),
             "{outcome:?}"
         );
         std::fs::remove_dir_all(dir).unwrap();
@@ -673,12 +666,12 @@ mod tests {
         store.set_manual_pause(false, || true).unwrap();
         let failed = report([Ok(()), Ok(()), Ok(()), Err(ReasonCode::ClipboardBusy)]);
         let outcome = finish_self_test(&mut store, &failed, true, seen, || true);
-        let StartupListen::Failed { checks, listening } = &outcome else {
+        let StartupListen::Failed { checks, resumed } = &outcome else {
             panic!("{outcome:?}");
         };
         assert_eq!(checks, &[CheckName::Clipboard]);
-        assert!(listening);
-        assert_eq!(outcome.label(), "failed_user_listening");
+        assert!(resumed);
+        assert_eq!(outcome.label(), "failed_user_resumed");
         assert!(!manual_paused(&store));
         assert!(store.runtime.engine_state().listening);
         assert_eq!(
@@ -691,8 +684,38 @@ mod tests {
         assert_eq!(title, "启动自检未通过");
         assert_eq!(
             body,
-            "未通过：剪贴板。输入监听已由你手动开启，可能无法正常工作；可打开管理界面查看引擎状态。"
+            "未通过：剪贴板。你已在启动期间手动恢复监听，监听可能无法正常工作；可在「运行状态与恢复」中查看详情。"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Review R3: the user resumed during startup while RECORDING holds the
+    /// engine (a recording is open), then a check failed. The resume is
+    /// kept (MANUAL not set again) but the engine does not listen, so the
+    /// notice states the user's action and never claims it is listening.
+    #[test]
+    fn a_resume_kept_under_another_reason_is_not_reported_as_listening() {
+        let dir = temp_dir();
+        let mut store = healthy_store(&dir);
+        store.runtime.set_pause(PauseReasons::RECORDING, true);
+        let seen = store.manual_changes();
+        store.set_manual_pause(false, || true).unwrap();
+        let failed = report([Ok(()), Err(ReasonCode::HookMissing), Ok(()), Ok(())]);
+        let outcome = finish_self_test(&mut store, &failed, true, seen, || true);
+
+        assert!(
+            matches!(outcome, StartupListen::Failed { resumed: true, .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.label(), "failed_user_resumed");
+        assert!(!manual_paused(&store), "MANUAL not set again");
+        assert_eq!(store.runtime.pause_reasons(), PauseReasons::RECORDING);
+        assert!(!store.runtime.engine_state().listening);
+        let (_, body) = outcome_notice(&outcome).unwrap();
+        assert!(body.contains("你已在启动期间手动恢复监听"), "{body}");
+        for claim in ["已开启", "已由你手动开启", "正在监听", "保持暂停"] {
+            assert!(!body.contains(claim), "{claim}: {body}");
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -708,13 +731,7 @@ mod tests {
         let seen = store.manual_changes();
         let outcome = finish_self_test(&mut store, &failed, true, seen, || true);
         assert!(
-            matches!(
-                outcome,
-                StartupListen::Failed {
-                    listening: false,
-                    ..
-                }
-            ),
+            matches!(outcome, StartupListen::Failed { resumed: false, .. }),
             "{outcome:?}"
         );
         assert_eq!(outcome.label(), "failed");
@@ -729,13 +746,7 @@ mod tests {
         store.set_manual_pause(true, || true).unwrap();
         let outcome = finish_self_test(&mut store, &failed, true, seen, || true);
         assert!(
-            matches!(
-                outcome,
-                StartupListen::Failed {
-                    listening: false,
-                    ..
-                }
-            ),
+            matches!(outcome, StartupListen::Failed { resumed: false, .. }),
             "{outcome:?}"
         );
         assert!(manual_paused(&store));
