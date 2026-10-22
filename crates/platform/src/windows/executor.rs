@@ -99,11 +99,34 @@
 //!   (`src-tauri`'s manual `execute_action` still flips `busy` itself
 //!   around a manual run, outside this lock; that code is not ours to
 //!   change, and `enqueue` only ever compare-exchanges `busy`.)
+//! * While holding `life`: never call the injector or the clipboard, never
+//!   call a callback, never join a thread, never make a channel send that
+//!   can block, and never wait for `send_lock`. Only bounded leaf locks are
+//!   taken under it (`worker`, `fault`, `shared.last`, and inside
+//!   `Runtime::record` the history ring and the event queue). Two bounded
+//!   non-lock steps also run under it: the rebuild starts the worker
+//!   thread, and `Runtime::record` hands its event to an unbounded queue
+//!   (a send that never blocks), starting the event thread when there is
+//!   none; it never runs a listener inline (listeners run on that thread)
+//!   and never calls back into the executor. The worker's job queue is
+//!   only ever offered with `try_send`.
+//! * The supervisor's calls never wait for an executor lock (A2):
+//!   `enforce_budget` and `probe` only `try_lock` `life`, `worker` and
+//!   `fault`. When one is held elsewhere, `probe` returns the status it
+//!   last observed (kept in an atomic) and `enforce_budget` skips the round
+//!   and looks again on the next tick, so a fence comes at most one tick
+//!   (1 s) late, against a [`STALL_BUDGET`] of 10 s.
+//! * Stall check (A1): `enforce_budget` decides and fences in one hold of
+//!   `life`. A first look names the suspect run; in the fencing hold, and
+//!   before anything changes, it confirms that the epoch is the same, that
+//!   `running` still holds the same run id, and that the heartbeat's
+//!   deadline has really passed. A new run's heartbeat starts in the hold
+//!   that registers it, so a check that sees the run sees its fresh
+//!   deadline. A run that ended while the check waited is never fenced in
+//!   the place of the next one.
 //! * Lock order, only ever nested this way: `send_lock` → `life` →
-//!   `worker` → leaves (`fault`, `shared.last`, the history). Nothing takes
-//!   `send_lock` while holding `life`. `Runtime::record` never calls back
-//!   into the executor (it delivers events on its own thread), so it may
-//!   run under `life`.
+//!   `worker` → leaves (`fault`, `shared.last`, the history). Nothing waits
+//!   for `send_lock` while holding `life`.
 use super::actions::{
     begin_trace, current_stage, execute_with_proof, set_stage, stage_marks, Ports, Stage,
     StageMarks,
@@ -123,6 +146,7 @@ use arc_swap::ArcSwapOption;
 use parking_lot::{Mutex as PlMutex, MutexGuard as PlMutexGuard};
 use std::cell::{Cell, RefCell};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::AtomicU8;
 use std::sync::{PoisonError, Weak};
 use std::thread::JoinHandle;
 
@@ -143,8 +167,8 @@ pub(super) enum CandidateProof {
 /// for this long is fenced by the supervisor. 待基线确定: long clipboard
 /// retries and slow `Open` targets must stay below it on real machines.
 pub(super) const STALL_BUDGET: Duration = Duration::from_secs(10);
-/// How long a sender, the fence, the busy guard or the rebuild waits for a
-/// send already in flight. Past it the holder is taken to be stuck inside
+/// How long a sender, a payer of owed key-ups or the rebuild waits for a
+/// send already in flight (the fence and the supervisor's calls never wait). Past it the holder is taken to be stuck inside
 /// the OS call and the waiter gives up without sending (fail closed).
 const SEND_LOCK_WAIT: Duration = Duration::from_millis(250);
 const FENCED: &str = "Executor task was fenced after a stall; stopped without further input";
@@ -451,10 +475,40 @@ pub(super) enum Pause {
     FenceDecided,
     /// In the busy guard: keys released, about to compare and clear.
     GuardBeforeClear,
+    /// In the stall check: the first look named a suspect run; the fencing
+    /// hold of `life`, which confirms it again, comes next.
+    StallCheck,
+}
+
+/// Every executor status [`ExecutorCore::status`] reports, so the last one
+/// observed fits in an atomic (an index) for `probe` to fall back on.
+const EXECUTOR_STATUSES: [Status; 4] = [
+    Status::Ok,
+    Status::Down(ReasonCode::ExecutorTimeout),
+    Status::Down(ReasonCode::ExecutorPanic),
+    Status::Down(ReasonCode::Internal),
+];
+
+/// The index of `status` in [`EXECUTOR_STATUSES`]; a status outside it
+/// (none is reported today) is kept as Down(Internal).
+fn status_index(status: Status) -> u8 {
+    EXECUTOR_STATUSES
+        .iter()
+        .position(|known| *known == status)
+        .unwrap_or(EXECUTOR_STATUSES.len() - 1) as u8
 }
 
 #[cfg(test)]
 type PauseHook = Arc<dyn Fn(Pause) + Send + Sync>;
+
+/// The executor locks a test can hold from another thread.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(super) enum CoreLock {
+    Life,
+    Worker,
+    Fault,
+}
 
 /// A held send lock: whoever has one may call `SendInput` (S1).
 pub(super) type SendTurn<'a> = PlMutexGuard<'a, ()>;
@@ -588,6 +642,10 @@ pub(super) struct ExecutorCore {
     clipboard_holder: AtomicU64,
     /// Why the executor is down until the next rebuild.
     fault: PlMutex<Option<ReasonCode>>,
+    /// The executor status last observed, as an index into
+    /// [`EXECUTOR_STATUSES`]: what `probe` returns while a lock it needs is
+    /// held elsewhere (A2).
+    last_status: AtomicU8,
     /// Execution history (B-35); production uses `runtime::current()`.
     runtime: Arc<Runtime>,
     #[cfg(test)]
@@ -623,6 +681,7 @@ impl ExecutorCore {
             release_owed: AtomicBool::new(false),
             clipboard_holder: AtomicU64::new(0),
             fault: PlMutex::new(None),
+            last_status: AtomicU8::new(0),
             #[cfg(test)]
             pause_hook: PlMutex::new(None),
         })
@@ -669,6 +728,17 @@ impl ExecutorCore {
     #[cfg(test)]
     pub(super) fn hold_send_lock(&self) -> SendTurn<'_> {
         self.send_lock.lock()
+    }
+
+    /// Holds one of the executor's own locks, as a thread stalled inside it
+    /// would (tests).
+    #[cfg(test)]
+    pub(super) fn hold_lock(&self, lock: CoreLock) -> impl Sized + '_ {
+        match lock {
+            CoreLock::Life => (Some(self.life.lock()), None, None),
+            CoreLock::Worker => (None, Some(self.worker.lock()), None),
+            CoreLock::Fault => (None, None, Some(self.fault.lock())),
+        }
     }
 
     /// Whether a fence's key-ups are still unpaid (tests).
@@ -981,29 +1051,60 @@ impl ExecutorCore {
         );
     }
 
-    /// Fences the running task when it made no progress within the budget.
+    /// Fences the running task when it made no progress within the budget
+    /// (`enforce_budget`). Never waits for a lock (A2): each one is only
+    /// try_locked, and when one is held elsewhere the round is skipped and
+    /// the next tick looks again. The first look only names a suspect; the
+    /// decision is taken again in the one hold of `life` that fences (A1):
+    /// same epoch, same run in `running`, and its heartbeat's deadline
+    /// passed. Only state changes in that hold.
     fn fence_if_stalled(&self, now: Instant) {
-        let running = self
-            .life
-            .lock()
+        let Some(life) = self.life.try_lock() else {
+            return Self::skip_round("life");
+        };
+        let suspect = life
             .running
             .as_ref()
-            .map(|running| running.epoch);
-        let Some(epoch) = running else {
+            .filter(|running| running.epoch == self.epoch())
+            .map(|running| (running.epoch, running.id));
+        drop(life);
+        let Some((epoch, id)) = suspect else {
             return;
         };
-        if epoch != self.epoch() {
+        if now.saturating_duration_since(self.last_beat()) <= self.budget {
             return;
         }
+        self.pause(Pause::StallCheck);
+        let Some(mut life) = self.life.try_lock() else {
+            return Self::skip_round("life");
+        };
+        let same_run = life
+            .running
+            .as_ref()
+            .is_some_and(|running| running.id == id);
         let stalled = now.saturating_duration_since(self.last_beat());
-        if stalled > self.budget {
-            tracing::warn!(
-                event = "executor.stalled",
-                stalled_ms = stalled.as_millis() as u64,
-                budget_ms = self.budget.as_millis() as u64
-            );
-            self.fence(epoch);
+        if self.epoch() != epoch || !same_run || stalled <= self.budget {
+            return;
         }
+        let (Some(mut worker), Some(mut fault)) = (self.worker.try_lock(), self.fault.try_lock())
+        else {
+            return Self::skip_round("worker_or_fault");
+        };
+        let running = self.bump(&mut life, &mut worker, &mut fault);
+        drop((fault, worker, life));
+        tracing::warn!(
+            event = "executor.stalled",
+            stalled_ms = stalled.as_millis() as u64,
+            budget_ms = self.budget.as_millis() as u64
+        );
+        self.retire(epoch, running);
+    }
+
+    /// A lock the stall check needs is held elsewhere: this round is
+    /// skipped, so the fence comes at most one tick (1 s) late, against a
+    /// [`STALL_BUDGET`] of 10 s.
+    fn skip_round(held: &'static str) {
+        tracing::debug!(event = "executor.budget_skipped", held);
     }
 
     /// Sends key-ups (or button-ups) for every key in [`HeldKeys`] that is
@@ -1042,18 +1143,33 @@ impl ExecutorCore {
         (released, refused)
     }
 
+    /// The components' status (`probe`). Never waits for a lock (A2): the
+    /// fault and the worker are only try_locked, and while either is held
+    /// elsewhere the executor status last observed is returned.
     fn status(&self) -> Vec<(Component, Status)> {
-        let fault = *self.fault.lock();
-        let alive = self.worker.lock().alive();
-        let executor = match fault {
-            Some(reason) => Status::Down(reason),
-            // Key-ups owed (S3): a send is stuck holding the lock, or
-            // `SendInput` refuses them; no input is sent until they are paid.
-            None if self.release_owed.load(Ordering::SeqCst) => {
-                Status::Down(ReasonCode::ExecutorTimeout)
+        let fault = self.fault.try_lock().map(|fault| *fault);
+        let alive = self.worker.try_lock().map(|worker| worker.alive());
+        let executor = match (fault, alive) {
+            (Some(fault), Some(alive)) => {
+                let status = match fault {
+                    Some(reason) => Status::Down(reason),
+                    // Key-ups owed (S3): a send is stuck holding the lock, or
+                    // `SendInput` refuses them; no input is sent until they
+                    // are paid.
+                    None if self.release_owed.load(Ordering::SeqCst) => {
+                        Status::Down(ReasonCode::ExecutorTimeout)
+                    }
+                    None if !alive => Status::Down(ReasonCode::Internal),
+                    None => Status::Ok,
+                };
+                self.last_status
+                    .store(status_index(status), Ordering::SeqCst);
+                status
             }
-            None if !alive => Status::Down(ReasonCode::Internal),
-            None => Status::Ok,
+            _ => {
+                tracing::debug!(event = "executor.probe_cached");
+                EXECUTOR_STATUSES[usize::from(self.last_status.load(Ordering::SeqCst))]
+            }
         };
         let holder = self.clipboard_holder.load(Ordering::SeqCst);
         let clipboard = if holder != 0 && holder - 1 < self.epoch() {
@@ -1141,8 +1257,10 @@ impl ExecutorCore {
                 started_at: started,
                 sent: Arc::clone(&sent),
             });
+            // The run's heartbeat starts in the hold that registers it: a
+            // stall check that sees this run sees its fresh deadline (A1).
+            self.beat();
         }
-        self.beat();
         let mut guard = BusyGuard {
             core: self,
             epoch,
@@ -1655,10 +1773,13 @@ impl<C: ClipboardBackend> ClipboardBackend for Claimed<C> {
 
 impl ExecutorControl for ExecutorCore {
     /// State only (S3): never calls the injector, never waits for the send
-    /// lock. Owed key-ups are left to their payers.
+    /// lock. Owed key-ups are left to their payers. Never waits for an
+    /// executor lock either (A2): a round that finds one held is skipped.
     fn enforce_budget(&self, now: Instant) {
         self.fence_if_stalled(now);
     }
+    /// Never waits for a lock (A2); while one is held elsewhere it returns
+    /// the executor status last observed.
     fn probe(&self, _now: Instant) -> Vec<(Component, Status)> {
         self.status()
     }

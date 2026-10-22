@@ -13,8 +13,8 @@
 )]
 use super::actions::{Ports, Stage, StageMarks};
 use super::executor::{
-    classify, run_candidate, stage_timings, Candidate, ExecutorCore, Pause, Runner, Serialized,
-    TaskScope, STALL_BUDGET,
+    classify, run_candidate, stage_timings, Candidate, CoreLock, ExecutorCore, Pause, Runner,
+    Serialized, TaskScope, STALL_BUDGET,
 };
 use super::pipeline_tests::SERIAL;
 use super::rawinput::{detect_candidate, Buffer, Event, Kind};
@@ -1755,6 +1755,266 @@ fn supervisor_calls_return_while_a_key_up_blocks() {
         .injector
         .calls()
         .contains(&InjectCall::Keys(vec![KEY_C])));
+}
+
+/// Lifecycle ruling A1: the stall check decides and fences in one hold of
+/// `life`. Held after its first look named run A as stalled, while A ends
+/// and run B starts, it must leave B alone: B is not fenced, nothing is
+/// recorded as ExecutorTimeout and the executor stays Ok.
+#[test]
+fn a_stall_check_held_while_the_next_run_starts_leaves_that_run_alone() {
+    let mut rig = ExecRig::new(vec![
+        text_rule("one", OutputMethod::Keys, BODY),
+        text_rule("two", OutputMethod::Keys, TYPED),
+    ]);
+    let (first, second) = (Hold::new(), Hold::new());
+    let (wait_first, wait_second) = (first.waiter(), second.waiter());
+    // Text goes out one character per call: hold each run's first one.
+    let texts = std::sync::atomic::AtomicUsize::new(0);
+    rig.injector.on_call(move |call| {
+        if matches!(call, InjectCall::Text(_)) {
+            match texts.fetch_add(1, Ordering::SeqCst) {
+                0 => wait_first(),
+                n if n == BODY.len() => wait_second(),
+                _ => {}
+            }
+        }
+    });
+    let looked = Hold::new();
+    let wait = looked.waiter();
+    rig.core.on_pause(move |at| {
+        if at == Pause::StallCheck && is_thread("qt-stall-check") {
+            wait();
+        }
+    });
+    assert!(rig.trigger("one"));
+    first.wait_arrived("run A's output");
+    let epoch = rig.core.epoch();
+    rig.clock.advance(STALL_BUDGET + Duration::from_secs(1));
+    let (core, now) = (Arc::clone(&rig.core), rig.clock.now());
+    let check = std::thread::Builder::new()
+        .name("qt-stall-check".into())
+        .spawn(move || core.enforce_budget(now))
+        .unwrap();
+    looked.wait_arrived("the stall check, A named");
+
+    drop(first);
+    rig.wait_idle();
+    assert_eq!(rig.last_entry().rule_id, "rule-one");
+    assert!(rig.trigger("two"));
+    second.wait_arrived("run B's output");
+    let (b, _) = rig.core.running_task().expect("B runs");
+    drop(looked);
+    check.join().unwrap();
+
+    assert_eq!(rig.core.epoch(), epoch, "B was not fenced");
+    assert_eq!(rig.core.running_task(), Some((b, "rule-two".into())));
+    assert!(rig.shared.busy.load(Ordering::SeqCst));
+    assert!(matches!(rig.executor_status(), Status::Ok));
+    drop(second);
+    rig.wait_idle();
+    let history = rig.history();
+    assert_eq!(history.len(), 2);
+    assert!(history
+        .iter()
+        .all(|entry| entry.reason != ReasonCode::ExecutorTimeout));
+    assert_eq!(rig.injector.typed(), format!("{BODY}{TYPED}"));
+    assert!(matches!(rig.executor_status(), Status::Ok));
+}
+
+/// Lifecycle ruling A1, the deadline: the same run, held after the first
+/// look named it as stalled, makes progress (its next send beats) before
+/// the check goes on. The fencing hold reads the heartbeat again and leaves
+/// the run alone.
+#[test]
+fn a_stall_check_held_while_the_run_makes_progress_leaves_it_alone() {
+    let mut rig = ExecRig::new(vec![text_rule("one", OutputMethod::Keys, BODY)]);
+    let (first, second) = (Hold::new(), Hold::new());
+    let (wait_first, wait_second) = (first.waiter(), second.waiter());
+    let texts = std::sync::atomic::AtomicUsize::new(0);
+    rig.injector.on_call(move |call| {
+        if matches!(call, InjectCall::Text(_)) {
+            match texts.fetch_add(1, Ordering::SeqCst) {
+                0 => wait_first(),
+                1 => wait_second(),
+                _ => {}
+            }
+        }
+    });
+    let looked = Hold::new();
+    let wait = looked.waiter();
+    rig.core.on_pause(move |at| {
+        if at == Pause::StallCheck && is_thread("qt-stall-check") {
+            wait();
+        }
+    });
+    assert!(rig.trigger("one"));
+    first.wait_arrived("the run's first character");
+    let (run, _) = rig.core.running_task().expect("the run");
+    let epoch = rig.core.epoch();
+    rig.clock.advance(STALL_BUDGET + Duration::from_secs(1));
+    let (core, now) = (Arc::clone(&rig.core), rig.clock.now());
+    let check = std::thread::Builder::new()
+        .name("qt-stall-check".into())
+        .spawn(move || core.enforce_budget(now))
+        .unwrap();
+    looked.wait_arrived("the stall check, the run named");
+
+    drop(first);
+    second.wait_arrived("the run's second character");
+    drop(looked);
+    check.join().unwrap();
+    assert_eq!(rig.core.epoch(), epoch, "the run was not fenced");
+    assert_eq!(rig.core.running_task(), Some((run, "rule-one".into())));
+    assert!(matches!(rig.executor_status(), Status::Ok));
+    drop(second);
+    rig.wait_idle();
+    assert_eq!(rig.injector.typed(), BODY);
+    assert_eq!(rig.last_entry().reason, ReasonCode::Ok);
+}
+
+/// Lifecycle ruling A1, the run id: held after the first look named the
+/// run, which then ends without another heartbeat (it was on its last
+/// character), the check finds `running` empty and fences nothing, though
+/// the last heartbeat is past its deadline.
+#[test]
+fn a_stall_check_held_while_the_run_ends_fences_nothing() {
+    let mut rig = ExecRig::new(vec![text_rule("one", OutputMethod::Keys, BODY)]);
+    let last = Hold::new();
+    let wait_last = last.waiter();
+    let texts = std::sync::atomic::AtomicUsize::new(0);
+    rig.injector.on_call(move |call| {
+        if matches!(call, InjectCall::Text(_))
+            && texts.fetch_add(1, Ordering::SeqCst) == BODY.len() - 1
+        {
+            wait_last();
+        }
+    });
+    let looked = Hold::new();
+    let wait = looked.waiter();
+    rig.core.on_pause(move |at| {
+        if at == Pause::StallCheck && is_thread("qt-stall-check") {
+            wait();
+        }
+    });
+    assert!(rig.trigger("one"));
+    last.wait_arrived("the run's last character");
+    let epoch = rig.core.epoch();
+    rig.clock.advance(STALL_BUDGET + Duration::from_secs(1));
+    let (core, now) = (Arc::clone(&rig.core), rig.clock.now());
+    let check = std::thread::Builder::new()
+        .name("qt-stall-check".into())
+        .spawn(move || core.enforce_budget(now))
+        .unwrap();
+    looked.wait_arrived("the stall check, the run named");
+
+    drop(last);
+    rig.wait_idle();
+    assert_eq!(rig.core.running_task(), None);
+    drop(looked);
+    check.join().unwrap();
+    assert_eq!(rig.core.epoch(), epoch, "nothing was fenced");
+    assert!(matches!(rig.executor_status(), Status::Ok));
+    assert_eq!(rig.history().len(), 1);
+    assert_eq!(rig.last_entry().reason, ReasonCode::Ok);
+    assert_eq!(rig.run("one").status, "unknown");
+}
+
+/// Holds one executor lock on a thread of its own until dropped.
+struct LockHolder {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl LockHolder {
+    fn hold(core: &Arc<ExecutorCore>, lock: CoreLock) -> Self {
+        let (held, taken) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let core = Arc::clone(core);
+        let thread = std::thread::spawn(move || {
+            let _guard = core.hold_lock(lock);
+            held.send(()).unwrap();
+            let _ = released.recv();
+        });
+        taken.recv().unwrap();
+        Self {
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+}
+impl Drop for LockHolder {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Lifecycle ruling A2: `enforce_budget` and `probe` never wait for an
+/// executor lock. While another thread holds `life`, `worker` or `fault`,
+/// both return within 50 ms on real threads: the budget round is skipped
+/// (no fence yet) and `probe` answers with the status it last observed.
+/// Once the lock is free, the next `enforce_budget` fences the stalled task.
+#[test]
+fn supervisor_calls_skip_a_held_executor_lock_and_fence_next_round() {
+    const LIMIT: Duration = Duration::from_millis(50);
+    const LOCKS: [CoreLock; 3] = [CoreLock::Life, CoreLock::Worker, CoreLock::Fault];
+    let mut rig = ExecRig::new(vec![text_rule("btw", OutputMethod::Keys, BODY)]);
+    let in_send = hold_first_send(&rig.injector);
+    assert!(rig.trigger("btw"));
+    in_send.wait_arrived("the task's first send");
+    assert!(matches!(rig.executor_status(), Status::Ok));
+    let epoch = rig.core.epoch();
+    rig.clock.advance(STALL_BUDGET + Duration::from_secs(1));
+    let probe_within = |rig: &ExecRig| {
+        let (core, now) = (Arc::clone(&rig.core), rig.clock.now());
+        within(LIMIT, move || core.probe(now))
+            .expect("probe returned")
+            .into_iter()
+            .find(|(component, _)| *component == Component::Executor)
+            .map(|(_, status)| status)
+            .unwrap()
+    };
+
+    for lock in LOCKS {
+        let held = LockHolder::hold(&rig.core, lock);
+        let (core, now) = (Arc::clone(&rig.core), rig.clock.now());
+        assert!(
+            within(LIMIT, move || core.enforce_budget(now)).is_some(),
+            "{lock:?} held: enforce_budget returned"
+        );
+        assert_eq!(rig.core.epoch(), epoch, "{lock:?} held: round skipped");
+        assert_eq!(probe_within(&rig), Status::Ok, "{lock:?} held");
+        drop(held);
+    }
+
+    rig.core.enforce_budget(rig.clock.now());
+    assert_eq!(rig.core.epoch(), epoch + 1, "the next round fenced");
+    let entry = rig.last_entry();
+    assert_eq!(
+        (entry.outcome, entry.reason),
+        (Outcome::Failed, ReasonCode::ExecutorTimeout)
+    );
+    assert_eq!(
+        rig.executor_status(),
+        Status::Down(ReasonCode::ExecutorTimeout)
+    );
+    for lock in LOCKS {
+        let held = LockHolder::hold(&rig.core, lock);
+        assert_eq!(
+            probe_within(&rig),
+            Status::Down(ReasonCode::ExecutorTimeout),
+            "{lock:?} held: the last observation"
+        );
+        drop(held);
+    }
+
+    drop(in_send);
+    assert!(rig.core.join_retired(Duration::from_secs(5)));
+    rig.core.rebuild().expect("the fenced send returned");
+    let result = rig.run("btw");
+    assert_eq!(result.status, "unknown", "{}", result.message);
 }
 
 /// Sources of the failure texts the executor's reason table maps.
