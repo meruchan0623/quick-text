@@ -2676,6 +2676,86 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
           expect(enabled(container)).toBe(before);
           expect(await exportSaves(mounted)).toBe(false);
         });
+
+        it('keeps the import dialog open until its save is done, the editor then the import', async () => {
+          const hold = holdAnswers('save_draft');
+          const mounted = await mountReady(hold);
+          const { backend, container } = mounted;
+          const strategy = '遇到重复的指令时怎么处理？';
+          await click(mounted, '导入');
+          await waitFor(mounted, () => {
+            expect(dialog(container, strategy)).not.toBeNull();
+          });
+          await clickIn(mounted, dialog(container, strategy), '导入');
+          await waitFor(mounted, () => {
+            expect(button(container, '确认导入草稿')).toBeDefined();
+          });
+          hold.arm();
+          await click(mounted, '确认导入草稿');
+          await waitFor(mounted, () => {
+            expect(hold.held[0]?.read).toBe(true);
+          });
+          // Closed, it would let the editor be edited, and the import replace the edits.
+          const report = () => dialog(container, '导入预览 · 确认后写入草稿');
+          const close = () =>
+            [...(report()?.querySelectorAll('button') ?? [])].find((b) => b.textContent === '关闭');
+          expect(close()?.disabled).toBe(true);
+          expect(
+            report()?.querySelector<HTMLButtonElement>('[aria-label="关闭报告"]')?.disabled,
+          ).toBe(true);
+          await clickIn(mounted, report(), '关闭');
+          expect(report()?.open).toBe(true);
+          // Esc.
+          await mounted.act(() => {
+            report()?.dispatchEvent(new Event('cancel', { cancelable: true }));
+          });
+          expect(report()?.open).toBe(true);
+          // A close the browser does not let be cancelled (Esc again, no user activation since).
+          await mounted.act(() => {
+            const modal = report();
+            modal?.close();
+            modal?.dispatchEvent(new Event('close'));
+          });
+          expect(report()?.open).toBe(true);
+          expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+          await answerHeld(mounted, hold, 0);
+          await waitFor(mounted, () => {
+            expect(report()).toBeNull();
+          });
+          expect(errorShown(container)).toBe('');
+          expect(container.querySelectorAll('tbody tr')).toHaveLength(5);
+          expect(revisionText(container)).toContain('草稿待应用');
+          // As saved: nothing unsaved.
+          expect(await exportSaves(mounted)).toBe(false);
+        });
+
+        it('lets the import dialog be closed once its save fails', async () => {
+          const hold = holdFailures('save_draft', FAILURE);
+          const mounted = await mountReady(hold);
+          const { container } = mounted;
+          const strategy = '遇到重复的指令时怎么处理？';
+          await click(mounted, '导入');
+          await waitFor(mounted, () => {
+            expect(dialog(container, strategy)).not.toBeNull();
+          });
+          await clickIn(mounted, dialog(container, strategy), '导入');
+          await waitFor(mounted, () => {
+            expect(button(container, '确认导入草稿')).toBeDefined();
+          });
+          hold.arm();
+          await click(mounted, '确认导入草稿');
+          await waitFor(mounted, () => {
+            expect(hold.held[0]?.read).toBe(true);
+          });
+          const report = () => dialog(container, '导入预览 · 确认后写入草稿');
+          await answerHeld(mounted, hold, 0);
+          expect(errorShown(container)).toContain(FAILURE);
+          // Still open, to try again or close.
+          expect(button(container, '确认导入草稿')?.disabled).toBe(false);
+          await clickIn(mounted, report(), '关闭');
+          expect(report()).toBeNull();
+          expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
+        });
       });
     });
   });

@@ -184,6 +184,9 @@ export default function App() {
     [localDirty, setLocalDirty] = useState(false),
     [autoListenMissing, setAutoListenMissing] = useState(false);
   const [editingErrors, setEditingErrors] = useState<Data[]>([]);
+  // The import's save in flight, from 「确认导入草稿」 until it is done or failed: its dialog
+  // cannot be closed meanwhile (review C10, see there).
+  const [importing, setImporting] = useState(false);
   // Clear the editor's validation errors when another rule is opened.
   const [errorsFor, setErrorsFor] = useState(editing?.id);
   if (errorsFor !== editing?.id) {
@@ -870,6 +873,10 @@ export default function App() {
       setDialog({ title: '导入预览 · 确认后写入草稿', data: r.report, importConfig: r.config });
       setMessage('请核对导入报告后确认');
     });
+  // 关闭, ✕ and Esc; ignored while the import's save is in flight (`importing`).
+  const closeReport = () => {
+    if (!importing) setDialog(null);
+  };
   const reject = (diagnostics: Data[]) => {
     setEditingErrors(diagnostics);
     return new Error('有设置需要修改，请查看编辑框中的提示；已填写的内容会保留。');
@@ -1806,11 +1813,11 @@ export default function App() {
         </Modal>
       )}
       {dialog && (
-        <Modal title={dialog.title} className="overlay top" onClose={() => setDialog(null)}>
+        <Modal title={dialog.title} className="overlay top" onClose={closeReport}>
           <div className="report">
             <div className="modal-title">
               <h2>{dialog.title}</h2>
-              <button aria-label="关闭报告" onClick={() => setDialog(null)}>
+              <button aria-label="关闭报告" disabled={importing} onClick={closeReport}>
                 ×
               </button>
             </div>
@@ -1825,19 +1832,29 @@ export default function App() {
                   onClick={() => {
                     const imported = dialog.importConfig;
                     if (!imported) return;
+                    setImporting(true);
                     void run(async () => {
-                      // The whole config replaced, the globals too, also when made again (see
-                      // `save`): no edit can be made meanwhile, as this dialog is modal and stays
-                      // open until the save is done.
-                      await save(() => imported);
-                      setDialog(null);
+                      // The whole config replaced, the globals too, also when made again over
+                      // edits made while it was saved (see `conclude`). None can be: this dialog
+                      // is modal (the rest of the window inert), and stays open until the save is
+                      // done or failed, its change made in the editor (`importing`: 关闭 and ✕
+                      // disabled, Esc ignored, a close the browser forces undone by `Modal`; its
+                      // backdrop does not close it). Review C10.
+                      try {
+                        await save(() => imported);
+                        setDialog(null);
+                      } finally {
+                        setImporting(false);
+                      }
                     }, '导入草稿已保存，请应用设置');
                   }}
                 >
                   确认导入草稿
                 </button>
               )}
-              <button onClick={() => setDialog(null)}>关闭</button>
+              <button disabled={importing} onClick={closeReport}>
+                关闭
+              </button>
             </div>
           </div>
         </Modal>

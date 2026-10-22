@@ -1,6 +1,9 @@
 import { useEffect, useRef } from 'react';
 
-/** A native modal `<dialog>`; Esc calls `onClose` instead of closing it directly. */
+/**
+ * A native modal `<dialog>`; Esc calls `onClose` instead of closing it directly: it closes when it
+ * is no longer rendered, so `onClose` may keep it open. Its backdrop does not close it.
+ */
 export function Modal({
   children,
   className,
@@ -28,6 +31,15 @@ export function Modal({
       className={className}
       onCancel={(e) => {
         e.preventDefault();
+        onClose();
+      }}
+      // A close request the browser does not let be cancelled (Chromium: Esc again, with no user
+      // activation since the last one) closes it anyway: open it again, and ask as for Esc. Not
+      // when unmounted (the effect's cleanup closes it), nor already open again (StrictMode).
+      onClose={(e) => {
+        const modal = e.currentTarget;
+        if (modal.open || !modal.isConnected) return;
+        modal.showModal();
         onClose();
       }}
     >
