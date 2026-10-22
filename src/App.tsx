@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { call } from './bridge';
+import { call } from './ipc/transport';
+import { errorText as describe } from './ipc/errors';
 import {
   actionLabel,
   clone,
@@ -19,8 +20,8 @@ import { useAsk } from './Ask';
 import { Modal } from './Modal';
 import { every } from './lib/timers';
 
-const errorText = (e: unknown) =>
-  typeof e === 'string' ? e : e instanceof Error ? e.message : JSON.stringify(e, null, 2);
+// `null` from describe() means the user cancelled: show nothing.
+const errorText = (e: unknown) => describe(e) ?? '';
 function Field({
   label,
   children,

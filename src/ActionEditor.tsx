@@ -1,5 +1,6 @@
 import { useRef, useState } from 'react';
-import { call } from './bridge';
+import { call } from './ipc/transport';
+import { parseCommandError } from './ipc/errors';
 import { actionChoice, actionLabel, actionOptions, clone, Data, Rule } from './model';
 import { moveItem, withoutKey } from './lib/list';
 type Props = {
@@ -306,12 +307,9 @@ export default function ActionEditor({
     try {
       return await call(command, args);
     } catch (e) {
-      try {
-        const ds = JSON.parse(typeof e === 'string' ? e : String(e));
-        if (Array.isArray(ds)) setDiagnostics(ds);
-      } catch {
-        // Not a diagnostics payload; the caller reports the original error.
-      }
+      // Validation failures point at the offending step; the caller reports the error itself.
+      const error = parseCommandError(e);
+      if (error.code === 'validation') setDiagnostics(error.detail.diagnostics);
       throw e;
     }
   };
