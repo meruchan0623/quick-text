@@ -1234,6 +1234,112 @@ fn problems_found_outside_the_load_survive_a_reload() {
     assert_eq!(kinds, outside);
 }
 
+/// Review A4 (contract §3 `store-state`): the frontend takes a snapshot in
+/// SafeMode(Locked), then the retry succeeds. The new revision and the end
+/// of safe mode arrive together as one `store-state` above the snapshot's
+/// `seq`, and the next snapshot (the bus's view) has them. A reload that
+/// changes neither sends nothing; publishing and rolling back send one each.
+#[test]
+fn a_locked_retry_after_a_snapshot_arrives_as_store_state() {
+    use crate::{
+        app_state::Managed,
+        commands::engine::runtime_snapshot,
+        events::{EventBus, Observer, Sink, STARTUP_PROBLEM, STORE_STATE},
+    };
+    use quicker_platform::health::{EngineState, HealthSnapshot, HistoryEntry};
+    use std::sync::mpsc;
+
+    struct Channel(mpsc::Sender<(&'static str, Value)>);
+    impl Sink for Channel {
+        fn emit(&self, name: &'static str, payload: Value) {
+            let _ = self.0.send((name, payload));
+        }
+    }
+    struct Quiet;
+    impl Observer for Quiet {
+        fn status(&mut self, _: &HealthSnapshot, _: &EngineState) {}
+        fn executed(&mut self, _: &HistoryEntry) {}
+    }
+    /// The `store-state` events before the next `startup-problem`, a marker
+    /// sent after the step under test (engine events are skipped).
+    fn store_states(rx: &mpsc::Receiver<(&'static str, Value)>) -> Vec<Value> {
+        let mut sent = vec![];
+        loop {
+            let (name, payload) = rx.recv_timeout(Duration::from_secs(10)).expect("event");
+            match name {
+                STARTUP_PROBLEM => return sent,
+                STORE_STATE => sent.push(payload),
+                _ => {}
+            }
+        }
+    }
+
+    let dir = TempDir::new();
+    let world = world();
+    write(&dir, "active.json", &bytes(&config_at(2)));
+    write(&dir, "draft.json", &bytes(&config_at(2)));
+    world.locked.lock().push("active.json");
+    let store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.safe_mode(), Some(SafeModeReason::Locked));
+    let runtime = store.runtime.clone();
+    let managed = Managed::new(store);
+    let (tx, rx) = mpsc::channel();
+    let bus = EventBus::start(&runtime, Channel(tx), Box::new(Quiet));
+    let problems = bus.problem_sink();
+    let marker = || problems(ProblemKind::AutostartRepaired {}.into());
+    // As in setup: setting the sink sends the initial value.
+    managed.lock().set_store_sink(bus.store_sink());
+    marker();
+    let initial = store_states(&rx);
+    let locked_revision = Config::default().revision;
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0]["revision"], locked_revision);
+    assert_eq!(initial[0]["safe_mode"], "locked");
+
+    let snapshot = runtime_snapshot(bus.view(), &managed);
+    assert_eq!(snapshot.revision, locked_revision);
+    assert_eq!(snapshot.safe_mode, Some(SafeModeReason::Locked));
+    assert!(snapshot.seq > initial[0]["seq"].as_u64().unwrap());
+
+    world.locked.lock().clear();
+    let report = retry_locked(&dir, &env(&world)).unwrap();
+    managed.lock().apply_retry(report);
+    marker();
+    let recovered = store_states(&rx);
+    assert_eq!(recovered.len(), 1, "revision and safe mode in one event");
+    let seq = recovered[0]["seq"].as_u64().unwrap();
+    assert!(seq > snapshot.seq);
+    assert_eq!(recovered[0]["revision"], 2);
+    assert_eq!(recovered[0]["safe_mode"], Value::Null);
+    let after = runtime_snapshot(bus.view(), &managed);
+    assert!(after.seq > seq);
+    assert_eq!((after.revision, after.safe_mode), (2, None));
+
+    // Unchanged: reloading the same files sends nothing.
+    managed
+        .lock()
+        .apply_retry(load_or_fallback(&dir, &env(&world)));
+    marker();
+    assert_eq!(store_states(&rx), Vec::<Value>::new());
+
+    // Any other cause: a publish, then a rollback (a new revision too).
+    {
+        let mut store = managed.lock();
+        let draft = store.draft.clone();
+        store.publish(draft).unwrap();
+    }
+    marker();
+    let published = store_states(&rx);
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0]["revision"], 3);
+    managed.lock().rollback_previous().unwrap();
+    marker();
+    let rolled_back = store_states(&rx);
+    assert_eq!(rolled_back.len(), 1);
+    assert_eq!(rolled_back[0]["revision"], 4);
+    assert_eq!(rolled_back[0]["safe_mode"], Value::Null);
+}
+
 /// Fault injection (B-52): the store points behave as the real failures.
 #[cfg(feature = "fault-injection")]
 mod injected {

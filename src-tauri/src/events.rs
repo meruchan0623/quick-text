@@ -9,16 +9,22 @@
 //! block) with no runtime or store lock held. Because a single thread emits,
 //! events leave in `seq` order.
 //!
-//! The bus also keeps the Health and State it last emitted with their `seq`
-//! ([`BusView`]); `get_runtime_snapshot` returns that view, so a snapshot is
-//! exactly the event stream up to its `seq`, and the events after it continue
-//! from there (nothing at or below the snapshot's `seq` is missing from it,
-//! nothing above it is older than what it already shows).
+//! The bus also keeps the Health, State and store state (revision, safe
+//! mode) it last emitted with their `seq` ([`BusView`]);
+//! `get_runtime_snapshot` returns that view, so a snapshot is exactly the
+//! event stream up to its `seq`, and the events after it continue from there
+//! (nothing at or below the snapshot's `seq` is missing from it, nothing
+//! above it is older than what it already shows).
+//!
+//! The store reports its revision and safe mode through a [`StoreSink`]
+//! after every change (and once when the sink is set, the initial
+//! `store-state`); the bus sends `store-state` unthrottled, only when the
+//! value differs from the last one sent.
 //!
 //! Idle cost: the bus thread sleeps in `recv` and only sets a timeout while
 //! something is held back (a trailing Health/State, held executions, a busy
 //! re-check), so it adds no periodic wake-ups.
-use crate::startup::StartupProblem;
+use crate::{error::SafeModeReason, startup::StartupProblem};
 use parking_lot::Mutex;
 use quicker_platform::{
     health::{EngineEvent, EngineState, HealthSnapshot, HistoryEntry},
@@ -40,6 +46,7 @@ pub const ENGINE_HEALTH: &str = "engine-health";
 pub const ENGINE_STATE: &str = "engine-state";
 pub const EXECUTION_RESULT: &str = "execution-result";
 pub const STARTUP_PROBLEM: &str = "startup-problem";
+pub const STORE_STATE: &str = "store-state";
 /// Legacy alias (0.4–0.5): the `"running" | "paused" | "listening"` string,
 /// without `seq`.
 pub const ENGINE_STATUS: &str = "engine-status";
@@ -86,14 +93,29 @@ pub trait Observer: Send + 'static {
 /// (`Store::add_problem`, a Locked retry). Never blocks.
 pub type ProblemSink = Arc<dyn Fn(StartupProblem) + Send + Sync>;
 
-/// The emitted stream at one point: the last `seq` and the Health and State
-/// sent up to it (before the first event, the values the bus started with,
-/// at `seq` 0).
+/// The store's active revision and safe mode: the `store-state` payload
+/// (with `seq`) and part of `get_runtime_snapshot`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct StoreState {
+    pub revision: u64,
+    pub safe_mode: Option<SafeModeReason>,
+}
+
+/// Receives the store's [`StoreState`] after each change, called with the
+/// store lock held (so reports arrive in the order the changes were made).
+/// Never blocks.
+pub type StoreSink = Arc<dyn Fn(StoreState) + Send + Sync>;
+
+/// The emitted stream at one point: the last `seq` and the Health, State
+/// and store state sent up to it (before the first event, the Health and
+/// State the bus started with, at `seq` 0; `store` is `None` until the
+/// first `store-state`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct BusView {
     pub seq: u64,
     pub health: HealthSnapshot,
     pub state: EngineState,
+    pub store: Option<StoreState>,
 }
 
 /// The legacy `engine-status` value (and `load_state.engine_status`).
@@ -110,6 +132,7 @@ pub fn legacy_status(state: &EngineState) -> &'static str {
 enum Input {
     Engine(EngineEvent),
     Problem(StartupProblem),
+    Store(StoreState),
 }
 
 /// What the throttle lets through, in order.
@@ -122,6 +145,7 @@ enum Out {
         suppressed: u64,
     },
     Problem(StartupProblem),
+    Store(StoreState),
 }
 
 pub struct EventBus {
@@ -142,6 +166,7 @@ impl EventBus {
             seq: 0,
             health: health.clone(),
             state: state.clone(),
+            store: None,
         }));
         let (tx, rx) = mpsc::channel();
         let worker = Worker {
@@ -153,6 +178,7 @@ impl EventBus {
             throttle: Throttle::new(health.clone(), state.clone()),
             health,
             state,
+            store: None,
             busy_check: None,
         };
         let spawned = std::thread::Builder::new()
@@ -187,6 +213,16 @@ impl EventBus {
             let _ = tx.send(Input::Problem(problem));
         })
     }
+
+    /// Where the store reports its revision and safe mode
+    /// ([`crate::store::Store::set_store_sink`]): each report that differs
+    /// from the last one sent becomes one `store-state` event.
+    pub fn store_sink(&self) -> StoreSink {
+        let tx = self.tx.clone();
+        Arc::new(move |store| {
+            let _ = tx.send(Input::Store(store));
+        })
+    }
 }
 
 /// The bus thread's state.
@@ -202,6 +238,8 @@ struct Worker {
     /// The latest Health and State received (for the observer).
     health: HealthSnapshot,
     state: EngineState,
+    /// The last store state let through (`None` before the first).
+    store: Option<StoreState>,
     /// Next `busy` re-check and how many are left.
     busy_check: Option<(Instant, u32)>,
 }
@@ -260,6 +298,13 @@ impl Worker {
                 self.after_execution(now);
             }
             Input::Problem(problem) => out.push(Out::Problem(problem)),
+            // Unthrottled; a report equal to the last one sent is dropped.
+            Input::Store(store) => {
+                if self.store != Some(store) {
+                    self.store = Some(store);
+                    out.push(Out::Store(store));
+                }
+            }
         }
     }
 
@@ -316,10 +361,10 @@ fn guarded(what: &'static str, f: impl FnOnce()) {
     }
 }
 
-/// Assigns the next `seq`, records Health/State in the view (one critical
-/// section, so a snapshot sees the `seq` and the values together) and emits
-/// with the lock released. A State that changes the legacy status string is
-/// followed by `engine-status`.
+/// Assigns the next `seq`, records Health/State/store state in the view
+/// (one critical section, so a snapshot sees the `seq` and the values
+/// together) and emits with the lock released. A State that changes the
+/// legacy status string is followed by `engine-status`.
 fn deliver(view: &Mutex<BusView>, sink: &dyn Sink, item: Out) {
     let (seq, legacy) = {
         let mut view = view.lock();
@@ -335,6 +380,10 @@ fn deliver(view: &Mutex<BusView>, sink: &dyn Sink, item: Out) {
                 let after = legacy_status(state);
                 (before != after).then_some(after)
             }
+            Out::Store(store) => {
+                view.store = Some(*store);
+                None
+            }
             Out::Execution { .. } | Out::Problem(_) => None,
         };
         (view.seq, legacy)
@@ -347,6 +396,7 @@ fn deliver(view: &Mutex<BusView>, sink: &dyn Sink, item: Out) {
             json!({ "seq": seq, "entry": entry, "suppressed": suppressed }),
         ),
         Out::Problem(problem) => (STARTUP_PROBLEM, with_seq(seq, &problem)),
+        Out::Store(store) => (STORE_STATE, with_seq(seq, &store)),
     };
     guarded("emit", || sink.emit(name, payload));
     if let Some(status) = legacy {
@@ -748,6 +798,7 @@ mod tests {
             seq: 0,
             health: HealthSnapshot::default(),
             state: state(false, false),
+            store: None,
         });
         let (tx, rx) = mpsc::channel();
         let sink = Channel(tx);
@@ -799,6 +850,7 @@ mod tests {
         assert_eq!(view.seq, 5);
         assert_eq!(view.health, health(HealthState::Healthy, None));
         assert_eq!(view.state, state(true, false));
+        assert_eq!(view.store, None);
     }
 
     #[test]
@@ -857,6 +909,71 @@ mod tests {
         assert_eq!(seen.statuses.first(), Some(&(HealthState::Starting, false)));
         assert_eq!(seen.statuses.last(), Some(&(HealthState::Healthy, true)));
         assert_eq!(seen.executed, [1]);
+    }
+
+    /// Review A4: `store-state` goes out at once (no merging, even for
+    /// reports back to back), numbered from the same `seq` as the rest, and
+    /// only when the reported value differs from the last one sent; the
+    /// view keeps the last one sent.
+    #[test]
+    fn store_state_goes_out_unthrottled_once_per_change() {
+        let runtime = Arc::new(Runtime::new(Arc::new(SystemClock)));
+        let (tx, rx) = mpsc::channel();
+        let bus = EventBus::start(&runtime, Channel(tx), Box::new(Recorder(Arc::default())));
+        assert_eq!(bus.view().store, None);
+        let report = bus.store_sink();
+        let locked = StoreState {
+            revision: 0,
+            safe_mode: Some(SafeModeReason::Locked),
+        };
+        let recovered = StoreState {
+            revision: 2,
+            safe_mode: None,
+        };
+        report(locked);
+        report(locked);
+        report(recovered);
+        report(recovered);
+        report(StoreState {
+            revision: 3,
+            safe_mode: None,
+        });
+        // A marker behind the reports: everything they caused is before it.
+        (bus.problem_sink())(ProblemKind::AutostartRepaired {}.into());
+        let mut sent = vec![];
+        loop {
+            let (name, payload) = next(&rx);
+            if name == STARTUP_PROBLEM {
+                break;
+            }
+            sent.push((name, payload));
+        }
+        assert_eq!(
+            sent,
+            [
+                (
+                    STORE_STATE,
+                    json!({"seq": 1, "revision": 0, "safe_mode": "locked"})
+                ),
+                (
+                    STORE_STATE,
+                    json!({"seq": 2, "revision": 2, "safe_mode": null})
+                ),
+                (
+                    STORE_STATE,
+                    json!({"seq": 3, "revision": 3, "safe_mode": null})
+                ),
+            ]
+        );
+        let view = bus.view();
+        assert_eq!(view.seq, 4);
+        assert_eq!(
+            view.store,
+            Some(StoreState {
+                revision: 3,
+                safe_mode: None
+            })
+        );
     }
 
     /// Review A3: the observer (tray run notifications) gets every history

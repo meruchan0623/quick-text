@@ -18,7 +18,7 @@ pub use metadata::merge_import_metadata;
 
 use crate::{
     error::{CommandError, IoOp, SafeModeReason},
-    events::ProblemSink,
+    events::{ProblemSink, StoreSink, StoreState},
     startup::{ProblemKind, StartupProblem},
 };
 use atomic::atomic_json;
@@ -64,6 +64,10 @@ pub struct Store {
     /// Where problems found after startup go (the EventBus, which sends
     /// `startup-problem`); `None` until the bus is up and in unit tests.
     problem_sink: Option<ProblemSink>,
+    /// Where the revision and safe mode go after each change (the EventBus,
+    /// which sends `store-state`); `None` until the bus is up and in most
+    /// unit tests.
+    store_sink: Option<StoreSink>,
     /// Successful [`Store::set_manual_pause`] calls so far, so startup can
     /// tell whether the user paused or resumed while it waited.
     manual_changes: AtomicU64,
@@ -115,6 +119,34 @@ impl Store {
     fn report_problem(&self, problem: &StartupProblem) {
         if let Some(sink) = &self.problem_sink {
             sink(problem.clone());
+        }
+    }
+    /// The active revision and safe mode (`store-state`,
+    /// `get_runtime_snapshot`).
+    pub fn store_state(&self) -> StoreState {
+        StoreState {
+            revision: self.active.revision,
+            safe_mode: self.safe_mode,
+        }
+    }
+    /// From now on the revision and safe mode are given to `sink` after
+    /// every change; the current value is given at once (the initial
+    /// `store-state`, so the EventBus's view has it before the frontend can
+    /// ask for a snapshot).
+    pub fn set_store_sink(&mut self, sink: StoreSink) {
+        self.store_sink = Some(sink);
+        self.report_store_state();
+    }
+    /// Reports the current revision and safe mode, still under the store
+    /// lock, so reports follow the order of the changes. The two places
+    /// that change them call it once they are done: [`Store::install`]
+    /// (startup and the SafeMode(Locked) retry: new revision and safe mode
+    /// left, one report) and `publish_with_metadata` (save/apply, rollback,
+    /// published import, which may also end safe mode). The EventBus drops
+    /// a report equal to the last one it sent.
+    fn report_store_state(&self) {
+        if let Some(sink) = &self.store_sink {
+            sink(self.store_state());
         }
     }
     /// The safe-mode gate for write commands (plan §7.2): everything that

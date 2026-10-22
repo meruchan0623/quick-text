@@ -6,7 +6,7 @@
 use crate::{
     app_state::{capabilities, Managed},
     error::{CommandError, SafeModeReason},
-    events::{BusView, EventBus},
+    events::{BusView, EventBus, StoreState},
 };
 use quicker_platform::{
     health::{EngineState, HealthSnapshot, HistoryEntry},
@@ -32,23 +32,29 @@ pub struct RuntimeSnapshot {
     pub safe_mode: Option<SafeModeReason>,
 }
 
-/// Builds the snapshot from the EventBus's view and, read after it, the
-/// rest. The order is what makes the snapshot a safe baseline: `seq`,
-/// `health` and `state` are one consistent copy of the emitted stream, and
-/// anything read later (the revision, safe mode, `history_seq`) is at least
-/// as new as it. A change the view does not contain is sent afterwards with
-/// a larger `seq`; in particular every history entry above `history_seq` was
-/// recorded after the view was taken, so its `execution-result` (or the
-/// `suppressed` count of one) has a `seq` above the snapshot's.
-fn runtime_snapshot(view: BusView, store: &Managed) -> RuntimeSnapshot {
-    let (runtime, revision, safe_mode) = {
+/// Builds the snapshot from the EventBus's view and, read after it,
+/// `history_seq`. `seq`, `health`, `state`, `revision` and `safe_mode` are
+/// one consistent copy of the emitted stream (the last `engine-health`,
+/// `engine-state` and `store-state` up to `seq`); a change the view does not
+/// contain is sent afterwards with a larger `seq`. `history_seq` is read
+/// later, so every history entry above it was recorded after the view was
+/// taken and its `execution-result` (or the `suppressed` count of one) has a
+/// `seq` above the snapshot's.
+///
+/// Before the bus has sent the first `store-state` (the store reports it
+/// when the sink is set during setup, before the webview loads, so this only
+/// covers a bus thread that never started) the revision and safe mode are
+/// read live from the store, after the view: still at least as new as it,
+/// and any later change still arrives as a `store-state` above `seq`.
+pub(crate) fn runtime_snapshot(view: BusView, store: &Managed) -> RuntimeSnapshot {
+    let (runtime, live) = {
         let store = store.lock();
-        (
-            store.runtime.clone(),
-            store.active.revision,
-            store.safe_mode(),
-        )
+        (store.runtime.clone(), store.store_state())
     };
+    let StoreState {
+        revision,
+        safe_mode,
+    } = view.store.unwrap_or(live);
     RuntimeSnapshot {
         seq: view.seq,
         health: view.health,

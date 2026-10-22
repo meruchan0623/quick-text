@@ -111,6 +111,7 @@ impl Store {
             tracing::info!(event = "store.safe_mode_import", "import published");
             self.set_safe_mode(None);
         }
+        self.report_store_state();
         Ok(())
     }
     /// One above the active revision and every `revisions/<n>.json`, so that

@@ -60,13 +60,14 @@ Rust 侧的共享类型在 `crates/platform/src/health.rs`，JSON 形状由其 s
 | `engine-health` | `{ seq, state: HealthState, components: ComponentHealth[] }` | 状态变化时立即发送；状态不变时最多每 5 秒重发一次。细则：`state` 变化立即发送；`state` 不变、只有 `components` 变化时，距上次发送满 5 秒立即发送，否则只保留最新值，到 5 秒时发出（其间变回上次发出的值则不发）；没有变化不重发（无心跳） |
 | `engine-state` | `{ seq, listening: boolean, paused_reasons: PauseReason[], busy: boolean, current_process: string \| null }` | 100ms 内的多次变化合并为一次。细则：距上次发送满 100ms 的变化立即发送，否则只保留最新值，在上次发送后 100ms 发出（其间变回上次发出的值则不发） |
 | `execution-result` | `{ seq, entry: HistoryEntry, suppressed: number }` | ≤ 10 条/秒；超出的条目不单独推送，下一条推送的 `suppressed` 记被合并的条数，前端据此显示「另有 N 条」，需要明细时调用 `list_history`。细则：1 秒滑动窗口；窗口满时只保留最新一条，窗口一有空位就发出（或被随后的新条目带走），`suppressed` 是被它合并、没有单独推送的条数 |
-| `startup-problem` | `{ seq, kind: string, severity: "info" \| "warning" \| "error", args: object }` | 每个问题一次；同时可通过 `startup_problems` 命令取全集。只推送加载之后才出现的问题（SafeMode(Locked) 重试成功后新出现的问题、`autostart_repaired`、`self_test_failed`、`log_level_elevated`）；加载时已有的问题不推送，由 `load_state.startup_problems` 提供。问题消失（例如 Locked 重试成功后移除 `safe_mode`）不发事件，前端在 `engine-state` 的 `paused_reasons` 不再含 `safe_mode` 时重新调用 `startup_problems` |
+| `startup-problem` | `{ seq, kind: string, severity: "info" \| "warning" \| "error", args: object }` | 每个问题一次；同时可通过 `startup_problems` 命令取全集。只推送加载之后才出现的问题（SafeMode(Locked) 重试成功后新出现的问题、`autostart_repaired`、`self_test_failed`、`log_level_elevated`）；加载时已有的问题不推送，由 `load_state.startup_problems` 提供。问题消失（例如 Locked 重试成功后移除 `safe_mode`）不发事件，前端在 `store-state` 的 `safe_mode` 变为 `null` 时（或 `engine-state` 的 `paused_reasons` 不再含 `safe_mode` 时）可以重新调用 `startup_problems` |
+| `store-state` | `{ seq, revision: number, safe_mode: SafeModeReason \| null }` | 不限速、不合并。当前生效修订号或安全模式变化时发送一次，不论原因（保存并应用、回滚、导入发布、SafeMode(Locked) 重试成功、其他后端路径）；两者同时变化（如 Locked 重试成功：新修订号与 `safe_mode: null`）是同一条事件；值与上一条 `store-state` 相同时不重发。启动时 EventBus 一就绪就推送一次初值（见下方发送规则） |
 | `engine-status` | 旧字符串 `"running"` \| `"paused"` \| `"listening"` | 0.4–0.5 保留为别名，不带 `seq`，新代码不要订阅。某条 `engine-state` 使这个字符串变化时紧随其后发送 |
 
 发送规则（`src-tauri/src/events.rs`）：
 
 - 只有 EventBus 的一个线程发送事件，`seq` 在发送时分配，所以事件按 `seq` 顺序到达。第一条事件的 `seq` 是 1。
-- 启动时的初始 Health / State 不推送，前端从 `load_state`（或 `get_runtime_snapshot`）取初值。
+- 启动时的初始 Health / State 不推送，前端从 `load_state`（或 `get_runtime_snapshot`）取初值。`store-state` 例外：EventBus 启动后、前端能调用命令之前，后端推送一次当前的 `revision`、`safe_mode`，所以 EventBus 的记录（`get_runtime_snapshot`）从一开始就有这两个值；前端可能在订阅之前错过这条初值，以 `load_state` / `get_runtime_snapshot` 为准即可。
 - 合并与限速只影响推送；托盘图标的提示、「暂停监听 / 恢复监听」菜单项和执行通知看到每一次变化。Windows 的执行通知在限速之前逐条取历史条目，按条目自己的 `rule_id`、`outcome` 判断（规则开了通知才发），每个历史 `seq` 一次，所以被 `suppressed` 合并的条目、被执行器超时围栏结束的执行也各有通知；macOS 没有执行历史，仍轮询最后一次结果。
 - 合并中、尚未发出的值不会出现在任何事件里，也不在 `get_runtime_snapshot` 里，直到它以更大的 `seq` 发出。
 
@@ -150,8 +151,9 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 
 ### 快照与事件（`get_runtime_snapshot`）
 
-- `seq`、`health`、`state` 是 EventBus 同一时刻的一份拷贝：`seq` 是最后发出的事件序号，`health`、`state` 是截至这个 `seq` 发出的值（还没有任何事件时 `seq` 为 0，`health`、`state` 是 EventBus 启动时的值）。合并中尚未发出的值不在快照里，它们之后以更大的 `seq` 发出。
-- 其余字段（`revision`、`safe_mode`、`history_seq`）在这份拷贝之后读取，所以至少和它一样新。快照没有包含的变化，一定以大于快照 `seq` 的事件到达；`seq` 不大于快照的事件可以直接丢弃，不会漏掉变化。
+- `seq`、`health`、`state`、`revision`、`safe_mode` 是 EventBus 同一时刻的一份拷贝：`seq` 是最后发出的事件序号，`health`、`state` 是截至这个 `seq` 最后一条 `engine-health`、`engine-state` 的值，`revision`、`safe_mode` 是截至这个 `seq` 最后一条 `store-state` 的值（还没有任何事件时 `seq` 为 0，`health`、`state` 是 EventBus 启动时的值）。合并中尚未发出的值不在快照里，它们之后以更大的 `seq` 发出。
+- `store-state` 的初值在启动时（前端能调用命令之前）交给 EventBus，所以快照里的 `revision`、`safe_mode` 来自这份拷贝。EventBus 还没有发出过 `store-state` 时（实际只在 EventBus 线程没能启动、之后不会有任何事件时出现），这两个值改为在拷贝之后从存储实时读取，仍然至少和拷贝一样新。
+- `history_seq` 在这份拷贝之后读取，所以至少和它一样新。快照没有包含的变化，一定以大于快照 `seq` 的事件到达；`seq` 不大于快照的事件可以直接丢弃，不会漏掉变化。例如快照之后 SafeMode(Locked) 重试成功：前端收到一条 `seq` 大于快照的 `store-state`，带新的 `revision` 和 `safe_mode: null`。
 - `history_seq` 是读取时已分配的最大历史序号。`seq` 不大于快照的 `execution-result` 所带的条目都满足 `entry.seq ≤ history_seq`；`entry.seq > history_seq` 的条目都是快照之后记录的，会以更大的 `seq` 推送（或计入某条推送的 `suppressed`）。快照之前的明细用 `list_history(null)` 取，之后的条目跟随事件；被合并的条目用 `list_history(history_seq)` 补齐。
 - 与 `load_state` 的区别：`load_state` 给实时值、不带 `seq`，适合首屏；对齐事件流用 `get_runtime_snapshot`。
 

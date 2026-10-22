@@ -59,6 +59,7 @@ impl Store {
             writable_hooks: vec![],
             writable_done: vec![],
             problem_sink: None,
+            store_sink: None,
             manual_changes: Default::default(),
         };
         store.install(report);
@@ -106,6 +107,9 @@ impl Store {
         self.startup_problems = report.problems;
         self.startup_problems.extend(kept);
         self.set_safe_mode(safe_mode);
+        // The new revision and the safe mode it left (or entered) together,
+        // in one report, under the lock the caller holds.
+        self.report_store_state();
     }
     /// Migration metadata of the draft, active and previous configurations.
     /// Outside safe mode the active one is also snapshotted.

@@ -67,9 +67,15 @@ fn main() {
             let pause_item = tray::build(app)?;
             let status = tray::TrayStatus::new(app.handle().clone(), pause_item, engine.clone());
             let bus = events::EventBus::start(&runtime, app.handle().clone(), Box::new(status));
-            app.state::<Managed>()
-                .lock()
-                .set_problem_sink(bus.problem_sink());
+            {
+                let managed = app.state::<Managed>();
+                let mut store = managed.lock();
+                store.set_problem_sink(bus.problem_sink());
+                // Sends the initial `store-state` (revision, safe mode), so
+                // the bus's view has them before the frontend can ask for
+                // `get_runtime_snapshot` (the webview loads after setup).
+                store.set_store_sink(bus.store_sink());
+            }
             app.manage(bus);
             startup::after_load(app.handle());
             startup::start_engine(engine, runtime);
