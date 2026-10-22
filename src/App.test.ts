@@ -196,6 +196,76 @@ describe('runtime status area (S-19)', () => {
     expect(row?.textContent).toMatch(/12 毫秒/);
   });
 
+  it('rewords the self-test banner as the user resumes and pauses, as one banner (review A6-2)', async () => {
+    const mounted = await mount();
+    const { backend, container } = mounted;
+    const banners = () => [...container.querySelectorAll('.banner')];
+    await waitFor(mounted, () => {
+      expect(headerStatus(container)).toBe('监听中');
+    });
+    // A check failed and nobody resumed while startup waited: still paused by the user reason.
+    await mounted.act(() => {
+      backend.setPaused('manual', true);
+      backend.addProblem({
+        kind: 'self_test_failed',
+        severity: 'warning',
+        args: { checks: ['clipboard'] },
+      });
+    });
+    await waitFor(mounted, () => {
+      expect(headerStatus(container)).toBe('已暂停');
+    });
+    expect(banners()).toHaveLength(1);
+    expect(banners()[0]?.textContent).toContain(
+      '启动自检未通过：剪贴板，没有自动开始监听。可在「运行状态与恢复」中查看详情或导出诊断包；排除问题后可点「恢复监听」。',
+    );
+    await click(mounted, '恢复监听');
+    await waitFor(mounted, () => {
+      expect(headerStatus(container)).toBe('监听中');
+    });
+    // The same banner, worded by the state now.
+    expect(banners()).toHaveLength(1);
+    expect(banners()[0]?.querySelector('small')).toBeNull();
+    expect(banners()[0]?.textContent).toContain(
+      '启动自检未通过：剪贴板。输入监听当前已开启，但可能无法正常工作；可在「运行状态与恢复」中查看详情或导出诊断包。',
+    );
+    expect(banners()[0]?.textContent).not.toMatch(/恢复监听|没有自动开始监听/);
+    await click(mounted, '暂停监听');
+    await waitFor(mounted, () => {
+      expect(banners()[0]?.textContent).toContain('没有自动开始监听');
+    });
+    expect(banners()).toHaveLength(1);
+  });
+
+  it('keeps a dismissed self-test banner hidden whatever its wording becomes (review A6-2)', async () => {
+    const mounted = await mount();
+    const { backend, container } = mounted;
+    await waitFor(mounted, () => {
+      expect(headerStatus(container)).toBe('监听中');
+    });
+    // The user resumed while startup waited: listening, the problem reported all the same.
+    await mounted.act(() => {
+      backend.addProblem({
+        kind: 'self_test_failed',
+        severity: 'warning',
+        args: { checks: ['raw_input'] },
+      });
+    });
+    expect(container.querySelector('.banner')?.textContent).toContain('输入监听当前已开启');
+    await click(mounted, '知道了');
+    expect(container.querySelector('.banner')).toBeNull();
+    await click(mounted, '暂停监听');
+    await waitFor(mounted, () => {
+      expect(headerStatus(container)).toBe('已暂停');
+    });
+    expect(container.querySelector('.banner')).toBeNull();
+    await click(mounted, '恢复监听');
+    await waitFor(mounted, () => {
+      expect(headerStatus(container)).toBe('监听中');
+    });
+    expect(container.querySelector('.banner')).toBeNull();
+  });
+
   it('exports diagnostics with the chosen redaction, and stays quiet on cancel', async () => {
     const mounted = await mount();
     const { backend, container } = mounted;

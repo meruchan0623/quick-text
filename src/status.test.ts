@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { initialView, type RuntimeView } from './ipc/events';
-import type { ComponentHealth, HealthSnapshot, HealthState } from './ipc/types';
+import type {
+  ComponentHealth,
+  EngineState,
+  HealthSnapshot,
+  HealthState,
+  StartupProblem,
+} from './ipc/types';
 import {
   affectedComponents,
   bannerItems,
@@ -197,6 +203,55 @@ describe('problemText', () => {
     expect(problemText({ kind: 'disk_almost_full', severity: 'warning', args: { free: 1 } })).toBe(
       '启动时发现一个问题：其他（disk_almost_full）。可在「运行状态与恢复」中导出诊断包了解详情。',
     );
+  });
+});
+
+describe('self_test_failed, worded by the engine state now (review A6-2)', () => {
+  const failed: StartupProblem = {
+    kind: 'self_test_failed',
+    severity: 'warning',
+    args: { checks: ['clipboard'] },
+  };
+  const PAUSED =
+    '启动自检未通过：剪贴板，没有自动开始监听。可在「运行状态与恢复」中查看详情或导出诊断包；排除问题后可点「恢复监听」。';
+
+  it('says listening is on, and points to no resume, while the engine listens', () => {
+    const text = problemText(failed, { listening: true, paused_reasons: [] });
+    expect(text).toBe(
+      '启动自检未通过：剪贴板。输入监听当前已开启，但可能无法正常工作；可在「运行状态与恢复」中查看详情或导出诊断包。',
+    );
+    expect(text).not.toMatch(/恢复监听|没有自动开始监听/);
+  });
+
+  it('keeps 「没有自动开始监听」 and 「恢复监听」 while the user pause is set', () => {
+    expect(problemText(failed, { listening: false, paused_reasons: ['manual'] })).toBe(PAUSED);
+    // With another reason too: resuming clears the user pause, the rest stands.
+    expect(problemText(failed, { listening: false, paused_reasons: ['safe_mode', 'manual'] })).toBe(
+      PAUSED,
+    );
+    // Not known yet: the backend's default, paused.
+    expect(problemText(failed)).toBe(PAUSED);
+    expect(problemText(failed, null)).toBe(PAUSED);
+  });
+
+  it('claims neither listening nor a resume to click while paused otherwise', () => {
+    for (const paused_reasons of [['recording'], ['fullscreen'], ['safe_mode'], ['engine_down']]) {
+      const text = problemText(failed, {
+        listening: false,
+        paused_reasons: paused_reasons as EngineState['paused_reasons'],
+      });
+      expect(text).toBe(
+        '启动自检未通过：剪贴板，输入监听可能无法正常工作。可在「运行状态与恢复」中查看详情或导出诊断包。',
+      );
+    }
+  });
+
+  it('keeps one banner key whatever the text', () => {
+    const [listening] = bannerItems(null, [failed], { listening: true, paused_reasons: [] });
+    const [paused] = bannerItems(null, [failed], { listening: false, paused_reasons: ['manual'] });
+    expect(listening?.key).toBe(paused?.key);
+    expect(listening?.text).not.toBe(paused?.text);
+    expect(paused?.text).toBe(PAUSED);
   });
 });
 
