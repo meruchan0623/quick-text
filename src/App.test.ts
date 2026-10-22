@@ -306,6 +306,81 @@ async function clickIn(mounted: Mounted, root: ParentNode | null, text: string):
 const statusText = (container: HTMLElement) =>
   container.querySelector('.status-text')?.textContent ?? '';
 
+/** The checkbox of the `<label>` reading `text`, or null when there is none. */
+const checkbox = (container: HTMLElement, text: string): HTMLInputElement | null =>
+  [...container.querySelectorAll('label')]
+    .find((l) => l.textContent.trim() === text)
+    ?.querySelector<HTMLInputElement>('input[type="checkbox"]') ?? null;
+
+/** Let React and the mock's pending promises settle. */
+const settle = (mounted: Pick<Mounted, 'act'>) =>
+  mounted.act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+
+interface HeldLoad {
+  /** The backend has read the state this load_state answers with. */
+  read: boolean;
+  /** The answer has been sent back. */
+  answered: boolean;
+  release: () => void;
+}
+
+interface LoadHold {
+  held: HeldLoad[];
+  attach: (backend: MockBackend) => void;
+  /** Hold the next `count` load_state calls. */
+  arm: (count?: number) => void;
+}
+
+/**
+ * Once attached, each armed load_state reads the state at once, as the backend would, but answers
+ * only on its `release()`: a load overtaken by a command's answer (review C2).
+ */
+function holdLoads(): LoadHold {
+  let armed = 0;
+  const held: HeldLoad[] = [];
+  return {
+    held,
+    attach: (backend) => {
+      const handle = backend.handle.bind(backend);
+      backend.handle = async (...[command, args]: Parameters<MockBackend['handle']>) => {
+        if (command !== 'load_state' || armed === 0) return handle(command, args);
+        armed -= 1;
+        let release: () => void = () => undefined;
+        const released = new Promise<void>((resolve) => {
+          release = () => {
+            resolve();
+          };
+        });
+        const entry: HeldLoad = {
+          read: false,
+          answered: false,
+          release: () => {
+            release();
+          },
+        };
+        held.push(entry);
+        const answer = await handle(command, args);
+        entry.read = true;
+        await released;
+        entry.answered = true;
+        return answer;
+      };
+    },
+    arm: (count = 1) => {
+      armed += count;
+    },
+  };
+}
+
+/** Release held load `index` and let its answer reach the app. */
+async function answerHeld(mounted: Mounted, hold: LoadHold, index: number): Promise<void> {
+  hold.held[index]?.release();
+  await waitFor(mounted, () => {
+    expect(hold.held[index]?.answered).toBe(true);
+  });
+  await settle(mounted);
+}
+
 describe('rule list, editor and settings (F-04)', () => {
   it('lists rules without a group under 「默认」', async () => {
     // Rule 1 is in 「默认」, rule 7 has group "".
@@ -524,12 +599,6 @@ describe('rule list, editor and settings (F-04)', () => {
 describe('启动时自动开始监听 (S-09)', () => {
   const AUTO_LISTEN = '启动时自动开始监听';
 
-  /** The checkbox of the `<label>` reading `text`, or null when there is none. */
-  const checkbox = (container: HTMLElement, text: string): HTMLInputElement | null =>
-    [...container.querySelectorAll('label')]
-      .find((l) => l.textContent.trim() === text)
-      ?.querySelector<HTMLInputElement>('input[type="checkbox"]') ?? null;
-
   /** Mount, wait for load_state and open the settings page. */
   async function openSettings(
     options: MockOptions = {},
@@ -617,71 +686,25 @@ describe('启动时自动开始监听 (S-09)', () => {
     expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
   });
 
-  /** Let React and the mock's pending promises settle. */
-  const settle = (mounted: Mounted) =>
-    mounted.act(() => new Promise((resolve) => setTimeout(resolve, 20)));
-
-  /**
-   * Once attached, the first load_state sent after `arm()` reads the state at once, as the backend
-   * would, but answers only on `release()`: a reload overtaken by a command's answer (review C2).
-   */
-  function holdLoad() {
-    let armed = false;
-    let read = false;
-    let answered = false;
-    let release: () => void = () => undefined;
-    const released = new Promise<void>((resolve) => {
-      release = () => {
-        resolve();
-      };
-    });
-    return {
-      attach: (backend: MockBackend) => {
-        const handle = backend.handle.bind(backend);
-        backend.handle = async (...[command, args]: Parameters<MockBackend['handle']>) => {
-          if (command !== 'load_state' || !armed) return handle(command, args);
-          armed = false;
-          const answer = await handle(command, args);
-          read = true;
-          await released;
-          answered = true;
-          return answer;
-        };
-      },
-      arm: () => {
-        armed = true;
-      },
-      read: () => read,
-      answered: () => answered,
-      release: () => {
-        release();
-      },
-    };
-  }
-
   /** Reload on focus with load_state held, toggle the setting meanwhile, then let the load answer. */
-  async function overtakeReload(mounted: Mounted, hold: ReturnType<typeof holdLoad>) {
+  async function overtakeReload(mounted: Mounted, hold: LoadHold) {
     const { container } = mounted;
     hold.arm();
     await mounted.act(() => {
       window.dispatchEvent(new Event('focus'));
     });
     await waitFor(mounted, () => {
-      expect(hold.read()).toBe(true);
+      expect(hold.held[0]?.read).toBe(true);
     });
     await toggle(mounted);
     await waitFor(mounted, () => {
       expect(checkbox(container, AUTO_LISTEN)?.checked).toBe(false);
     });
-    hold.release();
-    await waitFor(mounted, () => {
-      expect(hold.answered()).toBe(true);
-    });
-    await settle(mounted);
+    await answerHeld(mounted, hold, 0);
   }
 
   it('keeps set_auto_listen’s answer over a load_state read before it (review C2)', async () => {
-    const hold = holdLoad();
+    const hold = holdLoads();
     const mounted = await openSettings({}, (backend) => {
       backend.autoListen = true;
       hold.attach(backend);
@@ -697,7 +720,7 @@ describe('启动时自动开始监听 (S-09)', () => {
   });
 
   it('keeps unsaved settings edits when the reload asked again answers (review C2)', async () => {
-    const hold = holdLoad();
+    const hold = holdLoads();
     const mounted = await openSettings({}, (backend) => {
       backend.autoListen = true;
       hold.attach(backend);
@@ -744,6 +767,245 @@ describe('启动时自动开始监听 (S-09)', () => {
     expect(callsOf(backend, 'set_autostart')[0]?.args).toEqual({ enabled: true });
     expect(checkbox(container, '登录后自动启动')?.checked).toBe(false);
     expect(container.querySelector('.alert.error')).toBeNull();
+  });
+});
+
+describe('writes wait for the first load_state snapshot (review C2 follow-up)', () => {
+  /** Commands that write the backend or submit the config, and the ones only their entries send. */
+  const WRITES = [
+    'save_draft',
+    'apply_settings',
+    'discard_draft',
+    'rollback',
+    'set_autostart',
+    'set_auto_listen',
+    'import_config',
+    'export_config',
+    'choose_file',
+    'get_foreground',
+  ];
+
+  const alerts = (container: HTMLElement) =>
+    [...container.querySelectorAll('[role="alert"]')].map((a) => a.textContent).join('\n');
+
+  const pauseButton = (container: HTMLElement) =>
+    button(container, '暂停监听') ?? button(container, '恢复监听');
+
+  /** Every write entry of the three pages, by page; `null` when it is not rendered. */
+  function writeEntries(container: HTMLElement, page: 'manage' | 'settings' | 'status') {
+    const entries = {
+      manage: () => [
+        checkbox(container, '启用文本指令'),
+        button(container, '＋ 添加指令'),
+        button(container, '导入'),
+        button(container, '导出'),
+        button(container, '应用设置'),
+      ],
+      settings: () => [
+        button(container, '保存参数草稿'),
+        button(container, '选择当前窗口加入黑名单'),
+        checkbox(container, '登录后自动启动'),
+        button(container, '应用设置'),
+      ],
+      status: () => [
+        button(container, '放弃未应用草稿'),
+        button(container, '恢复上一个版本'),
+        button(container, '应用设置'),
+      ],
+    };
+    return entries[page]().map((entry) => entry ?? null);
+  }
+
+  async function failFirstLoad(): Promise<Mounted> {
+    const mounted = await mount({}, (backend) => {
+      backend.failures.set('load_state', '桌面引擎没有响应');
+    });
+    await waitFor(mounted, () => {
+      expect(alerts(mounted.container)).toContain('未能读取当前配置');
+    });
+    return mounted;
+  }
+
+  it('keeps every write disabled, and unsent, while the first load_state failed', async () => {
+    const mounted = await failFirstLoad();
+    const { backend, container } = mounted;
+    expect(alerts(container)).toContain('桌面引擎没有响应');
+    expect(button(container, '重试')?.disabled).toBe(false);
+    expect(statusText(container)).toBe('未能读取当前配置');
+    expect(container.textContent).not.toContain('已连接');
+    expect(container.querySelectorAll('tbody tr')).toHaveLength(0);
+    // Not a write of the config: the engine can still be paused.
+    expect(pauseButton(container)?.disabled).toBe(false);
+
+    const tryAll = async (entries: (HTMLInputElement | HTMLButtonElement | null)[]) => {
+      for (const entry of entries) {
+        expect(entry).not.toBeNull();
+        expect(entry?.disabled).toBe(true);
+        await mounted.act(() => {
+          entry?.click();
+        });
+      }
+    };
+    await tryAll(writeEntries(container, 'manage'));
+
+    await click(mounted, '文本指令参数设置');
+    await tryAll(writeEntries(container, 'settings'));
+    const separators = field(container, '词分隔符');
+    expect(separators.matches(':disabled')).toBe(true);
+    // The fieldset disables the field for the user only; an input event still reaches React.
+    const before = separators.value;
+    await type(mounted, separators, ' ;');
+    expect(field(container, '词分隔符').value).toBe(before);
+
+    await click(mounted, '运行状态与恢复');
+    await tryAll(writeEntries(container, 'status'));
+    expect(button(container, '刷新状态')?.disabled).toBe(false);
+    expect(button(container, '停止当前动作')?.disabled).toBe(false);
+
+    await settle(mounted);
+    expect(dialog(container, '放弃全部未应用草稿？')?.open ?? false).toBe(false);
+    expect(dialog(container, '回滚到上一个生效版本？')?.open ?? false).toBe(false);
+    for (const command of WRITES) expect(callsOf(backend, command)).toEqual([]);
+    expect(callsOf(backend, 'load_state')).toHaveLength(1);
+  });
+
+  it('says so, never 「已连接」, when commands overtake all three first loads', async () => {
+    const hold = holdLoads();
+    hold.arm(3);
+    const mounted = await mount({}, (backend) => {
+      hold.attach(backend);
+    });
+    const { backend, container } = mounted;
+    for (let i = 0; i < 3; i++) {
+      await waitFor(mounted, () => {
+        expect(hold.held[i]?.read).toBe(true);
+        expect(pauseButton(container)?.disabled).toBe(false);
+      });
+      // set_paused answers with the whole state while load_state i, read before it, is on its way.
+      await mounted.act(() => {
+        pauseButton(container)?.click();
+      });
+      await waitFor(mounted, () => {
+        expect(callsOf(backend, 'set_paused')).toHaveLength(i + 1);
+      });
+      await settle(mounted);
+      expect(container.textContent).not.toContain('已连接');
+      await answerHeld(mounted, hold, i);
+    }
+    await waitFor(mounted, () => {
+      expect(alerts(container)).toContain('未能读取当前配置：读取期间状态一再变化');
+    });
+    expect(callsOf(backend, 'load_state')).toHaveLength(3);
+    expect(container.textContent).not.toContain('已连接');
+    expect(statusText(container)).toBe('未能读取当前配置');
+    expect(container.querySelectorAll('tbody tr')).toHaveLength(0);
+    expect(writeEntries(container, 'manage').map((entry) => entry?.disabled)).toEqual(
+      Array<boolean>(5).fill(true),
+    );
+
+    await click(mounted, '重试');
+    await waitFor(mounted, () => {
+      expect(statusText(container)).toContain('已连接');
+    });
+    expect(callsOf(backend, 'load_state')).toHaveLength(4);
+    expect(alerts(container)).not.toContain('未能读取当前配置');
+    expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
+    expect(writeEntries(container, 'manage').map((entry) => entry?.disabled)).toEqual(
+      Array<boolean>(5).fill(false),
+    );
+  });
+
+  it('unlocks the writes once the config is read', async () => {
+    const mounted = await failFirstLoad();
+    const { backend, container } = mounted;
+    await click(mounted, '重试');
+    await waitFor(mounted, () => {
+      expect(statusText(container)).toContain('已连接');
+    });
+    expect(alerts(container)).not.toContain('未能读取当前配置');
+    expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
+    for (const entry of writeEntries(container, 'manage')) expect(entry?.disabled).toBe(false);
+
+    await click(mounted, '文本指令参数设置');
+    for (const entry of writeEntries(container, 'settings')) expect(entry?.disabled).toBe(false);
+    expect(field(container, '词分隔符').matches(':disabled')).toBe(false);
+    await type(mounted, field(container, '词分隔符'), ' ;');
+    expect(field(container, '词分隔符').value).toBe(' ;');
+    await click(mounted, '保存参数草稿');
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+    });
+    const saved = callsOf(backend, 'save_draft')[0]?.args.config as {
+      rules: unknown[];
+      globals: { word_separators: string };
+    };
+    // The draft submitted is the config read, not the empty one shown before.
+    expect(saved.rules).toHaveLength(3);
+    expect(saved.globals.word_separators).toBe(' ;');
+
+    await click(mounted, '运行状态与恢复');
+    for (const entry of writeEntries(container, 'status')) expect(entry?.disabled).toBe(false);
+  });
+
+  /** Mount with load_state holdable and wait until the config is read. */
+  async function mountReady(hold: LoadHold): Promise<Mounted> {
+    const mounted = await mount({}, (backend) => {
+      hold.attach(backend);
+    });
+    await waitFor(mounted, () => {
+      expect(statusText(mounted.container)).toContain('已连接');
+    });
+    return mounted;
+  }
+
+  /** Let set_autostart overtake each of the three held loads of a reload already started. */
+  async function overtakeAll(mounted: Mounted, hold: LoadHold): Promise<void> {
+    const { backend, container } = mounted;
+    await click(mounted, '文本指令参数设置');
+    for (let i = 0; i < 3; i++) {
+      await waitFor(mounted, () => {
+        expect(hold.held[i]?.read).toBe(true);
+      });
+      await mounted.act(() => {
+        checkbox(container, '登录后自动启动')?.click();
+      });
+      await waitFor(mounted, () => {
+        expect(callsOf(backend, 'set_autostart')).toHaveLength(i + 1);
+      });
+      await settle(mounted);
+      await answerHeld(mounted, hold, i);
+    }
+    await settle(mounted);
+    expect(callsOf(backend, 'load_state')).toHaveLength(4);
+  }
+
+  it('does not report 「状态已刷新」 when commands overtake every load of a refresh', async () => {
+    const hold = holdLoads();
+    const mounted = await mountReady(hold);
+    const { container } = mounted;
+    await click(mounted, '运行状态与恢复');
+    hold.arm(3);
+    await click(mounted, '刷新状态');
+    await overtakeAll(mounted, hold);
+    await waitFor(mounted, () => {
+      expect(alerts(container)).toContain('读取期间状态一再变化，读到的内容已过时，这次没有刷新');
+    });
+    expect(statusText(container)).not.toContain('状态已刷新');
+    // The config read first stays; the writes stay usable.
+    expect(button(container, '保存参数草稿')?.disabled).toBe(false);
+  });
+
+  it('stays silent when commands overtake every load of a focus reload', async () => {
+    const hold = holdLoads();
+    const mounted = await mountReady(hold);
+    const { container } = mounted;
+    hold.arm(3);
+    await mounted.act(() => {
+      window.dispatchEvent(new Event('focus'));
+    });
+    await overtakeAll(mounted, hold);
+    expect(alerts(container)).toBe('');
+    expect(statusText(container)).toContain('已连接');
   });
 });
 

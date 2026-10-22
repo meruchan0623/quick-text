@@ -49,6 +49,9 @@ import { ruleEditDiagnostics } from './lib/numberFields';
 const errorText = (e: unknown) => describe(e) ?? '';
 // How many times one load_state is asked for while commands keep overtaking it (review C2).
 const LOAD_ATTEMPTS = 3;
+const OVERTAKEN = '读取期间状态一再变化，读到的内容已过时';
+const REFRESH_OVERTAKEN = `${OVERTAKEN}，这次没有刷新。请再点一次「刷新状态」。`;
+const NOT_READY = '还没有读取到当前配置，暂时不能修改指令和设置。';
 function Field({
   label,
   children,
@@ -220,23 +223,64 @@ export default function App() {
     answers.current += 1;
     setState(update);
   };
+  // Until the first load_state snapshot is applied, `config` is emptyConfig, not the user's: a write
+  // would replace their draft or settings with it. Every write is disabled until then (`ready`) and
+  // refused again by its handler (`requireReady`, read from the ref, which is never behind).
+  const loaded = useRef(false);
+  const [ready, setReady] = useState(false);
+  // Why the first load_state did not apply; shown with 「重试」 until one does.
+  const [loadFailure, setLoadFailure] = useState('');
+  const requireReady = () => {
+    if (!loaded.current) throw new Error(NOT_READY);
+  };
+  /** Apply a load_state snapshot; the first one initializes the editor and unlocks the writes. */
+  const applySnapshot = (s: State) => {
+    if (loaded.current) {
+      // Unsaved local edits are kept.
+      if (edited.current) setState(s);
+      else receive(s);
+      return;
+    }
+    receive(s);
+    loaded.current = true;
+    setReady(true);
+    setLoadFailure('');
+    setMessage('已连接 · 保存写入草稿，应用设置后生效');
+  };
   /**
-   * load_state into `apply`. An answer overtaken by a command's answer is not applied but asked for
-   * again, at most LOAD_ATTEMPTS times in all: the fields only load_state carries would otherwise
-   * stay stale until the next focus, and 「刷新状态」 would report a refresh that did not happen. A
-   * load sent after a command answered reads that command's change, so the next answer applies.
-   * The check and `apply` run in one step after the answer arrives, with nothing in between.
+   * load_state, applied; resolves whether it was. An answer overtaken by a command's answer is not
+   * applied but asked for again, at most LOAD_ATTEMPTS times in all: the fields only load_state
+   * carries would otherwise stay stale until the next focus. A load sent after a command answered
+   * reads that command's change, so the next answer applies. The check and the apply run in one
+   * step after the answer arrives, with nothing in between.
    */
-  const loadInto = async (apply: (s: State) => void) => {
+  const load = async (): Promise<boolean> => {
     for (let attempt = 0; attempt < LOAD_ATTEMPTS; attempt++) {
       const generation = answers.current;
       const s = await call<State>('load_state');
       if (generation === answers.current) {
-        apply(s);
-        return;
+        applySnapshot(s);
+        return true;
       }
     }
-    // Overtaken every time: keep what the commands answered.
+    // Overtaken every time: keep what the commands answered; the caller says so.
+    return false;
+  };
+  /**
+   * The first load, at start and on 「重试」: ends initialized or with a retryable failure. A
+   * failure shown stays until replaced: by nothing on success, or by the new failure.
+   */
+  const loadFirst = async () => {
+    let failure = OVERTAKEN;
+    try {
+      if (await load()) return;
+    } catch (e) {
+      failure = errorText(e) || '读取被中断';
+    }
+    // A reload (window focus) may have initialized meanwhile.
+    if (loaded.current) return;
+    setLoadFailure(failure);
+    setMessage('未能读取当前配置');
   };
   const run = async (fn: () => Promise<any>, success?: string) => {
     setBusy(true);
@@ -252,19 +296,14 @@ export default function App() {
       setBusy(false);
     }
   };
+  // Once, at start; 「重试」 calls loadFirst itself.
+  const loadFirstRef = useRef(loadFirst);
   useEffect(() => {
-    loadInto((s) => {
-      receive(s);
-      setMessage('已连接 · 保存写入草稿，应用设置后生效');
-    }).catch((e: unknown) => setError(errorText(e)));
+    void loadFirstRef.current();
   }, []);
   // The legacy load_state fields (target observation, capabilities, draft flags) have no event:
   // reload them when the window regains focus and on 「刷新状态」. Unsaved local edits are kept.
-  const reload = () =>
-    loadInto((s) => {
-      if (edited.current) setState(s);
-      else receive(s);
-    });
+  const reload = load;
   const reloadRef = useRef(reload);
   useEffect(() => {
     reloadRef.current = reload;
@@ -272,7 +311,7 @@ export default function App() {
   useEffect(() => {
     const onFocus = () => {
       reloadRef.current().catch(() => {
-        // Keep showing the last known state; 「刷新状态」 reports errors.
+        // Keep showing the last known state; 「刷新状态」 reports errors and an overtaken load.
       });
     };
     window.addEventListener('focus', onFocus);
@@ -280,8 +319,9 @@ export default function App() {
   }, []);
   const refresh = () =>
     run(async () => {
-      await reload();
+      const applied = await reload();
       if (runtime.status !== 'unsupported') await sync.resync();
+      if (!applied) throw new Error(REFRESH_OVERTAKEN);
     }, '状态已刷新');
   const repair = () =>
     run(async () => {
@@ -322,6 +362,7 @@ export default function App() {
     typeof state?.auto_listen_on_start === 'boolean' ? state.auto_listen_on_start : null;
   const setAutoListen = (enabled: boolean) =>
     run(async () => {
+      requireReady();
       try {
         const value = await call<boolean>('set_auto_listen', { enabled });
         patchState((s) => (s ? { ...s, auto_listen_on_start: value } : s));
@@ -351,11 +392,16 @@ export default function App() {
     setEditing(null);
   };
   const change = (c: Config) => {
+    // The settings fields are disabled through their fieldset, which React does not see: an input
+    // event still reaches onChange. Before the first snapshot there is nothing to edit yet.
+    if (!loaded.current) return;
     setConfig(c);
     setLocalDirty(true);
     edited.current = true;
   };
   const save = async (c = config) => {
+    // Every path that submits the config ends here (rules, settings, 总开关, import, export, apply).
+    requireReady();
     const s = await call<State>('save_draft', { config: c });
     receiveAnswer(s);
     return s;
@@ -411,6 +457,7 @@ export default function App() {
   const choose = async (kind = 'file') => call<string[] | null>('choose_file', { kind });
   const exportData = () =>
     run(async () => {
+      requireReady();
       if (localDirty) await save();
       const path = await call<string | null>('export_config');
       // null: the save dialog was cancelled; say nothing (ipc-contract §4).
@@ -418,6 +465,7 @@ export default function App() {
     });
   const importData = () =>
     run(async () => {
+      requireReady();
       const p = await choose('import');
       if (!p?.length) return;
       const strategy = await askValue({
@@ -497,7 +545,9 @@ export default function App() {
               修复引擎
             </button>
           )}
-          <button onClick={togglePause} disabled={!state || busy}>
+          {/* Not a write of the config: usable before it is read, as soon as the current pause is
+              known, so the engine can be stopped even when load_state fails. */}
+          <button onClick={togglePause} disabled={busy || (!live && !state)}>
             {(live ? live.manualPause : state?.paused) ? '恢复监听' : '暂停监听'}
           </button>
         </div>
@@ -518,6 +568,14 @@ export default function App() {
         </span>
       </nav>
       <BannerStack view={runtime} onOpenDataDir={() => openDir('open_data_dir')} />
+      {!ready && loadFailure && (
+        <div className="alert error" role="alert">
+          未能读取当前配置：{loadFailure}。读取成功前不能修改指令和设置。
+          <button className="retry" disabled={busy} onClick={() => run(loadFirst)}>
+            重试
+          </button>
+        </div>
+      )}
       {error && (
         <div className="alert error" role="alert">
           {error}
@@ -533,6 +591,7 @@ export default function App() {
               <input
                 type="checkbox"
                 checked={config.enabled}
+                disabled={!ready}
                 onChange={(e) =>
                   run(() => save({ ...config, enabled: e.target.checked }), '总开关已保存到草稿')
                 }
@@ -551,11 +610,19 @@ export default function App() {
               <input type="checkbox" checked={hide} onChange={(e) => setHide(e.target.checked)} />
               隐藏摘要
             </label>
-            <button className="primary" onClick={() => openEditor(newRule(platform))}>
+            <button
+              className="primary"
+              disabled={!ready}
+              onClick={() => openEditor(newRule(platform))}
+            >
               ＋ 添加指令
             </button>
-            <button onClick={importData}>导入</button>
-            <button onClick={exportData}>导出</button>
+            <button disabled={!ready} onClick={importData}>
+              导入
+            </button>
+            <button disabled={!ready} onClick={exportData}>
+              导出
+            </button>
           </div>
 
           <div className="batch">
@@ -565,7 +632,7 @@ export default function App() {
               {selected.length} 条
             </span>
             <button
-              disabled={!selected.length}
+              disabled={!ready || !selected.length}
               onClick={() =>
                 mutate((rs) => rs.map((r) => (selectedSet.has(r.id) ? { ...r, enabled: true } : r)))
               }
@@ -573,7 +640,7 @@ export default function App() {
               启用
             </button>
             <button
-              disabled={!selected.length}
+              disabled={!ready || !selected.length}
               onClick={() =>
                 mutate((rs) =>
                   rs.map((r) => (selectedSet.has(r.id) ? { ...r, enabled: false } : r)),
@@ -583,7 +650,7 @@ export default function App() {
               停用
             </button>
             <button
-              disabled={!selected.length}
+              disabled={!ready || !selected.length}
               onClick={async () => {
                 const g = await askValue({
                   title: `把所选 ${selected.length} 条指令移到哪个分组？`,
@@ -599,7 +666,7 @@ export default function App() {
               移至分组
             </button>
             <button
-              disabled={!selected.length}
+              disabled={!ready || !selected.length}
               onClick={async () => {
                 if (
                   await confirmAction({
@@ -740,8 +807,9 @@ export default function App() {
                 ))}
               </tbody>
             </table>
-            {/* No empty state before the first load_state answer (F-04). */}
-            {state && !rows.length && !unreadableRows.length && (
+            {/* No empty state before the first load_state snapshot (F-04); set_paused's answer
+                may fill `state` earlier. */}
+            {ready && !rows.length && !unreadableRows.length && (
               <div className="empty">
                 <div aria-hidden="true">⌨</div>
                 <strong>{search ? '没有匹配的指令' : '建立你的第一条文本指令'}</strong>
@@ -776,66 +844,75 @@ export default function App() {
               配置中含超出可安全保存范围的数值，保存时可能被改写。
             </p>
           )}
-          <Field label="默认触发字符">
-            <EndKeys
-              platform={platform}
-              value={config.globals.terminators}
-              onChange={(v) =>
-                change({ ...config, globals: { ...config.globals, terminators: v } })
-              }
-            />
-          </Field>
-          <Field label="词分隔符" hint="空格、Tab、换行用于确定触发边界。">
-            <input
-              value={config.globals.word_separators}
-              onChange={(e) =>
-                change({
-                  ...config,
-                  globals: { ...config.globals, word_separators: e.target.value },
-                })
-              }
-            />
-          </Field>
-          {fixedImeErasure(platform) ? (
-            // Principle 5 (S-16): the Windows input backend only erases by Backspace, so the Esc
-            // method it never runs is not offered; a stored `escape` is kept for other platforms.
-            <Field
-              label="默认输入法删除方式"
-              hint="Windows 版固定按缩写长度退格删除，不提供其他方式。中文选字中的数字或空格可能选择候选词，建议切到英文输入后使用。"
-            >
-              <span className="fixed-value">按缩写长度退格删除</span>
-            </Field>
-          ) : (
-            <Field
-              label="默认输入法删除方式"
-              hint="中文选字中的数字或空格可能选择候选词，建议切到英文输入后使用。"
-            >
-              <select
-                value={config.globals.ime_erasure}
-                onChange={(e) =>
-                  change({ ...config, globals: { ...config.globals, ime_erasure: e.target.value } })
+          {/* Edits here only become a write on 「保存参数草稿」, but made before the config is read
+              they would be edits of emptyConfig, dropped by the first snapshot. */}
+          <fieldset className="settings-fields" disabled={!ready}>
+            <Field label="默认触发字符">
+              <EndKeys
+                platform={platform}
+                value={config.globals.terminators}
+                onChange={(v) =>
+                  change({ ...config, globals: { ...config.globals, terminators: v } })
                 }
-              >
-                <option value="escape">按 Esc 关闭选字框</option>
-                <option value="backspace">Backspace 删除已上屏字符</option>
-              </select>
+              />
             </Field>
-          )}
-          <Field
-            label="黑名单程序"
-            hint="每行一个 Windows 进程名或 Mac 应用标识；黑名单内不执行文本指令。"
-          >
-            <LinesInput
-              rows={5}
-              value={config.globals.blacklist}
-              onChange={(blacklist) =>
-                change({ ...config, globals: { ...config.globals, blacklist } })
-              }
-            />
-          </Field>
+            <Field label="词分隔符" hint="空格、Tab、换行用于确定触发边界。">
+              <input
+                value={config.globals.word_separators}
+                onChange={(e) =>
+                  change({
+                    ...config,
+                    globals: { ...config.globals, word_separators: e.target.value },
+                  })
+                }
+              />
+            </Field>
+            {fixedImeErasure(platform) ? (
+              // Principle 5 (S-16): the Windows input backend only erases by Backspace, so the Esc
+              // method it never runs is not offered; a stored `escape` is kept for other platforms.
+              <Field
+                label="默认输入法删除方式"
+                hint="Windows 版固定按缩写长度退格删除，不提供其他方式。中文选字中的数字或空格可能选择候选词，建议切到英文输入后使用。"
+              >
+                <span className="fixed-value">按缩写长度退格删除</span>
+              </Field>
+            ) : (
+              <Field
+                label="默认输入法删除方式"
+                hint="中文选字中的数字或空格可能选择候选词，建议切到英文输入后使用。"
+              >
+                <select
+                  value={config.globals.ime_erasure}
+                  onChange={(e) =>
+                    change({
+                      ...config,
+                      globals: { ...config.globals, ime_erasure: e.target.value },
+                    })
+                  }
+                >
+                  <option value="escape">按 Esc 关闭选字框</option>
+                  <option value="backspace">Backspace 删除已上屏字符</option>
+                </select>
+              </Field>
+            )}
+            <Field
+              label="黑名单程序"
+              hint="每行一个 Windows 进程名或 Mac 应用标识；黑名单内不执行文本指令。"
+            >
+              <LinesInput
+                rows={5}
+                value={config.globals.blacklist}
+                onChange={(blacklist) =>
+                  change({ ...config, globals: { ...config.globals, blacklist } })
+                }
+              />
+            </Field>
+          </fieldset>
           <button
+            disabled={!ready}
             onClick={() =>
               run(async () => {
+                requireReady();
                 const w = await call('get_foreground');
                 const platform = w.platform ?? state?.platform ?? state?.engine_detail?.platform;
                 const identity =
@@ -859,8 +936,10 @@ export default function App() {
               <input
                 type="checkbox"
                 checked={!!state?.autostart}
+                disabled={!ready}
                 onChange={(e) =>
                   run(async () => {
+                    requireReady();
                     const enabled = e.target.checked;
                     // Show what the backend set (Rust returns the resulting value), not the request.
                     const value = await call<unknown>('set_autostart', { enabled });
@@ -882,14 +961,18 @@ export default function App() {
                 <input
                   type="checkbox"
                   checked={autoListen}
-                  disabled={autoListenMissing}
+                  disabled={!ready || autoListenMissing}
                   onChange={(e) => setAutoListen(e.target.checked)}
                 />
                 启动时自动开始监听
               </label>
             )}
           </div>
-          <button className="primary" onClick={() => run(() => save(), '参数已保存到草稿')}>
+          <button
+            className="primary"
+            disabled={!ready}
+            onClick={() => run(() => save(), '参数已保存到草稿')}
+          >
             保存参数草稿
           </button>
           <h3>许可证与第三方声明</h3>
@@ -922,17 +1005,25 @@ export default function App() {
           <div className="inline">
             <button onClick={refresh}>刷新状态</button>
             <button
+              disabled={!ready}
               onClick={async () => {
                 if (await confirmAction({ title: '放弃全部未应用草稿？', confirm: '放弃草稿' }))
-                  void run(async () => receiveAnswer(await call<State>('discard_draft')));
+                  void run(async () => {
+                    requireReady();
+                    receiveAnswer(await call<State>('discard_draft'));
+                  });
               }}
             >
               放弃未应用草稿
             </button>
             <button
+              disabled={!ready}
               onClick={async () => {
                 if (await confirmAction({ title: '回滚到上一个生效版本？', confirm: '回滚' }))
-                  void run(async () => receiveAnswer(await call<State>('rollback')));
+                  void run(async () => {
+                    requireReady();
+                    receiveAnswer(await call<State>('rollback'));
+                  });
               }}
             >
               恢复上一个版本
@@ -980,10 +1071,11 @@ export default function App() {
           {busy ? '正在处理…' : message}
         </span>
         <button
-          disabled={busy || !state}
+          disabled={busy || !ready}
           className="primary"
           onClick={() =>
             run(async () => {
+              requireReady();
               if (localDirty) await save();
               receiveAnswer(await call<State>('apply_settings'));
             }, '设置已应用，生效版本已更新')

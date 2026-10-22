@@ -392,15 +392,27 @@ footer {
   border: 0;
   padding: 0 8px;
 }
+.alert button.retry {
+  border: 1px solid currentColor;
+  border-radius: 4px;
+}
 .settings {
   padding: 25px 34px;
   background: white;
   flex: 1;
   overflow: auto;
 }
-.settings > .field {
+.settings > .field,
+.settings-fields > .field {
   max-width: 580px;
   margin: 18px 0;
+}
+/* Groups the settings fields only to disable them together before the config is read. */
+.settings-fields {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
 }
 .settings h2 {
   font-size: 18px;
