@@ -1,7 +1,11 @@
 //! L2 tests of the executor's clipboard path (P5-B) on the [`ExecRig`]: the
-//! clipboard component in Health (probe, A2).
+//! clipboard component in Health (probe, A2), and the lease's reason and
+//! skipped formats reaching the history entry as raised (B-08, B-35).
 use super::*;
 use crate::windows::clipboard::OPEN_ATTEMPTS;
+
+const CF_METAFILEPICT: u32 = 3;
+const CF_PALETTE: u32 = 9;
 
 /// The Clipboard status `probe` reports right now.
 fn clipboard_status(rig: &ExecRig) -> Status {
@@ -152,4 +156,154 @@ fn the_probe_keeps_the_last_clipboard_status_while_it_cannot_read_it() {
     set(Some(clipboard_health(HealthState::Healthy, None)));
     rig.supervisor.tick();
     assert_eq!(rig.state(), HealthState::Healthy);
+}
+
+/// I4a: the backup's verification never settles (every release of the
+/// clipboard moves its sequence on). The lease gives up before anything was
+/// written or erased: the run is Skipped with `ClipboardChanged`, the
+/// lease's own reason, never `Internal` from its wording. Nothing was sent
+/// (the abbreviation is still there) and the clipboard was never cleared.
+#[test]
+fn backup_verification_that_never_settles_is_skipped_with_the_trigger_kept() {
+    let mut rig = ExecRig::new(vec![text_rule("pst", OutputMethod::Paste, BODY)]);
+    let script = rig.clipboard.clone();
+    // Lock 0 takes the backup, lock 1 verifies it.
+    rig.clipboard.on_lock(move |index| {
+        if index == 1 {
+            script.churn_sequence(true);
+        }
+    });
+    let sent = rig.injector.calls().len();
+    let result = rig.run("pst");
+    rig.clipboard.churn_sequence(false);
+    rig.clipboard.on_lock(|_| {});
+    assert_eq!(
+        (
+            result.status.as_str(),
+            result.message.as_str(),
+            result.side_effects
+        ),
+        (
+            "failed",
+            "Clipboard ownership could not be verified within the retry limit",
+            false
+        )
+    );
+    assert_eq!(
+        rig.injector.calls().len(),
+        sent,
+        "no backspace, no paste, no typing fallback"
+    );
+    assert_eq!(rig.clipboard.clears(), 0, "the clipboard was never cleared");
+    assert_eq!(rig.clipboard.content(), vec![(13, utf16("original"))]);
+    let entry = rig.last_entry();
+    assert_eq!(
+        (entry.outcome, entry.reason, entry.side_effects),
+        (Outcome::Skipped, ReasonCode::ClipboardChanged, false)
+    );
+    assert!(entry.skipped_formats.is_empty());
+
+    let result = rig.run("pst");
+    assert_eq!(result.status, "unknown", "{}", result.message);
+}
+
+/// The history entry lists the formats the backup skipped (BestEffort,
+/// restored without them) or, for a refused backup, the formats it would
+/// have lost; a refusal is Skipped with the lease's reason and nothing sent.
+#[test]
+fn the_history_entry_lists_the_formats_the_backup_skipped() {
+    let mut rig = ExecRig::new(vec![text_rule("pst", OutputMethod::Paste, BODY)]);
+    rig.clipboard
+        .take_over(9, vec![(13, utf16("original")), (CF_PALETTE, vec![0x9A])]);
+    let result = rig.run("pst");
+    assert_eq!(result.status, "unknown", "{}", result.message);
+    assert_eq!(rig.clipboard.content(), vec![(13, utf16("original"))]);
+    let entry = rig.last_entry();
+    assert_eq!(
+        (entry.outcome, entry.reason),
+        (Outcome::Succeeded, ReasonCode::Ok)
+    );
+    assert_eq!(entry.skipped_formats, vec![CF_PALETTE]);
+
+    // Nothing re-synthesizes a lone CF_METAFILEPICT: the backup refuses.
+    let lone = vec![(13, utf16("caption")), (CF_METAFILEPICT, vec![3])];
+    rig.clipboard.take_over(9, lone.clone());
+    let sent = rig.injector.calls().len();
+    let result = rig.run("pst");
+    assert_eq!(result.status, "failed");
+    assert_eq!(rig.injector.calls().len(), sent, "no erase, no typing");
+    assert_eq!(rig.clipboard.content(), lone);
+    let entry = rig.last_entry();
+    assert_eq!(
+        (entry.outcome, entry.reason, entry.side_effects),
+        (Outcome::Skipped, ReasonCode::ClipboardFormatSkipped, false)
+    );
+    assert_eq!(entry.skipped_formats, vec![CF_METAFILEPICT]);
+
+    rig.clipboard.take_over(9, vec![(13, utf16("original"))]);
+    let result = rig.run("pst");
+    assert_eq!(result.status, "unknown", "{}", result.message);
+    assert!(rig.last_entry().skipped_formats.is_empty());
+}
+
+/// A manual run's entry gets the lease's reason and formats the same way
+/// (`record_manual` reads the report, not the message).
+#[test]
+fn a_manual_paste_records_the_lease_reason_and_formats() {
+    let rig = ExecRig::new(vec![]);
+    rig.clipboard
+        .take_over(9, vec![(13, utf16("caption")), (CF_METAFILEPICT, vec![3])]);
+    super::actions::begin_trace();
+    let manual = Serialized::new(&*rig.injector, Some(Arc::clone(&rig.core)));
+    let clipboard = rig.clipboard.clone();
+    let report = super::actions::run_plan(
+        &Ports {
+            injector: &manual,
+            foreground: &rig.foreground,
+            clock: &*rig.clock,
+            clipboard: move || Ok(clipboard.clone()),
+        },
+        &rig.shared,
+        ActionPlan {
+            steps: vec![Step::new(
+                Operation::Text {
+                    text: BODY.into(),
+                    method: OutputMethod::Paste,
+                },
+                SourceSpan::default(),
+            )],
+            ..Default::default()
+        },
+        MockForeground::window(FOCUS, APP),
+        rig.shared.generation.load(Ordering::SeqCst),
+        None,
+        None,
+        1.0,
+    );
+    assert_eq!(report.reason, Some(ReasonCode::ClipboardFormatSkipped));
+    assert_eq!(report.skipped_formats, vec![CF_METAFILEPICT]);
+    let before = crate::runtime::history_seq();
+    let process = "qt-manual-lease.exe";
+    super::executor::record_manual(process, &report, Instant::now());
+    assert!(report.result.is_err());
+    assert!(rig.injector.calls().is_empty(), "nothing was sent");
+    let entry = crate::runtime::list_history(Some(before))
+        .into_iter()
+        .rfind(|entry| entry.process.as_deref() == Some(process))
+        .expect("the manual run was recorded");
+    assert_eq!(
+        (
+            entry.trigger,
+            entry.outcome,
+            entry.reason,
+            entry.side_effects
+        ),
+        (
+            TriggerKind::Manual,
+            Outcome::Skipped,
+            ReasonCode::ClipboardFormatSkipped,
+            false
+        )
+    );
+    assert_eq!(entry.skipped_formats, vec![CF_METAFILEPICT]);
 }

@@ -3,9 +3,10 @@
 use super::*;
 use super::{
     clipboard::{
-        acquire_clipboard, clipboard_formats, written_before_erase, ClipboardLease, WinClipboard,
+        acquire_clipboard, clipboard_formats, written_before_erase, ClipboardLease, LeaseError,
+        WinClipboard,
     },
-    executor::CandidateProof,
+    executor::{CandidateProof, RunReport},
     foreground::WinForeground,
     inject::{
         button, erase, hotkey, key, mouse_input, press, release_owned, send_terminator, unicode,
@@ -13,6 +14,7 @@ use super::{
     },
     keystate::{modifiers_held, physical},
 };
+use crate::health::ReasonCode;
 use crate::traits::{ClipboardBackend, Clock, ForegroundProbe, Injector, SystemClock};
 thread_local! {
     static AUTOMATIC_EXECUTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -279,13 +281,13 @@ pub fn execute(
     let started = SystemClock.now();
     begin_trace();
     let process = target.process.clone();
-    let result = if erase != 0 {
-        Err("Automatic erasure requires observed text proof".into())
+    let report = if erase != 0 {
+        RunReport::text(Err("Automatic erasure requires observed text proof".into()))
     } else {
         execute_inner(s, plan, target, generation, None, terminator, speed)
     };
-    super::executor::record_manual(&process, &result, started);
-    result
+    super::executor::record_manual(&process, &report, started);
+    report.result
 }
 pub(super) fn execute_inner(
     s: Arc<Shared>,
@@ -295,8 +297,8 @@ pub(super) fn execute_inner(
     proof: Option<CandidateProof>,
     terminator: Option<String>,
     speed: f64,
-) -> Result<ExecutionResult, String> {
-    execute_with_proof(
+) -> RunReport {
+    run_plan(
         &Ports {
             // Manual output takes the executor's send lock too (S1).
             injector: &super::executor::serialized(&WinInjector),
@@ -322,10 +324,95 @@ pub(super) struct Ports<'a, I, F, K, B> {
     /// Opens the backend for a clipboard lease (paste plans only).
     pub(super) clipboard: B,
 }
+/// Why a run stopped: the message its result carries and, when the
+/// clipboard lease stopped it, the lease's reason and the formats behind a
+/// refused backup ([`LeaseError`]), passed on as they are. Every other stop
+/// is text only, which the executor maps (`REASONS`).
+pub(super) struct Stop {
+    reason: Option<ReasonCode>,
+    message: String,
+    formats: Vec<u32>,
+}
+impl From<String> for Stop {
+    fn from(message: String) -> Self {
+        Self {
+            reason: None,
+            message,
+            formats: vec![],
+        }
+    }
+}
+impl From<&str> for Stop {
+    fn from(message: &str) -> Self {
+        Self::from(message.to_owned())
+    }
+}
+impl From<LeaseError> for Stop {
+    fn from(error: LeaseError) -> Self {
+        Self {
+            reason: Some(error.reason),
+            message: error.message,
+            formats: error.formats,
+        }
+    }
+}
+/// A run's result with the lease's reason when the lease stopped it.
+type Ran = (ExecutionResult, Option<ReasonCode>);
 /// Single execution entry for production and pipeline tests: installs the
 /// match proof for the stamp guard (uninstalled on drop), then runs optional
 /// trigger erasure, output steps, owned-input cleanup, terminator and
-/// clipboard restore.
+/// clipboard restore. The report carries the clipboard lease's reason when
+/// the lease stopped the run, and the formats its backup skipped, or
+/// refused, for the history entry (B-08, B-35).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "execute_inner's parameters plus the port bundle"
+)]
+pub(super) fn run_plan<I, F, K, C, B>(
+    ports: &Ports<'_, I, F, K, B>,
+    s: &Shared,
+    plan: ActionPlan,
+    target: Foreground,
+    generation: u64,
+    proof: Option<CandidateProof>,
+    terminator: Option<String>,
+    speed: f64,
+) -> RunReport
+where
+    I: Injector,
+    F: ForegroundProbe,
+    K: Clock,
+    C: ClipboardBackend,
+    B: Fn() -> Result<C, String>,
+{
+    let mut skipped_formats = vec![];
+    let ran = run_steps(
+        ports,
+        s,
+        plan,
+        target,
+        generation,
+        proof,
+        terminator,
+        speed,
+        &mut skipped_formats,
+    );
+    let (result, reason) = match ran {
+        Ok((result, reason)) => (Ok(result), reason),
+        Err(stop) => {
+            // A refused backup opened no lease: its formats are the only ones.
+            skipped_formats.extend(stop.formats);
+            (Err(stop.message), stop.reason)
+        }
+    };
+    RunReport {
+        result,
+        reason,
+        skipped_formats,
+    }
+}
+/// [`run_plan`]'s result alone, for the pipeline tests that compare it.
+#[cfg(test)]
 #[allow(
     clippy::too_many_arguments,
     reason = "execute_inner's parameters plus the port bundle"
@@ -334,12 +421,38 @@ pub(super) fn execute_with_proof<I, F, K, C, B>(
     ports: &Ports<'_, I, F, K, B>,
     s: &Shared,
     plan: ActionPlan,
-    mut target: Foreground,
+    target: Foreground,
     generation: u64,
     proof: Option<CandidateProof>,
     terminator: Option<String>,
     speed: f64,
 ) -> Result<ExecutionResult, String>
+where
+    I: Injector,
+    F: ForegroundProbe,
+    K: Clock,
+    C: ClipboardBackend,
+    B: Fn() -> Result<C, String>,
+{
+    run_plan(ports, s, plan, target, generation, proof, terminator, speed).result
+}
+/// [`run_plan`]'s body. `skipped` receives the formats the lease's backup
+/// skipped as soon as the lease is open.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "run_plan's parameters plus the skipped formats it reports"
+)]
+fn run_steps<I, F, K, C, B>(
+    ports: &Ports<'_, I, F, K, B>,
+    s: &Shared,
+    plan: ActionPlan,
+    mut target: Foreground,
+    generation: u64,
+    proof: Option<CandidateProof>,
+    terminator: Option<String>,
+    speed: f64,
+    skipped: &mut Vec<u32>,
+) -> Result<Ran, Stop>
 where
     I: Injector,
     F: ForegroundProbe,
@@ -374,9 +487,12 @@ where
     guarded(probe, s, &target, generation)?;
     // All potentially failing source/format checks happen before trigger deletion.
     set_stage(Stage::Clipboard, clock.now());
-    let mut clipboard = acquire_clipboard(&plan, || ClipboardLease::new((ports.clipboard)()?))?;
+    let mut clipboard = acquire_clipboard(&plan, || -> Result<_, Stop> {
+        Ok(ClipboardLease::new((ports.clipboard)()?)?)
+    })?;
     let mut payloads = std::collections::BTreeMap::new();
     if let Some(lease) = clipboard.as_ref() {
+        skipped.extend_from_slice(lease.skipped_formats());
         for (index, step) in plan.steps.iter().enumerate() {
             if let Some(formats) = clipboard_formats(&step.operation)? {
                 payloads.insert(index, lease.prepare(formats)?);
@@ -394,20 +510,21 @@ where
         let early = written_before_erase(&plan)
             .filter(|_| erasure.is_some())
             .and_then(|index| payloads.remove(&index))
-            .map(|mut prepared| {
+            .map(|mut prepared| -> Result<(), Stop> {
                 lease.write_prepared(&mut prepared)?;
                 lease.verify_current()?;
-                guarded(probe, s, &target, generation)
+                Ok(guarded(probe, s, &target, generation)?)
             });
         match early {
-            Some(Err(message)) => {
-                return Ok(ExecutionResult {
+            Some(Err(stop)) => {
+                let result = ExecutionResult {
                     id: "erase".into(),
                     status: "failed".into(),
-                    message,
+                    message: stop.message,
                     completed_steps: 0,
                     side_effects: SENT_EFFECT.with(|flag| flag.get()),
-                });
+                };
+                return Ok((result, stop.reason));
             }
             Some(Ok(())) => {}
             None => lease.verify_current()?,
@@ -419,13 +536,14 @@ where
             guarded(probe, s, &target, generation)
         });
         if let Err(message) = erased {
-            return Ok(ExecutionResult {
+            let result = ExecutionResult {
                 id: "erase".into(),
                 status: "failed".into(),
                 message,
                 completed_steps: 0,
                 side_effects: SENT_EFFECT.with(|flag| flag.get()),
-            });
+            };
+            return Ok((result, None));
         }
     }
     set_stage(Stage::Output, clock.now());
@@ -433,7 +551,7 @@ where
     let mut owned_mouse = vec![];
     let mut completed = 0;
     let started = clock.now();
-    let mut failure = None;
+    let mut failure: Option<Stop> = None;
     for step in &plan.steps {
         if clock.now().saturating_duration_since(started) > Duration::from_secs(120) {
             failure = Some("Execution timeout".into());
@@ -454,10 +572,10 @@ where
             target = now;
         }
         if let Err(e) = guarded(probe, s, &target, generation) {
-            failure = Some(e);
+            failure = Some(e.into());
             break;
         }
-        let result = (|| -> Result<(), String> {
+        let result = (|| -> Result<(), Stop> {
             match &step.operation {
                 Operation::Text {
                     text,
@@ -607,7 +725,7 @@ where
     for v in owned {
         if !physical(v) {
             if let Err(error) = key(injector, v, true) {
-                failure.get_or_insert_with(|| format!("Owned key cleanup failed: {error}"));
+                failure.get_or_insert_with(|| format!("Owned key cleanup failed: {error}").into());
             }
         }
     }
@@ -621,8 +739,9 @@ where
         };
         if !physical(v) {
             if let Err(error) = button(injector, clock, b, ButtonState::Up) {
-                failure
-                    .get_or_insert_with(|| format!("Owned mouse button cleanup failed: {error}"));
+                failure.get_or_insert_with(|| {
+                    format!("Owned mouse button cleanup failed: {error}").into()
+                });
             }
         }
     }
@@ -631,20 +750,25 @@ where
             if let Err(error) =
                 guarded(probe, s, &target, generation).and_then(|_| send_terminator(injector, &t))
             {
-                failure = Some(error);
+                failure = Some(error.into());
             }
         }
     }
     if let Some(mut lease) = clipboard {
         set_stage(Stage::Restore, clock.now());
         if let Err(e) = lease.restore() {
-            failure = Some(format!("Clipboard restore failed after input: {e}"));
+            failure = Some(Stop {
+                reason: Some(e.reason),
+                message: format!("Clipboard restore failed after input: {}", e.message),
+                formats: vec![],
+            });
         }
     }
     set_stage(Stage::Done, clock.now());
+    let reason = failure.as_ref().and_then(|stop| stop.reason);
     let result = ExecutionResult {
         id: format!("run-{}", s.generation.load(Ordering::SeqCst)),
-        status: if failure.as_deref() == Some("Cancelled") {
+        status: if failure.as_ref().map(|stop| stop.message.as_str()) == Some("Cancelled") {
             "cancelled"
         } else if failure.is_some() {
             "failed"
@@ -652,8 +776,10 @@ where
             "unknown"
         }
         .into(),
-        message: failure
-            .unwrap_or_else(|| "Input was sent; target consumption cannot be confirmed".into()),
+        message: failure.map_or_else(
+            || "Input was sent; target consumption cannot be confirmed".into(),
+            |stop| stop.message,
+        ),
         completed_steps: completed,
         side_effects: SENT_EFFECT.with(|flag| flag.get()) || completed > 0,
     };
@@ -664,7 +790,7 @@ where
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.clone());
     }
-    Ok(result)
+    Ok((result, reason))
 }
 
 #[cfg(test)]

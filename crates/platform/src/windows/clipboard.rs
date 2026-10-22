@@ -235,23 +235,29 @@ fn fault_busy_window(armed: Option<u64>, until: &mut Option<Instant>, now: Insta
 }
 
 /// Why a lease step failed: a stable reason code for history (B-35) plus the
-/// message the action result has always carried.
+/// message the action result has always carried. Both reach the run's
+/// history entry as they are (`RunReport`), never through the message text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct LeaseError {
     pub(super) reason: ReasonCode,
     pub(super) message: String,
+    /// A refused backup's losses (B-08), for `HistoryEntry::skipped_formats`:
+    /// the formats it skipped up to the refusal plus the ones that refused
+    /// it (Full's first loss, an unknown handle type, a synthesized format
+    /// without its source; nothing more when no restorable format was
+    /// left). Empty for every other failure.
+    pub(super) formats: Vec<u32>,
 }
 impl LeaseError {
     fn new(reason: ReasonCode, message: impl Into<String>) -> Self {
         Self {
             reason,
             message: message.into(),
+            formats: vec![],
         }
     }
-}
-impl From<LeaseError> for String {
-    fn from(error: LeaseError) -> Self {
-        error.message
+    fn refusing(self, formats: Vec<u32>) -> Self {
+        Self { formats, ..self }
     }
 }
 
@@ -309,10 +315,11 @@ fn critical<C: ClipboardBackend, R>(
         }
     }
     exhausted(backend, degraded);
-    Err(LeaseError::new(
-        ReasonCode::ClipboardBusy,
-        "Clipboard is busy",
-    ))
+    Err(busy())
+}
+/// [`critical`] found the clipboard busy on every attempt.
+fn busy() -> LeaseError {
+    LeaseError::new(ReasonCode::ClipboardBusy, "Clipboard is busy")
 }
 
 /// Clipboard time of one backup worker section.
@@ -484,10 +491,10 @@ fn clipboard_operation(operation: &Operation) -> bool {
 }
 
 // no-regression #2: a paste whose clipboard lease fails never downgrades to typed keys.
-pub(super) fn acquire_clipboard<T>(
+pub(super) fn acquire_clipboard<T, E>(
     plan: &ActionPlan,
-    acquire: impl FnOnce() -> Result<T, String>,
-) -> Result<Option<T>, String> {
+    acquire: impl FnOnce() -> Result<T, E>,
+) -> Result<Option<T>, E> {
     if plan
         .steps
         .iter()
@@ -969,10 +976,13 @@ fn take_backup<R: ClipboardRead>(
             Handling::Ignore => continue,
             // Its sources may come later in enumeration order.
             Handling::Covered(sources) => {
-                covered.push(sources);
+                covered.push((format, sources));
                 continue;
             }
-            Handling::Unknown => return Err(refusal(false)),
+            Handling::Unknown => {
+                skipped.push(format);
+                return Err(refusal(false).refusing(skipped));
+            }
             Handling::Skip => {}
             Handling::Copy => {
                 let read = reader.read_format(format, MAX_FORMAT_BYTES);
@@ -1002,17 +1012,23 @@ fn take_backup<R: ClipboardRead>(
         skipped.push(format);
         // Full stops reading at the first loss.
         if policy == RestorePolicy::Full {
-            return Err(refusal(too_large));
+            return Err(refusal(too_large).refusing(skipped));
         }
     }
     let restored = |sources: &[u32]| data.iter().any(|(format, _)| sources.contains(format));
-    if !covered.iter().all(|sources| restored(sources)) {
-        return Err(refusal(too_large));
+    let uncovered: Vec<u32> = covered
+        .iter()
+        .filter(|(_, sources)| !restored(sources))
+        .map(|(format, _)| *format)
+        .collect();
+    if !uncovered.is_empty() {
+        skipped.extend(uncovered);
+        return Err(refusal(too_large).refusing(skipped));
     }
     // The restore would empty a clipboard that held data. TextOnly opted
     // into dropping everything that is not text.
     if policy != RestorePolicy::TextOnly && data.is_empty() && !formats.is_empty() {
-        return Err(refusal(too_large));
+        return Err(refusal(too_large).refusing(skipped));
     }
     Ok(Backup {
         formats,
@@ -1028,6 +1044,19 @@ fn unverifiable() -> LeaseError {
 }
 fn uncaptured() -> LeaseError {
     changed("Clipboard payload was never verified after the paste write; clipboard preserved")
+}
+/// A write found the clipboard changed since the lease last verified it;
+/// nothing was cleared.
+fn overwrite_refused() -> LeaseError {
+    changed("Clipboard changed externally; stopped without overwriting it")
+}
+/// `EmptyClipboard` failed with the clipboard open: nothing was written.
+fn clear_failed() -> LeaseError {
+    LeaseError::new(ReasonCode::Internal, "Clipboard clear failed")
+}
+/// `SetClipboardData` failed after the clear.
+fn write_failed() -> LeaseError {
+    LeaseError::new(ReasonCode::Internal, "Clipboard write failed")
 }
 /// Locked: checks that `owner` still owns the clipboard, that its format set
 /// passes `formats_ok` and that it holds exactly `expected`; `expired` is
@@ -1166,8 +1195,8 @@ fn verify_backup<C: ClipboardBackend>(
 }
 fn finish_clipboard_restore<T>(
     backup: &mut Vec<T>,
-    result: Result<(), String>,
-) -> Result<(), String> {
+    result: Result<(), LeaseError>,
+) -> Result<(), LeaseError> {
     result?;
     backup.clear();
     Ok(())
@@ -1238,12 +1267,14 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
             }
         }
     }
-    pub(super) fn verify_current(&self) -> Result<(), String> {
+    pub(super) fn verify_current(&self) -> Result<(), LeaseError> {
         if self
             .written
             .is_none_or(|seq| self.backend.sequence() != seq)
         {
-            return Err("Clipboard changed externally before paste; no paste was sent".into());
+            return Err(changed(
+                "Clipboard changed externally before paste; no paste was sent",
+            ));
         }
         Ok(())
     }
@@ -1267,16 +1298,15 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
     pub(super) fn prepare(
         &self,
         formats: ClipboardFormats,
-    ) -> Result<PreparedClipboard<C::Staged>, String> {
+    ) -> Result<PreparedClipboard<C::Staged>, LeaseError> {
         let mut prepared = PreparedClipboard {
             handles: vec![],
             expected: vec![],
         };
         for (format, bytes) in formats.into_iter().chain(self.exclusion_markers()) {
-            let (staged, reported) = self
-                .backend
-                .stage(&bytes)
-                .map_err(|error| format!("{error} before deletion"))?;
+            let (staged, reported) = self.backend.stage(&bytes).map_err(|error| {
+                LeaseError::new(ReasonCode::Internal, format!("{error} before deletion"))
+            })?;
             prepared.expected.push((format, reported));
             prepared.handles.push((format, staged));
         }
@@ -1285,7 +1315,7 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
     pub(super) fn write_prepared(
         &mut self,
         prepared: &mut PreparedClipboard<C::Staged>,
-    ) -> Result<(), String> {
+    ) -> Result<(), LeaseError> {
         let Self {
             backend,
             owned_payload,
@@ -1295,12 +1325,12 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
             baseline,
             ..
         } = self;
-        critical(backend, degraded, || -> Result<(), String> {
+        critical(backend, degraded, || -> Result<(), LeaseError> {
             if written.is_some_and(|seq| backend.sequence() != seq) {
-                return Err("Clipboard changed externally; stopped without overwriting it".into());
+                return Err(overwrite_refused());
             }
             if !backend.clear() {
-                return Err("Clipboard clear failed".into());
+                return Err(clear_failed());
             }
             *dirty = true;
             owned_payload.clear();
@@ -1310,7 +1340,7 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
                 let (f, h) = prepared.handles.remove(0);
                 if !backend.set(f, h) {
                     *written = Some(backend.sequence());
-                    return Err("Clipboard write failed".into());
+                    return Err(write_failed());
                 }
                 if let Some((_, bytes)) = prepared.expected.iter().find(|(format, _)| *format == f)
                 {
@@ -1343,8 +1373,8 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
         Ok(())
     }
     /// [`ClipboardLease::open`] with the default options.
-    pub(super) fn new(backend: C) -> Result<Self, String> {
-        Self::open(backend, LeaseOptions::default()).map_err(String::from)
+    pub(super) fn new(backend: C) -> Result<Self, LeaseError> {
+        Self::open(backend, LeaseOptions::default())
     }
     /// Backs up the clipboard under `options` (B-08), then verifies the
     /// backup in a second section so a copy racing it is detected. Every
@@ -1421,11 +1451,14 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
     pub(super) fn restore_delay(&self) -> Duration {
         self.restore_delay
     }
-    fn write(&mut self, formats: ClipboardFormats) -> Result<(), String> {
+    fn write(&mut self, formats: ClipboardFormats) -> Result<(), LeaseError> {
         // Allocate before opening: the critical section only clears and sets.
         let mut staged = Vec::with_capacity(formats.len());
         for (format, bytes) in formats {
-            let (handle, expected) = self.backend.stage_format(format, &bytes)?;
+            let (handle, expected) = self
+                .backend
+                .stage_format(format, &bytes)
+                .map_err(|error| LeaseError::new(ReasonCode::Internal, error))?;
             staged.push((format, handle, expected));
         }
         let Self {
@@ -1436,16 +1469,14 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
             baseline,
             ..
         } = self;
-        critical(backend, degraded, || -> Result<(), String> {
+        critical(backend, degraded, || -> Result<(), LeaseError> {
             if let Some(seq) = *written {
                 if backend.sequence() != seq {
-                    return Err(
-                        "Clipboard changed externally; stopped without overwriting it".into(),
-                    );
+                    return Err(overwrite_refused());
                 }
             }
             if !backend.clear() {
-                return Err("Clipboard clear failed".into());
+                return Err(clear_failed());
             }
             mark_external_effect();
             owned_payload.clear();
@@ -1453,7 +1484,7 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
             *written = Some(backend.sequence());
             for (format, handle, expected) in staged {
                 if !backend.set(format, handle) {
-                    return Err("Clipboard write failed".into());
+                    return Err(write_failed());
                 }
                 owned_payload.push((format, expected));
             }
@@ -1461,7 +1492,7 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
             Ok(())
         })?
     }
-    pub(super) fn restore(&mut self) -> Result<(), String> {
+    pub(super) fn restore(&mut self) -> Result<(), LeaseError> {
         if !self.dirty {
             return Ok(());
         }
@@ -1504,7 +1535,7 @@ mod tests {
     fn busy_clipboard_restore_preserves_original_payload_for_drop_retry() {
         let original = vec![(13u32, vec![b'o', 0, b'l', 0, b'd', 0, 0, 0])];
         let mut backup = original.clone();
-        assert!(finish_clipboard_restore(&mut backup, Err("clipboard busy".into())).is_err());
+        assert!(finish_clipboard_restore(&mut backup, Err(busy())).is_err());
         assert_eq!(backup, original);
         let retried_payload = backup.clone();
         finish_clipboard_restore(&mut backup, Ok(())).unwrap();
@@ -1572,9 +1603,7 @@ mod tests {
             ..Default::default()
         };
         SENT_EFFECT.with(|flag| flag.set(false));
-        let result = acquire_clipboard::<()>(&plan, || {
-            Err("Existing clipboard has an unsupported handle format".into())
-        });
+        let result = acquire_clipboard::<(), _>(&plan, || Err(refusal(false)));
         assert!(result.is_err());
         assert!(matches!(&plan.steps[0].operation,
             Operation::Text { text, method: OutputMethod::Paste } if text == "中文\nemoji🙂"));
@@ -1592,7 +1621,10 @@ mod tests {
             )],
             ..Default::default()
         };
-        assert_eq!(acquire_clipboard(&plan, || Ok(42)).unwrap(), Some(42));
+        assert_eq!(
+            acquire_clipboard::<_, String>(&plan, || Ok(42)).unwrap(),
+            Some(42)
+        );
         assert!(matches!(
             plan.steps[0].operation,
             Operation::Text {
@@ -1607,7 +1639,7 @@ mod tests {
             },
             SourceSpan::default(),
         ));
-        assert!(acquire_clipboard::<()>(&plan, || Err("cannot preserve".into())).is_err());
+        assert!(acquire_clipboard::<(), String>(&plan, || Err("cannot preserve".into())).is_err());
         assert!(matches!(
             plan.steps[0].operation,
             Operation::Text {
@@ -1628,9 +1660,10 @@ mod tests {
             )],
             ..Default::default()
         };
-        let lease =
-            acquire_clipboard::<()>(&plan, || panic!("key output must leave clipboard alone"))
-                .unwrap();
+        let lease = acquire_clipboard::<(), String>(&plan, || {
+            panic!("key output must leave clipboard alone")
+        })
+        .unwrap();
         assert!(lease.is_none());
     }
     #[test]
@@ -1713,8 +1746,11 @@ mod tests {
         let clipboard = MockClipboard::new(7, text("original"));
         clipboard.set_busy(OPEN_ATTEMPTS);
         assert_eq!(
-            ClipboardLease::new(clipboard.clone()).err().as_deref(),
-            Some("Clipboard is busy; trigger preserved")
+            ClipboardLease::new(clipboard.clone()).err(),
+            Some(LeaseError::new(
+                ReasonCode::ClipboardBusy,
+                "Clipboard is busy; trigger preserved"
+            ))
         );
         assert_eq!(clipboard.pauses().len(), OPEN_ATTEMPTS - 1);
         assert_eq!(clipboard.health(), BUSY);
@@ -1732,8 +1768,11 @@ mod tests {
             }
         });
         assert_eq!(
-            ClipboardLease::new(clipboard.clone()).err().as_deref(),
-            Some("Clipboard is busy; trigger preserved")
+            ClipboardLease::new(clipboard.clone()).err(),
+            Some(LeaseError::new(
+                ReasonCode::ClipboardBusy,
+                "Clipboard is busy; trigger preserved"
+            ))
         );
         assert_eq!(clipboard.health(), BUSY);
     }
@@ -1840,7 +1879,7 @@ mod tests {
         lease.write_prepared(&mut prepared).unwrap();
         assert_eq!(clipboard.content(), pasted(&clipboard, "expansion"));
         clipboard.set_busy(OPEN_ATTEMPTS);
-        assert_eq!(lease.restore(), Err("Clipboard is busy".into()));
+        assert_eq!(lease.restore(), Err(busy()));
         assert_eq!(clipboard.content(), pasted(&clipboard, "expansion"));
         assert_eq!(clipboard.health(), BUSY);
         clipboard.set_busy(OPEN_ATTEMPTS - 1);
@@ -2156,6 +2195,90 @@ mod tests {
         paste_and_restore(lease, &clipboard);
         assert_eq!(clipboard.content(), ClipboardFormats::new());
     }
+    /// A refused backup names what it would have lost (for the history's
+    /// skipped formats): the skips up to the refusal plus the formats that
+    /// refused it. Every other failure names none.
+    #[test]
+    fn refusals_name_the_formats_they_would_have_lost() {
+        let formats_of = |content: ClipboardFormats, policy, large: Option<u32>| {
+            let clipboard = MockClipboard::new(7, content);
+            if let Some(format) = large {
+                clipboard.report_size(format, MAX_FORMAT_BYTES + 1);
+            }
+            let error = refused(open_with(&clipboard, policy));
+            (error.reason, error.formats)
+        };
+        let with_text = |extra: &[(u32, Vec<u8>)]| {
+            let mut content = text("original");
+            content.extend_from_slice(extra);
+            content
+        };
+        use RestorePolicy::{BestEffort, Full};
+        // Full stops at its first loss.
+        assert_eq!(
+            formats_of(
+                with_text(&[(CF_PALETTE, vec![0x9A]), (0x200, vec![0x22])]),
+                Full,
+                None
+            ),
+            (ReasonCode::ClipboardFormatSkipped, vec![CF_PALETTE])
+        );
+        assert_eq!(
+            formats_of(with_text(&[(0xC0C0, vec![7; 16])]), Full, Some(0xC0C0)),
+            (ReasonCode::ClipboardTooLarge, vec![0xC0C0])
+        );
+        // An unknown handle type, after a skip BestEffort accepted.
+        assert_eq!(
+            formats_of(
+                with_text(&[(CF_PALETTE, vec![0x9A]), (0x400, vec![4])]),
+                BestEffort,
+                None
+            ),
+            (ReasonCode::ClipboardFormatSkipped, vec![CF_PALETTE, 0x400])
+        );
+        // A synthesized format without its source.
+        assert_eq!(
+            formats_of(with_text(&[(CF_METAFILEPICT, vec![3])]), BestEffort, None),
+            (ReasonCode::ClipboardFormatSkipped, vec![CF_METAFILEPICT])
+        );
+        // ... whose source was too large to keep.
+        assert_eq!(
+            formats_of(
+                with_text(&[
+                    (CF_ENHMETAFILE, vec![1, 0, 0, 0]),
+                    (CF_METAFILEPICT, vec![3])
+                ]),
+                BestEffort,
+                Some(CF_ENHMETAFILE)
+            ),
+            (
+                ReasonCode::ClipboardTooLarge,
+                vec![CF_ENHMETAFILE, CF_METAFILEPICT]
+            )
+        );
+        // Nothing restorable was left.
+        assert_eq!(
+            formats_of(
+                vec![(CF_PALETTE, vec![0x9A]), (0x200, vec![0x22])],
+                BestEffort,
+                None
+            ),
+            (ReasonCode::ClipboardFormatSkipped, vec![CF_PALETTE, 0x200])
+        );
+        // Failures that are not refusals carry no formats.
+        let unreadable = with_text(&[(0xC123, vec![])]);
+        assert_eq!(
+            formats_of(unreadable, BestEffort, None),
+            (ReasonCode::Internal, vec![])
+        );
+        let clipboard = MockClipboard::new(7, text("original"));
+        clipboard.set_busy(OPEN_ATTEMPTS);
+        let error = refused(open_with(&clipboard, BestEffort));
+        assert_eq!(
+            (error.reason, error.formats),
+            (ReasonCode::ClipboardBusy, vec![])
+        );
+    }
     #[test]
     fn hung_owner_refuses_before_opening_the_clipboard() {
         for policy in [
@@ -2315,7 +2438,7 @@ mod tests {
             expected.push((theirs, vec![1, 2, 3]));
             assert_eq!(clipboard.owner_now(), MockClipboard::LEASE);
             if explicit {
-                assert_eq!(lease.restore(), Err(formats_changed().message));
+                assert_eq!(lease.restore(), Err(formats_changed()));
                 // A comparison that opened the clipboard and refused is as
                 // final as a failed capture.
                 assert_eq!(lease.baseline, Capture::Failed);
@@ -2368,7 +2491,7 @@ mod tests {
                 let expected = clipboard.content();
                 assert_eq!(clipboard.owner_now(), MockClipboard::LEASE);
                 if explicit {
-                    assert_eq!(lease.restore(), Err(payload_changed().message), "{case}");
+                    assert_eq!(lease.restore(), Err(payload_changed()), "{case}");
                     assert_eq!(clipboard.content(), expected, "{case}");
                 }
                 drop(lease);
@@ -2385,7 +2508,7 @@ mod tests {
         // CF_TEXT: it can only come from another application.
         clipboard.add_format(CF_TEXT, b"expansion\0".to_vec());
         let expected = clipboard.content();
-        assert_eq!(lease.restore(), Err(formats_changed().message));
+        assert_eq!(lease.restore(), Err(formats_changed()));
         drop(lease);
         assert_eq!(clipboard.content(), expected);
         assert_eq!(clipboard.clears(), 1);
@@ -2410,7 +2533,7 @@ mod tests {
             assert_eq!(baseline.derived, vec![dibv5.clone()]);
             clipboard.add_format(rewritten, vec![0xEE]);
             if refused {
-                assert_eq!(lease.restore(), Err(payload_changed().message));
+                assert_eq!(lease.restore(), Err(payload_changed()));
                 assert_eq!(clipboard.clears(), 1);
             } else {
                 lease.restore().unwrap();
@@ -2428,7 +2551,7 @@ mod tests {
             left.remove(missing);
             clipboard.tamper(left.clone());
             assert_eq!(clipboard.owner_now(), MockClipboard::LEASE);
-            assert_eq!(lease.restore(), Err(payload_changed().message));
+            assert_eq!(lease.restore(), Err(payload_changed()));
             drop(lease);
             assert_eq!(clipboard.content(), left, "missing #{missing}");
             assert_eq!(clipboard.clears(), 1, "missing #{missing}");
@@ -2439,7 +2562,7 @@ mod tests {
         let mut lease = synthesized_lease(&clipboard, text("expansion"), locale);
         let left = pasted(&clipboard, "expansion");
         clipboard.tamper(left.clone());
-        assert_eq!(lease.restore(), Err(formats_changed().message));
+        assert_eq!(lease.restore(), Err(formats_changed()));
         drop(lease);
         assert_eq!(clipboard.content(), left);
         assert_eq!(clipboard.clears(), 1);
@@ -2457,10 +2580,7 @@ mod tests {
         });
         let mut lease = ClipboardLease::new(clipboard.clone()).unwrap();
         let mut prepared = lease.prepare(text("expansion")).unwrap();
-        assert_eq!(
-            lease.write_prepared(&mut prepared),
-            Err(formats_changed().message)
-        );
+        assert_eq!(lease.write_prepared(&mut prepared), Err(formats_changed()));
         assert_eq!(lease.baseline, Capture::Failed);
         assert!(lease.verify_current().is_err());
         drop(lease);
@@ -2484,17 +2604,14 @@ mod tests {
             });
             let mut lease = ClipboardLease::new(clipboard.clone()).unwrap();
             let mut prepared = lease.prepare(text("expansion")).unwrap();
-            assert_eq!(
-                lease.write_prepared(&mut prepared),
-                Err("Clipboard payload cannot be verified".into())
-            );
+            assert_eq!(lease.write_prepared(&mut prepared), Err(unverifiable()));
             assert_eq!(lease.baseline, Capture::Failed);
             // Another application then replaces CF_TEXT in place with data
             // that reads, would pass the whitelist and is not the paste's.
             clipboard.add_format(CF_TEXT, b"unrelated\0".to_vec());
             let replaced = clipboard.content();
             if explicit {
-                assert_eq!(lease.restore(), Err(uncaptured().message));
+                assert_eq!(lease.restore(), Err(uncaptured()));
                 assert_eq!(clipboard.content(), replaced);
             }
             drop(lease);
@@ -2511,10 +2628,7 @@ mod tests {
             clipboard.fail_set(1);
             let mut lease = ClipboardLease::new(clipboard.clone()).unwrap();
             let mut prepared = lease.prepare(text("expansion")).unwrap();
-            assert_eq!(
-                lease.write_prepared(&mut prepared),
-                Err("Clipboard write failed".into())
-            );
+            assert_eq!(lease.write_prepared(&mut prepared), Err(write_failed()));
             assert_eq!(lease.baseline, Capture::Untried);
             if explicit {
                 lease.restore().unwrap();
@@ -2544,10 +2658,7 @@ mod tests {
             });
             let mut lease = ClipboardLease::new(clipboard.clone()).unwrap();
             let mut prepared = lease.prepare(text("expansion")).unwrap();
-            assert_eq!(
-                lease.write_prepared(&mut prepared),
-                Err("Clipboard is busy".into())
-            );
+            assert_eq!(lease.write_prepared(&mut prepared), Err(busy()));
             assert_eq!(lease.baseline, Capture::Untried);
             assert_eq!(clipboard.health(), BUSY);
             if explicit {
@@ -2576,13 +2687,10 @@ mod tests {
         });
         let mut lease = ClipboardLease::new(clipboard.clone()).unwrap();
         let mut prepared = lease.prepare(text("expansion")).unwrap();
-        assert_eq!(
-            lease.write_prepared(&mut prepared),
-            Err("Clipboard is busy".into())
-        );
+        assert_eq!(lease.write_prepared(&mut prepared), Err(busy()));
         clipboard.churn_sequence(false);
         assert_eq!(lease.baseline, Capture::Failed);
-        assert_eq!(lease.restore(), Err(uncaptured().message));
+        assert_eq!(lease.restore(), Err(uncaptured()));
         drop(lease);
         assert_eq!(clipboard.content(), pasted(&clipboard, "expansion"));
         assert_eq!(clipboard.clears(), 1);
@@ -2604,15 +2712,9 @@ mod tests {
         });
         let mut lease = ClipboardLease::new(clipboard.clone()).unwrap();
         let mut prepared = lease.prepare(text("expansion")).unwrap();
-        assert_eq!(
-            lease.write_prepared(&mut prepared),
-            Err("Clipboard is busy".into())
-        );
+        assert_eq!(lease.write_prepared(&mut prepared), Err(busy()));
         assert_eq!(lease.baseline, Capture::Untried);
-        assert_eq!(
-            lease.restore(),
-            Err("Clipboard payload cannot be verified".into())
-        );
+        assert_eq!(lease.restore(), Err(unverifiable()));
         assert_eq!(lease.baseline, Capture::Failed);
         // Another application then replaces CF_TEXT in place with data that
         // reads, would pass the whitelist and is not the paste's.
@@ -2643,12 +2745,9 @@ mod tests {
             });
             let mut lease = ClipboardLease::new(clipboard.clone()).unwrap();
             let mut prepared = lease.prepare(text("expansion")).unwrap();
-            assert_eq!(
-                lease.write_prepared(&mut prepared),
-                Err("Clipboard is busy".into())
-            );
+            assert_eq!(lease.write_prepared(&mut prepared), Err(busy()));
             assert_eq!(lease.baseline, Capture::Untried);
-            assert_eq!(lease.restore(), Err("Clipboard is busy".into()));
+            assert_eq!(lease.restore(), Err(busy()));
             let Capture::Captured(baseline) = &lease.baseline else {
                 panic!("captured by the restore's check");
             };

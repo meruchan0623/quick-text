@@ -13,8 +13,8 @@
 )]
 use super::actions::{Ports, Stage, StageMarks};
 use super::executor::{
-    classify, run_candidate, stage_timings, Candidate, CoreLock, ExecutorCore, Pause, Runner,
-    Serialized, TaskScope, STALL_BUDGET,
+    classify, run_candidate, stage_timings, Candidate, CoreLock, ExecutorCore, Pause, RunReport,
+    Runner, Serialized, TaskScope, STALL_BUDGET,
 };
 use super::pipeline_tests::SERIAL;
 use super::rawinput::{detect_candidate, Buffer, Event, Kind};
@@ -978,9 +978,15 @@ fn verdicts_follow_the_real_path() {
             side_effects: sent,
         })
     };
-    let verdict = |result: Result<ExecutionResult, String>, stage: Stage, sent: bool| {
-        let verdict = classify(&result, stage, sent);
+    let reported = |result: Result<ExecutionResult, String>,
+                    reason: Option<ReasonCode>,
+                    stage: Stage,
+                    sent: bool| {
+        let verdict = classify(&result, reason, stage, sent);
         (verdict.outcome, verdict.reason)
+    };
+    let verdict = |result: Result<ExecutionResult, String>, stage: Stage, sent: bool| {
+        reported(result, None, stage, sent)
     };
     let failed = |message: &str| Err::<ExecutionResult, String>(message.into());
     let cases = [
@@ -1037,9 +1043,48 @@ fn verdicts_follow_the_real_path() {
             verdict(failed("Engine paused; input stopped"), Stage::Guard, false),
             (Outcome::Skipped, ReasonCode::Paused),
         ),
+        // The clipboard lease's reason comes with the report (B-08): it
+        // decides, the text is not read.
+        (
+            reported(
+                failed("Clipboard is busy"),
+                Some(ReasonCode::ClipboardBusy),
+                Stage::Clipboard,
+                false,
+            ),
+            (Outcome::Failed, ReasonCode::ClipboardBusy),
+        ),
+        (
+            reported(
+                failed("unexpected"),
+                Some(ReasonCode::ClipboardChanged),
+                Stage::Clipboard,
+                false,
+            ),
+            (Outcome::Skipped, ReasonCode::ClipboardChanged),
+        ),
+        (
+            reported(
+                run("failed", "unexpected", true),
+                Some(ReasonCode::ClipboardChanged),
+                Stage::Output,
+                true,
+            ),
+            (Outcome::Failed, ReasonCode::ClipboardChanged),
+        ),
+        (
+            reported(
+                run("failed", "unexpected", false),
+                Some(ReasonCode::ClipboardTooLarge),
+                Stage::Clipboard,
+                false,
+            ),
+            (Outcome::Skipped, ReasonCode::ClipboardTooLarge),
+        ),
+        // A clipboard text without its reason is no longer recognised.
         (
             verdict(failed("Clipboard is busy"), Stage::Clipboard, false),
-            (Outcome::Failed, ReasonCode::ClipboardBusy),
+            (Outcome::Failed, ReasonCode::Internal),
         ),
         (
             verdict(failed("Cancelled"), Stage::Output, true),
@@ -1650,7 +1695,7 @@ fn refused_key_ups_stay_owed_and_no_input_is_sent_until_they_are_paid() {
     let process = "qt-owed-manual.exe";
     super::executor::record_manual(
         process,
-        &Err("SendInput accepted 0/12 events".into()),
+        &RunReport::text(Err("SendInput accepted 0/12 events".into())),
         Instant::now(),
     );
     let recorded = crate::runtime::current()
@@ -2084,7 +2129,6 @@ fn supervisor_calls_skip_a_held_executor_lock_and_fence_next_round() {
 /// Sources of the failure texts the executor's reason table maps.
 const INJECT_RS: &str = include_str!("inject.rs");
 const ACTIONS_RS: &str = include_str!("actions.rs");
-const CLIPBOARD_RS: &str = include_str!("clipboard.rs");
 const PROTECTION_RS: &str = include_str!("protection.rs");
 const RAWINPUT_RS: &str = include_str!("rawinput.rs");
 const EXECUTOR_RS: &str = include_str!("executor.rs");
@@ -2094,7 +2138,8 @@ const EXECUTOR_RS: &str = include_str!("executor.rs");
 /// must map to. A reworded text fails
 /// `every_mapped_failure_text_is_quoted_from_its_source` (the quote is gone
 /// from its source) instead of silently falling back to `Internal`. A new
-/// failure text that should not be `Internal` belongs here too.
+/// failure text that should not be `Internal` belongs here too. Clipboard
+/// texts never do: their reason travels with the stop (`RunReport::reason`).
 const ORIGINALS: &[(&str, &str, ReasonCode)] = &[
     (
         INJECT_RS,
@@ -2183,77 +2228,6 @@ const ORIGINALS: &[(&str, &str, ReasonCode)] = &[
         "Read-only or protected accessibility control blocked",
         ReasonCode::ProtectedControl,
     ),
-    (CLIPBOARD_RS, "Clipboard is busy", ReasonCode::ClipboardBusy),
-    (
-        CLIPBOARD_RS,
-        "Clipboard is busy; trigger preserved",
-        ReasonCode::ClipboardBusy,
-    ),
-    (
-        CLIPBOARD_RS,
-        "Clipboard owner changed externally; clipboard preserved",
-        ReasonCode::ClipboardChanged,
-    ),
-    (
-        CLIPBOARD_RS,
-        "Clipboard formats changed externally; clipboard preserved",
-        ReasonCode::ClipboardChanged,
-    ),
-    (
-        CLIPBOARD_RS,
-        "Clipboard payload changed externally; clipboard preserved",
-        ReasonCode::ClipboardChanged,
-    ),
-    (
-        CLIPBOARD_RS,
-        "Clipboard changed externally before paste; no paste was sent",
-        ReasonCode::ClipboardChanged,
-    ),
-    (
-        CLIPBOARD_RS,
-        "Clipboard changed externally; stopped without overwriting it",
-        ReasonCode::ClipboardChanged,
-    ),
-    (
-        CLIPBOARD_RS,
-        "Clipboard format cannot be safely backed up; trigger preserved",
-        ReasonCode::ClipboardFormatSkipped,
-    ),
-    (
-        CLIPBOARD_RS,
-        "Clipboard format is too large to back up; trigger preserved",
-        ReasonCode::ClipboardTooLarge,
-    ),
-    (
-        CLIPBOARD_RS,
-        "Clipboard data took too long to read; trigger preserved",
-        ReasonCode::ClipboardBusy,
-    ),
-    (
-        CLIPBOARD_RS,
-        "Clipboard data did not arrive in time; trigger preserved",
-        ReasonCode::ClipboardBusy,
-    ),
-    (
-        CLIPBOARD_RS,
-        "Clipboard owner is not responding; trigger preserved",
-        ReasonCode::ClipboardBusy,
-    ),
-    (
-        CLIPBOARD_RS,
-        "Clipboard owner kept changing during backup; trigger preserved",
-        ReasonCode::ClipboardChanged,
-    ),
-    (
-        CLIPBOARD_RS,
-        "Clipboard payload was never verified after the paste write; clipboard preserved",
-        ReasonCode::ClipboardChanged,
-    ),
-    (
-        CLIPBOARD_RS,
-        "Existing clipboard has an unsupported handle format",
-        ReasonCode::ClipboardFormatSkipped,
-    ),
     (
         EXECUTOR_RS,
         "Executor task was fenced after a stall; stopped without further input",
@@ -2268,11 +2242,6 @@ const ORIGINALS: &[(&str, &str, ReasonCode)] = &[
         EXECUTOR_RS,
         "Executor task panicked; stopped",
         ReasonCode::ExecutorPanic,
-    ),
-    (
-        EXECUTOR_RS,
-        "Clipboard is still held by a stalled action; paste refused (no typing fallback)",
-        ReasonCode::ClipboardBusy,
     ),
 ];
 
@@ -2295,13 +2264,75 @@ fn every_mapped_failure_text_is_quoted_from_its_source() {
             side_effects: false,
         };
         assert_eq!(
-            classify(&Ok(failed), Stage::Done, false).reason,
+            classify(&Ok(failed), None, Stage::Done, false).reason,
             *want,
             "{text:?}"
         );
         assert_eq!(
-            classify(&Err((*text).into()), Stage::Output, false).reason,
+            classify(&Err((*text).into()), None, Stage::Output, false).reason,
             *want,
+            "{text:?}"
+        );
+    }
+}
+
+/// Clipboard stops are not in the reason table (B-08): their reason travels
+/// with the stop. Each text below, the lease's and the executor's clipboard
+/// claim's, falls back to `Internal` when it arrives without one, so a
+/// clipboard reason can only come from the lease or the claim, never from
+/// matching its wording.
+#[test]
+fn clipboard_texts_carry_no_reason_of_their_own() {
+    let clipboard_rs = include_str!("clipboard.rs");
+    let texts = [
+        (clipboard_rs, "Clipboard is busy"),
+        (clipboard_rs, "Clipboard is busy; trigger preserved"),
+        (
+            clipboard_rs,
+            "Clipboard owner changed externally; clipboard preserved",
+        ),
+        (
+            clipboard_rs,
+            "Clipboard formats changed externally; clipboard preserved",
+        ),
+        (
+            clipboard_rs,
+            "Clipboard changed externally before paste; no paste was sent",
+        ),
+        (
+            clipboard_rs,
+            "Clipboard format cannot be safely backed up; trigger preserved",
+        ),
+        (
+            clipboard_rs,
+            "Clipboard format is too large to back up; trigger preserved",
+        ),
+        (
+            clipboard_rs,
+            "Clipboard data took too long to read; trigger preserved",
+        ),
+        (
+            clipboard_rs,
+            "Clipboard owner is not responding; trigger preserved",
+        ),
+        (
+            clipboard_rs,
+            "Clipboard owner kept changing during backup; trigger preserved",
+        ),
+        (
+            clipboard_rs,
+            "Clipboard ownership could not be verified within the retry limit",
+        ),
+        (
+            EXECUTOR_RS,
+            "Clipboard is still held by a stalled action; paste refused (no typing fallback)",
+        ),
+    ];
+    for (source, text) in texts {
+        assert!(source.contains(&format!("\"{text}\"")), "{text:?}");
+        assert_eq!(
+            classify(&Err(text.into()), None, Stage::Clipboard, false).reason,
+            ReasonCode::Internal,
             "{text:?}"
         );
     }
@@ -2420,7 +2451,7 @@ fn physical_key_conflicts_are_modifier_held_on_the_real_paths() {
     super::actions::begin_trace();
     let manual = Serialized::new(&*rig.injector, Some(Arc::clone(&rig.core)));
     let clipboard = rig.clipboard.clone();
-    let result = super::actions::execute_with_proof(
+    let report = super::actions::run_plan(
         &Ports {
             injector: &manual,
             foreground: &rig.foreground,
@@ -2439,8 +2470,8 @@ fn physical_key_conflicts_are_modifier_held_on_the_real_paths() {
         1.0,
     );
     let before = crate::runtime::history_seq();
-    super::executor::record_manual(APP, &result, Instant::now());
-    let run = result.expect("the plan ran");
+    super::executor::record_manual(APP, &report, Instant::now());
+    let run = report.result.expect("the plan ran");
     assert_eq!(
         (run.status.as_str(), run.message.as_str(), run.side_effects),
         (
