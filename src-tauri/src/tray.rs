@@ -3,9 +3,14 @@
 //! the engine flags).
 use crate::{app_state::Managed, error::CommandError, events::Observer};
 use quicker_domain::Rule;
+#[cfg(any(not(windows), test))]
+use quicker_platform::ExecutionResult;
 use quicker_platform::{
-    health::{EngineState, HealthSnapshot, HealthState, HistoryEntry, PauseReasons, StatusText},
-    ExecutionResult, Shared,
+    health::{
+        EngineState, HealthSnapshot, HealthState, HistoryEntry, Outcome, PauseReasons, StatusText,
+        TriggerKind,
+    },
+    Shared,
 };
 use std::sync::{atomic::Ordering, Arc, PoisonError};
 use tauri::{menu::MenuItem, AppHandle, Manager, Wry};
@@ -120,30 +125,30 @@ pub struct TrayStatus {
     pause_item: MenuItem<Wry>,
     tooltip: Option<&'static str>,
     listening: Option<bool>,
+    /// The rules (`Shared::config`) the run notifications look up.
+    engine: Arc<Shared>,
     /// Windows: run notifications follow history entries. Elsewhere the
-    /// engine records no history, so a polling thread does it (`None` here).
-    notifier: Option<LastNotifier>,
+    /// engine records no history, so a polling thread does it and this
+    /// stays unused.
+    notices: HistoryNotices,
 }
 
 impl TrayStatus {
     pub fn new(handle: AppHandle, pause_item: MenuItem<Wry>, engine: Arc<Shared>) -> Self {
-        let notifier = LastNotifier {
+        #[cfg(not(windows))]
+        LastNotifier {
             handle: handle.clone(),
-            engine,
+            engine: Arc::clone(&engine),
             seen: String::new(),
-        };
-        let notifier = if cfg!(windows) {
-            Some(notifier)
-        } else {
-            notifier.spawn_polling();
-            None
-        };
+        }
+        .spawn_polling();
         Self {
             handle,
             pause_item,
             tooltip: None,
             listening: None,
-            notifier,
+            engine,
+            notices: HistoryNotices::default(),
         }
     }
 }
@@ -166,22 +171,84 @@ impl Observer for TrayStatus {
         }
     }
 
-    fn executed(&mut self, _entry: &HistoryEntry) {
-        if let Some(notifier) = &mut self.notifier {
-            notifier.check();
+    /// Called for every history entry, before the `execution-result` rate
+    /// limit, so a burst loses no notification.
+    fn executed(&mut self, entry: &HistoryEntry) {
+        if !cfg!(windows) {
+            return;
+        }
+        if let Some((title, body)) = self.notices.take(entry, &self.engine) {
+            notify(&self.handle, title, &body);
         }
     }
 }
 
+/// Windows run notifications: one per history entry whose rule asks for it,
+/// built from the entry alone (rule id, outcome), each `seq` once. Never
+/// from `Shared::last`: a run queued behind another may be overwritten
+/// there before the bus sees its entry, and a run the executor fences
+/// (budget timeout) never sets it, while every run has exactly one entry.
+/// Not merged or rate-limited: a burst of failures notifies each one.
+#[derive(Default)]
+struct HistoryNotices {
+    last_seq: Option<u64>,
+}
+
+impl HistoryNotices {
+    fn take(&mut self, entry: &HistoryEntry, engine: &Shared) -> Option<(&'static str, String)> {
+        if self.last_seq.is_some_and(|seen| entry.seq <= seen) {
+            return None;
+        }
+        self.last_seq = Some(entry.seq);
+        let config = engine.config.lock().unwrap_or_else(PoisonError::into_inner);
+        entry_notification(entry, &config.rules)
+    }
+}
+
+/// The notification for one history entry, if its rule (`rule_id`, the
+/// rule's own id) has notifications enabled. Manual runs have no rule.
+fn entry_notification(entry: &HistoryEntry, rules: &[Rule]) -> Option<(&'static str, String)> {
+    if entry.trigger == TriggerKind::Manual {
+        return None;
+    }
+    let rule = rules.iter().find(|rule| rule.id == entry.rule_id)?;
+    rule_notification(rule, entry.outcome)
+}
+
+/// Title and body for one run of `rule` that ended with `outcome`, if the
+/// rule asks for notifications (0.3: every run of such a rule; a completed
+/// run still reads "结果未知" because consumption by the target is not
+/// verified).
+fn rule_notification(rule: &Rule, outcome: Outcome) -> Option<(&'static str, String)> {
+    let notification = &rule.notification;
+    if !notification.enabled {
+        return None;
+    }
+    let title = match outcome {
+        Outcome::Succeeded | Outcome::Unknown => "输入已发送 · 目标结果未知",
+        Outcome::Cancelled => "动作已停止",
+        Outcome::DroppedBusy => "动作未执行 · 上一个动作仍在运行",
+        Outcome::Failed | Outcome::Skipped => "动作执行失败",
+    };
+    let body = if notification.message.is_empty() {
+        "请在文本指令管理中查看执行状态".to_owned()
+    } else {
+        notification.message.clone()
+    };
+    Some((title, body))
+}
+
 /// Notifies about the engine's last run result when its rule asks for it
-/// (unchanged from 0.3: unknown / cancelled / failed results of a rule with
-/// `notification.enabled`). Each result is notified once.
+/// (macOS, unchanged from 0.3: unknown / cancelled / failed results of a
+/// rule with `notification.enabled`). Each result is notified once.
+#[cfg(not(windows))]
 struct LastNotifier {
     handle: AppHandle,
     engine: Arc<Shared>,
     seen: String,
 }
 
+#[cfg(not(windows))]
 impl LastNotifier {
     fn check(&mut self) {
         let last = self
@@ -226,30 +293,22 @@ impl LastNotifier {
     }
 }
 
-/// The title and body to show for `last`, if its rule (the id before the
-/// generation, `"{rule.id}:{generation}"`) has notifications enabled.
+/// macOS: the title and body to show for `last`, if its rule (the id before
+/// the generation, `"{rule.id}:{generation}"`) has notifications enabled.
 /// Manual runs (`"run-{gen}"`) match no rule.
+#[cfg(any(not(windows), test))]
 fn run_notification(last: &ExecutionResult, rules: &[Rule]) -> Option<(&'static str, String)> {
     let rule = rules.iter().find(|rule| {
         last.id
             .strip_prefix(rule.id.as_str())
             .is_some_and(|rest| rest.starts_with(':'))
     })?;
-    let notification = &rule.notification;
-    if !notification.enabled {
-        return None;
-    }
-    let title = match last.status.as_str() {
-        "unknown" => "输入已发送 · 目标结果未知",
-        "cancelled" => "动作已停止",
-        _ => "动作执行失败",
+    let outcome = match last.status.as_str() {
+        "unknown" => Outcome::Unknown,
+        "cancelled" => Outcome::Cancelled,
+        _ => Outcome::Failed,
     };
-    let body = if notification.message.is_empty() {
-        "请在文本指令管理中查看执行状态".to_owned()
-    } else {
-        notification.message.clone()
-    };
-    Some((title, body))
+    rule_notification(rule, outcome)
 }
 
 #[cfg(test)]
@@ -257,6 +316,7 @@ mod tests {
     use super::*;
     use crate::error::SafeModeReason;
     use quicker_domain::Notification;
+    use quicker_platform::health::ReasonCode;
 
     fn rule(id: &str, enabled: bool, message: &str) -> Rule {
         Rule {
@@ -302,6 +362,123 @@ mod tests {
         assert_eq!(run_notification(&result("quiet:1", "failed"), &rules), None);
         assert_eq!(run_notification(&result("run-4", "failed"), &rules), None);
         assert_eq!(run_notification(&result("gone:1", "failed"), &rules), None);
+    }
+
+    fn entry(seq: u64, rule_id: &str, outcome: Outcome, reason: ReasonCode) -> HistoryEntry {
+        HistoryEntry {
+            seq,
+            at_ms: 0,
+            rule_id: rule_id.into(),
+            trigger: TriggerKind::Immediate,
+            outcome,
+            reason,
+            process: None,
+            completed_steps: 0,
+            side_effects: false,
+            skipped_formats: Vec::new(),
+            timings: Default::default(),
+        }
+    }
+
+    fn engine_with(rules: Vec<Rule>) -> Arc<Shared> {
+        let engine = Shared::new();
+        engine.config.lock().unwrap().rules = rules;
+        engine
+    }
+
+    const FAILED: &str = "动作执行失败";
+    const SENT: &str = "输入已发送 · 目标结果未知";
+
+    /// Review A3: two runs queued back to back, the second settling (and
+    /// overwriting `Shared::last`) before the bus delivers the first entry.
+    /// Each entry notifies by its own rule and outcome.
+    #[test]
+    fn queued_results_each_notify_by_their_own_entry() {
+        let engine = engine_with(vec![rule("a", true, ""), rule("quiet", false, "x")]);
+        // Shared::last already holds the second run's success.
+        *engine.last.lock().unwrap() = Some(result("a:8", "unknown"));
+        let mut notices = HistoryNotices::default();
+        let fail = entry(1, "a", Outcome::Failed, ReasonCode::ClipboardBusy);
+        let done = entry(2, "a", Outcome::Succeeded, ReasonCode::Ok);
+        assert_eq!(notices.take(&fail, &engine).map(|n| n.0), Some(FAILED));
+        assert_eq!(notices.take(&done, &engine).map(|n| n.0), Some(SENT));
+
+        // A failure of a quiet rule queued before a notifying rule's success:
+        // only the second notifies.
+        let mut notices = HistoryNotices::default();
+        let quiet_fail = entry(3, "quiet", Outcome::Failed, ReasonCode::ClipboardBusy);
+        let done = entry(4, "a", Outcome::Succeeded, ReasonCode::Ok);
+        assert_eq!(notices.take(&quiet_fail, &engine), None);
+        assert_eq!(notices.take(&done, &engine).map(|n| n.0), Some(SENT));
+
+        // And the other way round: the notifying failure, then a quiet success.
+        let mut notices = HistoryNotices::default();
+        let fail = entry(5, "a", Outcome::Failed, ReasonCode::ClipboardBusy);
+        let quiet_done = entry(6, "quiet", Outcome::Succeeded, ReasonCode::Ok);
+        assert_eq!(notices.take(&fail, &engine).map(|n| n.0), Some(FAILED));
+        assert_eq!(notices.take(&quiet_done, &engine), None);
+    }
+
+    /// Review A3: the executor fences a run past its budget and records
+    /// Failed / executor_timeout without touching `Shared::last`, which
+    /// still holds an older, already notified result.
+    #[test]
+    fn a_fenced_run_notifies_although_shared_last_is_unchanged() {
+        let engine = engine_with(vec![rule("a", true, "超时了")]);
+        *engine.last.lock().unwrap() = Some(result("a:1", "unknown"));
+        let mut notices = HistoryNotices::default();
+        assert_eq!(
+            notices.take(&entry(1, "a", Outcome::Unknown, ReasonCode::Ok), &engine),
+            Some((SENT, "超时了".into()))
+        );
+        let fenced = entry(2, "a", Outcome::Failed, ReasonCode::ExecutorTimeout);
+        assert_eq!(
+            notices.take(&fenced, &engine),
+            Some((FAILED, "超时了".into()))
+        );
+    }
+
+    #[test]
+    fn history_notices_take_each_seq_once_and_skip_manual_runs() {
+        let engine = engine_with(vec![rule("a", true, ""), rule("ab", true, "")]);
+        let mut notices = HistoryNotices::default();
+        let first = entry(5, "a", Outcome::Failed, ReasonCode::ClipboardBusy);
+        assert!(notices.take(&first, &engine).is_some());
+        // Redelivered or older: nothing.
+        assert_eq!(notices.take(&first, &engine), None);
+        assert_eq!(
+            notices.take(&entry(4, "a", Outcome::Failed, ReasonCode::Ok), &engine),
+            None
+        );
+        // The id matches exactly: "ab" is not "a".
+        assert_eq!(
+            notices
+                .take(&entry(6, "ab", Outcome::Cancelled, ReasonCode::Ok), &engine)
+                .map(|n| n.0),
+            Some("动作已停止")
+        );
+        assert_eq!(
+            notices
+                .take(
+                    &entry(7, "a", Outcome::DroppedBusy, ReasonCode::DroppedBusy),
+                    &engine
+                )
+                .map(|n| n.0),
+            Some("动作未执行 · 上一个动作仍在运行")
+        );
+        assert_eq!(
+            notices
+                .take(&entry(8, "a", Outcome::Skipped, ReasonCode::Ok), &engine)
+                .map(|n| n.0),
+            Some(FAILED)
+        );
+        let mut manual = entry(9, "", Outcome::Failed, ReasonCode::Ok);
+        manual.trigger = TriggerKind::Manual;
+        assert_eq!(notices.take(&manual, &engine), None);
+        assert_eq!(
+            notices.take(&entry(10, "gone", Outcome::Failed, ReasonCode::Ok), &engine),
+            None
+        );
     }
 
     #[test]

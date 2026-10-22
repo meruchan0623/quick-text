@@ -67,7 +67,7 @@ Rust 侧的共享类型在 `crates/platform/src/health.rs`，JSON 形状由其 s
 
 - 只有 EventBus 的一个线程发送事件，`seq` 在发送时分配，所以事件按 `seq` 顺序到达。第一条事件的 `seq` 是 1。
 - 启动时的初始 Health / State 不推送，前端从 `load_state`（或 `get_runtime_snapshot`）取初值。
-- 合并与限速只影响推送；托盘图标的提示、「暂停监听 / 恢复监听」菜单项和执行通知看到每一次变化。
+- 合并与限速只影响推送；托盘图标的提示、「暂停监听 / 恢复监听」菜单项和执行通知看到每一次变化。Windows 的执行通知在限速之前逐条取历史条目，按条目自己的 `rule_id`、`outcome` 判断（规则开了通知才发），每个历史 `seq` 一次，所以被 `suppressed` 合并的条目、被执行器超时围栏结束的执行也各有通知；macOS 没有执行历史，仍轮询最后一次结果。
 - 合并中、尚未发出的值不会出现在任何事件里，也不在 `get_runtime_snapshot` 里，直到它以更大的 `seq` 发出。
 
 类型细节（与 `health.rs` 一致）：

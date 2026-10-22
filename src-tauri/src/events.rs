@@ -858,4 +858,40 @@ mod tests {
         assert_eq!(seen.statuses.last(), Some(&(HealthState::Healthy, true)));
         assert_eq!(seen.executed, [1]);
     }
+
+    /// Review A3: the observer (tray run notifications) gets every history
+    /// entry, before the `execution-result` limit folds a burst.
+    #[test]
+    fn the_observer_sees_every_entry_of_a_burst_the_push_folds() {
+        let runtime = Arc::new(Runtime::new(Arc::new(SystemClock)));
+        let (tx, rx) = mpsc::channel();
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let _bus = EventBus::start(&runtime, Channel(tx), Box::new(Recorder(seen.clone())));
+        for _ in 0..15 {
+            runtime.record(Record {
+                rule_id: "r".into(),
+                trigger: TriggerKind::Terminator,
+                outcome: Outcome::Failed,
+                reason: ReasonCode::ClipboardBusy,
+                process: None,
+                completed_steps: 0,
+                side_effects: false,
+                skipped_formats: vec![],
+                timings: StageTimings::default(),
+            });
+        }
+        let mut pushed = vec![];
+        while pushed.last().map(|(seq, _)| *seq) != Some(15) {
+            let (name, payload) = next(&rx);
+            if name == EXECUTION_RESULT {
+                let seq = payload["entry"]["seq"].as_u64().unwrap();
+                pushed.push((seq, payload["suppressed"].as_u64().unwrap()));
+            }
+        }
+        // The push: ten at once, the other five folded into one.
+        assert_eq!(pushed.len(), EXECUTION_LIMIT + 1);
+        assert_eq!(pushed.last(), Some(&(15, 4)));
+        // The observer: each of the fifteen, in order.
+        assert_eq!(seen.lock().executed, (1..=15).collect::<Vec<u64>>());
+    }
 }
