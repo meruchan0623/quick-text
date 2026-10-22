@@ -269,8 +269,10 @@ struct ExecRig {
     core: Arc<ExecutorCore>,
     runtime: Arc<Runtime>,
     supervisor: Arc<Supervisor>,
-    /// Routes this thread's injections (manual runs) to the core's private
-    /// record of held input, as the worker's are (`keystate::OwnInput`).
+    /// The core's private record of held input (`keystate::OwnInput`).
+    own: &'static keystate::OwnInput,
+    /// Routes this thread's injections (manual runs) to `own`, as the
+    /// worker's are.
     _own: Box<dyn std::any::Any>,
     _serial: MutexGuard<'static, ()>,
 }
@@ -336,6 +338,7 @@ impl ExecRig {
             core,
             runtime,
             supervisor,
+            own,
             _own: Box::new(track),
             _serial: serial,
         };
@@ -1469,6 +1472,110 @@ fn a_panic_inside_a_tap_keeps_the_key_until_it_is_released() {
         (Outcome::Failed, ReasonCode::ExecutorPanic)
     );
     assert!(entry.side_effects);
+}
+
+/// Send exclusion (c) with a key-up from elsewhere (I4b): the user's B-up
+/// (no MARK) reaches the hooks after the tap's B-down was marked and before
+/// `SendInput` takes it; the call then takes the B-down and panics, so
+/// nothing replays it. The mark is in flight, which the hook's
+/// `released_elsewhere` does not clear: the busy guard still sends the MARK
+/// key-up, and while `SendInput` refuses it the debt is not taken as paid
+/// and B stays in the record. Once accepted, the next task pays it before
+/// its own input, and nothing is left in flight.
+#[test]
+fn a_key_up_from_elsewhere_before_a_panicking_send_keeps_the_key_owed() {
+    let mut rig = ExecRig::with_release(vec![press_b()]);
+    let own = rig.own;
+    let at_panic = Arc::new(std::sync::Mutex::new(None));
+    let seen = Arc::clone(&at_panic);
+    // The mock drops its hook when the hook panics: installed for this run.
+    rig.injector.on_call(move |call| {
+        if *call == InjectCall::Keys(vec![KEY_B]) {
+            // hook.rs: a key-up without our MARK, inside the call.
+            own.released_elsewhere(KEY_B);
+            *seen.lock().unwrap_or_else(PoisonError::into_inner) = Some(own.held_and_pending());
+            panic!("injector panicked inside SendInput");
+        }
+    });
+    rig.release.refuse(&[KEY_B]);
+    let failed = rig.run("kb");
+    assert_eq!(failed.status, "failed");
+    // The busy guard sent the MARK key-up anyway; refused, it stays owed.
+    assert_eq!(rig.release.calls(), vec![key_up(KEY_B)]);
+    assert!(rig.core.release_owed(), "a refused key-up is not paid");
+    assert_eq!(rig.core.held_keys(), vec![KEY_B]);
+    assert_eq!(own.held_and_pending(), (vec![], vec![KEY_B]));
+    assert_eq!(
+        *at_panic.lock().unwrap_or_else(PoisonError::into_inner),
+        Some((vec![], vec![KEY_B])),
+        "the key-up from elsewhere left the in-flight mark"
+    );
+    assert_eq!(
+        (rig.last_entry().outcome, rig.last_entry().reason),
+        (Outcome::Failed, ReasonCode::ExecutorPanic)
+    );
+
+    rig.release.refuse(&[]);
+    let journal = journal(&rig, |_| {});
+    let result = rig.run("kb");
+    assert_eq!(result.status, "unknown", "{}", result.message);
+    assert_eq!(rig.release.calls(), vec![key_up(KEY_B), key_up(KEY_B)]);
+    assert!(!rig.core.release_owed());
+    assert!(rig.core.held_keys().is_empty());
+    assert_eq!(own.held_and_pending(), (vec![], vec![]));
+    let entries = journaled(&journal);
+    assert_eq!(
+        entries.first(),
+        Some(&("release", key_up(KEY_B))),
+        "the payment comes first: {entries:?}"
+    );
+    let taps = entries
+        .iter()
+        .filter(|(_, call)| *call == InjectCall::Keys(vec![KEY_B]));
+    assert_eq!(taps.count(), 1, "{entries:?}");
+}
+
+/// S2 on the normal path (I4b): a batch's key-downs are in flight only
+/// during its call. Once `SendInput` accepts the whole batch they are held
+/// exactly as replayed, nothing stays in flight, and no extra key-up
+/// follows.
+#[test]
+fn a_fully_accepted_batch_is_held_as_replayed_and_nothing_stays_in_flight() {
+    let mut rig = ExecRig::with_release(vec![hold_a_and_b()]);
+    let own = rig.own;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    rig.injector.on_call(move |call| {
+        let entry = (call.clone(), own.held_and_pending());
+        log.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(entry);
+    });
+    let result = rig.run("hold");
+    assert_eq!(result.status, "unknown", "{}", result.message);
+    let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let first = seen
+        .iter()
+        .position(|(call, _)| *call == key_down(KEY_A))
+        .expect("the plan's first key-down");
+    // (call, (held, in flight) during that call)
+    assert_eq!(
+        &seen[first..],
+        &[
+            (key_down(KEY_A), (vec![], vec![KEY_A])),
+            (key_down(KEY_B), (vec![KEY_A], vec![KEY_B])),
+            (
+                InjectCall::Keys(vec![KEY_C]),
+                (vec![KEY_A, KEY_B], vec![KEY_C])
+            ),
+            (key_up(KEY_B), (vec![KEY_A, KEY_B], vec![])),
+            (key_up(KEY_A), (vec![KEY_A], vec![])),
+        ]
+    );
+    assert_eq!(own.held_and_pending(), (vec![], vec![]));
+    assert!(rig.core.held_keys().is_empty());
+    assert!(rig.release.calls().is_empty(), "no extra key-up");
+    assert!(!rig.core.release_owed());
 }
 
 /// Send exclusion (d) and fail closed: while the send lock stays held (a

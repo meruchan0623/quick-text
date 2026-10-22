@@ -16,8 +16,9 @@
 //!   holds down (shared with `inject.rs` and the hooks), through the small
 //!   [`HeldKeys`] interface, so whoever ends the task (the busy guard, or
 //!   after a fence on a stall the payers of its debt, S3) sends the
-//!   matching MARK key-ups. A key the hooks saw released elsewhere is
-//!   cleared there and gets no key-up from here.
+//!   matching MARK key-ups. A held key the hooks saw released elsewhere is
+//!   cleared there and gets no key-up from here (a key still in flight
+//!   keeps its key-up, S2).
 //! * Send exclusion (`send_lock`). S1: every `SendInput` the executor makes
 //!   (task output, the plan's own cleanup, re-sent key-ups) runs while the
 //!   send lock is held, and the epoch check that allows it is made in the
@@ -40,12 +41,18 @@
 //!   lock first would not shorten it, it would only make the fence hang
 //!   whenever a `SendInput` hangs.
 //!   S2: the held-key bitmap is settled in the same hold: every key-down of
-//!   the batch (taps and chords alike) is marked before the call; once
-//!   `SendInput` returns `k`, only the accepted prefix is replayed in order
-//!   (a down marks, an up clears), so a key-down past the prefix stays
-//!   marked (at worst one redundant MARK key-up later). Without a usable
-//!   `k` (a panic inside the call, or `k` above the batch size) every
-//!   key-down of the batch stays held.
+//!   the batch (taps and chords alike) is marked in flight before the call;
+//!   once `SendInput` returns `k`, the batch's key-downs are settled as held
+//!   and only the accepted prefix is replayed in order (a down marks, an up
+//!   clears), so a key-down past the prefix stays marked (at worst one
+//!   redundant MARK key-up later). Without a usable `k` (a panic inside the
+//!   call, or `k` above the batch size) every key-down of the batch stays in
+//!   flight. An in-flight mark is ours like a held key, but a key-up from
+//!   elsewhere does not clear it: one that reaches the hooks between the
+//!   mark and the call taking the key-down would otherwise leave that
+//!   key-down without a record after a panic, with no key-up from cleanup
+//!   and a debt counted as paid. Only an accepted key-up of ours, or a
+//!   usable `k`, ends it.
 //!   S3: the fence's key-ups go through the same lock, so they follow the
 //!   old epoch's in-flight send. The fence itself never sends them: it only
 //!   records a release debt (`release_owed`). The debt is paid inside a
@@ -581,9 +588,18 @@ impl Refusal {
 /// `inject.rs` notes accepted input in, so there is a single source of
 /// truth; see the adapter there.
 pub(super) trait HeldKeys: Send + Sync {
+    /// S2, before a batch's call: `vk` may be pressed by the call (in
+    /// flight). A key-up from elsewhere does not end this mark (the hooks
+    /// clear only settled keys); only [`settle_down`](Self::settle_down)
+    /// or [`mark_up`](Self::mark_up) does.
     fn mark_down(&self, vk: u16);
+    /// S2, after the call returned a usable count: `vk` is held and no
+    /// longer in flight; from now on a key-up from elsewhere ends it.
+    fn settle_down(&self, vk: u16);
+    /// Our key-up of `vk` was accepted (or the user now holds it): neither
+    /// held nor in flight.
     fn mark_up(&self, vk: u16);
-    /// Currently held keys, ascending.
+    /// Keys held or in flight, ascending.
     fn held_snapshot(&self) -> Vec<u16>;
 }
 
@@ -777,18 +793,20 @@ impl ExecutorCore {
         payment
     }
 
-    /// Sends the key-ups of every key in the bitmap and settles the debt by
-    /// the result: settled only when none was refused, otherwise the
-    /// refused keys stay in the bitmap and stay owed. Clearing the flag here
-    /// is safe against a concurrent fence: while `turn` is held no task can
-    /// mark a key down (S2 marks only in the send lock), so every key a task
-    /// held when the fence recorded its debt was in this snapshot. Outside
-    /// the lock the shared record only gains notes `inject.rs` makes after
-    /// a send returned: the accepted prefix of a task batch S2 already
-    /// marked (if this payment released such a key first, the late note
-    /// sets it again: at worst one redundant MARK key-up later), or a
-    /// manual run's presses, which that run's own cleanup releases. The
-    /// hooks only clear bits.
+    /// Sends the key-ups of every key in the bitmap (held or still in
+    /// flight, S2) and settles the debt by the result: settled only when
+    /// none was refused, otherwise the refused keys stay in the bitmap and
+    /// stay owed. Clearing the flag here is safe against a concurrent fence:
+    /// while `turn` is held no task can mark a key down (S2 marks only in
+    /// the send lock), so every key a task held when the fence recorded its
+    /// debt was in this snapshot. Outside the lock the shared record only
+    /// gains notes `inject.rs` makes after a send returned: the accepted
+    /// prefix of a task batch S2 already marked (if this payment released
+    /// such a key first, the late note sets it again: at worst one redundant
+    /// MARK key-up later), or a manual run's presses, which that run's own
+    /// cleanup releases. The hooks only clear bits, and never an in-flight
+    /// mark, so a key a panicking send may have pressed stays owed until its
+    /// key-up is accepted.
     fn release_all(&self, turn: &SendTurn<'_>) -> Payment {
         let (released, refused) = self.release_held(turn);
         let debt = if refused == 0 {
@@ -1694,7 +1712,8 @@ impl<I: Injector> Fenced<'_, I> {
         if scope.check().is_err() {
             return 0;
         }
-        // S2: every key-down of the batch is held before the call...
+        // S2: every key-down of the batch is marked in flight before the
+        // call...
         for &(vk, up) in events {
             if !up {
                 core.held.mark_down(vk);
@@ -1705,14 +1724,22 @@ impl<I: Injector> Fenced<'_, I> {
             // Side effects of a run the fence may have to record.
             scope.sent.store(true, Ordering::SeqCst);
         }
-        // ...and after it only the accepted prefix is replayed, in order. A
-        // count above the batch size is unusable: every key-down stays held.
+        // ...and once it returned a usable count, still in this hold, the
+        // batch's key-downs are settled as held and only the accepted prefix
+        // is replayed, in order. A count above the batch size is unusable,
+        // and a panic inside the call skips this: every key-down stays in
+        // flight, which a key-up from elsewhere cannot clear.
         if let Some(prefix) = events.get(..accepted as usize) {
+            for &(vk, up) in events {
+                if !up {
+                    core.held.settle_down(vk);
+                }
+            }
             for &(vk, up) in prefix {
                 if up {
                     core.held.mark_up(vk);
                 } else {
-                    core.held.mark_down(vk);
+                    core.held.settle_down(vk);
                 }
             }
         }

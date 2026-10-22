@@ -222,8 +222,19 @@ impl Sample {
 /// but the asynchronous key state does, so mirror corrections consult this:
 /// keys held here are never imported, and samples overlapping an injection
 /// are discarded. Lock- and allocation-free.
+///
+/// Two sets of bits, and a key is ours while it is in either: `held`, the
+/// transitions the system accepted, and `pending`, the executor's key-downs
+/// marked before a batch's call returned (S2). A key-up from elsewhere
+/// ([`OwnInput::released_elsewhere`]) clears only `held`; an accepted key-up
+/// of ours clears both.
 pub(super) struct OwnInput {
     held: [AtomicU64; 4],
+    /// Key-downs of an executor batch whose call has not returned a usable
+    /// count yet (in flight); kept after a panic inside the call or a count
+    /// that cannot be mapped to events, until our key-up of the key is
+    /// accepted.
+    pending: [AtomicU64; 4],
     /// Injections in flight.
     active: AtomicU32,
     /// Advanced when each injection starts and ends.
@@ -233,6 +244,7 @@ impl OwnInput {
     pub(super) const fn new() -> Self {
         Self {
             held: [const { AtomicU64::new(0) }; 4],
+            pending: [const { AtomicU64::new(0) }; 4],
             active: AtomicU32::new(0),
             seq: AtomicU64::new(0),
         }
@@ -255,27 +267,61 @@ impl OwnInput {
     pub(super) fn settled(&self, seen: u64) -> bool {
         !self.active() && self.seq() == seen
     }
-    fn slot(&self, vk: u16) -> Option<(&AtomicU64, u64)> {
-        self.held
+    fn slot(words: &[AtomicU64; 4], vk: u16) -> Option<(&AtomicU64, u64)> {
+        words
             .get(usize::from(vk >> 6))
             .map(|word| (word, 1u64 << (vk & 63)))
     }
-    fn note(&self, vk: u16, down: bool) {
-        if let Some((word, bit)) = self.slot(vk) {
-            if down {
-                word.fetch_or(bit, Ordering::SeqCst);
-            } else {
-                word.fetch_and(!bit, Ordering::SeqCst);
-            }
+    fn set(words: &[AtomicU64; 4], vk: u16) {
+        if let Some((word, bit)) = Self::slot(words, vk) {
+            word.fetch_or(bit, Ordering::SeqCst);
         }
     }
-    fn bit(&self, vk: u16) -> bool {
-        self.slot(vk)
-            .is_some_and(|(word, bit)| word.load(Ordering::SeqCst) & bit != 0)
+    fn clear(words: &[AtomicU64; 4], vk: u16) {
+        if let Some((word, bit)) = Self::slot(words, vk) {
+            word.fetch_and(!bit, Ordering::SeqCst);
+        }
     }
-    /// We hold `vk` down. Modifiers count as one family: an injected generic
-    /// Ctrl shows up as the left Ctrl in the asynchronous state, and the
-    /// reverse.
+    /// An accepted key-down of ours: held.
+    fn note_down(&self, vk: u16) {
+        Self::set(&self.held, vk);
+    }
+    /// An accepted key-up of ours: the key is up, whoever pressed it, so
+    /// neither held nor in flight.
+    fn note_up(&self, vk: u16) {
+        Self::clear(&self.held, vk);
+        Self::clear(&self.pending, vk);
+    }
+    /// Held or in flight. `pending` is read first: a settling key is set in
+    /// `held` before it leaves `pending`, so it is never missed in between.
+    fn bit(&self, vk: u16) -> bool {
+        let read = |words| {
+            Self::slot(words, vk).is_some_and(|(word, bit)| word.load(Ordering::SeqCst) & bit != 0)
+        };
+        read(&self.pending) || read(&self.held)
+    }
+    /// The keys whose bits are set in `words` (64 codes each), ascending.
+    fn keys(words: impl Iterator<Item = u64>) -> Vec<u16> {
+        words
+            .zip(0u16..)
+            .flat_map(|(bits, index)| {
+                (0u16..64)
+                    .filter(move |bit| bits & (1u64 << bit) != 0)
+                    .map(move |bit| index * 64 + bit)
+            })
+            .collect()
+    }
+    /// (held, in flight), each ascending (tests).
+    #[cfg(test)]
+    pub(super) fn held_and_pending(&self) -> (Vec<u16>, Vec<u16>) {
+        let load = |words: &[AtomicU64; 4]| {
+            Self::keys(words.iter().map(|word| word.load(Ordering::SeqCst)))
+        };
+        (load(&self.held), load(&self.pending))
+    }
+    /// We hold `vk` down, or an executor batch pressing it is in flight.
+    /// Modifiers count as one family: an injected generic Ctrl shows up as
+    /// the left Ctrl in the asynchronous state, and the reverse.
     pub(super) fn holds(&self, vk: u16) -> bool {
         let family = match vk {
             VK_CONTROL | VK_LCONTROL | VK_RCONTROL => [VK_CONTROL, VK_LCONTROL, VK_RCONTROL],
@@ -311,6 +357,15 @@ impl OwnInput {
     /// bit is the safer mistake: a press of ours left unset would be
     /// imported by a resync as physical and skipped by `release_owned`, and
     /// the key would stay down.
+    ///
+    /// Never clears `pending`: such a key-up can come between the executor's
+    /// mark and `SendInput` taking the key-down, and if the call then
+    /// panics, or returns a count that cannot be mapped to events, nothing
+    /// replays it; the key would be down with no record left, so cleanup
+    /// would send no key-up for it and a payment would count the debt as
+    /// settled. The executor clears `pending` when the call returns a usable
+    /// count (the batch's key-downs move to `held`), and an accepted key-up
+    /// of ours clears it.
     pub(super) fn released_elsewhere(&self, vk: u16) {
         let ended = match vk {
             VK_CONTROL | VK_LCONTROL => [VK_CONTROL, VK_LCONTROL],
@@ -320,7 +375,7 @@ impl OwnInput {
         };
         let mut cleared = false;
         for v in ended {
-            if let Some((word, bit)) = self.slot(v) {
+            if let Some((word, bit)) = Self::slot(&self.held, v) {
                 cleared |= word.fetch_and(!bit, Ordering::SeqCst) & bit != 0;
             }
         }
@@ -332,31 +387,33 @@ impl OwnInput {
 
 /// The executor's held-key interface over the same bits, so there is one
 /// record of what this process holds down. Its writers: `inject.rs` notes
-/// the transitions the system accepted; the executor marks a batch's
-/// key-downs before the call and replays the accepted prefix after it, in
-/// the send lock (S2), and clears a key once its MARK key-up is accepted;
-/// the hooks clear a key whose key-up came from elsewhere
-/// ([`OwnInput::released_elsewhere`]), and the executor then sends no
-/// key-up for it. A mark does not move `seq`, like [`Injecting::pressed`];
-/// the sends themselves run inside [`OwnInput::begin`].
+/// the transitions the system accepted (in `held`); the executor marks a
+/// batch's key-downs in `pending` before the call and, in the same hold of
+/// the send lock (S2), once the call returned a usable count moves them to
+/// `held` and replays the accepted prefix; it clears a key (in both sets)
+/// once its MARK key-up is accepted. The hooks clear a `held` key whose
+/// key-up came from elsewhere ([`OwnInput::released_elsewhere`]), and the
+/// executor then sends no key-up for it; a `pending` key keeps its key-up.
+/// A mark does not move `seq`, like [`Injecting::pressed`]; the sends
+/// themselves run inside [`OwnInput::begin`].
 impl super::executor::HeldKeys for OwnInput {
     fn mark_down(&self, vk: u16) {
-        self.note(vk, true);
+        Self::set(&self.pending, vk);
+    }
+    fn settle_down(&self, vk: u16) {
+        // `held` first: `bit` and `held_snapshot` never miss it in between.
+        Self::set(&self.held, vk);
+        Self::clear(&self.pending, vk);
     }
     fn mark_up(&self, vk: u16) {
-        self.note(vk, false);
+        self.note_up(vk);
     }
     fn held_snapshot(&self) -> Vec<u16> {
-        self.held
-            .iter()
-            .zip(0u16..)
-            .flat_map(|(word, index)| {
-                let bits = word.load(Ordering::SeqCst);
-                (0u16..64)
-                    .filter(move |bit| bits & (1u64 << bit) != 0)
-                    .map(move |bit| index * 64 + bit)
-            })
-            .collect()
+        // Per word, `pending` before `held` (see `bit`).
+        Self::keys(self.pending.iter().zip(&self.held).map(|(pending, held)| {
+            let pending = pending.load(Ordering::SeqCst);
+            pending | held.load(Ordering::SeqCst)
+        }))
     }
 }
 
@@ -367,11 +424,12 @@ pub(super) struct Injecting<'a> {
 impl Injecting<'_> {
     /// The system accepted our key-down (or button-down) of `vk`.
     pub(super) fn pressed(&self, vk: u16) {
-        self.own.note(vk, true);
+        self.own.note_down(vk);
     }
-    /// The system accepted our key-up (or button-up) of `vk`.
+    /// The system accepted our key-up (or button-up) of `vk`: held or in
+    /// flight, it is up now.
     pub(super) fn released(&self, vk: u16) {
-        self.own.note(vk, false);
+        self.own.note_up(vk);
     }
 }
 impl Drop for Injecting<'_> {
@@ -889,13 +947,40 @@ mod tests {
         );
         own.mark_up(VK_LCONTROL);
         assert!(!own.holds(VK_CONTROL), "the executor's key-up ends ours");
-        // A key-up from elsewhere: the executor owes no key-up for it.
+        // In flight, a key-up from elsewhere leaves the mark: the call may
+        // still take the key-down, and nothing would replay it after a
+        // panic. Nothing of ours ended either, so no resync is disturbed.
+        let seen = own.seq();
         own.released_elsewhere(0x41);
+        own.released_elsewhere(VK_RSHIFT);
+        assert!(own.holds(0x41) && own.settled(seen));
+        assert_eq!(own.held_snapshot(), vec![VK_LBUTTON, 0x41, VK_RSHIFT]);
+        assert_eq!(
+            own.held_and_pending(),
+            (vec![], vec![VK_LBUTTON, 0x41, VK_RSHIFT])
+        );
+        // Settled (the call returned a usable count), a key-up from
+        // elsewhere ends it: the executor owes no key-up for it.
+        own.settle_down(0x41);
+        own.settle_down(VK_LBUTTON);
+        assert_eq!(
+            own.held_and_pending(),
+            (vec![VK_LBUTTON, 0x41], vec![VK_RSHIFT])
+        );
+        own.released_elsewhere(0x41);
+        assert!(!own.holds(0x41) && !own.settled(seen));
         assert_eq!(own.held_snapshot(), vec![VK_LBUTTON, VK_RSHIFT]);
+        // Our accepted key-up ends a key whether held or in flight, also
+        // when `inject.rs` notes it.
+        own.mark_up(VK_LBUTTON);
+        own.begin().released(VK_RSHIFT);
+        assert!(own.held_snapshot().is_empty());
+        assert_eq!(own.held_and_pending(), (vec![], vec![]));
     }
 
     #[test]
     fn resync_never_imports_keys_this_process_holds() {
+        use super::super::executor::HeldKeys;
         let keys = KeyBits::new();
         let own = OwnInput::new();
         {
@@ -903,13 +988,17 @@ mod tests {
             injecting.pressed(0x41);
             injecting.pressed(VK_CONTROL);
         }
-        // The asynchronous state shows our A and our Ctrl (as LCONTROL),
+        // An executor key-down still in flight is ours too.
+        own.mark_down(0x42);
+        // The asynchronous state shows our A, B and Ctrl (as LCONTROL),
         // plus a Shift the user really holds.
-        let probe = FakeKeys::new(&[0x41, VK_CONTROL, VK_LCONTROL, VK_LSHIFT]);
+        let probe = FakeKeys::new(&[0x41, 0x42, VK_CONTROL, VK_LCONTROL, VK_LSHIFT]);
         assert!(keys.resync_unless_injected(&probe, &own, own.seq()));
         assert!(keys.seeded());
-        assert!(!keys.held(0x41) && !keys.held(VK_CONTROL));
+        assert!(!keys.held(0x41) && !keys.held(0x42) && !keys.held(VK_CONTROL));
         assert!(keys.held(VK_SHIFT));
+        // Unseeded, the physical query masks it as well.
+        assert!(!physical_in(&KeyBits::new(), &probe, &own, 0x42));
         // A real press of a key we also hold still shows: the mirror keeps
         // the hook's value for owned keys.
         keys.set(0x41, true);
