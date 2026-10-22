@@ -40,7 +40,7 @@ afterEach(() => {
 });
 
 describe('ErrorBoundary', () => {
-  it('shows a recoverable page and logs only the error class and component names', async () => {
+  it('shows a recoverable page and logs only the error class and stack frames', async () => {
     const backend = new MockBackend({ rules: 0 });
     const { host, root } = await render(backend);
     expect(host.querySelector('[role="alert"] h1')?.textContent).toBe('界面出错了');
@@ -48,7 +48,11 @@ describe('ErrorBoundary', () => {
     expect(reports).toHaveLength(1);
     const args = reports[0]?.args;
     expect(args?.message).toBe('TypeError');
-    expect(String(args?.stack)).toMatch(/^Boom(@|$)/m);
+    // The frames of the error's own stack as the browser wrote them, without the message line.
+    const frames = String(args?.stack).split('\n');
+    expect(frames[0]).toMatch(/^at \S+ErrorBoundary\.test\.tsx:\d+:\d+$/);
+    expect(frames.every((frame) => /^at \S+:\d+:\d+$/.test(frame))).toBe(true);
+    expect(args?.source).toBe(frames[0]?.slice(3));
     expect(Object.keys(args ?? {}).sort()).toEqual(['message', 'source', 'stack']);
     expect(JSON.stringify(args)).not.toContain('secret');
 

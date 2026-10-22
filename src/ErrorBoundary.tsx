@@ -1,7 +1,7 @@
 // Outermost error boundary: a render error shows a recoverable page instead of a blank window, and
 // is logged through `log_frontend_error` without its message or any rule content (see
 // lib/errorReport.ts).
-import { Component, Fragment, type ErrorInfo, type ReactNode } from 'react';
+import { Component, Fragment, type ReactNode } from 'react';
 import { invoke } from './ipc/transport';
 import { frontendErrorReport } from './lib/errorReport';
 
@@ -22,11 +22,9 @@ export class ErrorBoundary extends Component<Props, State> {
     return { failed: true };
   }
 
-  override componentDidCatch(error: unknown, info: ErrorInfo): void {
+  override componentDidCatch(error: unknown): void {
     // A 0.3 backend has no such command, and a failed report must not fail the page.
-    invoke<null>('log_frontend_error', frontendErrorReport(error, info.componentStack)).catch(
-      () => undefined,
-    );
+    invoke<null>('log_frontend_error', frontendErrorReport(error)).catch(() => undefined);
   }
 
   #retry = () => {
