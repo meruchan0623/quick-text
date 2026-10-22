@@ -1,7 +1,7 @@
 //! L2 pipeline tests (S-23): the production match step, erasure, output and
 //! clipboard lease running on `crate::mock` ports. Nothing here reaches
 //! SendInput, the vendored injector or the real clipboard.
-use super::actions::{run, Ports};
+use super::actions::{execute_with_proof, Ports};
 use super::executor::{Candidate, CandidateProof};
 use super::inject::{erase, Erasure};
 use super::rawinput::{detect_candidate, Buffer, Event, Kind, Stamp};
@@ -79,14 +79,10 @@ impl Rig {
             clipboard: MockClipboard::new(7, clip("original")),
         }
     }
+    /// The stamp the capture path records now (production `stamp` over the
+    /// mock input context).
     fn stamp(&self) -> Stamp {
-        Stamp {
-            focus: FOCUS,
-            epoch: 1,
-            caret: 1,
-            revision: self.shared.config.lock().unwrap().revision,
-            layout: 0x0409,
-        }
+        rawinput::stamp(&self.shared, &self.foreground).expect("mock context is readable")
     }
     /// Delivers a text event captured at `generation` while the engine is at
     /// `current` (they differ when external input arrived in between).
@@ -117,7 +113,8 @@ impl Rig {
         text.chars()
             .fold(None, |_, ch| self.key_in(&ch.to_string()))
     }
-    /// Runs a candidate the way the executor thread does, on the mock ports.
+    /// Runs a candidate the way the executor thread does, on the mock ports,
+    /// through the production entry that installs and uninstalls the proof.
     fn execute(&self, candidate: &Candidate) -> Result<ExecutionResult, String> {
         // `physical()` reports "held" when its mirror is contended, so runs
         // from parallel tests must not overlap (production has one executor).
@@ -126,11 +123,8 @@ impl Rig {
         let config = self.shared.config.lock().unwrap().clone();
         let plan = expand_reusable(&candidate.rule.action, &config, &VariableContext::default())
             .map_err(|errors| format!("{} plan errors", errors.len()))?;
-        let erasure = match &candidate.proof {
-            CandidateProof::Espanso(proof) => proof.erasure(),
-        };
         let clipboard = self.clipboard.clone();
-        run(
+        execute_with_proof(
             &Ports {
                 injector: &self.injector,
                 foreground: &self.foreground,
@@ -141,7 +135,7 @@ impl Rig {
             plan,
             candidate.focus.clone(),
             candidate.generation,
-            Some(erasure),
+            Some(candidate.proof.clone()),
             if candidate.matched.consume_terminator {
                 None
             } else {
@@ -463,4 +457,194 @@ fn erase_waits_only_for_the_remaining_settle_time() {
     erase(&injector, &clock, &erasure, || Ok(())).unwrap();
     assert_eq!(clock.sleeps(), vec![Duration::from_millis(15)]);
     assert_eq!(injector.taps(VK_BACK), 2);
+}
+
+/// Fail-stop message of the stamp guard (`rawinput::validate_stamp`). The
+/// result carries no reason code yet; B-35 classifies it as
+/// `ReasonCode::StaleInput`.
+const STAMP_CHANGED: &str = "Focus, caret, layout or configuration changed; input stopped";
+
+/// One component of the transaction stamp.
+#[derive(Clone, Copy, Debug)]
+enum StampField {
+    Caret,
+    FocusEpoch,
+    Layout,
+    Revision,
+}
+
+/// When, after the match, the stamp changes.
+#[derive(Clone, Copy, Debug)]
+enum Moment {
+    /// While the clipboard lease takes its backup, before any backspace.
+    BeforeErase,
+    /// Right after backspace number `k` (1-based) was accepted.
+    AfterBackspace(usize),
+}
+
+impl Rig {
+    /// The change the focus/caret hooks, a layout switch or a config reload
+    /// would make to one stamp component.
+    fn stamp_change(&self, field: StampField) -> impl Fn() + Send + 'static {
+        let foreground = self.foreground.clone();
+        let shared = self.shared.clone();
+        move || match field {
+            StampField::Caret => foreground.update_input_context(|c| c.caret_epoch += 1),
+            StampField::FocusEpoch => foreground.update_input_context(|c| c.focus_epoch += 1),
+            StampField::Layout => foreground.update_input_context(|c| c.layout = 0x0804),
+            StampField::Revision => shared.compiled.lock().unwrap().config.revision += 1,
+        }
+    }
+}
+
+fn assert_stamp_change_fails_stop(moment: Moment, field: StampField) {
+    let case = format!("{field:?} changed {moment:?}");
+    let mut rig = Rig::new(rule(None, OutputMethod::Paste));
+    let candidate = rig.type_str("btw").unwrap();
+    let change = rig.stamp_change(field);
+    let backspaces = match moment {
+        Moment::BeforeErase => {
+            // Lock 0 is the lease reading its backup.
+            rig.clipboard.on_lock(move |index| {
+                if index == 0 {
+                    change();
+                }
+            });
+            0
+        }
+        Moment::AfterBackspace(k) => {
+            let mut seen = 0;
+            rig.injector.on_call(move |call| {
+                if *call == InjectCall::Keys(vec![VK_BACK]) {
+                    seen += 1;
+                    if seen == k {
+                        change();
+                    }
+                }
+            });
+            k
+        }
+    };
+    let sequence = rig.clipboard.sequence_now();
+    let outcome = rig.execute(&candidate);
+    let message = match moment {
+        // The pre-erase guard rejects the run before anything is sent.
+        Moment::BeforeErase => outcome.expect_err(&case),
+        Moment::AfterBackspace(_) => {
+            let result = outcome.expect(&case);
+            assert_eq!(result.id, "erase", "{case}");
+            assert_eq!(result.status, "failed", "{case}");
+            assert_eq!(result.completed_steps, 0, "{case}");
+            assert!(result.side_effects, "{case}");
+            result.message
+        }
+    };
+    assert_eq!(message, STAMP_CHANGED, "{case}");
+    // No input after the change: only the backspaces accepted before it.
+    assert_eq!(
+        rig.injector.calls(),
+        vec![InjectCall::Keys(vec![VK_BACK]); backspaces],
+        "{case}"
+    );
+    // #1: the lease never wrote, so sequence, owner and content are intact.
+    assert_eq!(rig.clipboard.clears(), 0, "{case}");
+    assert_eq!(rig.clipboard.sequence_now(), sequence, "{case}");
+    assert_eq!(rig.clipboard.owner_now(), 7, "{case}");
+    assert_eq!(rig.clipboard.content(), clip("original"), "{case}");
+}
+
+macro_rules! stamp_change_cases {
+    ($($name:ident => $moment:expr, $field:expr;)+) => {
+        $(
+            #[test]
+            fn $name() {
+                assert_stamp_change_fails_stop($moment, $field);
+            }
+        )+
+    };
+}
+
+stamp_change_cases! {
+    caret_change_before_erase_fails_stop => Moment::BeforeErase, StampField::Caret;
+    focus_epoch_change_before_erase_fails_stop => Moment::BeforeErase, StampField::FocusEpoch;
+    layout_change_before_erase_fails_stop => Moment::BeforeErase, StampField::Layout;
+    revision_change_before_erase_fails_stop => Moment::BeforeErase, StampField::Revision;
+    caret_change_mid_erase_fails_stop => Moment::AfterBackspace(2), StampField::Caret;
+    focus_epoch_change_mid_erase_fails_stop => Moment::AfterBackspace(2), StampField::FocusEpoch;
+    layout_change_mid_erase_fails_stop => Moment::AfterBackspace(2), StampField::Layout;
+    revision_change_mid_erase_fails_stop => Moment::AfterBackspace(2), StampField::Revision;
+}
+
+#[test]
+fn stamp_change_after_paste_write_restores_clipboard_without_paste() {
+    let mut rig = Rig::new(rule(None, OutputMethod::Paste));
+    let candidate = rig.type_str("btw").unwrap();
+    let change = rig.stamp_change(StampField::Caret);
+    // Locks: 0 backup, 1 backup verification, 2 paste write.
+    rig.clipboard.on_lock(move |index| {
+        if index == 2 {
+            change();
+        }
+    });
+    let result = rig.execute(&candidate).unwrap();
+    assert_eq!(result.status, "failed");
+    assert_eq!(result.message, STAMP_CHANGED);
+    assert_eq!(
+        rig.injector.calls(),
+        vec![InjectCall::Keys(vec![VK_BACK]); 3],
+        "no paste chord after the change"
+    );
+    // #1: our payload re-verified under our ownership, then the original
+    // was written back.
+    assert_eq!(rig.clipboard.content(), clip("original"));
+    assert_eq!(rig.clipboard.clears(), 2);
+}
+
+#[test]
+fn unchanged_stamp_passes_guard_and_completes() {
+    let mut rig = Rig::new(rule(None, OutputMethod::Paste));
+    let candidate = rig.type_str("btw").unwrap();
+    let reads = rig.foreground.input_context_reads();
+    let result = rig.execute(&candidate).unwrap();
+    assert_eq!(result.status, "unknown", "{}", result.message);
+    assert_eq!(rig.injector.taps(VK_BACK), 3);
+    assert_eq!(rig.chords(), 1);
+    assert_eq!(rig.clipboard.content(), clip("original"));
+    // The guard compared live stamps: 2 pre-erase checks, 3 backspaces, the
+    // step check and 2 paste checks.
+    let compared = rig.foreground.input_context_reads() - reads;
+    assert!(compared >= 8, "stamp read {compared} times");
+}
+
+#[test]
+fn proof_is_installed_only_for_the_run() {
+    let mut rig = Rig::new(rule(None, OutputMethod::Keys));
+    let candidate = rig.type_str("btw").unwrap();
+    let during = Arc::new(Mutex::new(None));
+    let (shared, foreground, seen) = (rig.shared.clone(), rig.foreground.clone(), during.clone());
+    rig.on_first_backspace(move || {
+        // Probe the guard from inside the run with a changed context.
+        foreground.update_input_context(|c| c.caret_epoch += 1);
+        *seen.lock().unwrap() = Some(rawinput::guard(&shared, &foreground));
+        foreground.update_input_context(|c| c.caret_epoch -= 1);
+    });
+    rig.execute(&candidate).unwrap();
+    assert_eq!(
+        during.lock().unwrap().clone(),
+        Some(Err(STAMP_CHANGED.to_string()))
+    );
+    rig.foreground.update_input_context(|c| c.caret_epoch += 1);
+    assert_eq!(rawinput::guard(&rig.shared, &rig.foreground), Ok(()));
+}
+
+#[test]
+fn proof_is_uninstalled_when_the_run_unwinds() {
+    let mut rig = Rig::new(rule(None, OutputMethod::Keys));
+    let candidate = rig.type_str("btw").unwrap();
+    rig.on_first_backspace(|| panic!("simulated injector panic"));
+    let unwound =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rig.execute(&candidate)));
+    assert!(unwound.is_err());
+    rig.foreground.update_input_context(|c| c.caret_epoch += 1);
+    assert_eq!(rawinput::guard(&rig.shared, &rig.foreground), Ok(()));
 }

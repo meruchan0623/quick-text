@@ -1,6 +1,6 @@
 //! Test doubles for the platform ports (S-23). Built for unit tests and, with
 //! `--features mock`, for downstream pipeline tests. Never touches the OS.
-use crate::traits::{ClipboardBackend, Clock, ForegroundProbe, Injector};
+use crate::traits::{ClipboardBackend, Clock, ForegroundProbe, Injector, InputContext};
 use crate::Foreground;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -125,6 +125,8 @@ impl Injector for MockInjector {
 
 pub type ClipboardFormats = Vec<(u32, Vec<u8>)>;
 
+type LockHook = Box<dyn FnMut(usize) + Send>;
+
 struct ClipboardModel {
     owner: u64,
     sequence: u32,
@@ -134,6 +136,8 @@ struct ClipboardModel {
     fail_set: usize,
     churn: bool,
     clears: usize,
+    locks: usize,
+    lock_hook: Option<LockHook>,
 }
 
 /// In-memory clipboard following Win32 rules: clearing takes ownership and
@@ -159,6 +163,8 @@ impl MockClipboard {
                 fail_set: 0,
                 churn: false,
                 clears: 0,
+                locks: 0,
+                lock_hook: None,
             })),
         }
     }
@@ -204,6 +210,11 @@ impl MockClipboard {
     pub fn fail_set(&self, count: usize) {
         self.state.lock().fail_set = count;
     }
+    /// Runs `hook` with the 0-based index of each successful lock, just
+    /// before the clipboard opens (e.g. to change the world mid-lease).
+    pub fn on_lock(&self, hook: impl FnMut(usize) + Send + 'static) {
+        self.state.lock().lock_hook = Some(Box::new(hook));
+    }
     fn open(&self) -> parking_lot::MutexGuard<'_, ClipboardModel> {
         let state = self.state.lock();
         assert!(state.open, "clipboard accessed outside locked()");
@@ -223,12 +234,22 @@ impl ClipboardBackend for MockClipboard {
         self.state.lock().sequence
     }
     fn locked<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
-        {
+        let (index, hook) = {
             let mut state = self.state.lock();
             if state.busy > 0 {
                 state.busy -= 1;
                 return None;
             }
+            state.locks += 1;
+            (state.locks - 1, state.lock_hook.take())
+        };
+        // Run the hook unlocked so it may script this clipboard.
+        if let Some(mut hook) = hook {
+            hook(index);
+            self.state.lock().lock_hook.get_or_insert(hook);
+        }
+        {
+            let mut state = self.state.lock();
             assert!(!state.open, "clipboard opened twice");
             state.open = true;
         }
@@ -279,16 +300,40 @@ impl ClipboardBackend for MockClipboard {
     }
 }
 
-/// Scriptable foreground window and protection verdict. Clones share state.
+struct ForegroundModel {
+    foreground: Foreground,
+    protection: Option<String>,
+    context: Option<InputContext>,
+    context_reads: usize,
+}
+
+/// Scriptable foreground window, protection verdict and input context.
+/// Clones share state.
 #[derive(Clone)]
 pub struct MockForeground {
-    state: Arc<Mutex<(Foreground, Option<String>)>>,
+    state: Arc<Mutex<ForegroundModel>>,
 }
 
 impl MockForeground {
+    /// Starts with [`MockForeground::context_for`] of `foreground`.
     pub fn new(foreground: Foreground) -> Self {
+        let context = Self::context_for(&foreground);
         Self {
-            state: Arc::new(Mutex::new((foreground, None))),
+            state: Arc::new(Mutex::new(ForegroundModel {
+                foreground,
+                protection: None,
+                context: Some(context),
+                context_reads: 0,
+            })),
+        }
+    }
+    /// Input context focused on `foreground`: epochs 1, US English layout.
+    pub fn context_for(foreground: &Foreground) -> InputContext {
+        InputContext {
+            focus: foreground.id,
+            focus_epoch: 1,
+            caret_epoch: 1,
+            layout: 0x0409,
         }
     }
     /// Snapshot helper: a Windows window `id` owned by `process`.
@@ -301,20 +346,40 @@ impl MockForeground {
             title: String::new(),
         }
     }
+    /// Replaces the window snapshot only; the input context is separate.
     pub fn set_foreground(&self, foreground: Foreground) {
-        self.state.lock().0 = foreground;
+        self.state.lock().foreground = foreground;
     }
     pub fn set_protection(&self, reason: Option<&str>) {
-        self.state.lock().1 = reason.map(str::to_owned);
+        self.state.lock().protection = reason.map(str::to_owned);
+    }
+    /// `None` simulates an unreadable context.
+    pub fn set_input_context(&self, context: Option<InputContext>) {
+        self.state.lock().context = context;
+    }
+    /// Applies `change` to the current context, if any.
+    pub fn update_input_context(&self, change: impl FnOnce(&mut InputContext)) {
+        if let Some(context) = self.state.lock().context.as_mut() {
+            change(context);
+        }
+    }
+    /// How often [`ForegroundProbe::input_context`] was read.
+    pub fn input_context_reads(&self) -> usize {
+        self.state.lock().context_reads
     }
 }
 
 impl ForegroundProbe for MockForeground {
     fn foreground(&self) -> Foreground {
-        self.state.lock().0.clone()
+        self.state.lock().foreground.clone()
     }
     fn protection(&self) -> Option<String> {
-        self.state.lock().1.clone()
+        self.state.lock().protection.clone()
+    }
+    fn input_context(&self) -> Option<InputContext> {
+        let mut state = self.state.lock();
+        state.context_reads += 1;
+        state.context
     }
 }
 

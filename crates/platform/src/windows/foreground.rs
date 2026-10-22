@@ -1,7 +1,7 @@
 //! Foreground window identity and cursor geometry.
 use super::protection::{native_input_protection, protection_block};
 use super::*;
-use crate::traits::ForegroundProbe;
+use crate::traits::{ForegroundProbe, InputContext};
 pub fn cursor() -> serde_json::Value {
     unsafe {
         let mut p: POINT = zeroed();
@@ -56,8 +56,8 @@ pub(super) fn focus_handle(window: HWND) -> HWND {
         }
     }
 }
-/// Production [`ForegroundProbe`]: the focused window plus the native-edit
-/// and cached UIA protection verdicts.
+/// Production [`ForegroundProbe`]: the focused window, the native-edit and
+/// cached UIA protection verdicts, and the hook-maintained focus epochs.
 pub(super) struct WinForeground;
 impl ForegroundProbe for WinForeground {
     fn foreground(&self) -> Foreground {
@@ -65,5 +65,17 @@ impl ForegroundProbe for WinForeground {
     }
     fn protection(&self) -> Option<String> {
         native_input_protection().or_else(protection_block)
+    }
+    fn input_context(&self) -> Option<InputContext> {
+        unsafe {
+            let top = GetForegroundWindow();
+            Some(InputContext {
+                focus: focus_handle(top) as u64,
+                focus_epoch: observer::FOCUS_EPOCH.load(Ordering::SeqCst),
+                caret_epoch: observer::CARET_EPOCH.load(Ordering::SeqCst),
+                layout: GetKeyboardLayout(GetWindowThreadProcessId(top, std::ptr::null_mut()))
+                    as usize as u64,
+            })
+        }
     }
 }

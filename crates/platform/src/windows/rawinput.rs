@@ -3,7 +3,7 @@
 use super::*;
 use super::{
     executor::{enqueue, Candidate, CandidateProof},
-    foreground::{focus_handle, WinForeground},
+    foreground::WinForeground,
     hook::expected_key_text,
     ime::ime_active,
     inject::Erasure,
@@ -132,21 +132,21 @@ fn kind(vkey: u16, text: Option<String>, modified: bool) -> Kind {
             .unwrap_or(Kind::Reset),
     }
 }
-fn stamp(shared: &Shared) -> Option<Stamp> {
+/// Current transaction stamp: the probe's input context plus the compiled
+/// configuration revision. `None` when either cannot be read.
+pub(super) fn stamp(shared: &Shared, probe: &impl ForegroundProbe) -> Option<Stamp> {
     let revision = shared.compiled.try_lock().ok()?.config.revision;
-    unsafe {
-        let top = GetForegroundWindow();
-        Some(Stamp {
-            focus: focus_handle(top) as u64,
-            epoch: observer::FOCUS_EPOCH.load(Ordering::SeqCst),
-            caret: observer::CARET_EPOCH.load(Ordering::SeqCst),
-            revision,
-            layout: GetKeyboardLayout(GetWindowThreadProcessId(top, std::ptr::null_mut())) as usize,
-        })
-    }
+    let context = probe.input_context()?;
+    Some(Stamp {
+        focus: context.focus,
+        epoch: context.focus_epoch,
+        caret: context.caret_epoch,
+        revision,
+        layout: context.layout as usize,
+    })
 }
 fn submit(shared: &Shared, kind: Kind, generation: u64, source: &'static str) {
-    let Some(stamp) = stamp(shared) else {
+    let Some(stamp) = stamp(shared, &WinForeground) else {
         return;
     };
     if EVENTS.get().is_none_or(|tx| {
@@ -371,10 +371,12 @@ pub(super) fn start(shared: Arc<Shared>) -> Result<(), String> {
 pub(super) fn install(proof: Option<Proof>) {
     PROOF.with(|p| *p.borrow_mut() = proof);
 }
-pub(super) fn guard(shared: &Shared) -> Result<(), String> {
+/// Fails when this thread runs under a match proof whose stamp no longer
+/// equals the current one (focus, epochs, layout or revision changed).
+pub(super) fn guard(shared: &Shared, probe: &impl ForegroundProbe) -> Result<(), String> {
     PROOF.with(|p| {
         if let Some(proof) = p.borrow().as_ref() {
-            validate_stamp(&proof.stamp, stamp(shared).as_ref())?;
+            validate_stamp(&proof.stamp, stamp(shared, probe).as_ref())?;
         }
         Ok(())
     })

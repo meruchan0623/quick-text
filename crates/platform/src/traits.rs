@@ -89,6 +89,21 @@ pub trait ClipboardBackend {
     fn set(&self, format: u32, staged: Self::Staged) -> bool;
 }
 
+/// Input context a match is bound to (no-regression #3). Together with the
+/// configuration revision it forms the transaction stamp that is captured
+/// with each typed key and re-checked before every destructive step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputContext {
+    /// Focused control handle.
+    pub focus: u64,
+    /// Advances whenever focus moves.
+    pub focus_epoch: u64,
+    /// Advances whenever the caret moves.
+    pub caret_epoch: u64,
+    /// Keyboard layout of the focused thread.
+    pub layout: u64,
+}
+
 /// Foreground/target port (S-23).
 pub trait ForegroundProbe: Send + Sync {
     /// Snapshot of the focused window and its process.
@@ -96,6 +111,9 @@ pub trait ForegroundProbe: Send + Sync {
     /// Veto reason when the focused control must not receive input
     /// (password, read-only or disabled; no-regression #5).
     fn protection(&self) -> Option<String>;
+    /// Current input context for the stamp guard; `None` when it cannot be
+    /// read, which the guard treats as a change (fail closed).
+    fn input_context(&self) -> Option<InputContext>;
     /// Whether two snapshots name the same target window and process.
     fn same_window(&self, a: &Foreground, b: &Foreground) -> bool {
         a.id == b.id && a.process.eq_ignore_ascii_case(&b.process)

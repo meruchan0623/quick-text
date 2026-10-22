@@ -7,7 +7,7 @@ use super::{
     foreground::WinForeground,
     inject::{
         button, erase, hotkey, key, mouse_input, press, release_owned, send_terminator, unicode,
-        vk, Erasure, WinInjector, SENT_EFFECT,
+        vk, WinInjector, SENT_EFFECT,
     },
     keystate::{modifiers_held, physical},
 };
@@ -137,7 +137,17 @@ fn common_keys(name: &str) -> Result<Vec<Key>, String> {
     };
     Ok(names.into_iter().map(Key::named).collect())
 }
+/// Run-scoped execution state: the match proof `rawinput::guard` checks and
+/// the automatic-execution flag. Both are cleared on drop, so an early
+/// return or unwinding never leaves a proof installed on the thread.
 struct FenceLease;
+impl FenceLease {
+    fn install(proof: Option<rawinput::Proof>) -> Self {
+        AUTOMATIC_EXECUTION.with(|automatic| automatic.set(proof.is_some()));
+        rawinput::install(proof);
+        FenceLease
+    }
+}
 impl Drop for FenceLease {
     fn drop(&mut self) {
         rawinput::install(None);
@@ -167,7 +177,7 @@ fn guarded_context(
     if !probe.same_window(&now, target) {
         return Err("Foreground window/process changed; stopped safely".into());
     }
-    rawinput::guard(s)?;
+    rawinput::guard(s, probe)?;
     if let Some(error) = probe.protection() {
         return Err(error);
     }
@@ -216,12 +226,7 @@ pub(super) fn execute_inner(
     terminator: Option<String>,
     speed: f64,
 ) -> Result<ExecutionResult, String> {
-    let proof = proof.map(|proof| match proof {
-        CandidateProof::Espanso(proof) => proof,
-    });
-    let erasure = proof.as_ref().map(rawinput::Proof::erasure);
-    rawinput::install(proof);
-    run(
+    execute_with_proof(
         &Ports {
             injector: &WinInjector,
             foreground: &WinForeground,
@@ -232,7 +237,7 @@ pub(super) fn execute_inner(
         plan,
         target,
         generation,
-        erasure,
+        proof,
         terminator,
         speed,
     )
@@ -246,19 +251,21 @@ pub(super) struct Ports<'a, I, F, K, B> {
     /// Opens the backend for a clipboard lease (paste plans only).
     pub(super) clipboard: B,
 }
-/// Runs a plan: optional trigger erasure, output steps, owned-input cleanup,
-/// terminator and clipboard restore. The caller installs the stamp proof.
+/// Single execution entry for production and pipeline tests: installs the
+/// match proof for the stamp guard (uninstalled on drop), then runs optional
+/// trigger erasure, output steps, owned-input cleanup, terminator and
+/// clipboard restore.
 #[allow(
     clippy::too_many_arguments,
     reason = "execute_inner's parameters plus the port bundle"
 )]
-pub(super) fn run<I, F, K, C, B>(
+pub(super) fn execute_with_proof<I, F, K, C, B>(
     ports: &Ports<'_, I, F, K, B>,
     s: &Shared,
     plan: ActionPlan,
     mut target: Foreground,
     generation: u64,
-    erasure: Option<Erasure>,
+    proof: Option<CandidateProof>,
     terminator: Option<String>,
     speed: f64,
 ) -> Result<ExecutionResult, String>
@@ -270,9 +277,12 @@ where
     B: Fn() -> Result<C, String>,
 {
     let (injector, probe, clock) = (ports.injector, ports.foreground, ports.clock);
+    let proof = proof.map(|proof| match proof {
+        CandidateProof::Espanso(proof) => proof,
+    });
+    let erasure = proof.as_ref().map(rawinput::Proof::erasure);
     SENT_EFFECT.with(|flag| flag.set(false));
-    AUTOMATIC_EXECUTION.with(|automatic| automatic.set(erasure.is_some()));
-    let _fence_lease = FenceLease;
+    let _fence_lease = FenceLease::install(proof);
     if !speed.is_finite() || speed <= 0.0 {
         return Err("Replay speed must be positive and finite".into());
     }
