@@ -294,8 +294,10 @@ mod imp {
         match (self_probe, target) {
             (Probe::Level { rid: me, .. }, Probe::Level { rid: other, .. }) => {
                 if other > me {
-                    "HIGHER: target integrity is above self -> UIPI would block injected input \
-                     (SendInput returns normally but the target never sees it)"
+                    "HIGHER: target integrity is above self -> UIPI is expected to block injected \
+                     input (SendInput is documented to fail in that case, but neither its return \
+                     value nor GetLastError names UIPI as the cause; the exact counts and what \
+                     the target receives are untested, see T-12)"
                         .to_owned()
                 } else if other == me {
                     "SAME: same integrity level -> UIPI does not block injection".to_owned()

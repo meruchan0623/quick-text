@@ -340,8 +340,10 @@ mod imp {
         input
     }
 
-    /// Synthetic Alt tap. Returns how many events SendInput accepted (it cannot tell us
-    /// whether UIPI dropped them, which is irrelevant here: the target is only a window).
+    /// Synthetic Alt tap. Returns how many events SendInput accepted. A short count means the
+    /// injection failed; it would not say whether UIPI was the cause (the documentation says
+    /// neither the return value nor `GetLastError` identifies UIPI), which is irrelevant here:
+    /// the target is only a window, and this example does not compare integrity levels.
     unsafe fn alt_tap(mask: bool) -> u32 {
         let mut events = vec![key_event(VK_MENU, false)];
         if mask {
