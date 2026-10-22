@@ -379,7 +379,7 @@ where
                     clipboard.as_ref().unwrap().verify_current()?;
                     guarded(probe, s, &target, generation)?;
                     hotkey(injector, &[Key::named("CTRL"), Key::named("V")])?;
-                    clock.sleep(Duration::from_millis(150));
+                    clock.sleep(clipboard.as_ref().unwrap().restore_delay());
                 }
                 Operation::KeyDown { key: k } => {
                     let v = vk(k)?;

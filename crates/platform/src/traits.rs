@@ -104,6 +104,77 @@ pub trait ClipboardBackend {
         _reason: Option<crate::health::ReasonCode>,
     ) {
     }
+    /// Locked: reads `format` for a backup. Handle formats the adapter can
+    /// serialize report their bytes (`CF_ENHMETAFILE`: the metafile bits).
+    /// The default maps [`ClipboardBackend::read`], which cannot tell a
+    /// missing format from an oversized one.
+    fn read_format(&self, format: u32, limit: usize) -> FormatRead {
+        match self.read(format, limit) {
+            Ok(Some(bytes)) => FormatRead::Data(bytes),
+            Ok(None) => FormatRead::Missing,
+            Err(_) => FormatRead::Unreadable,
+        }
+    }
+    /// Like [`ClipboardBackend::stage`], allocating the handle type `format`
+    /// needs (an `HENHMETAFILE` for `CF_ENHMETAFILE`).
+    fn stage_format(&self, format: u32, bytes: &[u8]) -> Result<(Self::Staged, Vec<u8>), String> {
+        let _ = format;
+        self.stage(bytes)
+    }
+    /// Not locked (it may wait): whether clipboard owner `owner` stopped
+    /// responding, so reading a delay-rendered format would block on it.
+    fn owner_hung(&self, _owner: u64) -> bool {
+        false
+    }
+}
+
+/// One format read for a clipboard backup (B-08).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FormatRead {
+    Data(Vec<u8>),
+    /// Enumerated but no data (rendering failed or empty).
+    Missing,
+    /// Larger than the limit; not copied.
+    TooLarge,
+    /// Present but its data cannot be read.
+    Unreadable,
+}
+
+/// What a clipboard lease does with formats it cannot back up (B-08).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestorePolicy {
+    /// Refuse the action (trigger preserved) unless every format that is
+    /// not re-synthesized by the system can be backed up.
+    Full,
+    /// Back up what can be restored; skip and record the rest.
+    #[default]
+    BestEffort,
+    /// Back up only text formats (CF_UNICODETEXT, CF_TEXT, CF_OEMTEXT,
+    /// CF_LOCALE); other formats are dropped without being recorded.
+    TextOnly,
+}
+
+/// Default wait between the paste chord and restoring the clipboard
+/// (espanso v2.4.1 uses the same; 0.3 waited a fixed 150 ms).
+pub const DEFAULT_RESTORE_DELAY: Duration = Duration::from_millis(300);
+
+/// Clipboard lease configuration. Preferences do not set it yet, so every
+/// lease uses `Default`: BestEffort and [`DEFAULT_RESTORE_DELAY`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeaseOptions {
+    pub policy: RestorePolicy,
+    /// Wait after the paste chord before restoring the previous clipboard.
+    pub restore_delay: Duration,
+}
+
+impl Default for LeaseOptions {
+    fn default() -> Self {
+        Self {
+            policy: RestorePolicy::default(),
+            restore_delay: DEFAULT_RESTORE_DELAY,
+        }
+    }
 }
 
 /// Input context a match is bound to (no-regression #3). Together with the
