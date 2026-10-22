@@ -1334,6 +1334,113 @@ impl AsyncKeyProbe for InjectWhileProbed {
     }
 }
 
+/// Runs `steps` through the production executor entry point, injecting
+/// through `injector` with time from `clock`. Returns the status and the
+/// message.
+fn execute_steps(
+    shared: &Shared,
+    injector: &MockInjector,
+    clock: &impl Clock,
+    steps: impl IntoIterator<Item = Operation>,
+) -> (String, String) {
+    let plan = ActionPlan {
+        steps: steps
+            .into_iter()
+            .map(|operation| Step::new(operation, SourceSpan::default()))
+            .collect(),
+        ..Default::default()
+    };
+    let foreground = MockForeground::new(window());
+    let ports = Ports {
+        injector,
+        foreground: &foreground,
+        clock,
+        clipboard: || -> Result<crate::mock::MockClipboard, String> { Err("unused".into()) },
+    };
+    let generation = shared.generation.load(Ordering::SeqCst);
+    let result =
+        execute_with_proof(&ports, shared, plan, window(), generation, None, None, 1.0).unwrap();
+    (result.status.to_string(), result.message)
+}
+
+/// Ticks `monitor` through a pending resync and its second pass (a few
+/// ticks at most), advancing `clock` to each time it asks for. Returns the
+/// log lines.
+fn settle_resyncs(
+    monitor: &mut Monitor<'_, FakeAsyncKeys, FakeClock>,
+    shared: &Shared,
+    clock: &FakeClock,
+) -> Vec<String> {
+    let ((), lines) = capture::logs(|| {
+        for _ in 0..4 {
+            let Some(next) = monitor.tick(shared) else {
+                break;
+            };
+            clock.advance(next.saturating_duration_since(clock.now()));
+        }
+    });
+    lines
+}
+
+/// H1: Ctrl+V where the system takes only the Ctrl press and then rejects
+/// both cleanup releases. Our Ctrl stays down in the asynchronous state; it
+/// is still ours, so neither resync pass imports any key we injected.
+#[test]
+fn a_partially_accepted_chord_stays_ours_through_both_resyncs() {
+    const V: u16 = 0x56;
+    let own: &'static OwnInput = Box::leak(Box::new(OwnInput::new()));
+    let _track = track_own_input(own);
+    // The executor's `physical()` reads the global mirror, which no test
+    // sets keys in; seeded, it never reads the real asynchronous state.
+    PHYSICAL.mark_seeded();
+    let shared = engine("btw");
+    let keys = leaked_keys();
+    let clock = FakeClock::new();
+    let async_keys = FakeAsyncKeys::default();
+    let signals = SessionSignals::new();
+    let mut monitor = Monitor::new(keys, &async_keys, &clock, &signals, own);
+    let injector = MockInjector::new();
+    injector.short_count(0, 1);
+    injector.short_count(1, 0);
+    injector.short_count(2, 0);
+    let (status, message) = execute_steps(
+        &shared,
+        &injector,
+        &clock,
+        [Operation::Hotkey {
+            keys: vec![Key::named("CTRL"), Key::named("V")],
+        }],
+    );
+    assert_ne!(status, "success", "{message}");
+    assert!(message.contains("key release failed"), "{message}");
+    assert_eq!(
+        injector.calls(),
+        [
+            InjectCall::Chord(vec![VK_CONTROL, V]),
+            InjectCall::Key { key: V, up: true },
+            InjectCall::Key {
+                key: VK_CONTROL,
+                up: true
+            },
+        ],
+        "only the Ctrl press got in; both releases were tried and rejected"
+    );
+    assert!(own.holds(VK_CONTROL) && !own.holds(V));
+    // The injected Ctrl reads down (generic and left) when the session
+    // unlocks.
+    async_keys.set(&[VK_CONTROL, VK_LCONTROL]);
+    signals.raise(Signal::Unlock);
+    let lines = settle_resyncs(&mut monitor, &shared, &clock);
+    assert_eq!(
+        count_of(&lines, "event=\"keystate.resync\""),
+        2,
+        "{lines:?}"
+    );
+    for vk in [VK_CONTROL, VK_LCONTROL, VK_RCONTROL, V] {
+        assert!(!keys.held(vk), "{vk:#x} was imported");
+    }
+}
+
 /// The hook kinds behind [`FakeSources::hooked`], in order.
 const HOOK_KINDS: [HookSet; 3] = [HookSet::KEYBOARD, HookSet::MOUSE, HookSet::FOCUS];
 

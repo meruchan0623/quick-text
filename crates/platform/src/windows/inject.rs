@@ -93,32 +93,71 @@ pub(super) fn release_owned(
     Ok(())
 }
 // H1: every injector call below runs inside `own_input().begin()`, and the
-// key and button transitions the system accepted are noted, so the input
-// consumer never imports our own output into the physical key mirror.
+// key and button transitions the system accepted are noted (for a batch,
+// the accepted prefix, before any cleanup), so the input consumer never
+// imports our own output into the physical key mirror.
 pub(super) fn key(injector: &impl Injector, v: u16, up: bool) -> Result<(), String> {
     let injecting = own_input().begin();
-    let accepted = injector.send_key(v, up);
-    if accepted == 1 {
-        if up {
-            injecting.released(v);
-        } else {
-            injecting.pressed(v);
-        }
-    }
-    record_send_result(accepted, 1)
+    submitted(&injecting, &[(v, up)], injector.send_key(v, up))
 }
 pub(super) fn press(injector: &impl Injector, v: u16) -> Result<(), String> {
     press_keys(injector, &[v])
 }
 pub(super) fn press_keys(injector: &impl Injector, keys: &[u16]) -> Result<(), String> {
-    let _injecting = own_input().begin();
-    let result = record_send_result(injector.send_keys(keys), keys.len() as u32 * 2);
+    let injecting = own_input().begin();
+    let sequence = taps(keys);
+    let result = submitted(&injecting, &sequence, injector.send_keys(keys));
     cleanup_submission(keys, result, physical, |v| key(injector, v, true))
 }
 pub(super) fn combination(injector: &impl Injector, keys: &[u16]) -> Result<(), String> {
-    let _injecting = own_input().begin();
-    let result = record_send_result(injector.send_chord(keys), keys.len() as u32 * 2);
+    let injecting = own_input().begin();
+    let sequence = chord(keys);
+    let result = submitted(&injecting, &sequence, injector.send_chord(keys));
     cleanup_submission(keys, result, physical, |v| key(injector, v, true))
+}
+/// The transitions [`Injector::send_keys`] submits, in order, as
+/// `(key, up)`: each key pressed, then released.
+fn taps(keys: &[u16]) -> Vec<(u16, bool)> {
+    keys.iter().flat_map(|&v| [(v, false), (v, true)]).collect()
+}
+/// The transitions [`Injector::send_chord`] submits, in order, as
+/// `(key, up)`: every key pressed, then all released in reverse.
+fn chord(keys: &[u16]) -> Vec<(u16, bool)> {
+    let presses = keys.iter().map(|&v| (v, false));
+    presses
+        .chain(keys.iter().rev().map(|&v| (v, true)))
+        .collect()
+}
+/// Notes what the system accepted of one batch `sequence` before anything
+/// else runs, so a partial submission keeps ownership of the presses it
+/// made (H1). `SendInput` inserts the events serially and returns how many
+/// it inserted, so `accepted` events are the first ones of `sequence`; the
+/// vendored injector returns that count unchanged. A count beyond the
+/// request cannot be mapped to events: every press of the batch is then
+/// kept as ours, until an accepted key-up of ours or a key-up the hooks see
+/// clears it.
+fn submitted(
+    injecting: &Injecting<'_>,
+    sequence: &[(u16, bool)],
+    accepted: u32,
+) -> Result<(), String> {
+    let requested = u32::try_from(sequence.len()).unwrap_or(u32::MAX);
+    if accepted > requested {
+        for &(v, up) in sequence {
+            if !up {
+                injecting.pressed(v);
+            }
+        }
+    } else {
+        for &(v, up) in sequence.iter().take(accepted as usize) {
+            if up {
+                injecting.released(v);
+            } else {
+                injecting.pressed(v);
+            }
+        }
+    }
+    record_send_result(accepted, requested)
 }
 fn cleanup_submission(
     keys: &[u16],
@@ -372,7 +411,7 @@ pub(super) fn erase(
 
 #[cfg(test)]
 mod tests {
-    use super::super::keystate::{track_own_input, OwnInput};
+    use super::super::keystate::{track_own_input, OwnInput, PHYSICAL};
     use super::*;
     use crate::mock::{FakeClock, MockInjector};
 
@@ -414,6 +453,46 @@ mod tests {
         mouse_input(&injector, MOUSEEVENTF_MOVE, 0, 1, 1).unwrap();
         assert!(!own.settled(seen) && !own.active() && !own.holds(VK_CONTROL));
         assert_eq!(in_flight.load(Ordering::SeqCst), 13);
+    }
+    #[test]
+    fn partial_batches_keep_the_presses_the_system_accepted() {
+        // The cleanup's `physical()` reads the global mirror; once seeded it
+        // never falls back to the real asynchronous state.
+        PHYSICAL.mark_seeded();
+        let own: &'static OwnInput = Box::leak(Box::new(OwnInput::new()));
+        let _track = track_own_input(own);
+        // Taps A, B: A down, A up and B down get in, and B's cleanup release
+        // is rejected. B stays ours; A is not.
+        let injector = MockInjector::new();
+        injector.short_count(0, 3);
+        injector.short_count(1, 0);
+        assert!(press_keys(&injector, &[0x41, 0x42]).is_err());
+        assert!(own.holds(0x42) && !own.holds(0x41));
+        // Chord Shift+X: both presses and X's release get in; Shift's
+        // cleanup release is rejected.
+        let injector = MockInjector::new();
+        injector.short_count(0, 3);
+        injector.short_count(2, 0);
+        assert!(combination(&injector, &[VK_SHIFT, 0x58]).is_err());
+        assert!(own.holds(VK_SHIFT) && !own.holds(0x58));
+        // A count beyond the request maps to no prefix: every press of the
+        // batch stays ours until a release of ours gets in.
+        let injector = MockInjector::new();
+        injector.short_count(0, 7);
+        injector.short_count(1, 0);
+        injector.short_count(2, 0);
+        assert!(combination(&injector, &[VK_MENU, 0x43]).is_err());
+        assert!(
+            own.holds(VK_MENU) && own.holds(0x43),
+            "both cleanup releases failed"
+        );
+        let injector = MockInjector::new();
+        injector.short_count(0, 2);
+        assert!(key(&injector, VK_MENU, true).is_err());
+        assert!(own.holds(VK_MENU), "an impossible count releases nothing");
+        injector.short_count(1, 2);
+        assert!(key(&injector, 0x44, false).is_err());
+        assert!(own.holds(0x44), "but takes the press");
     }
     #[test]
     fn failed_key_release_retains_ownership_for_cleanup() {
