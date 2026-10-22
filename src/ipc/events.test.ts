@@ -1,41 +1,98 @@
-import { act, createElement } from 'react';
+import { act, createElement, StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { afterEach, describe, expect, it } from 'vitest';
-import { HISTORY_LIMIT, RuntimeSync, SeqLedger, useRuntime, type RuntimeIo } from './events';
+import {
+  HISTORY_LIMIT,
+  RETRY_CAP_MS,
+  retryDelay,
+  RuntimeSync,
+  SeqLedger,
+  useRuntime,
+  type RuntimeIo,
+  type Schedule,
+} from './events';
 import { createMockTransport, MockBackend, type MockOptions } from './mock';
+import { EVENT_NAMES, type RuntimeSnapshot } from './types';
 
 describe('SeqLedger', () => {
   it('applies consecutive events', () => {
     const ledger = new SeqLedger();
-    ledger.rebase(10);
+    ledger.install(10);
     expect(ledger.accept(11)).toBe('apply');
     expect(ledger.accept(12)).toBe('apply');
-    expect(ledger.last).toBe(12);
+    expect(ledger.mark).toBe(12);
   });
 
   it('drops duplicates and out-of-order events', () => {
     const ledger = new SeqLedger();
-    ledger.rebase(10);
+    ledger.install(10);
     expect(ledger.accept(10)).toBe('drop');
     expect(ledger.accept(9)).toBe('drop');
     expect(ledger.accept(11)).toBe('apply');
     expect(ledger.accept(11)).toBe('drop');
-    expect(ledger.last).toBe(11);
+    expect(ledger.mark).toBe(11);
   });
 
-  it('reports a gap and moves past it', () => {
+  it('reports a gap without moving past it', () => {
     const ledger = new SeqLedger();
-    ledger.rebase(10);
+    ledger.install(10);
     expect(ledger.accept(13)).toBe('gap');
-    expect(ledger.last).toBe(13);
-    expect(ledger.accept(12)).toBe('drop');
-    expect(ledger.accept(14)).toBe('apply');
+    expect(ledger.mark).toBe(10);
+    expect(ledger.accept(12)).toBe('gap');
+    expect(ledger.accept(11)).toBe('apply');
+    expect(ledger.accept(12)).toBe('apply');
+    expect(ledger.accept(13)).toBe('apply');
   });
 
   it('treats any event without a baseline as a gap', () => {
     expect(new SeqLedger().accept(1)).toBe('gap');
   });
+
+  it('installs a snapshot only at or above the mark', () => {
+    const ledger = new SeqLedger();
+    expect(ledger.install(10)).toBe(true);
+    expect(ledger.accept(11)).toBe('apply');
+    // An older snapshot changes nothing: covered events stay covered.
+    expect(ledger.install(9)).toBe(false);
+    expect(ledger.mark).toBe(11);
+    expect(ledger.accept(10)).toBe('drop');
+    expect(ledger.accept(11)).toBe('drop');
+    expect(ledger.install(11)).toBe(true);
+    expect(ledger.install(15)).toBe(true);
+    expect(ledger.accept(12)).toBe('drop');
+    expect(ledger.accept(16)).toBe('apply');
+  });
+
+  it('backs off retries up to a cap', () => {
+    expect([1, 2, 3, 4].map(retryDelay)).toEqual([250, 500, 1000, 2000]);
+    expect(retryDelay(10)).toBe(RETRY_CAP_MS);
+    expect(retryDelay(1000)).toBe(RETRY_CAP_MS);
+  });
 });
+
+/** Retries run only when a test fires them. */
+function manualClock() {
+  const timers: { run: () => void; ms: number; cancelled: boolean }[] = [];
+  const schedule: Schedule = (run, ms) => {
+    const timer = { run, ms, cancelled: false };
+    timers.push(timer);
+    return () => {
+      timer.cancelled = true;
+    };
+  };
+  const live = () => timers.filter((t) => !t.cancelled);
+  return {
+    schedule,
+    /** Delays of the retries waiting to run. */
+    waiting: () => live().map((t) => t.ms),
+    /** Run every waiting retry. */
+    fire: () => {
+      const due = live();
+      timers.length = 0;
+      for (const timer of due) timer.run();
+    },
+  };
+}
 
 const syncs: RuntimeSync[] = [];
 afterEach(() => {
@@ -45,10 +102,53 @@ afterEach(() => {
 function setup(options: MockOptions = {}, io?: (backend: MockBackend) => RuntimeIo) {
   const backend = new MockBackend({ rules: 0, ...options });
   const focus = new EventTarget();
-  const sync = new RuntimeSync(io ? io(backend) : createMockTransport(backend), focus);
+  const clock = manualClock();
+  const sync = new RuntimeSync(
+    io ? io(backend) : createMockTransport(backend),
+    focus,
+    clock.schedule,
+  );
   syncs.push(sync);
   const snapshots = () => backend.calls.filter((c) => c.command === 'get_runtime_snapshot').length;
-  return { backend, focus, sync, snapshots };
+  return { backend, focus, sync, snapshots, clock };
+}
+
+/**
+ * Mock IPC whose snapshot responses can be held back (they are taken when asked for, like the
+ * backend does, and delivered on `release`) and rewritten.
+ */
+function controlled() {
+  const gates: (() => void)[] = [];
+  let holding = false;
+  let rewrite: ((snapshot: RuntimeSnapshot) => RuntimeSnapshot) | null = null;
+  const io = (backend: MockBackend): RuntimeIo => {
+    const mock = createMockTransport(backend);
+    return {
+      listen: (event, handler) => mock.listen(event, handler),
+      invoke: async (command, args) => {
+        let result = await mock.invoke<unknown>(command, args);
+        if (command === 'get_runtime_snapshot') {
+          if (rewrite) result = rewrite(result as RuntimeSnapshot);
+          rewrite = null;
+          if (holding) await new Promise<void>((resolve) => gates.push(resolve));
+        }
+        return result as never;
+      },
+    };
+  };
+  return {
+    io,
+    hold: () => {
+      holding = true;
+    },
+    release: () => {
+      holding = false;
+      for (const open of gates.splice(0)) open();
+    },
+    rewriteNext: (fn: (snapshot: RuntimeSnapshot) => RuntimeSnapshot) => {
+      rewrite = fn;
+    },
+  };
 }
 
 /** Let queued promise callbacks (mock IPC round trips) run. */
@@ -216,24 +316,185 @@ describe('RuntimeSync', () => {
   });
 
   it('marks a 0.3 backend as unsupported and stops resyncing', async () => {
-    const { backend, focus, sync, snapshots } = setup({ legacy: true });
+    const { backend, focus, sync, snapshots, clock } = setup({ legacy: true });
     await sync.start();
     expect(sync.getView().status).toBe('unsupported');
     focus.dispatchEvent(new Event('focus'));
     await settle();
     expect(snapshots()).toBe(1);
     expect(backend.calls.map((c) => c.command)).toEqual(['get_runtime_snapshot']);
+    expect(clock.waiting()).toEqual([]);
   });
 
   it('keeps connecting after a failed snapshot and retries on focus', async () => {
-    const { backend, focus, sync } = setup();
+    const { backend, focus, sync, snapshots, clock } = setup();
     backend.failures.set('get_runtime_snapshot', { code: 'internal', detail: { trace_id: 't' } });
     await sync.start();
     expect(sync.getView().status).toBe('connecting');
+    expect(clock.waiting()).toEqual([250]);
+    // Focus asks right away and takes the place of the scheduled retry.
     focus.dispatchEvent(new Event('focus'));
     await settle();
     await settle();
     expect(sync.getView().status).toBe('ready');
+    expect(clock.waiting()).toEqual([]);
+    expect(snapshots()).toBe(2);
+  });
+
+  it('retries failed snapshots with a growing delay until one lands', async () => {
+    const { backend, sync, clock } = setup();
+    const failure = { code: 'internal', detail: { trace_id: 't' } };
+    backend.failures.set('get_runtime_snapshot', failure);
+    await sync.start();
+    expect(clock.waiting()).toEqual([250]);
+    backend.failures.set('get_runtime_snapshot', failure);
+    clock.fire();
+    await settle();
+    expect(clock.waiting()).toEqual([500]);
+    clock.fire();
+    await settle();
+    await settle();
+    expect(sync.getView().status).toBe('ready');
+    expect(clock.waiting()).toEqual([]);
+  });
+});
+
+describe('RuntimeSync seq ledger (late, old and overlapping snapshots)', () => {
+  it('asks again when an event sent after the snapshot was taken goes missing', async () => {
+    const gate = controlled();
+    const { backend, focus, sync, snapshots, clock } = setup({}, gate.io);
+    await sync.start();
+    gate.hold();
+    focus.dispatchEvent(new Event('focus'));
+    await settle(); // snapshot taken at S, its response held back
+    const taken = backend.seq;
+    backend.skipSeq(1); // S+1 is lost…
+    backend.setBusy(true); // …S+2 arrives while the snapshot is in flight
+    gate.release();
+    await settle();
+    await settle();
+    // The snapshot is installed, but S+2 does not continue it: it waits for the next snapshot.
+    let view = sync.getView();
+    expect(view.seq).toBe(taken);
+    expect(view.engine?.busy).toBe(false);
+    expect(snapshots()).toBe(2);
+    expect(clock.waiting()).toEqual([250]);
+    clock.fire();
+    await settle();
+    await settle();
+    view = sync.getView();
+    expect(snapshots()).toBe(3);
+    expect(view.seq).toBe(backend.seq);
+    expect(view.engine?.busy).toBe(true);
+    expect(clock.waiting()).toEqual([]);
+  });
+
+  it('discards a snapshot older than the view and keeps dropping covered events', async () => {
+    const gate = controlled();
+    const { backend, focus, sync, snapshots, clock } = setup({}, gate.io);
+    await sync.start();
+    backend.setHealth('degraded'); // S+1 (health), S+2 (state): applied
+    await settle();
+    const mark = backend.seq;
+    const lists = () => backend.calls.filter((c) => c.command === 'list_history').length;
+    const listed = lists();
+    // A snapshot from before those events, still saying healthy.
+    gate.rewriteNext((s) => ({
+      ...s,
+      seq: mark - 2,
+      health: { state: 'healthy', components: [] },
+    }));
+    focus.dispatchEvent(new Event('focus'));
+    await settle();
+    await settle();
+    let view = sync.getView();
+    expect(view.health?.state).toBe('degraded');
+    expect(view.seq).toBe(mark);
+    expect(lists()).toBe(listed); // discarded before fetching anything else
+    expect(clock.waiting()).toEqual([250]);
+    // S+1 again, now claiming failed: still covered, still dropped.
+    backend.deliver('engine-health', { seq: mark - 1, state: 'failed', components: [] });
+    // The next event still continues the view while the retry waits.
+    backend.setBusy(true);
+    await settle();
+    view = sync.getView();
+    expect(view.health?.state).toBe('degraded');
+    expect(view.engine?.busy).toBe(true);
+    expect(view.seq).toBe(mark + 1);
+    // Another old one in a row: the delay doubles.
+    gate.rewriteNext((s) => ({ ...s, seq: mark - 2 }));
+    clock.fire();
+    await settle();
+    await settle();
+    expect(clock.waiting()).toEqual([500]);
+    expect(sync.getView().seq).toBe(mark + 1);
+    // Focus takes the place of the waiting retry: one request, and the backoff is reset.
+    focus.dispatchEvent(new Event('focus'));
+    await settle();
+    await settle();
+    expect(clock.waiting()).toEqual([]);
+    expect(snapshots()).toBe(4);
+    expect(sync.getView().seq).toBe(backend.seq);
+  });
+
+  it('asks for one follow-up however many gaps arrive while a snapshot is in flight', async () => {
+    const gate = controlled();
+    const { backend, focus, sync, snapshots, clock } = setup({}, gate.io);
+    await sync.start();
+    gate.hold();
+    focus.dispatchEvent(new Event('focus'));
+    await settle();
+    backend.skipSeq(1);
+    backend.setBusy(true);
+    backend.skipSeq(3);
+    backend.setHealth('degraded');
+    backend.skipSeq(1);
+    backend.recordExecution({ rule_id: 'late' });
+    gate.release();
+    await settle();
+    await settle();
+    expect(snapshots()).toBe(2);
+    expect(clock.waiting()).toEqual([250]);
+    // More gaps while the follow-up waits do not ask again.
+    backend.skipSeq(2);
+    backend.setBusy(false);
+    await settle();
+    expect(snapshots()).toBe(2);
+    expect(clock.waiting()).toEqual([250]);
+    clock.fire();
+    await settle();
+    await settle();
+    expect(snapshots()).toBe(3);
+    expect(clock.waiting()).toEqual([]);
+    const view = sync.getView();
+    expect(view.seq).toBe(backend.seq);
+    expect(view.health?.state).toBe('degraded');
+    expect(view.engine?.busy).toBe(false);
+    expect(view.history.map((r) => r.entry.rule_id)).toContain('late');
+  });
+
+  it('sends one request for a gap and a focus together', async () => {
+    const { backend, focus, sync, snapshots, clock } = setup();
+    await sync.start();
+    backend.skipSeq(1);
+    backend.setBusy(true); // gap: asks for a snapshot
+    focus.dispatchEvent(new Event('focus')); // shares it
+    focus.dispatchEvent(new Event('focus'));
+    await settle();
+    await settle();
+    expect(snapshots()).toBe(2);
+    expect(sync.getView().seq).toBe(backend.seq);
+    expect(sync.getView().engine?.busy).toBe(true);
+    // The other way round: the gap arrives while the focus snapshot is in flight and is covered.
+    focus.dispatchEvent(new Event('focus'));
+    backend.skipSeq(1);
+    backend.setBusy(false);
+    await settle();
+    await settle();
+    expect(snapshots()).toBe(3);
+    expect(sync.getView().seq).toBe(backend.seq);
+    expect(sync.getView().engine?.busy).toBe(false);
+    expect(clock.waiting()).toEqual([]);
   });
 });
 
@@ -257,6 +518,46 @@ describe('useRuntime', () => {
       await settle();
     });
     expect(host.textContent).toBe('ready:failed');
+    act(() => root.unmount());
+  });
+
+  it('subscribes and asks once when StrictMode mounts twice', async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const listened: string[] = [];
+    const { backend, sync, snapshots } = setup({}, (b) => {
+      const mock = createMockTransport(b);
+      return {
+        invoke: (command, args) => mock.invoke(command, args),
+        listen: (event, handler) => {
+          listened.push(event);
+          return mock.listen(event, handler);
+        },
+      };
+    });
+    let renders = 0;
+    function Probe() {
+      const view = useRuntime(sync);
+      renders += 1;
+      return createElement('output', null, `${view.status}:${String(view.history.length)}`);
+    }
+    const host = document.createElement('div');
+    const root = createRoot(host);
+    await act(async () => {
+      root.render(createElement(StrictMode, null, createElement(Probe)));
+      await settle();
+      await settle();
+    });
+    expect(renders).toBeGreaterThan(1); // StrictMode did render (and mount) twice
+    expect(host.textContent).toBe('ready:0');
+    expect(listened).toEqual([...EVENT_NAMES]);
+    expect(snapshots()).toBe(1);
+    // Pushed events arrive through that one subscription, without another snapshot.
+    await act(async () => {
+      backend.recordExecution();
+      await settle();
+    });
+    expect(host.textContent).toBe('ready:1');
+    expect(snapshots()).toBe(1);
     act(() => root.unmount());
   });
 });

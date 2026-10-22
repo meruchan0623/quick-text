@@ -1,6 +1,12 @@
 // Runtime events (B-44, S-19): the four broadcast events replace polling. Every payload carries the
 // global `seq`; stale and duplicate events are dropped, and a gap or the window regaining focus
 // realigns everything with one `get_runtime_snapshot` (docs/ipc-contract-0.4.md §3).
+//
+// The view is always a snapshot plus the events after it without a hole. The seq it reflects (the
+// ledger's high-water mark) only moves forward: a snapshot older than the mark is discarded, and an
+// event behind a gap waits until a snapshot covers the gap. At most one snapshot request is in
+// flight; whatever else asks for one meanwhile shares it or, when it does not settle things (stale,
+// failed, or followed by a gap), one retry scheduled with a capped backoff.
 import { useEffect, useSyncExternalStore } from 'react';
 import { isMissingCommand } from './errors';
 import { invoke, listen, type Transport, type Unlisten } from './transport';
@@ -18,30 +24,64 @@ import { EVENT_NAMES } from './types';
 
 export type SeqVerdict = 'apply' | 'drop' | 'gap';
 
-/** Pure seq bookkeeping: what to do with an incoming event. */
+/**
+ * Pure seq bookkeeping around a high-water mark that only moves forward: the view reflects a
+ * snapshot taken at some seq plus every event after it, without a hole, up to `mark`.
+ */
 export class SeqLedger {
-  #last: number | null = null;
+  #mark: number | null = null;
 
-  get last(): number | null {
-    return this.#last;
+  /** The newest seq the view reflects; null before the first snapshot. */
+  get mark(): number | null {
+    return this.#mark;
   }
 
   /**
-   * `drop`: not newer than what was already processed. `gap`: newer, but at least one event in
-   * between was missed — apply it and realign. Without a baseline every event is a gap.
+   * `drop`: already covered (a duplicate or an older event). `apply`: the next one; the mark moves
+   * to it. `gap`: newer, but at least one event in between is missing; the mark stays where it is,
+   * so the event has to wait for a snapshot. Without a baseline every event is a gap.
    */
   accept(seq: number): SeqVerdict {
-    const last = this.#last;
-    if (last !== null && seq <= last) return 'drop';
-    this.#last = seq;
-    return last !== null && seq === last + 1 ? 'apply' : 'gap';
+    const mark = this.#mark;
+    if (mark !== null && seq <= mark) return 'drop';
+    if (mark === null || seq !== mark + 1) return 'gap';
+    this.#mark = seq;
+    return 'apply';
   }
 
-  /** New baseline from a snapshot. */
-  rebase(seq: number): void {
-    this.#last = seq;
+  /**
+   * Install a snapshot taken at `seq`. Refused (false, nothing changes) when it is older than the
+   * mark: it would roll the view back and make events already covered acceptable again.
+   */
+  install(seq: number): boolean {
+    if (this.#mark !== null && seq < this.#mark) return false;
+    this.#mark = seq;
+    return true;
   }
 }
+
+/** Runs `run` after `ms` milliseconds; returns a function that cancels it. */
+export type Schedule = (run: () => void, ms: number) => () => void;
+
+const later: Schedule = (run, ms) => {
+  const id = setTimeout(run, ms);
+  return () => {
+    clearTimeout(id);
+  };
+};
+
+export const RETRY_BASE_MS = 250;
+export const RETRY_CAP_MS = 10_000;
+
+/** Delay before retry `attempt` (1, 2, …) after snapshots that did not settle: doubling, capped. */
+export const retryDelay = (attempt: number): number =>
+  Math.min(RETRY_BASE_MS * 2 ** Math.max(attempt - 1, 0), RETRY_CAP_MS);
+
+/**
+ * Events kept while waiting for a snapshot. Past this the oldest are dropped: the snapshot covers
+ * them, or the gap they leave asks for another one.
+ */
+const HELD_LIMIT = 1000;
 
 export interface HistoryRow {
   entry: HistoryEntry;
@@ -102,26 +142,37 @@ function mergeHistory(current: HistoryRow[], incoming: HistoryRow[]): HistoryRow
 
 /**
  * Keeps a RuntimeView in sync with the backend. One instance per app (see `useRuntime`); tests
- * create their own with a mock `RuntimeIo` and an `EventTarget` standing in for `window`.
+ * create their own with a mock `RuntimeIo`, an `EventTarget` standing in for `window` and their
+ * own `Schedule` for retries.
  */
 export class RuntimeSync {
   readonly #io: RuntimeIo;
   readonly #focusTarget: EventTarget | null;
+  readonly #schedule: Schedule;
   readonly #ledger = new SeqLedger();
   readonly #listeners = new Set<() => void>();
   #view: RuntimeView = initialView;
   #started = false;
   #disposed = false;
   #unlisten: Unlisten[] = [];
-  /** Events that arrive while a snapshot is being fetched; replayed on top of it. */
-  #buffer: AnyEvent[] | null = [];
-  #resync: Promise<void> | null = null;
+  /**
+   * Events that cannot be applied yet: they arrived while a snapshot was in flight, or behind a
+   * gap. Replayed in seq order on top of the next snapshot (or of the current view).
+   */
+  #held: AnyEvent[] = [];
+  /** The one snapshot round trip in flight. */
+  #inFlight: Promise<void> | null = null;
+  /** Cancels the scheduled retry, while one is scheduled. */
+  #retry: (() => void) | null = null;
+  /** Snapshots in a row that did not settle; sets the retry delay. */
+  #attempt = 0;
   /** History is known without holes up to this seq; `list_history` continues from here. */
   #historySeq: number | null = null;
 
-  constructor(io: RuntimeIo, focusTarget: EventTarget | null = null) {
+  constructor(io: RuntimeIo, focusTarget: EventTarget | null = null, schedule: Schedule = later) {
     this.#io = io;
     this.#focusTarget = focusTarget;
+    this.#schedule = schedule;
   }
 
   getView = (): RuntimeView => this.#view;
@@ -133,7 +184,7 @@ export class RuntimeSync {
 
   /** Idempotent: subscribe to every broadcast event, then take the first snapshot. */
   async start(): Promise<void> {
-    if (this.#started) return this.#resync ?? Promise.resolve();
+    if (this.#started) return this.#inFlight ?? Promise.resolve();
     this.#started = true;
     const subscriptions = await Promise.allSettled(
       EVENT_NAMES.map((name) =>
@@ -153,6 +204,8 @@ export class RuntimeSync {
 
   dispose(): void {
     this.#disposed = true;
+    this.#cancelRetry();
+    this.#held = [];
     this.#focusTarget?.removeEventListener('focus', this.#onFocus);
     for (const unlisten of this.#unlisten.splice(0)) unlisten();
     this.#listeners.clear();
@@ -162,32 +215,58 @@ export class RuntimeSync {
     if (this.#view.status !== 'unsupported') void this.resync();
   };
 
-  /** Realign with the backend; concurrent calls share one round trip. */
+  /**
+   * Realign with the backend now. Never more than one request at a time: a call while one is in
+   * flight shares it, and a scheduled retry is folded into this one.
+   */
   resync(): Promise<void> {
-    this.#resync ??= this.#doResync().finally(() => {
-      this.#resync = null;
+    if (this.#inFlight) return this.#inFlight;
+    if (this.#disposed) return Promise.resolve();
+    this.#cancelRetry();
+    const request = this.#snapshot().finally(() => {
+      this.#inFlight = null;
     });
-    return this.#resync;
+    this.#inFlight = request;
+    return request;
   }
 
-  async #doResync(): Promise<void> {
-    this.#buffer ??= [];
+  /** Ask again later, unless a retry is already scheduled (they coalesce). */
+  #retryLater(): void {
+    if (this.#disposed || this.#retry) return;
+    this.#attempt += 1;
+    this.#retry = this.#schedule(() => {
+      this.#retry = null;
+      void this.resync();
+    }, retryDelay(this.#attempt));
+  }
+
+  #cancelRetry(): void {
+    this.#retry?.();
+    this.#retry = null;
+  }
+
+  async #snapshot(): Promise<void> {
     let snapshot: RuntimeSnapshot;
     try {
       snapshot = await this.#io.invoke<RuntimeSnapshot>('get_runtime_snapshot');
     } catch (e) {
-      const buffered = this.#buffer;
-      this.#buffer = null;
+      if (this.#disposed) return;
       if (isMissingCommand(e)) {
+        // A 0.3 backend: no snapshots and no events, now or later.
+        this.#held = [];
         this.#set({ ...this.#view, status: 'unsupported' });
       } else {
-        // Keep what we have and apply what arrived meanwhile; the next focus or gap retries.
-        for (const event of buffered)
-          if (this.#ledger.accept(event.payload.seq) !== 'drop') this.#apply(event);
+        // Keep the view (still consistent) and go on from it; try again later.
+        this.#settle(false);
       }
       return;
     }
-    this.#ledger.rebase(snapshot.seq);
+    if (this.#disposed) return;
+    if (!this.#ledger.install(snapshot.seq)) {
+      // Older than what the view already reflects: discard it, keep the view, try again later.
+      this.#settle(false);
+      return;
+    }
     let view: RuntimeView = {
       ...this.#view,
       status: 'ready',
@@ -217,29 +296,60 @@ export class RuntimeSync {
     }
     if (problems.status === 'fulfilled')
       view = { ...view, problems: mergeProblems(view.problems, problems.value) };
+    // (Disposed meanwhile: nobody listens any more, nothing is held and no retry is scheduled.)
     this.#set(view);
-    // Replay what arrived during the round trip; anything not newer than the snapshot is stale.
-    const buffered = this.#buffer.sort((a, b) => a.payload.seq - b.payload.seq);
-    this.#buffer = null;
-    for (const event of buffered) {
-      const last = this.#ledger.last;
-      if (last !== null && event.payload.seq <= last) continue;
-      this.#ledger.rebase(event.payload.seq);
-      this.#apply(event);
+    this.#settle(true);
+  }
+
+  /**
+   * End of a snapshot round trip: apply the held events that continue the mark. Settled only when
+   * the snapshot was installed and no event is left behind a gap; otherwise ask again later.
+   */
+  #settle(installed: boolean): void {
+    const gap = this.#replay();
+    if (installed && !gap) this.#attempt = 0;
+    else this.#retryLater();
+  }
+
+  /**
+   * Apply held events in seq order while they continue the mark; covered ones are dropped. Stops at
+   * the first gap and keeps the rest held; returns whether there was one.
+   */
+  #replay(): boolean {
+    const held = this.#held.sort((a, b) => a.payload.seq - b.payload.seq);
+    this.#held = [];
+    for (const [index, event] of held.entries()) {
+      const verdict = this.#ledger.accept(event.payload.seq);
+      if (verdict === 'apply') this.#apply(event);
+      else if (verdict === 'gap') {
+        this.#held = held.slice(index);
+        return true;
+      }
     }
+    return false;
+  }
+
+  #hold(event: AnyEvent): void {
+    this.#held.push(event);
+    if (this.#held.length > HELD_LIMIT) this.#held.splice(0, this.#held.length - HELD_LIMIT);
   }
 
   #receive(event: AnyEvent): void {
-    if (this.#disposed) return;
-    if (this.#buffer) {
-      this.#buffer.push(event);
+    if (this.#disposed || this.#view.status === 'unsupported') return;
+    const mark = this.#ledger.mark;
+    if (mark !== null && event.payload.seq <= mark) return; // a duplicate or an older event
+    // A snapshot is on its way, or earlier events already wait behind a gap: wait with them.
+    if (this.#inFlight || this.#held.length > 0) {
+      this.#hold(event);
       return;
     }
-    if (this.#view.status === 'unsupported') return;
-    const verdict = this.#ledger.accept(event.payload.seq);
-    if (verdict === 'drop') return;
-    this.#apply(event);
-    if (verdict === 'gap') void this.resync();
+    if (this.#ledger.accept(event.payload.seq) === 'apply') {
+      this.#apply(event);
+      return;
+    }
+    // Something was missed: hold this until a snapshot covers the hole. A scheduled retry will.
+    this.#hold(event);
+    if (!this.#retry) void this.resync();
   }
 
   #noteHistorySeq(seqs: number[]): void {
