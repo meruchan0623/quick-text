@@ -1731,6 +1731,210 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       expect(statusText(container)).not.toContain('已重新读取配置');
     });
   });
+
+  describe('the editor ends each write, its answer installed or not (review C7)', () => {
+    type Confirmed = readonly [button: string, title: string, confirm: string];
+    const DISCARD: Confirmed = ['放弃未应用草稿', '放弃全部未应用草稿？', '放弃草稿'];
+    const ROLLBACK: Confirmed = ['恢复上一个版本', '回滚到上一个生效版本？', '回滚'];
+
+    /** Press `button` on 「运行状态与恢复」, confirm, and go back to the settings. */
+    async function confirmOnStatus(mounted: Mounted, [text, title, confirm]: Confirmed) {
+      await click(mounted, '运行状态与恢复');
+      await click(mounted, text);
+      await clickIn(mounted, dialog(mounted.container, title), confirm);
+      await click(mounted, '文本指令参数设置');
+    }
+
+    /** The word separators the last save_draft sent. */
+    const sentSeparators = (backend: MockBackend) =>
+      (
+        callsOf(backend, 'save_draft').at(-1)?.args.config as
+          { globals: { word_separators: string } } | undefined
+      )?.globals.word_separators;
+
+    /** Save from the settings and wait for it. */
+    async function saveSettings(mounted: Mounted) {
+      const count = callsOf(mounted.backend, 'save_draft').length;
+      await click(mounted, '保存参数草稿');
+      await waitFor(mounted, () => {
+        expect(callsOf(mounted.backend, 'save_draft')).toHaveLength(count + 1);
+      });
+      await settle(mounted);
+    }
+
+    /** A focus load, applied. */
+    async function focusLoad(mounted: Mounted) {
+      const count = callsOf(mounted.backend, 'load_state').length;
+      await focus(mounted);
+      await waitFor(mounted, () => {
+        expect(callsOf(mounted.backend, 'load_state')).toHaveLength(count + 1);
+      });
+      await settle(mounted);
+    }
+
+    /**
+     * `confirmed` sent, its answer held (after `meanwhile`, if any) while a focus load shows the
+     * store as the command left it; then the answer arrives, and is dropped: the load's revision is
+     * as new, and its request later.
+     */
+    async function dropAnswer(
+      mounted: Mounted,
+      hold: LoadHold,
+      confirmed: Confirmed,
+      meanwhile?: () => Promise<void>,
+    ) {
+      hold.arm();
+      await confirmOnStatus(mounted, confirmed);
+      await waitFor(mounted, () => {
+        expect(hold.held[0]?.read).toBe(true);
+      });
+      if (meanwhile) await meanwhile();
+      await focusLoad(mounted);
+      await answerHeld(mounted, hold, 0);
+    }
+
+    it('puts the discarded draft in the editor when the answer of 放弃未应用草稿 is dropped', async () => {
+      const hold = holdAnswers('discard_draft');
+      const mounted = await mountReady(hold);
+      const { backend, container } = mounted;
+      await click(mounted, '文本指令参数设置');
+      const before = separators(container);
+      // The field shows it without the line break.
+      const stored = backend.draft.globals.word_separators;
+      await type(mounted, field(container, '词分隔符'), ' ;');
+      await dropAnswer(mounted, hold, DISCARD);
+      expect(separators(container)).toBe(before);
+      expect(revisionText(container)).toContain('配置已同步');
+      // Saving does not bring the discarded edit back.
+      await saveSettings(mounted);
+      expect(sentSeparators(backend)).toBe(stored);
+      expect(backend.draft.globals.word_separators).toBe(stored);
+    });
+
+    it('puts the restored config in the editor when the answer of 恢复上一个版本 is dropped', async () => {
+      const hold = holdAnswers('rollback');
+      const mounted = await mountReady(hold);
+      const { backend, container } = mounted;
+      await click(mounted, '文本指令参数设置');
+      const before = separators(container);
+      const stored = backend.draft.globals.word_separators;
+      // v2 published elsewhere, so there is a v1 to go back to.
+      await publish(mounted, ',');
+      await waitFor(mounted, () => {
+        expect(separators(container)).toBe(',');
+      });
+      await type(mounted, field(container, '词分隔符'), ' ;');
+      await dropAnswer(mounted, hold, ROLLBACK);
+      expect(separators(container)).toBe(before);
+      expect(revisionText(container)).toContain('当前生效 v3');
+      expect(revisionText(container)).toContain('配置已同步');
+      // The load said v3 was newer than the edit; the editor has v3 now.
+      expect(notices(container)).toBe('');
+      // Taken from the view shown, not an earlier one: nothing to read again.
+      expect(callsOf(backend, 'load_state')).toHaveLength(3);
+      await saveSettings(mounted);
+      expect(sentSeparators(backend)).toBe(stored);
+    });
+
+    it('marks the editor saved when the answer of its save is dropped', async () => {
+      const hold = holdAnswers('save_draft');
+      const mounted = await mountReady(hold);
+      const { backend, container } = mounted;
+      await click(mounted, '文本指令参数设置');
+      await type(mounted, field(container, '词分隔符'), ' ;');
+      hold.arm();
+      await click(mounted, '保存参数草稿');
+      await waitFor(mounted, () => {
+        expect(hold.held[0]?.read).toBe(true);
+      });
+      await focusLoad(mounted);
+      await answerHeld(mounted, hold, 0);
+      expect(separators(container)).toBe(' ;');
+      expect(statusText(container)).toBe('参数已保存到草稿');
+      expect(notices(container)).toBe('');
+      // Nothing left to save: 应用设置 applies at once.
+      await click(mounted, '应用设置');
+      await waitFor(mounted, () => {
+        expect(revisionText(container)).toContain('当前生效 v2');
+      });
+      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+      expect(backend.active.globals.word_separators).toBe(' ;');
+      // Nor an unsaved edit to keep: a revision published elsewhere is taken straight in.
+      await publish(mounted, '|');
+      await waitFor(mounted, () => {
+        expect(separators(container)).toBe('|');
+      });
+      expect(notices(container)).toBe('');
+    });
+
+    it('keeps edits made after 放弃未应用草稿 was sent when its answer is dropped', async () => {
+      const hold = holdAnswers('discard_draft');
+      const mounted = await mountReady(hold);
+      const { backend, container } = mounted;
+      await click(mounted, '文本指令参数设置');
+      await type(mounted, field(container, '词分隔符'), ' ;');
+      await dropAnswer(mounted, hold, DISCARD, () =>
+        type(mounted, field(container, '词分隔符'), ' |'),
+      );
+      expect(separators(container)).toBe(' |');
+      expect(revisionText(container)).toContain('草稿待应用');
+      await saveSettings(mounted);
+      expect(sentSeparators(backend)).toBe(' |');
+    });
+
+    it('keeps edits made while 恢复上一个版本 ran, and says the revision it made', async () => {
+      const hold = holdAnswers('rollback');
+      const mounted = await mountReady(hold);
+      const { container } = mounted;
+      await click(mounted, '文本指令参数设置');
+      const before = separators(container);
+      await publish(mounted, ',');
+      await waitFor(mounted, () => {
+        expect(separators(container)).toBe(',');
+      });
+      hold.arm();
+      await confirmOnStatus(mounted, ROLLBACK);
+      await waitFor(mounted, () => {
+        expect(hold.held[0]?.read).toBe(true);
+      });
+      await type(mounted, field(container, '词分隔符'), ' |');
+      // Installed: v3 is newer than anything shown.
+      await answerHeld(mounted, hold, 0);
+      expect(separators(container)).toBe(' |');
+      expect(revisionText(container)).toContain('当前生效 v3');
+      expect(notices(container)).toContain('配置已在后台更新为 v3。编辑器中未保存的修改仍然保留');
+      await click(mounted, '放弃修改，载入新配置');
+      expect(separators(container)).toBe(before);
+      expect(notices(container)).toBe('');
+    });
+
+    it('keeps edits made while 应用设置 saved, unsaved, over the revision it applied', async () => {
+      const hold = holdAnswers('save_draft');
+      const mounted = await mountReady(hold);
+      const { backend, container } = mounted;
+      await click(mounted, '文本指令参数设置');
+      await type(mounted, field(container, '词分隔符'), ' ;');
+      hold.arm();
+      await click(mounted, '应用设置');
+      await waitFor(mounted, () => {
+        expect(hold.held[0]?.read).toBe(true);
+      });
+      await type(mounted, field(container, '词分隔符'), ' |');
+      await answerHeld(mounted, hold, 0);
+      await waitFor(mounted, () => {
+        expect(revisionText(container)).toContain('当前生效 v2');
+      });
+      await settle(mounted);
+      // What was saved is applied; the later edit stays in the editor, still to be saved.
+      expect(backend.active.globals.word_separators).toBe(' ;');
+      expect(separators(container)).toBe(' |');
+      expect(revisionText(container)).toContain('草稿待应用');
+      // v2 is this window's own: loading it says nothing newer.
+      await focusLoad(mounted);
+      expect(notices(container)).toBe('');
+      expect(separators(container)).toBe(' |');
+    });
+  });
 });
 
 describe('action types by capability status (S-16, principle 5)', () => {

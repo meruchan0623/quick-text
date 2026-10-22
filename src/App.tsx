@@ -190,6 +190,8 @@ export default function App() {
   const runtime = useRuntime(sync);
   const live = liveStatus(runtime);
   const edited = useRef(false);
+  // Counts every local edit (`change`), so a write can tell whether any came after it was sent.
+  const edits = useRef(0);
   const modeCache = useRef(
     new Map<
       string,
@@ -227,8 +229,15 @@ export default function App() {
   // 放弃未应用草稿, 恢复上一个版本.
   const editorRevision = useRef<number | null>(null);
   const [newer, setNewer] = useState<{ revision: number; saved: boolean } | null>(null);
-  const receive = (s: State) => {
+  // The state shown, as soon as it is set: a write whose answer was not installed puts what is
+  // shown in the editor (review C7), maybe before the render that shows it.
+  const shown = useRef<State | null>(null);
+  const show = (s: State) => {
+    shown.current = s;
     setState(s);
+  };
+  const receive = (s: State) => {
+    show(s);
     // A rule field with a serde default may be absent; the editor reads it filled in, as Rust does.
     const draft = completeConfig(s.draft);
     setConfig(draft);
@@ -238,16 +247,29 @@ export default function App() {
     edited.current = false;
     editorRevision.current = s.revision;
   };
+  /** Say a store revision newer than the one the editor's unsaved edits are based on. */
+  const sayNewer = (revision: number) => {
+    // Unsaved local edits are never replaced by an answer. When the store moved on under them, say
+    // so; the user loads the new config or keeps editing (and saving overwrites).
+    const base = editorRevision.current;
+    if (base !== null && revision > base)
+      setNewer((n) => (n !== null && n.revision >= revision ? n : { revision, saved: false }));
+  };
   // Review C6: one rule installs every answer that carries the state: load_state, save_draft,
   // apply_settings, discard_draft, rollback, set_paused. Each request takes the next request id as
-  // it is sent (Tauri may run commands concurrently, so answers can arrive in any order); its answer
-  // is installed only over an earlier view: a later store revision, or the same revision and a
-  // later request. The revision is the authority: while the app runs the backend never lowers it
-  // (a publish, a rollback too, takes one above every revision on disk; the SafeMode(Locked) retry
-  // starts from the 0 of the read-only state), so an answer with a lower one read the store before
-  // the view shown did. Within a revision, the order sent stands for the order run. An answer not
-  // installed leaves everything shown as it is (the editor's unsaved edits too); its command still
-  // succeeded and resolves as usual.
+  // it is sent; its answer is installed only over an earlier view: a later store revision, or the
+  // same revision and a later request. The revision is the authority: while the app runs the
+  // backend never lowers it (a publish, a rollback too, takes one above every revision on disk; the
+  // SafeMode(Locked) retry starts from the 0 of the read-only state), so an answer with a lower one
+  // read the store before the view shown did.
+  // Within a revision, the order sent stands for the order run. The premise (review C7): each of
+  // these commands, and set_autostart and set_auto_listen, ordered by request id below, is a
+  // synchronous `#[tauri::command] fn` (src-tauri/src/commands), which Tauri 2 runs on the main
+  // thread one at a time, in the order the calls arrive; no async command takes part. Only their
+  // answers may reach the window out of order, a delayed one after a later one: what this rule is
+  // for. Were one of them made async, the order sent would no longer say which one ran last.
+  // An answer not installed changes nothing shown; its command still succeeded, resolves as usual
+  // and ends its part in the editor all the same (`conclude`).
   const requests = useRef(0);
   const installed = useRef({ revision: -1, request: 0 });
   // set_autostart and set_auto_listen answer with the value alone, without a revision; it is
@@ -260,8 +282,8 @@ export default function App() {
   });
   /** The view to show for state answer `s` to request `request`, or null when it is not installed. */
   const install = (s: State, request: number): State | null => {
-    const shown = installed.current;
-    if (s.revision < shown.revision || (s.revision === shown.revision && request <= shown.request))
+    const last = installed.current;
+    if (s.revision < last.revision || (s.revision === last.revision && request <= last.request))
       return null;
     installed.current = { revision: s.revision, request };
     let view = s;
@@ -277,7 +299,7 @@ export default function App() {
   const installSetting = (field: Setting, value: boolean, request: number) => {
     if (request <= (settings.current[field]?.request ?? installed.current.request)) return;
     settings.current[field] = { request, value };
-    setState((s) => (s ? { ...s, [field]: value } : s));
+    if (shown.current) show({ ...shown.current, [field]: value });
   };
   // Review C5: the store revision this window has caught up with, by an installed load_state or by
   // the installed answer of a write that made that revision (apply_settings, rollback) or took the
@@ -295,15 +317,55 @@ export default function App() {
   // This window's writes of the store in flight. The store-state a write causes may arrive before
   // its answer; the answer carries the new revision, so no reload is needed for it (see below).
   const [writing, setWriting] = useState(0);
+  /**
+   * The editor's part of a write that succeeded, done the same whether or not its answer was
+   * installed (`answerShown`, review C7): a dropped answer must not leave behind edits the command
+   * did away with. An answer not installed was overtaken by a view that read the store after the
+   * command ran, so the view shown has the command's outcome. `untouched`: no local edit since the
+   * request was sent. Edits made since are kept, never replaced by an answer, as with a load.
+   */
+  const conclude = (command: StoreWrite, answerShown: boolean, untouched: boolean) => {
+    const now = shown.current;
+    // Never null: every write waits for the first snapshot.
+    if (now === null) return;
+    if (untouched) {
+      if (command === 'discard_draft' || command === 'rollback') {
+        // The store's config in the editor, as the view shown has it; a notice about a newer
+        // revision is moot.
+        receive(now);
+        setNewer(null);
+      } else if (answerShown) receive(now);
+      else {
+        // The editor's config is the store's draft (saved, or saved and applied); kept as it is.
+        setLocalDirty(false);
+        edited.current = false;
+      }
+    } else if (answerShown) {
+      // Kept as with a load (shown already). A revision answering this window's save or apply has
+      // the editor's config, as sent: not newer than it.
+      if (command === 'save_draft' || command === 'apply_settings')
+        editorRevision.current = Math.max(editorRevision.current ?? now.revision, now.revision);
+      else sayNewer(now.revision);
+    }
+  };
   const write = async (command: StoreWrite, args?: Record<string, unknown>) => {
     setWriting((n) => n + 1);
-    // Both as the request is sent: the revision the editor's config is based on (review C6).
+    // As the request is sent: the revision the editor's config is based on (review C6), and the
+    // local edits so far (review C7). Applying publishes the store's draft, without the editor's
+    // unsaved edits (made while 应用设置 saved): they count as made since.
     const request = ++requests.current;
     const base = editorRevision.current;
+    const sent = edits.current;
+    const unsaved = command === 'apply_settings' && edited.current;
     try {
       const s = await call<State>(command, args);
       const view = install(s, request);
-      if (view !== null) receive(view);
+      if (view !== null) {
+        show(view);
+        // Not save_draft's: its config is not the editor's yet (see `reconciled`).
+        if (command !== 'save_draft') reconcileTo(s.revision);
+      }
+      conclude(command, view !== null, !unsaved && edits.current === sent);
       if (command === 'save_draft') {
         // Active revision newer than the editor's config: the save replaced the draft of a revision
         // this window never took in. Said until acknowledged, as is a save over a notice standing,
@@ -318,10 +380,6 @@ export default function App() {
               ? { revision: s.revision, saved: true }
               : null,
         );
-      } else if (view !== null) {
-        reconcileTo(s.revision);
-        // Rollback and discard_draft put the store's config in the editor, applying keeps it.
-        if (command !== 'apply_settings') setNewer(null);
       }
       return s;
     } finally {
@@ -358,14 +416,8 @@ export default function App() {
         // A later revision is in the editor now: a notice about an earlier one is moot.
         setNewer((n) => (n !== null && s.revision > n.revision ? null : n));
       } else {
-        // Unsaved local edits are kept, never replaced by a load. When the store moved on under
-        // them, say so; the user loads the new config or keeps editing (and saving overwrites).
-        setState(s);
-        const base = editorRevision.current;
-        if (base !== null && s.revision > base)
-          setNewer((n) =>
-            n !== null && n.revision >= s.revision ? n : { revision: s.revision, saved: false },
-          );
+        show(s);
+        sayNewer(s.revision);
       }
       return;
     }
@@ -542,7 +594,7 @@ export default function App() {
       // set_paused only toggles the manual reason; the unsaved draft in the editor stays untouched.
       const request = ++requests.current;
       const view = install(await call<State>('set_paused', { paused: !manual }), request);
-      if (view !== null) setState(view);
+      if (view !== null) show(view);
     });
   const exportDiagnostics = () =>
     run(async () => {
@@ -612,6 +664,7 @@ export default function App() {
     setConfig(c);
     setLocalDirty(true);
     edited.current = true;
+    edits.current += 1;
   };
   const save = async (c = config) => {
     // Every path that submits the config ends here (rules, settings, 总开关, import, export, apply).
