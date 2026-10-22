@@ -26,6 +26,18 @@ pub fn atomic_json<T: Serialize + ?Sized>(path: &Path, config: &T) -> Result<(),
 /// Moves `from` over `to` in one step, replacing `to` if it exists:
 /// `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` on
 /// Windows, `rename` elsewhere. Readers see either the old or the new file.
+///
+/// This is the one replace step behind every crash-safe write of the app:
+/// the store files ([`atomic_json`]), `export_config` (`store::export`) and
+/// the diagnostics bundle (`diagnostics::bundle`). The contract for callers:
+/// `from` is a temp file in the directory of `to` (same volume), its content
+/// has been flushed with `sync_all` and its handle closed before the call, so
+/// the data is on disk before the name points at it. `MOVEFILE_WRITE_THROUGH`
+/// then returns only once the move itself is on disk.
+///
+/// The move replaces the directory entry at `to` and does not follow it: a
+/// symlink or hard link found there is replaced, the file it points to is not
+/// written. A directory at `to` makes the call fail.
 pub fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {

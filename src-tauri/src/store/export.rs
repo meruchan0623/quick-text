@@ -7,7 +7,7 @@
 //! staged in a new temp file next to the target, the location of that open
 //! file is checked again, and the temp file then replaces the target by
 //! rename (see [`stage_and_replace`]).
-use super::Store;
+use super::{atomic::replace_file, Store};
 use crate::error::{file_label, CommandError, IoOp, SafeModeReason};
 use quicker_domain::*;
 use std::{
@@ -94,13 +94,15 @@ impl StageHooks for () {}
 ///    the data directory. This catches a parent directory or junction
 ///    redirected into the data directory after the pathname check.
 /// 3. The package is written and synced through that handle.
-/// 4. The temp file replaces the target by rename. A rename replaces the
-///    directory entry at the destination and does not follow it: a symlink
-///    or hard link that was put there in the meantime, even one pointing at
-///    `active.json`, is itself replaced and the file it points to is not
-///    written. On Windows this relies on `std::fs::rename` using
-///    `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` or `FileRenameInfoEx`, which
-///    both act on the destination name only.
+/// 4. The temp file replaces the target by rename ([`replace_file`], the
+///    replace step shared with the store files and the diagnostics bundle).
+///    A rename replaces the directory entry at the destination and does not
+///    follow it: a symlink or hard link that was put there in the meantime,
+///    even one pointing at `active.json`, is itself replaced and the file it
+///    points to is not written. On Windows `replace_file` is
+///    `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`,
+///    which acts on the destination name only and returns once the move is
+///    on disk.
 ///
 /// On any failure the temp file is removed and the target is left as it was,
 /// so a failed export never truncates the user's existing file.
@@ -141,8 +143,10 @@ fn stage_and_replace(
         .create_new(true)
         .open(&temp)
         .map_err(write_error)?;
+    // `check_and_fill` synced the temp file and closed its handle on return,
+    // as `replace_file` requires.
     let result = check_and_fill(file, &temp, target, data_dir, bytes, hooks).and_then(|()| {
-        fs::rename(&temp, target).map_err(|e| CommandError::io(IoOp::Rename, Some(target), &e))
+        replace_file(&temp, target).map_err(|e| CommandError::io(IoOp::Rename, Some(target), &e))
     });
     if result.is_err() {
         if let Err(e) = fs::remove_file(&temp) {
