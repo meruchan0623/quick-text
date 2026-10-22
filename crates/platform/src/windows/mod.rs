@@ -35,6 +35,7 @@ mod protection;
 mod rawinput;
 mod recording;
 mod selection;
+mod session;
 pub use actions::{execute, preflight};
 pub use foreground::{cursor, foreground};
 pub use input::{engine_ready, input_status, native_ready};

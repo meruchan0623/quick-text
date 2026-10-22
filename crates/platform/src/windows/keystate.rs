@@ -4,6 +4,12 @@
 //! hooks update it without taking a lock and readers never observe a
 //! "contended" mirror. Until the mirror is seeded, readers fall back to the
 //! asynchronous key state through [`AsyncKeyProbe`]; tests only use fakes.
+//!
+//! A key-up the hooks never see (secure desktop, a session switch, a hook
+//! gap) would leave a modifier stuck down and block every expansion. The
+//! input consumer therefore resynchronises the mirror after session signals
+//! and runs [`ModifierWatch`], which re-checks modifiers held for
+//! [`MODIFIER_VERIFY_AFTER`] against the asynchronous key state.
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -81,11 +87,19 @@ impl KeyBits {
     ///
     /// A bit the hooks changed while its word was being probed keeps the
     /// hook's value: that transition is newer than the probe sample.
+    ///
+    /// The generic Shift/Ctrl/Alt codes are not seeded: the asynchronous
+    /// state of a generic code is "either side down", while the low-level
+    /// hook reports the sided codes, so no key-up would ever clear a seeded
+    /// generic bit. The sided bits already make [`KeyBits::held`] true.
     pub(super) fn resync(&self, probe: &impl AsyncKeyProbe) {
         for (base, word) in (0u16..).step_by(64).zip(&self.words) {
             let before = word.load(Ordering::SeqCst);
             let probed = (0..64u16)
-                .filter(|bit| base + bit != 0 && probe.down(base + bit))
+                .filter(|bit| {
+                    let vk = base + bit;
+                    vk != 0 && !GENERIC_MODIFIERS.contains(&vk) && probe.down(vk)
+                })
                 .fold(0u64, |acc, bit| acc | 1 << bit);
             // The closure never returns None, so the update cannot fail.
             let _ = word.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
@@ -100,6 +114,94 @@ impl KeyBits {
     #[cfg(test)]
     pub(super) fn mark_seeded(&self) {
         self.seeded.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Generic codes; the low-level hook reports the sided ones.
+const GENERIC_MODIFIERS: [u16; 3] = [VK_SHIFT, VK_CONTROL, VK_MENU];
+/// Every code that counts as a held modifier anywhere in the engine.
+const MODIFIERS: [u16; 11] = [
+    VK_SHIFT,
+    VK_CONTROL,
+    VK_MENU,
+    VK_LSHIFT,
+    VK_RSHIFT,
+    VK_LCONTROL,
+    VK_RCONTROL,
+    VK_LMENU,
+    VK_RMENU,
+    VK_LWIN,
+    VK_RWIN,
+];
+/// How long a modifier may stay down in the mirror before the asynchronous
+/// key state is consulted (S-05: a lost key-up heals within 30 s).
+pub(super) const MODIFIER_VERIFY_AFTER: Duration = Duration::from_secs(30);
+
+fn modifier_name(vk: u16) -> &'static str {
+    match vk {
+        VK_SHIFT => "shift",
+        VK_CONTROL => "ctrl",
+        VK_MENU => "alt",
+        VK_LSHIFT => "lshift",
+        VK_RSHIFT => "rshift",
+        VK_LCONTROL => "lctrl",
+        VK_RCONTROL => "rctrl",
+        VK_LMENU => "lalt",
+        VK_RMENU => "ralt",
+        VK_LWIN => "lwin",
+        VK_RWIN => "rwin",
+        _ => "other",
+    }
+}
+
+/// Consumer-side check for modifiers whose key-up the hooks never saw.
+/// Never used on a hook thread.
+#[derive(Default)]
+pub(super) struct ModifierWatch {
+    /// When each [`MODIFIERS`] bit was first seen down, or last verified.
+    since: [Option<Instant>; MODIFIERS.len()],
+}
+impl ModifierWatch {
+    /// Samples the mirror at `now`. A modifier down for
+    /// [`MODIFIER_VERIFY_AFTER`] is checked against `probe`: still down
+    /// restarts its timer, up clears the bit (`keystate.heal`). Returns when
+    /// the next check is due, if any modifier is down.
+    ///
+    /// A press landing between the probe and the clear is lost until the
+    /// key is released (a window of microseconds, once per 30 s at most).
+    pub(super) fn check(
+        &mut self,
+        keys: &KeyBits,
+        probe: &impl AsyncKeyProbe,
+        now: Instant,
+    ) -> Option<Instant> {
+        let mut next: Option<Instant> = None;
+        for (&vk, since) in MODIFIERS.iter().zip(self.since.iter_mut()) {
+            if !keys.get(vk) {
+                *since = None;
+                continue;
+            }
+            let start = *since.get_or_insert(now);
+            if now.saturating_duration_since(start) >= MODIFIER_VERIFY_AFTER {
+                if !probe.down(vk) {
+                    keys.set(vk, false);
+                    *since = None;
+                    tracing::warn!(event = "keystate.heal", modifier = modifier_name(vk));
+                    continue;
+                }
+                *since = Some(now);
+            }
+            let due = since.and_then(|start| start.checked_add(MODIFIER_VERIFY_AFTER));
+            next = match (next, due) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        next
+    }
+    /// Forgets every timer (after a full resync).
+    pub(super) fn reset(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -238,6 +340,71 @@ mod tests {
         keys.resync(&Racing { keys: &keys });
         assert!(!keys.held(VK_LCONTROL), "the newer key-up wins");
         assert!(keys.held(VK_LSHIFT), "the newer key-down wins");
+    }
+
+    #[test]
+    fn resync_seeds_sided_modifiers_only_so_their_key_up_clears_them() {
+        let keys = KeyBits::new();
+        // Ctrl held during a resync: the asynchronous state reports both the
+        // generic and the sided code.
+        keys.resync(&FakeKeys::new(&[VK_CONTROL, VK_LCONTROL]));
+        assert!(keys.held(VK_CONTROL));
+        // The hook only ever reports the sided key-up.
+        keys.set(VK_LCONTROL, false);
+        assert!(!keys.held(VK_CONTROL), "no generic bit left behind");
+        // A generic bit set by injected input is cleared by the next resync.
+        keys.set(VK_SHIFT, true);
+        keys.resync(&FakeKeys::new(&[VK_SHIFT]));
+        assert!(!keys.held(VK_SHIFT));
+    }
+
+    #[test]
+    fn the_watch_verifies_a_modifier_only_after_thirty_seconds() {
+        let keys = KeyBits::new();
+        let start = Instant::now();
+        let mut watch = ModifierWatch::default();
+        let released = FakeKeys::new(&[]);
+        assert_eq!(watch.check(&keys, &released, start), None, "nothing held");
+        keys.set(VK_RWIN, true);
+        assert_eq!(
+            watch.check(&keys, &released, start),
+            Some(start + MODIFIER_VERIFY_AFTER)
+        );
+        let almost = start + MODIFIER_VERIFY_AFTER - Duration::from_millis(1);
+        watch.check(&keys, &released, almost);
+        assert_eq!(released.reads.get(), 0, "not probed early");
+        assert!(keys.held(VK_RWIN));
+        let due = start + MODIFIER_VERIFY_AFTER;
+        assert_eq!(watch.check(&keys, &released, due), None);
+        assert_eq!(released.reads.get(), 1);
+        assert!(!keys.held(VK_RWIN), "healed");
+    }
+
+    #[test]
+    fn a_modifier_really_held_is_kept_and_rechecked_later() {
+        let keys = KeyBits::new();
+        let start = Instant::now();
+        let mut watch = ModifierWatch::default();
+        let held = FakeKeys::new(&[VK_LSHIFT]);
+        keys.set(VK_LSHIFT, true);
+        watch.check(&keys, &held, start);
+        let due = start + MODIFIER_VERIFY_AFTER;
+        assert_eq!(
+            watch.check(&keys, &held, due),
+            Some(due + MODIFIER_VERIFY_AFTER)
+        );
+        assert!(keys.held(VK_LSHIFT));
+        // Released normally: the timer is dropped without probing.
+        keys.set(VK_LSHIFT, false);
+        assert_eq!(watch.check(&keys, &held, due), None);
+        assert_eq!(held.reads.get(), 1);
+        // A new press starts a fresh 30 s.
+        keys.set(VK_LSHIFT, true);
+        let later = due + Duration::from_secs(5);
+        assert_eq!(
+            watch.check(&keys, &held, later),
+            Some(later + MODIFIER_VERIFY_AFTER)
+        );
     }
 
     #[test]

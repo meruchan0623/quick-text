@@ -18,13 +18,15 @@ use super::{
     foreground::WinForeground,
     hook::{mouse_operation, pointer_move, test_input_enabled, HookPipe, HookRecord, HOOK_READY},
     ime::ime_active,
+    keystate::{AsyncKeyProbe, KeyBits, ModifierWatch, SystemAsyncKeys, PHYSICAL},
     rawinput::{
         acceptance_event, detect_candidate, event_from, note_source, Buffer, Event, RawRecord,
     },
     recording::{record_event, stop_record_events},
+    session::{self, SessionSignals},
 };
 use crate::health::{Component, ComponentHealth, HealthState, ReasonCode};
-use crate::traits::ForegroundProbe;
+use crate::traits::{Clock, ForegroundProbe, SystemClock};
 use crossbeam_queue::ArrayQueue;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::PoisonError;
@@ -235,6 +237,70 @@ impl Consumer {
         self.buffer = Buffer::default();
     }
 }
+/// Second resync after a session signal, for key transitions that were
+/// still in flight when the first one ran (B-05).
+pub(super) const RESYNC_SECOND_PASS: Duration = Duration::from_millis(200);
+
+/// Consumer-side timers (B-05): the key-mirror resync after session signals
+/// and the stuck-modifier check. All time comes from `clock`; every system
+/// read goes through `ports`.
+pub(super) struct Monitor<'a, P: AsyncKeyProbe, C: Clock> {
+    keys: &'a KeyBits,
+    ports: &'a P,
+    clock: &'a C,
+    signals: &'a SessionSignals,
+    watch: ModifierWatch,
+    second_pass: Option<Instant>,
+}
+impl<'a, P: AsyncKeyProbe, C: Clock> Monitor<'a, P, C> {
+    pub(super) fn new(
+        keys: &'a KeyBits,
+        ports: &'a P,
+        clock: &'a C,
+        signals: &'a SessionSignals,
+    ) -> Self {
+        Self {
+            keys,
+            ports,
+            clock,
+            signals,
+            watch: ModifierWatch::default(),
+            second_pass: None,
+        }
+    }
+    /// Handles pending session signals and due checks. Returns when it next
+    /// needs to run, if anything is scheduled.
+    pub(super) fn tick(&mut self, shared: &Shared) -> Option<Instant> {
+        let now = self.clock.now();
+        let mut signalled = false;
+        for signal in self.signals.take() {
+            tracing::info!(event = "session.signal", signal = signal.name());
+            signalled = true;
+        }
+        if signalled {
+            // Typing before and after a session change is not one word.
+            shared.generation.fetch_add(1, Ordering::SeqCst);
+            observer::CARET_EPOCH.fetch_add(1, Ordering::SeqCst);
+            self.resync("first");
+            self.second_pass = now.checked_add(RESYNC_SECOND_PASS);
+        } else if self.second_pass.is_some_and(|due| now >= due) {
+            // Mirror only: a word typed right after an unlock stays intact.
+            self.second_pass = None;
+            self.resync("second");
+        }
+        let modifiers = self.watch.check(self.keys, self.ports, now);
+        match (self.second_pass, modifiers) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+    fn resync(&mut self, pass: &'static str) {
+        self.keys.resync(self.ports);
+        self.watch.reset();
+        tracing::info!(event = "keystate.resync", pass);
+    }
+}
+
 /// Records a pointer operation unless the pointer is over our own window.
 /// Hit-testing runs only while a recording is active, never on the hook.
 fn record_pointer(shared: &Shared, operation: Operation, x: i32, y: i32) {
@@ -256,31 +322,38 @@ fn run_consumer(
     hooks: &'static HookPipe<'static>,
     raw: &'static Lane<RawRecord>,
 ) {
+    let clock = SystemClock;
     let mut consumer = Consumer::default();
+    let mut monitor = Monitor::new(&PHYSICAL, &SystemAsyncKeys, &clock, &session::SIGNALS);
     while !shared.shutdown.load(Ordering::SeqCst) {
         let drained = catch_unwind(AssertUnwindSafe(|| {
-            consumer.drain(&shared, hooks, raw, &WinForeground, &mut |candidate| {
+            let handled = consumer.drain(&shared, hooks, raw, &WinForeground, &mut |candidate| {
                 enqueue(&shared, candidate)
-            })
+            });
+            (handled, monitor.tick(&shared))
         }));
-        let handled = match drained {
-            Ok(handled) => handled,
+        let (handled, next) = match drained {
+            Ok(drained) => drained,
             Err(_) => {
                 tracing::error!(event = "input.consumer_panic");
                 consumer.reset();
                 shared.generation.fetch_add(1, Ordering::SeqCst);
-                1
+                (1, None)
             }
         };
         if handled == 0 {
-            std::thread::park_timeout(IDLE_PARK);
+            let wait = next.map_or(IDLE_PARK, |due| {
+                due.saturating_duration_since(clock.now()).min(IDLE_PARK)
+            });
+            std::thread::park_timeout(wait);
         }
     }
     rawinput::close_window();
 }
 
-/// Creates both lanes, starts the consumer, then the RawInput detector
-/// (which also starts the UIA protection sampler) and the hook thread.
+/// Creates both lanes, starts the consumer and the session window, then the
+/// RawInput detector (which also starts the UIA protection sampler) and the
+/// hook thread.
 pub(crate) fn start_input_sources(shared: Arc<Shared>) -> Result<(), String> {
     let hooks = hook::pipe(test_input_enabled());
     let raw = rawinput::lane();
@@ -290,6 +363,7 @@ pub(crate) fn start_input_sources(shared: Arc<Shared>) -> Result<(), String> {
         .spawn(move || run_consumer(consumer_shared, hooks, raw))
         .map_err(|error| format!("Input consumer could not start: {error}"))?;
     CONSUMER.set(consumer.thread().clone()).ok();
+    session::start();
     rawinput::start(shared)?;
     hook::spawn_hooks();
     Ok(())

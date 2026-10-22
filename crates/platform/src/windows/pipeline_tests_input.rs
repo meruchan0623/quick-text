@@ -13,14 +13,16 @@ use super::hook::{
     classify, handle_key, handle_mouse, HookAction, HookPipe, HookRecord, KeyInfo, KeyRecord,
     MouseInfo, Origin,
 };
-use super::input::{Consumer, Lane};
-use super::keystate::KeyBits;
+use super::input::{Consumer, Lane, Monitor, RESYNC_SECOND_PASS};
+use super::keystate::{AsyncKeyProbe, KeyBits, MODIFIER_VERIFY_AFTER};
 use super::rawinput::{raw_record, InputEvent, RawRecord, KEYBOARD_LAYOUT_CACHE_INTERVAL};
+use super::session::{SessionSignals, Signal};
 use super::*;
-use crate::mock::MockForeground;
-use crate::traits::{ForegroundProbe, InputContext};
+use crate::mock::{FakeClock, MockForeground};
+use crate::traits::{Clock, ForegroundProbe, InputContext};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{MutexGuard, PoisonError};
 
 const FOCUS: u64 = 0x2a;
@@ -223,6 +225,43 @@ fn drain(
 }
 fn records(hooks: &HookPipe) -> Vec<HookRecord> {
     std::iter::from_fn(|| hooks.lane().pop()).collect()
+}
+/// Types `word` as hardware keys through the RawInput lane.
+fn type_word(
+    shared: &Shared,
+    keys: &KeyBits,
+    lane: &Lane<RawRecord>,
+    probe: &impl ForegroundProbe,
+    word: &str,
+) {
+    for ch in word.chars() {
+        assert!(raw_key(shared, keys, lane, probe, ch));
+    }
+}
+/// Fake asynchronous key state: the listed codes are down; reads counted.
+#[derive(Default)]
+struct FakeAsyncKeys {
+    down: Mutex<Vec<u16>>,
+    reads: AtomicUsize,
+}
+impl FakeAsyncKeys {
+    fn with(down: &[u16]) -> Self {
+        let keys = Self::default();
+        keys.set(down);
+        keys
+    }
+    fn set(&self, down: &[u16]) {
+        *self.down.lock().unwrap() = down.to_vec();
+    }
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+}
+impl AsyncKeyProbe for FakeAsyncKeys {
+    fn down(&self, vk: u16) -> bool {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.down.lock().unwrap().contains(&vk)
+    }
 }
 
 #[test]
@@ -636,4 +675,145 @@ fn our_own_tagged_input_never_enters_the_detection_buffer() {
         }
         assert!(shared.generation.load(Ordering::SeqCst) > before + 1);
     }
+}
+
+/// S-05: Ctrl goes down and its key-up is lost. Expansion is refused (a
+/// chord is held) until the 30 s check on the fake clock finds Ctrl up in
+/// the asynchronous key state and heals the mirror.
+#[test]
+fn a_lost_ctrl_key_up_heals_after_thirty_seconds() {
+    let _serial = serial();
+    let shared = engine("btw");
+    let keys = leaked_keys();
+    let hooks = HookPipe::new(keys, 16, false, nothing);
+    let raw = Lane::new(16, nothing);
+    let probe = MockForeground::new(window());
+    let clock = FakeClock::new();
+    let released = FakeAsyncKeys::default();
+    let signals = SessionSignals::new();
+    let mut monitor = Monitor::new(keys, &released, &clock, &signals);
+    let mut consumer = Consumer::default();
+    handle_key(&hooks, &shared, &probe, WM_KEYDOWN, hardware(VK_LCONTROL));
+    assert!(drain(&mut consumer, &shared, &hooks, &raw, &probe).is_empty());
+    assert_eq!(
+        monitor.tick(&shared),
+        Some(clock.now() + MODIFIER_VERIFY_AFTER)
+    );
+    type_word(&shared, keys, &raw, &probe, "btw");
+    assert!(
+        drain(&mut consumer, &shared, &hooks, &raw, &probe).is_empty(),
+        "Ctrl+B, Ctrl+T, Ctrl+W are shortcuts, not text"
+    );
+    clock.advance(MODIFIER_VERIFY_AFTER - Duration::from_millis(1));
+    monitor.tick(&shared);
+    assert!(keys.held(VK_CONTROL));
+    assert_eq!(released.reads(), 0, "not verified before 30 s");
+    clock.advance(Duration::from_millis(1));
+    let (next, lines) = capture::logs(|| monitor.tick(&shared));
+    assert_eq!(next, None, "nothing left to watch");
+    assert_eq!(
+        count_of(&lines, "event=\"keystate.heal\" modifier=\"lctrl\""),
+        1,
+        "{lines:?}"
+    );
+    assert_eq!(released.reads(), 1, "only the stuck modifier is probed");
+    assert!(!keys.held(VK_CONTROL));
+    type_word(&shared, keys, &raw, &probe, "btw");
+    assert_eq!(drain(&mut consumer, &shared, &hooks, &raw, &probe).len(), 1);
+}
+
+/// S-05: a modifier the user really holds is verified, kept and checked
+/// again 30 s later; the probe is never consulted while nothing is held.
+#[test]
+fn a_ctrl_really_held_survives_the_check() {
+    let _serial = serial();
+    let shared = engine("btw");
+    let keys = leaked_keys();
+    let hooks = HookPipe::new(keys, 16, false, nothing);
+    let probe = FixedProbe(context());
+    let clock = FakeClock::new();
+    let held = FakeAsyncKeys::with(&[VK_RCONTROL]);
+    let signals = SessionSignals::new();
+    let mut monitor = Monitor::new(keys, &held, &clock, &signals);
+    assert_eq!(monitor.tick(&shared), None);
+    handle_key(&hooks, &shared, &probe, WM_KEYDOWN, hardware(VK_RCONTROL));
+    monitor.tick(&shared);
+    clock.advance(MODIFIER_VERIFY_AFTER);
+    assert_eq!(
+        monitor.tick(&shared),
+        Some(clock.now() + MODIFIER_VERIFY_AFTER)
+    );
+    assert!(keys.held(VK_CONTROL));
+    assert_eq!(held.reads(), 1);
+    handle_key(&hooks, &shared, &probe, WM_KEYUP, hardware(VK_RCONTROL));
+    assert_eq!(monitor.tick(&shared), None);
+    assert_eq!(held.reads(), 1, "a normal release needs no probe");
+}
+
+/// S-05: Win+L locks the session; the Win key-up happens on the secure
+/// desktop and the hook never sees it. Unlock resyncs at once, so a
+/// trigger works immediately instead of after the 30 s check. A second
+/// resync 200 ms later only refreshes the mirror and does not break a word
+/// typed across it.
+#[test]
+fn after_an_unlock_a_trigger_works_immediately() {
+    let _serial = serial();
+    let shared = engine("btw");
+    let keys = leaked_keys();
+    let hooks = HookPipe::new(keys, 16, false, nothing);
+    let raw = Lane::new(16, nothing);
+    let probe = MockForeground::new(window());
+    let clock = FakeClock::new();
+    let async_keys = FakeAsyncKeys::with(&[VK_LWIN]);
+    let signals = SessionSignals::new();
+    let mut monitor = Monitor::new(keys, &async_keys, &clock, &signals);
+    let mut consumer = Consumer::default();
+    handle_key(&hooks, &shared, &probe, WM_KEYDOWN, hardware(VK_LWIN));
+    handle_key(&hooks, &shared, &probe, WM_KEYDOWN, hardware(0x4c));
+    drain(&mut consumer, &shared, &hooks, &raw, &probe);
+    monitor.tick(&shared);
+    // Lock: Win is still physically down when the first resync runs.
+    signals.raise(Signal::Lock);
+    let before = shared.generation.load(Ordering::SeqCst);
+    let (_, lines) = capture::logs(|| monitor.tick(&shared));
+    assert_eq!(count_of(&lines, "signal=\"lock\""), 1, "{lines:?}");
+    assert!(keys.held(VK_LWIN));
+    assert_eq!(shared.generation.load(Ordering::SeqCst), before + 1);
+    // Released on the secure desktop; unlock 10 s later (before any 30 s
+    // check could help).
+    async_keys.set(&[]);
+    clock.advance(Duration::from_secs(10));
+    signals.raise(Signal::Unlock);
+    let (next, lines) = capture::logs(|| monitor.tick(&shared));
+    assert_eq!(
+        count_of(&lines, "event=\"session.signal\" signal=\"unlock\""),
+        1
+    );
+    assert_eq!(
+        count_of(&lines, "event=\"keystate.resync\" pass=\"first\""),
+        1
+    );
+    assert_eq!(next, Some(clock.now() + RESYNC_SECOND_PASS));
+    assert!(!keys.held(VK_LWIN) && !keys.held(0x4c));
+    type_word(&shared, keys, &raw, &probe, "btw");
+    assert_eq!(
+        drain(&mut consumer, &shared, &hooks, &raw, &probe).len(),
+        1,
+        "the first word after the unlock expands"
+    );
+    // A word typed across the second pass still expands.
+    type_word(&shared, keys, &raw, &probe, "bt");
+    drain(&mut consumer, &shared, &hooks, &raw, &probe);
+    clock.advance(RESYNC_SECOND_PASS - Duration::from_millis(1));
+    let (_, lines) = capture::logs(|| monitor.tick(&shared));
+    assert_eq!(count_of(&lines, "keystate.resync"), 0, "not yet");
+    clock.advance(Duration::from_millis(1));
+    let (next, lines) = capture::logs(|| monitor.tick(&shared));
+    assert_eq!(
+        count_of(&lines, "event=\"keystate.resync\" pass=\"second\""),
+        1
+    );
+    assert_eq!(next, None);
+    type_word(&shared, keys, &raw, &probe, "w");
+    assert_eq!(drain(&mut consumer, &shared, &hooks, &raw, &probe).len(), 1);
 }
