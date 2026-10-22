@@ -79,7 +79,15 @@ impl EraseModel {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal grapheme segmentation (UAX #29 subset: GB3-GB5, GB9-GB9b, GB11-GB13)
+// Approximate grapheme segmentation
+//
+// All rules of UAX #29 are implemented (GB3-GB13), but the property tables are small
+// hand-written subsets of the Unicode data (common Extend, Prepend, SpacingMark and
+// Extended_Pictographic ranges, the Hangul Jamo blocks and the precomposed Hangul
+// syllables). It is good enough to show how the erase models diverge. It is NOT
+// authoritative: the first-release planner (`plan_undo_invariant`) does not depend on
+// it for soundness, it only accepts the whitelist in `is_simple_scalar`. A real
+// implementation of a per-app model table must use `unicode-segmentation`.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +101,16 @@ enum Gcb {
     Prepend,
     SpacingMark,
     ExtPict,
+    /// Hangul leading consonant (Jamo L).
+    L,
+    /// Hangul vowel (Jamo V).
+    V,
+    /// Hangul trailing consonant (Jamo T).
+    T,
+    /// Precomposed Hangul syllable without a trailing consonant.
+    Lv,
+    /// Precomposed Hangul syllable with a trailing consonant.
+    Lvt,
     Other,
 }
 
@@ -116,6 +134,22 @@ fn gcb(c: char) -> Gcb {
     }
     if (0x1F1E6..=0x1F1FF).contains(&u) {
         return Gcb::Ri;
+    }
+    if in_any(u, &[(0x1100, 0x115F), (0xA960, 0xA97C)]) {
+        return Gcb::L;
+    }
+    if in_any(u, &[(0x1160, 0x11A7), (0xD7B0, 0xD7C6)]) {
+        return Gcb::V;
+    }
+    if in_any(u, &[(0x11A8, 0x11FF), (0xD7CB, 0xD7FB)]) {
+        return Gcb::T;
+    }
+    if (0xAC00..=0xD7A3).contains(&u) {
+        return if (u - 0xAC00).is_multiple_of(28) {
+            Gcb::Lv
+        } else {
+            Gcb::Lvt
+        };
     }
     const EXTEND: &[(u32, u32)] = &[
         (0x0300, 0x036F),
@@ -188,11 +222,14 @@ fn gcb(c: char) -> Gcb {
 }
 
 fn is_break(prev: Gcb, cur: Gcb, pict_state: u8, ri_run: usize) -> bool {
-    use Gcb::{Control, Cr, ExtPict, Extend, Lf, Prepend, Ri, SpacingMark, Zwj};
+    use Gcb::{Control, Cr, ExtPict, Extend, Lf, Lv, Lvt, Prepend, Ri, SpacingMark, Zwj, L, T, V};
     match (prev, cur) {
         (Cr, Lf) => false,                        // GB3
         (Control | Cr | Lf, _) => true,           // GB4
         (_, Control | Cr | Lf) => true,           // GB5
+        (L, L | V | Lv | Lvt) => false,           // GB6
+        (Lv | V, V | T) => false,                 // GB7
+        (Lvt | T, T) => false,                    // GB8
         (_, Extend | Zwj | SpacingMark) => false, // GB9, GB9a
         (Prepend, _) => false,                    // GB9b
         (_, ExtPict) if pict_state == 2 => false, // GB11
@@ -351,6 +388,14 @@ enum Refusal {
         emoji: usize,
         grapheme: usize,
     },
+    /// First release: this scalar of the expansion (or terminator) is not on the whitelist
+    /// (`is_simple_scalar`), so no claim is made about how a target erases it.
+    UnsupportedText(char),
+    /// First release: the text before the abbreviation is unknown, so a join between it and
+    /// the expansion cannot be ruled out.
+    UnknownContext,
+    /// First release: the last scalar before the abbreviation is not on the whitelist.
+    UnsupportedContext(char),
 }
 
 impl fmt::Display for Refusal {
@@ -375,6 +420,20 @@ impl fmt::Display for Refusal {
             Refusal::JunctionRisk => write!(
                 f,
                 "preceding text unknown and the expansion starts with a combining/joining/regional-indicator scalar"
+            ),
+            Refusal::UnsupportedText(c) => write!(
+                f,
+                "U+{:04X} is not on the first-release whitelist (plain letters, CJK, Hangul syllables, single emoticons); no claim about how targets erase it",
+                u32::from(*c)
+            ),
+            Refusal::UnknownContext => write!(
+                f,
+                "preceding text unknown; a join with the expansion cannot be ruled out (pass --preceding)"
+            ),
+            Refusal::UnsupportedContext(c) => write!(
+                f,
+                "the scalar before the abbreviation, U+{:04X}, is not on the whitelist; it might fuse with the expansion",
+                u32::from(*c)
             ),
             Refusal::ModelDependent { codepoint, emoji, grapheme } => write!(
                 f,
@@ -474,12 +533,87 @@ const MODERN_MODELS: [EraseModel; 3] = [
     EraseModel::Grapheme,
 ];
 
-/// Conservative variant for the first release of B-34: the undo is only planned when
-/// the answer is the same under all of `MODERN_MODELS`, so it is right in any target
-/// without knowing which model that target uses. Text with combining marks, ZWJ
-/// sequences, flags, skin tones or keycaps is refused (`ModelDependent`) until a
-/// per-app model table exists (S-29 measurements).
+/// Scalars on the first-release whitelist, written by hand from the Unicode blocks and
+/// deliberately independent of `gcb`. Everything here is a "simple" scalar: it never
+/// takes part in a join with a neighbouring simple scalar.
+///
+/// * printable ASCII (U+0020-U+007E)
+/// * Latin-1 letters and symbols, without (c), (r) and the soft hyphen
+/// * Latin Extended-A/B, Greek, Cyrillic (without the combining range U+0483-U+0489)
+/// * CJK punctuation, Hiragana, Katakana, CJK ideographs, fullwidth ASCII forms
+/// * precomposed Hangul syllables (no conjoining Jamo, no Hangul filler)
+/// * the single-scalar emoticons U+1F600-U+1F64F
+///
+/// Missing on purpose: every combining mark, variation selector, ZWJ, Prepend and
+/// SpacingMark scalar, Hangul Jamo, regional indicators, skin-tone modifiers, keycap
+/// parts and the other pictographs (all of which can start or join a sequence), and the
+/// scripts (Arabic, Hebrew, Thai, Indic ...) whose clusters were not measured.
+const SIMPLE_RANGES: &[(u32, u32)] = &[
+    (0x0020, 0x007E),
+    (0x00A0, 0x00A8),
+    (0x00AA, 0x00AC),
+    (0x00AF, 0x00FF),
+    (0x0100, 0x024F),
+    (0x0370, 0x03FF),
+    (0x0400, 0x0482),
+    (0x048A, 0x04FF),
+    (0x3000, 0x3003),
+    (0x3005, 0x3011),
+    (0x3041, 0x3096),
+    (0x309D, 0x309F),
+    (0x30A1, 0x30FF),
+    (0x3400, 0x4DBF),
+    (0x4E00, 0x9FFF),
+    (0xAC00, 0xD7A3),
+    (0xFF01, 0xFF5E),
+    (0x1F600, 0x1F64F),
+];
+
+/// Whether `c` is on the first-release whitelist (see `SIMPLE_RANGES`), plus Tab and
+/// line feed, which UAX #29 always separates (GB4, GB5) and the engine types as one key.
+///
+/// Soundness, independent of any segmenter: in UAX #29 every rule that forbids a break
+/// between two scalars needs a CR, a conjoining Hangul Jamo, an Extend, ZWJ, SpacingMark
+/// or Prepend scalar, or a regional indicator (GB3, GB6-GB9c, GB12, GB13), or a ZWJ
+/// (GB11); the conjunct Linker of GB9c is itself an Extend scalar. None of those is
+/// simple, and the Hangul syllables only join a following Jamo V or T. So between two simple scalars there is always a boundary: every simple
+/// scalar is its own grapheme cluster, its own emoji unit and its own code point, and
+/// all three models count the same.
+fn is_simple_scalar(c: char) -> bool {
+    matches!(c, '\t' | '\n') || in_any(u32::from(c), SIMPLE_RANGES)
+}
+
+/// Conservative variant for the first release of B-34. The undo is planned only when
+/// the deletion count cannot depend on the target's Backspace model, which is decided
+/// by a whitelist of scalars proven not to join (`is_simple_scalar`), never by running
+/// a segmenter over the text:
+///
+/// * every scalar of the expansion and the terminator must be simple;
+/// * the text before the abbreviation must be known and end in a simple scalar (a
+///   Prepend scalar, a CR, or a Hangul Jamo there could fuse with the expansion).
+///
+/// Anything else is refused until a per-app model table exists (S-29 measurements).
+/// The three-model comparison below is a second, redundant check; for whitelisted text
+/// it cannot disagree.
 fn plan_undo_invariant(req: &UndoRequest<'_>, policy: &Policy) -> Result<UndoPlan, Refusal> {
+    let typed = normalize_line_breaks(req.expansion);
+    if let Some(c) = typed
+        .chars()
+        .chain(req.terminator)
+        .find(|c| !is_simple_scalar(*c))
+    {
+        return Err(Refusal::UnsupportedText(c));
+    }
+    match req.preceding {
+        None => return Err(Refusal::UnknownContext),
+        Some(preceding) => {
+            if let Some(c) = preceding.chars().next_back() {
+                if !is_simple_scalar(c) {
+                    return Err(Refusal::UnsupportedContext(c));
+                }
+            }
+        }
+    }
     let mut plans = Vec::with_capacity(MODERN_MODELS.len());
     for model in MODERN_MODELS {
         plans.push(plan_undo(&UndoRequest { model, ..*req }, policy)?);
@@ -620,7 +754,7 @@ fn run_cli(args: &[String]) -> Result<(), String> {
     }
     match plan_undo_invariant(&base, &policy) {
         Ok(plan) => println!(
-            "invariant (codepoint/emoji/grapheme agree): extra_backspaces={} retype={:?}",
+            "invariant (whitelisted text, known context): extra_backspaces={} retype={:?}",
             plan.extra_backspaces, plan.retype
         ),
         Err(why) => println!("invariant: refused: {why}"),
@@ -696,6 +830,20 @@ fn demo() {
         Case {
             label: "cafe + U+0301",
             expansion: "cafe\u{301}",
+            trigger: TriggerMode::Immediate,
+            terminator: None,
+            consume: true,
+        },
+        Case {
+            label: "Hangul jamo L+V",
+            expansion: "\u{1100}\u{1161}",
+            trigger: TriggerMode::Immediate,
+            terminator: None,
+            consume: true,
+        },
+        Case {
+            label: "Hangul syllables",
+            expansion: "\u{D55C}\u{AE00}",
             trigger: TriggerMode::Immediate,
             terminator: None,
             consume: true,
@@ -941,6 +1089,29 @@ mod tests {
         "\u{4E2D}",
         "\u{94D}",
         "\u{600}",
+        "\n",
+        "\r\n",
+        "\u{1100}", // Hangul Jamo L
+        "\u{1161}", // Hangul Jamo V
+        "\u{11A8}", // Hangul Jamo T
+        "\u{AC00}", // Hangul syllable LV
+        "\u{D55C}", // Hangul syllable LVT
+    ];
+    /// Only simple scalars (see `is_simple_scalar`): every text built from these is accepted
+    /// by the invariant planner when the context is simple too.
+    const SIMPLE_ATOMS: &[&str] = &[
+        "a",
+        "b",
+        " ",
+        ";",
+        "1",
+        "\u{E9}",
+        "\u{416}",
+        "\u{3B1}",
+        "\u{4E2D}",
+        "\u{D55C}",
+        "\u{AC00}",
+        "\u{1F600}",
         "\n",
         "\r\n",
     ];
@@ -1254,36 +1425,195 @@ mod tests {
     }
 
     #[test]
-    fn invariant_plan_accepts_only_text_every_modern_target_agrees_on() {
+    fn invariant_plan_accepts_only_whitelisted_text() {
         let p = Policy::default();
-        let at = |text: &str| plan_undo_invariant(&req(";e", text, EraseModel::Grapheme), &p);
-        // Plain text and single-scalar emoji: same count under codepoint / emoji / grapheme.
-        assert_eq!(at("Best regards").expect("plan").extra_backspaces, 11);
-        assert_eq!(at("ok \u{1F600}").expect("plan").extra_backspaces, 3);
-        assert_eq!(at("\u{4E2D}\u{6587}").expect("plan").extra_backspaces, 1);
-        // Everything with a sequence is model dependent and refused.
+        let at = |text: &str| {
+            let mut r = req(";e", text, EraseModel::Grapheme);
+            r.preceding = Some("x ");
+            plan_undo_invariant(&r, &p)
+        };
+        let extra_of = |text: &str| at(text).expect("plan").extra_backspaces;
+        // Expected values are the scalar count minus the user's own Backspace, counted by hand.
+        assert_eq!(extra_of("Best regards"), 11);
+        assert_eq!(extra_of("caf\u{E9}"), 3);
+        assert_eq!(extra_of("ok \u{1F600}"), 3);
+        assert_eq!(extra_of("\u{4E2D}\u{6587}"), 1);
+        assert_eq!(extra_of("\u{D55C}\u{AE00}"), 1); // two precomposed Hangul syllables
         assert_eq!(
-            at("cafe\u{301}"),
-            Err(Refusal::ModelDependent {
-                codepoint: 4,
-                emoji: 4,
-                grapheme: 3
-            })
+            extra_of("\u{41F}\u{440}\u{438}\u{432}\u{435}\u{442}"),
+            5 // six Cyrillic letters
         );
-        assert!(matches!(
-            at("\u{1F468}\u{200D}\u{1F469}"),
-            Err(Refusal::ModelDependent { .. })
-        ));
-        assert!(matches!(
-            at("a\u{1F44D}\u{1F3FD}"),
-            Err(Refusal::ModelDependent { .. })
-        ));
-        assert!(matches!(
-            at("1\u{FE0F}\u{20E3}"),
-            Err(Refusal::ModelDependent { .. })
-        ));
-        // Underlying refusals still win over the invariance check.
+        // Everything that can join is refused, naming the first offending scalar.
+        for (text, bad) in [
+            ("cafe\u{301}", '\u{301}'),                   // combining acute
+            ("\u{1100}\u{1161}", '\u{1100}'),             // Hangul Jamo L + V: one cluster
+            ("a\u{1161}", '\u{1161}'),                    // lone Jamo V
+            ("a\u{11A8}", '\u{11A8}'),                    // lone Jamo T
+            ("\u{600}a", '\u{600}'),                      // Prepend
+            ("\u{915}\u{903}", '\u{915}'),                // Devanagari: not measured
+            ("\u{1F1EF}\u{1F1F5}\u{1F1FA}", '\u{1F1EF}'), // three regional indicators
+            ("\u{1F468}\u{200D}\u{1F469}", '\u{1F468}'),  // ZWJ sequence
+            ("a\u{200D}\u{1F600}", '\u{200D}'),           // stray ZWJ
+            ("a\u{FE0F}", '\u{FE0F}'),                    // variation selector
+            ("\u{1F44D}\u{1F3FD}", '\u{1F44D}'),          // skin tone
+            ("1\u{FE0F}\u{20E3}", '\u{FE0F}'),            // keycap
+            ("\u{A9}", '\u{A9}'),                         // (c) is Extended_Pictographic
+        ] {
+            assert_eq!(at(text), Err(Refusal::UnsupportedText(bad)), "{text:?}");
+        }
+        // Underlying refusals still win over the whitelist for text that passes it.
         assert_eq!(at(""), Err(Refusal::Empty));
+        // A terminator is held to the same standard.
+        let mut r = req(";e", "abc", EraseModel::Grapheme);
+        r.preceding = Some("x ");
+        r.trigger = TriggerMode::Terminator;
+        r.terminator = Some('\u{301}');
+        assert_eq!(
+            plan_undo_invariant(&r, &p),
+            Err(Refusal::UnsupportedText('\u{301}'))
+        );
+    }
+
+    #[test]
+    fn invariant_plan_needs_known_simple_context() {
+        let p = Policy::default();
+        let plan = |preceding: Option<&str>| {
+            let mut r = req(";e", "abc", EraseModel::Grapheme);
+            r.preceding = preceding;
+            plan_undo_invariant(&r, &p).map(|plan| plan.extra_backspaces)
+        };
+        assert_eq!(plan(Some("")), Ok(2)); // empty field
+        assert_eq!(plan(Some("x ")), Ok(2));
+        assert_eq!(plan(Some("line\n")), Ok(2));
+        assert_eq!(plan(None), Err(Refusal::UnknownContext));
+        // A Prepend scalar, a CR or a Jamo before the abbreviation can fuse with the expansion.
+        assert_eq!(
+            plan(Some("\u{600}")),
+            Err(Refusal::UnsupportedContext('\u{600}'))
+        );
+        assert_eq!(plan(Some("x\r")), Err(Refusal::UnsupportedContext('\r')));
+        assert_eq!(
+            plan(Some("\u{1100}")),
+            Err(Refusal::UnsupportedContext('\u{1100}'))
+        );
+        assert_eq!(
+            plan(Some("e\u{301}")),
+            Err(Refusal::UnsupportedContext('\u{301}'))
+        );
+    }
+
+    #[test]
+    fn hangul_jamo_is_one_cluster_and_must_not_be_approved() {
+        // U+1100 U+1161 is L + V: two scalars, ONE grapheme cluster (UAX #29 GB6).
+        let jamo = "\u{1100}\u{1161}";
+        let p = Policy::default();
+        let mut r = req(";h", jamo, EraseModel::Grapheme);
+        r.preceding = Some("x ");
+        // Hand-computed. After the expansion the user presses Backspace once: a target that
+        // deletes by grapheme removes both Jamo, so nothing more is needed; a target that
+        // deletes by scalar needs one more press.
+        assert_eq!(extra(&r, &p), 0);
+        r.model = EraseModel::CodePoint;
+        assert_eq!(extra(&r, &p), 1);
+        // Sending the scalar count to a grapheme target eats the user's space.
+        let scalar_plan = plan_undo(&r, &p).expect("plan");
+        let grapheme_target = UndoRequest {
+            model: EraseModel::Grapheme,
+            ..r
+        };
+        let (got, want) = simulate(&grapheme_target, &scalar_plan, "x ", false);
+        assert_eq!(String::from_utf16_lossy(&got), "x;h");
+        assert_eq!(String::from_utf16_lossy(&want), "x ;h");
+        // The invariant planner must therefore refuse it.
+        assert_eq!(
+            plan_undo_invariant(&r, &p),
+            Err(Refusal::UnsupportedText('\u{1100}'))
+        );
+    }
+
+    #[test]
+    fn whitelist_boundaries() {
+        for c in [
+            'a',
+            ' ',
+            '~',
+            '\u{A0}',
+            '\u{E9}',
+            '\u{FF}',
+            '\u{100}',
+            '\u{24F}',
+            '\u{3B1}',
+            '\u{416}',
+            '\u{482}',
+            '\u{48A}',
+            '\u{3000}',
+            '\u{3042}',
+            '\u{30AB}',
+            '\u{4E2D}',
+            '\u{FF21}',
+            '\u{AC00}',
+            '\u{D55C}',
+            '\u{D7A3}',
+            '\u{1F600}',
+            '\u{1F64F}',
+            '\t',
+            '\n',
+        ] {
+            assert!(is_simple_scalar(c), "{c:?} should be simple");
+        }
+        for c in [
+            '\0',
+            '\r',
+            '\u{7F}',
+            '\u{A9}',
+            '\u{AD}',
+            '\u{AE}',
+            '\u{300}',
+            '\u{36F}',
+            '\u{483}',
+            '\u{489}',
+            '\u{600}',
+            '\u{903}',
+            '\u{915}',
+            '\u{1100}',
+            '\u{1161}',
+            '\u{11A8}',
+            '\u{200B}',
+            '\u{200C}',
+            '\u{200D}',
+            '\u{20E3}',
+            '\u{3004}',
+            '\u{3099}',
+            '\u{309A}',
+            '\u{D7B0}',
+            '\u{FE0F}',
+            '\u{FF9E}',
+            '\u{1F1E6}',
+            '\u{1F3FB}',
+            '\u{1F44D}',
+            '\u{1F468}',
+            '\u{1F650}',
+            '\u{E0020}',
+        ] {
+            assert!(!is_simple_scalar(c), "{c:?} must not be simple");
+        }
+    }
+
+    #[test]
+    fn simple_scalars_carry_no_joining_class_in_the_segmenter_tables() {
+        for &(lo, hi) in SIMPLE_RANGES {
+            for u in lo..=hi {
+                let Some(c) = char::from_u32(u) else { continue };
+                let class = gcb(c);
+                let emoticon = (0x1F600..=0x1F64F).contains(&u) && class == Gcb::ExtPict;
+                let syllable =
+                    (0xAC00..=0xD7A3).contains(&u) && matches!(class, Gcb::Lv | Gcb::Lvt);
+                assert!(
+                    class == Gcb::Other || emoticon || syllable,
+                    "U+{u:04X} is {class:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1294,9 +1624,15 @@ mod tests {
         for crlf in [false, true] {
             for (trigger, terminator, consume) in TRIGGERS {
                 for _ in 0..2500 {
-                    let prefix = rng.text(ATOMS, 4);
+                    // Half of the corpus is simple text, so that plenty of plans are accepted.
+                    let pool = if rng.next().is_multiple_of(2) {
+                        SIMPLE_ATOMS
+                    } else {
+                        ATOMS
+                    };
+                    let prefix = rng.text(pool, 4);
                     let abbreviation = rng.text(&["a", "b", ";", "x"], 3);
-                    let expansion = rng.text(ATOMS, 6);
+                    let expansion = rng.text(pool, 6);
                     let mut r = req(&abbreviation, &expansion, EraseModel::Grapheme);
                     r.trigger = trigger;
                     r.terminator = terminator;
@@ -1305,6 +1641,12 @@ mod tests {
                     match plan_undo_invariant(&r, &relaxed()) {
                         Ok(plan) => {
                             accepted += 1;
+                            // Independent of any segmenter: one unit per scalar.
+                            assert_eq!(
+                                plan.expansion_units,
+                                normalize_line_breaks(&expansion).chars().count(),
+                                "{expansion:?}"
+                            );
                             for model in MODERN_MODELS {
                                 let actual = UndoRequest { model, ..r };
                                 let (got, want) = simulate(&actual, &plan, &prefix, crlf);
@@ -1317,7 +1659,7 @@ mod tests {
             }
         }
         assert!(
-            accepted > 500 && refused > 500,
+            accepted > 2000 && refused > 2000,
             "accepted={accepted} refused={refused}"
         );
     }
@@ -1333,6 +1675,54 @@ mod tests {
         assert_eq!(clusters("\u{1F468}\u{200D}\u{1F469}").len(), 1);
         assert_eq!(clusters("\u{1F468}\u{200D}a").len(), 2);
         assert_eq!(clusters("1\u{FE0F}\u{20E3}").len(), 1);
+    }
+
+    /// Expected cluster counts are written out from the UAX #29 rules (GB4-GB13), not
+    /// computed by the segmenter under test.
+    #[test]
+    fn segmenter_follows_the_uax29_rules_the_first_version_skipped() {
+        let n = |s: &str| clusters(s).len();
+        // GB6-GB8: conjoining Hangul.
+        assert_eq!(n("\u{1100}\u{1161}"), 1); // L V
+        assert_eq!(n("\u{1100}\u{1161}\u{11A8}"), 1); // L V T
+        assert_eq!(n("\u{1100}\u{1100}"), 1); // L L
+        assert_eq!(n("\u{1100}\u{AC00}"), 1); // L LV
+        assert_eq!(n("\u{1100}\u{AC01}"), 1); // L LVT
+        assert_eq!(n("\u{AC00}\u{1161}"), 1); // LV V
+        assert_eq!(n("\u{AC00}\u{11A8}"), 1); // LV T
+        assert_eq!(n("\u{AC01}\u{11A8}"), 1); // LVT T
+        assert_eq!(n("\u{AC01}\u{1161}"), 2); // LVT V: no rule joins them
+        assert_eq!(n("\u{11A8}\u{1161}"), 2); // T V
+        assert_eq!(n("\u{1161}\u{1100}"), 2); // V L
+        assert_eq!(n("\u{D55C}\u{AE00}"), 2); // two syllables
+                                              // GB9b: Prepend joins whatever follows, but not a control (GB5).
+        assert_eq!(n("\u{600}a"), 1);
+        assert_eq!(n("a\u{600}"), 2);
+        assert_eq!(n("\u{600}\u{600}a"), 1);
+        assert_eq!(n("\u{600}\n"), 2);
+        // GB9, GB9a: Extend and SpacingMark attach to what precedes them.
+        assert_eq!(n("a\u{301}\u{301}"), 1);
+        assert_eq!(n("\u{915}\u{903}"), 1);
+        assert_eq!(n("\u{903}a"), 2);
+        // GB12, GB13: regional indicators pair up from the left.
+        let ri = |k: usize| "\u{1F1EF}".repeat(k);
+        assert_eq!(
+            [1, 2, 3, 4, 5].map(|k| n(&ri(k))),
+            [1, 1, 2, 2, 3] // 1 | 2 | 2+1 | 2+2 | 2+2+1
+        );
+        assert_eq!(n(&format!("a{}", ri(2))), 2);
+        assert_eq!(n(&format!("{}a", ri(2))), 2);
+        // GB11: ExtPict Extend* ZWJ x ExtPict, and nothing else.
+        assert_eq!(n("\u{1F468}\u{200D}\u{1F469}"), 1);
+        assert_eq!(n("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"), 1);
+        assert_eq!(n("\u{2764}\u{FE0F}\u{200D}\u{1F525}"), 1);
+        assert_eq!(n("\u{1F468}\u{1F3FD}\u{200D}\u{1F469}"), 1); // skin tone is Extend
+        assert_eq!(n("a\u{200D}\u{1F469}"), 2); // ZWJ after a non-pictograph
+        assert_eq!(n("\u{1F468}\u{200D}\u{200D}\u{1F469}"), 2); // second ZWJ is not Extend
+        assert_eq!(n("\u{1F468}\u{1F469}"), 2); // no ZWJ
+                                                // GB4, GB5: controls always separate.
+        assert_eq!(n("\r\r"), 2);
+        assert_eq!(n("\n\r"), 2);
     }
 
     #[test]
