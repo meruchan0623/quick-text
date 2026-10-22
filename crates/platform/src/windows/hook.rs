@@ -56,15 +56,7 @@ unsafe extern "system" fn keyboard(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
         return CallNextHookEx(std::ptr::null_mut(), code, w, l);
     }
     let down = w as u32 == WM_KEYDOWN || w as u32 == WM_SYSKEYDOWN;
-    if let Some(set) = PHYSICAL.get() {
-        if let Ok(mut set) = set.try_lock() {
-            if down {
-                set.insert(event.vkCode as u16);
-            } else {
-                set.remove(&(event.vkCode as u16));
-            }
-        }
-    }
+    PHYSICAL.set(event.vkCode as u16, down);
     if down && event.vkCode == VK_ESCAPE as u32 && physical(VK_CONTROL) && physical(VK_SHIFT) {
         shared.cancel.store(true, Ordering::SeqCst);
         shared.generation.fetch_add(1, Ordering::SeqCst);
@@ -108,48 +100,33 @@ unsafe extern "system" fn keyboard(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
 
     CallNextHookEx(std::ptr::null_mut(), code, w, l)
 }
+/// The mouse button (as a virtual-key code) a low-level mouse message
+/// presses or releases, if any.
+fn mouse_button(msg: u32, data: u32) -> Option<(u16, bool)> {
+    let x = if data >> 16 == 1 {
+        VK_XBUTTON1
+    } else {
+        VK_XBUTTON2
+    };
+    match msg {
+        WM_LBUTTONDOWN => Some((VK_LBUTTON, true)),
+        WM_LBUTTONUP => Some((VK_LBUTTON, false)),
+        WM_RBUTTONDOWN => Some((VK_RBUTTON, true)),
+        WM_RBUTTONUP => Some((VK_RBUTTON, false)),
+        WM_MBUTTONDOWN => Some((VK_MBUTTON, true)),
+        WM_MBUTTONUP => Some((VK_MBUTTON, false)),
+        WM_XBUTTONDOWN => Some((x, true)),
+        WM_XBUTTONUP => Some((x, false)),
+        _ => None,
+    }
+}
 unsafe extern "system" fn mouse(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     if code >= 0 {
         let ev = &*(l as *const MSLLHOOKSTRUCT);
         if ev.dwExtraInfo != MARK {
             if let Some(s) = ENGINE.get() {
-                if let Some(set) = PHYSICAL.get() {
-                    let mut set = set.lock().unwrap();
-                    match w as u32 {
-                        WM_LBUTTONDOWN => {
-                            set.insert(VK_LBUTTON);
-                        }
-                        WM_LBUTTONUP => {
-                            set.remove(&VK_LBUTTON);
-                        }
-                        WM_RBUTTONDOWN => {
-                            set.insert(VK_RBUTTON);
-                        }
-                        WM_RBUTTONUP => {
-                            set.remove(&VK_RBUTTON);
-                        }
-                        WM_MBUTTONDOWN => {
-                            set.insert(VK_MBUTTON);
-                        }
-                        WM_MBUTTONUP => {
-                            set.remove(&VK_MBUTTON);
-                        }
-                        WM_XBUTTONDOWN => {
-                            set.insert(if ev.mouseData >> 16 == 1 {
-                                VK_XBUTTON1
-                            } else {
-                                VK_XBUTTON2
-                            });
-                        }
-                        WM_XBUTTONUP => {
-                            set.remove(&if ev.mouseData >> 16 == 1 {
-                                VK_XBUTTON1
-                            } else {
-                                VK_XBUTTON2
-                            });
-                        }
-                        _ => {}
-                    }
+                if let Some((button, down)) = mouse_button(w as u32, ev.mouseData) {
+                    PHYSICAL.set(button, down);
                 }
                 // Pointer movement alone cannot move the caret; only clicks and
                 // wheel reset the typed-key buffer (as in espanso).
@@ -300,4 +277,26 @@ pub(super) fn spawn_hooks() {
             UnhookWindowsHookEx(mouse_hook);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mouse_buttons_map_to_virtual_keys() {
+        assert_eq!(mouse_button(WM_LBUTTONDOWN, 0), Some((VK_LBUTTON, true)));
+        assert_eq!(mouse_button(WM_RBUTTONUP, 0), Some((VK_RBUTTON, false)));
+        assert_eq!(mouse_button(WM_MBUTTONDOWN, 0), Some((VK_MBUTTON, true)));
+        assert_eq!(
+            mouse_button(WM_XBUTTONDOWN, 1 << 16),
+            Some((VK_XBUTTON1, true))
+        );
+        assert_eq!(
+            mouse_button(WM_XBUTTONUP, 2 << 16),
+            Some((VK_XBUTTON2, false))
+        );
+        assert_eq!(mouse_button(WM_MOUSEMOVE, 0), None);
+        assert_eq!(mouse_button(WM_MOUSEWHEEL, 120 << 16), None);
+    }
 }
