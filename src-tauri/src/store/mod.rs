@@ -24,11 +24,11 @@ use atomic::atomic_json;
 use meta::MetaHandle;
 use metadata::metadata_for_config;
 use quicker_domain::*;
-use quicker_platform::Shared;
+use quicker_platform::{health::PauseReasons, runtime::Runtime, Shared};
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{atomic::Ordering, Arc},
 };
 
 pub struct Store {
@@ -38,6 +38,10 @@ pub struct Store {
     previous: Option<Config>,
     disk_hash: Option<Vec<u8>>,
     pub engine: Arc<Shared>,
+    /// The runtime `engine` is attached to: the authority on pause reasons
+    /// and health (P5 item 2). `engine.paused` is only its derived value;
+    /// nothing in the shell writes it.
+    pub runtime: Arc<Runtime>,
     pub unresolved: Vec<MigrationItem>,
     active_unresolved: Vec<MigrationItem>,
     previous_unresolved: Vec<MigrationItem>,
@@ -97,6 +101,47 @@ impl Store {
             None => Ok(()),
         }
     }
+    /// `set_paused` and the tray toggle (contract §4): sets or clears
+    /// `PauseReasons::MANUAL` and nothing else, so with another reason still
+    /// set (recording, self-test, an engine that is not up) the engine stays
+    /// paused after a successful resume.
+    ///
+    /// A resume is refused in safe mode (`safe_mode`, plan §7.2) and while
+    /// the health does not accept it (`engine_unavailable` with that health,
+    /// B-03); `ready` is the platform's own live readiness test, asked last.
+    /// The refusal is feedback only: even a resume that raced a health
+    /// change cannot expand, because the runtime derives the gates' flag
+    /// from the health as well. Every change bumps the generation, and a
+    /// pause cancels the running task.
+    pub fn set_manual_pause(
+        &self,
+        paused: bool,
+        ready: impl FnOnce() -> bool,
+    ) -> Result<(), CommandError> {
+        if !paused {
+            self.ensure_writable()?;
+            let health = self.runtime.health().state;
+            if !health.accepts_resume() {
+                return Err(CommandError::EngineUnavailable { health });
+            }
+            if !ready() {
+                return Err(CommandError::engine_unavailable(
+                    "This platform input adapter is not ready; engine remains paused",
+                ));
+            }
+        }
+        self.runtime.set_pause(PauseReasons::MANUAL, paused);
+        self.engine.generation.fetch_add(1, Ordering::SeqCst);
+        if paused {
+            self.engine.cancel.store(true, Ordering::SeqCst);
+        }
+        tracing::info!(
+            event = "engine.manual_pause",
+            paused,
+            "manual pause changed"
+        );
+        Ok(())
+    }
     /// Runs `hook` once per session, the first time the store is writable:
     /// right away outside safe mode, otherwise when safe mode ends (the
     /// SafeMode(Locked) retry succeeds, or a published import leaves
@@ -118,21 +163,23 @@ impl Store {
             self.writable_hooks.push((key, hook));
         }
     }
-    /// The only place safe mode changes. The engine is never resumed here:
-    /// it starts paused and stays paused through safe mode.
-    // P1a: set/clear `PauseReasons::SAFE_MODE` here; P5: emit the change.
+    /// The only place safe mode changes, and with it
+    /// `PauseReasons::SAFE_MODE`. The engine is never resumed here: entering
+    /// also sets MANUAL (as the 0.3 flag did), and leaving clears only
+    /// SAFE_MODE, so the engine stays paused until the user resumes it.
+    /// Resuming is refused while in safe mode ([`Store::set_manual_pause`]).
     fn set_safe_mode(&mut self, reason: Option<SafeModeReason>) {
         if self.safe_mode == reason {
             return;
         }
         match reason {
             Some(reason) => {
-                self.engine
-                    .paused
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                self.runtime
+                    .set_pause(PauseReasons::SAFE_MODE.with(PauseReasons::MANUAL), true);
                 tracing::warn!(event = "store.safe_mode", ?reason, "safe mode active");
             }
             None => {
+                self.runtime.set_pause(PauseReasons::SAFE_MODE, false);
                 self.startup_problems
                     .retain(|p| !matches!(p.kind, ProblemKind::SafeMode { .. }));
                 tracing::info!(event = "store.safe_mode_exit", "safe mode ended");
@@ -225,6 +272,21 @@ impl Store {
 #[cfg(test)]
 mod test_support {
     use quicker_domain::*;
+    use quicker_platform::health::{HealthSnapshot, HealthState};
+
+    pub fn healthy() -> HealthSnapshot {
+        HealthSnapshot {
+            state: HealthState::Healthy,
+            components: vec![],
+        }
+    }
+    /// Brings a test store's engine to listening the way the app does: the
+    /// supervisor reports Healthy, then the user resumes (`set_paused`).
+    pub fn listening(store: &super::Store) {
+        store.runtime.publish_health(healthy());
+        store.set_manual_pause(false, || true).unwrap();
+        assert!(store.runtime.engine_state().listening);
+    }
 
     pub fn metadata_config(ids: &[&str]) -> Config {
         Config {
@@ -274,7 +336,70 @@ mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+    use quicker_platform::health::{HealthSnapshot, HealthState};
     use std::fs;
+    /// Contract §4: `set_paused` only sets or clears MANUAL. A resume is
+    /// refused while the engine is not up (with that health) or not ready;
+    /// with another reason still set it succeeds and stays paused.
+    #[test]
+    fn manual_pause_is_the_only_reason_set_paused_touches() {
+        let dir = std::env::temp_dir().join(format!("quicker-text-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::load(dir.clone());
+        assert_eq!(store.runtime.pause_reasons(), PauseReasons::MANUAL);
+        let generation = || store.engine.generation.load(Ordering::SeqCst);
+        // Starting: refused with the health that refused it, nothing changes.
+        let before = generation();
+        assert!(matches!(
+            store.set_manual_pause(false, || true),
+            Err(CommandError::EngineUnavailable {
+                health: HealthState::Starting
+            })
+        ));
+        assert_eq!(store.runtime.pause_reasons(), PauseReasons::MANUAL);
+        assert_eq!(generation(), before);
+        // Up but the platform adapter is not ready.
+        store.runtime.publish_health(healthy());
+        assert!(matches!(
+            store.set_manual_pause(false, || false),
+            Err(CommandError::EngineUnavailable {
+                health: HealthState::Failed
+            })
+        ));
+        assert!(store.engine.paused.load(Ordering::SeqCst));
+        // Resume while recording: MANUAL clears, the engine stays paused.
+        store.runtime.set_pause(PauseReasons::RECORDING, true);
+        store.set_manual_pause(false, || true).unwrap();
+        assert_eq!(store.runtime.pause_reasons(), PauseReasons::RECORDING);
+        assert!(!store.runtime.engine_state().listening);
+        assert!(store.engine.paused.load(Ordering::SeqCst));
+        assert_eq!(generation(), before + 1);
+        // Recording ends: listening.
+        store.runtime.set_pause(PauseReasons::RECORDING, false);
+        assert!(store.runtime.engine_state().listening);
+        assert!(!store.engine.paused.load(Ordering::SeqCst));
+        // A pause cancels the running task and leaves the other reasons alone.
+        store.engine.cancel.store(false, Ordering::SeqCst);
+        store.runtime.set_pause(PauseReasons::SELF_TEST, true);
+        store.set_manual_pause(true, || unreachable!()).unwrap();
+        assert!(store.engine.cancel.load(Ordering::SeqCst));
+        assert_eq!(
+            store.runtime.pause_reasons(),
+            PauseReasons::MANUAL.with(PauseReasons::SELF_TEST)
+        );
+        // The engine going down holds the flag without touching MANUAL.
+        store.runtime.set_pause(PauseReasons::SELF_TEST, false);
+        store.set_manual_pause(false, || true).unwrap();
+        store.runtime.publish_health(HealthSnapshot {
+            state: HealthState::Recovering,
+            components: vec![],
+        });
+        assert!(store.engine.paused.load(Ordering::SeqCst));
+        assert!(!store
+            .runtime
+            .pause_reasons()
+            .intersects(PauseReasons::USER_VISIBLE));
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn discard_import_restores_published_originals_after_reload() {
         let dir =

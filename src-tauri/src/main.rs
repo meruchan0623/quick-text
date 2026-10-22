@@ -59,10 +59,11 @@ fn main() {
             ));
             let store = store::Store::load(dir);
             let engine = store.engine.clone();
+            let runtime = store.runtime.clone();
             app.manage(Managed::new(store));
             startup::after_load(app.handle());
             tray::spawn_status_watcher(app.handle().clone(), engine.clone());
-            startup::start_engine(engine);
+            startup::start_engine(engine, runtime);
             tray::build(app)?;
             if std::env::args().any(|x| x == "--background") {
                 if let Some(w) = app.get_webview_window("main") {

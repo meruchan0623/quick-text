@@ -5,8 +5,8 @@ use crate::{
     startup::StartupProblem,
 };
 use quicker_domain::*;
-use quicker_platform::ExecutionResult;
-use std::sync::atomic::Ordering;
+use quicker_platform::{health::PauseReasons, runtime::Runtime, ExecutionResult, Shared};
+use std::sync::{atomic::Ordering, PoisonError};
 use tauri::{Manager, State};
 
 #[tauri::command]
@@ -18,34 +18,16 @@ pub fn load_state(store: State<Managed>) -> Result<AppState, CommandError> {
 pub fn startup_problems(store: State<Managed>) -> Vec<StartupProblem> {
     store.lock().startup_problems().to_vec()
 }
+/// Sets or clears the manual pause reason only (contract §4). Other reasons
+/// (safe mode, recording, self-test, the engine not up) keep the engine
+/// paused, so `set_paused(false)` may return a paused state. A resume is
+/// refused with `safe_mode` in safe mode and `engine_unavailable` while the
+/// supervisor's health does not accept it; a resume during a recording
+/// clears MANUAL and stays paused until the recording stops.
 #[tauri::command]
 pub fn set_paused(paused: bool, store: State<Managed>) -> Result<AppState, CommandError> {
     let s = store.lock();
-    if !paused {
-        // Safe mode keeps the engine paused (B-04).
-        s.ensure_writable()?;
-        if s.engine.recording.lock().unwrap().is_some() {
-            // Recording owns the input until it stops.
-            return Err(CommandError::Busy);
-        }
-        // Resume follows the supervisor's health (B-03): one snapshot read,
-        // the same test as `runtime::accepts_resume()`, so the error carries
-        // the state that refused it.
-        let health = quicker_platform::runtime::current_health().state;
-        if !health.accepts_resume() {
-            return Err(CommandError::EngineUnavailable { health });
-        }
-    }
-    if !paused && !quicker_platform::engine_ready() {
-        return Err(CommandError::engine_unavailable(
-            "This platform input adapter is not ready; engine remains paused",
-        ));
-    }
-    s.engine.paused.store(paused, Ordering::SeqCst);
-    s.engine.generation.fetch_add(1, Ordering::SeqCst);
-    if paused {
-        s.engine.cancel.store(true, Ordering::SeqCst)
-    }
+    s.set_manual_pause(paused, quicker_platform::engine_ready)?;
     Ok(s.state())
 }
 #[tauri::command]
@@ -124,20 +106,79 @@ pub async fn execute_action(
     }
     result.map_err(CommandError::internal)?
 }
+/// Opens a recording session. Detection pauses through the `Recording`
+/// reason before the session opens and for as long as it stays open.
 #[tauri::command]
 pub fn start_recording(store: State<Managed>) -> Result<(), CommandError> {
-    if store.lock().engine.busy.load(Ordering::SeqCst) {
-        return Err(CommandError::Busy);
-    }
-    quicker_platform::start_recording(&store.lock().engine).map_err(CommandError::internal)
+    let (engine, runtime) = {
+        let s = store.lock();
+        if s.engine.busy.load(Ordering::SeqCst) {
+            return Err(CommandError::Busy);
+        }
+        (s.engine.clone(), s.runtime.clone())
+    };
+    runtime.set_pause(PauseReasons::RECORDING, true);
+    let started = quicker_platform::start_recording(&engine).map_err(CommandError::internal);
+    sync_recording_reason(&runtime, &engine);
+    started
 }
+/// Closes the recording session and returns what it captured. The
+/// `Recording` reason clears with it, so the engine goes back to what the
+/// other reasons say (a manual pause from before the recording still holds).
 #[tauri::command]
 pub fn stop_recording(store: State<Managed>) -> Result<ActionPlan, CommandError> {
-    let engine = store.lock().engine.clone();
+    let (engine, runtime) = {
+        let s = store.lock();
+        (s.engine.clone(), s.runtime.clone())
+    };
     // Windows stops and takes the recording in one critical section, so no
     // hook event lands between the two (M2).
     #[cfg(windows)]
-    return quicker_platform::finish_and_take(&engine).map_err(CommandError::internal);
+    let plan = quicker_platform::finish_and_take(&engine);
     #[cfg(not(windows))]
-    quicker_platform::stop_recording(&engine).map_err(CommandError::internal)
+    let plan = quicker_platform::stop_recording(&engine);
+    sync_recording_reason(&runtime, &engine);
+    plan.map_err(CommandError::internal)
+}
+/// `Recording` is held exactly while a recording session is open. Read
+/// after every start or stop, whatever its outcome, so a failed start does
+/// not leave the reason behind and a failed stop does not drop it early.
+/// The recording lock is released before the runtime is touched.
+fn sync_recording_reason(runtime: &Runtime, engine: &Shared) {
+    let active = engine
+        .recording
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_some();
+    runtime.set_pause(PauseReasons::RECORDING, active);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quicker_platform::traits::SystemClock;
+    use std::sync::Arc;
+
+    #[test]
+    fn the_recording_reason_follows_the_open_session() {
+        let runtime = Runtime::new(Arc::new(SystemClock));
+        let engine = Shared::new();
+        runtime.attach(&engine);
+        runtime.set_pause(PauseReasons::MANUAL, false);
+        // A start that failed leaves no reason behind.
+        runtime.set_pause(PauseReasons::RECORDING, true);
+        sync_recording_reason(&runtime, &engine);
+        assert!(!runtime.pause_reasons().contains(PauseReasons::RECORDING));
+        // An open session holds it, and the engine stays paused even with
+        // MANUAL clear.
+        *engine.recording.lock().unwrap() = Some(vec![]);
+        sync_recording_reason(&runtime, &engine);
+        assert_eq!(runtime.pause_reasons(), PauseReasons::RECORDING);
+        assert!(engine.paused.load(Ordering::SeqCst));
+        // Closing it clears only RECORDING.
+        runtime.set_pause(PauseReasons::MANUAL, true);
+        engine.recording.lock().unwrap().take();
+        sync_recording_reason(&runtime, &engine);
+        assert_eq!(runtime.pause_reasons(), PauseReasons::MANUAL);
+    }
 }

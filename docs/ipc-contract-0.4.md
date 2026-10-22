@@ -108,7 +108,9 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 |---|---|
 | 全部 | 错误类型改为 `CommandError` |
 | `load_state` | 返回值在原字段之外新增 `health: HealthSnapshot`、`engine_state: EngineState`（不含 `seq`）、`startup_problems: StartupProblem[]`、`safe_mode: SafeModeReason \| null`；`engine_status` 字符串保留 |
-| `set_paused(paused)` | 只置位或清除 `manual`；其他暂停原因仍在时，返回的状态仍是暂停 |
+| `set_paused(paused)` | 只置位或清除 `manual`；其他暂停原因仍在时，返回的状态仍是暂停。恢复（`paused: false`）在安全模式下返回 `safe_mode`；Health 不是 `healthy` / `degraded` 时返回 `engine_unavailable { health }`；录制中恢复不再返回 `busy`，而是清除 `manual` 后仍因 `recording` 保持暂停。托盘「暂停 / 恢复」走同一逻辑 |
+| `start_recording`、`stop_recording` | 录制期间置位 `recording` 暂停原因，录制结束即清除；结束后引擎回到其他原因决定的状态（录制前已手动暂停的仍暂停，原来在监听的恢复监听） |
+| `load_state.paused`、`engine_status` | 由运行时推导：`paused` = 不在监听（任何暂停原因，或 Health 不接受恢复）；`engine_status` 为 `running`（执行中）、`paused` 或 `listening` |
 | `save_draft(config)` | 先做校验，存在 error 级诊断时返回 `validation`（B-42） |
 | `export_config` | 用户取消保存对话框时返回 `null`（原来是错误） |
 | `choose_file`、`import_config` | 对话框按扩展名过滤；取消返回 `null` |

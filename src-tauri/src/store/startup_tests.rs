@@ -15,7 +15,7 @@ use crate::{
     startup::{defer_autostart_repair, ProblemKind},
 };
 use quicker_domain::*;
-use quicker_platform::traits::Clock;
+use quicker_platform::{health::PauseReasons, traits::Clock};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -298,6 +298,19 @@ fn locked_active_is_read_only_until_it_unlocks() {
     // Not recovered from revisions/1.json.
     assert_eq!(store.active, Config::default());
     assert!(store.engine.paused.load(Ordering::SeqCst));
+    assert_eq!(
+        store.runtime.pause_reasons(),
+        PauseReasons::SAFE_MODE.with(PauseReasons::MANUAL)
+    );
+    // Even with the engine up, safe mode refuses a resume.
+    store.runtime.publish_health(healthy());
+    assert!(matches!(
+        store.set_manual_pause(false, || true),
+        Err(CommandError::SafeMode {
+            reason: SafeModeReason::Locked
+        })
+    ));
+    assert!(store.engine.paused.load(Ordering::SeqCst));
     assert!(store.save(config_at(5)).is_err());
     assert!(store.discard().is_err());
     assert!(store.publish(config_at(5)).is_err());
@@ -317,7 +330,11 @@ fn locked_active_is_read_only_until_it_unlocks() {
         .all(|p| !matches!(p.kind, ProblemKind::SafeMode { .. })));
     // Leaving safe mode never resumes the engine.
     assert!(store.engine.paused.load(Ordering::SeqCst));
+    assert_eq!(store.runtime.pause_reasons(), PauseReasons::MANUAL);
     store.ensure_writable().unwrap();
+    store.set_manual_pause(false, || true).unwrap();
+    assert!(store.runtime.engine_state().listening);
+    assert!(!store.engine.paused.load(Ordering::SeqCst));
 }
 
 /// A corrupt file that cannot be renamed must not be overwritten either.
@@ -537,6 +554,7 @@ fn safe_mode_refuses_writes_and_import_leaves_it() {
         .iter()
         .all(|p| !matches!(p.kind, ProblemKind::SafeMode { .. })));
     assert!(store.engine.paused.load(Ordering::SeqCst));
+    assert_eq!(store.runtime.pause_reasons(), PauseReasons::MANUAL);
     store.ensure_writable().unwrap();
 }
 
@@ -1206,7 +1224,8 @@ mod injected {
         store.publish(metadata_config(&["one"])).unwrap();
         let old = store.active.clone();
         let on_disk = fs::read(dir.join("active.json")).unwrap();
-        store.engine.paused.store(false, Ordering::SeqCst);
+        listening(&store);
+        assert!(!store.engine.paused.load(Ordering::SeqCst));
         debug_inject_fault(FaultPoint::StoreWriteFail, 0);
         assert!(matches!(
             store.publish(metadata_config(&["two"])),
@@ -1218,6 +1237,7 @@ mod injected {
         assert_eq!(store.active, old);
         assert_eq!(fs::read(dir.join("active.json")).unwrap(), on_disk);
         assert!(!store.engine.paused.load(Ordering::SeqCst));
+        assert!(store.runtime.engine_state().listening);
         // One-shot: the next publish goes through.
         store.publish(metadata_config(&["two"])).unwrap();
         assert_eq!(store.active.revision, 2);

@@ -7,7 +7,10 @@ use crate::{
     error::SafeModeReason,
     store::{self, RecoverySource, Store, StoreEnv},
 };
-use quicker_platform::{runtime, supervisor_wiring, ExecutionResult, Shared};
+use quicker_platform::{
+    runtime::{self, Runtime},
+    supervisor_wiring, ExecutionResult, Shared,
+};
 use serde::Serialize;
 use std::{
     path::PathBuf,
@@ -111,25 +114,27 @@ pub fn defer_autostart_repair(
     );
 }
 
-/// Starts the engine under supervision (B-03): attaches it to the runtime
-/// (its pause flag becomes the runtime's manual pause), starts the platform
-/// engine, and installs the supervisor on this platform's adapters, which
-/// publishes Health. Until then Health stays Starting and nothing can
-/// resume. The supervisor stops with the engine: at session end (Windows)
-/// and on `RunEvent::Exit` ([`on_run_event`]).
+/// Starts the engine under supervision (B-03): starts the platform engine
+/// and installs the supervisor on this platform's adapters, which publishes
+/// Health. `runtime` is the one the store attached `engine` to at load
+/// (`Store::runtime`, the pause authority). Until the first Healthy publish
+/// the engine is held paused and nothing can resume. The supervisor stops
+/// with the engine: at session end (Windows) and on `RunEvent::Exit`
+/// ([`on_run_event`]).
 ///
 /// A failed start keeps the legacy `last` message; Health then ends in
 /// Failed (`engine_down`) after the startup attempts instead of staying
 /// Starting.
-pub fn start_engine(engine: Arc<Shared>) {
-    let runtime = runtime::current();
-    runtime.attach(&engine);
+pub fn start_engine(engine: Arc<Shared>, runtime: Arc<Runtime>) {
     // Registered before the session window exists; runs on it at
     // WM_ENDSESSION, so it only sets the shutdown flag.
     #[cfg(windows)]
-    quicker_platform::on_session_end(Box::new(|| {
-        supervisor_wiring::begin_shutdown(&runtime::current());
-    }));
+    {
+        let runtime = Arc::clone(&runtime);
+        quicker_platform::on_session_end(Box::new(move || {
+            supervisor_wiring::begin_shutdown(&runtime);
+        }));
+    }
     let started = quicker_platform::start_engine(engine.clone());
     if let Err(message) = &started {
         tracing::error!(event = "engine.start_failed", error = %message);

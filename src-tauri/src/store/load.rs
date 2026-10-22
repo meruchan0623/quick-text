@@ -12,12 +12,12 @@ use crate::{
     startup::ProblemKind,
 };
 use quicker_domain::*;
-use quicker_platform::{fault::FaultPoint, Shared};
+use quicker_platform::{fault::FaultPoint, runtime::Runtime, Shared};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::atomic::Ordering,
+    sync::{atomic::Ordering, Arc},
 };
 
 impl Store {
@@ -35,13 +35,19 @@ impl Store {
         }
         let meta = MetaHandle::new(&dir, StoreMeta::default(), false);
         let report = load_or_fallback(&dir, env);
+        // Attached before `install`, so safe mode lands in the runtime's
+        // reasons; the engine starts paused (adopted as MANUAL).
+        let engine = Shared::new();
+        let runtime = engine_runtime();
+        runtime.attach(&engine);
         let mut store = Self {
             dir,
             draft: Config::default(),
             active: Config::default(),
             previous: None,
             disk_hash: None,
-            engine: Shared::new(),
+            engine,
+            runtime,
             unresolved: vec![],
             active_unresolved: vec![],
             previous_unresolved: vec![],
@@ -135,6 +141,19 @@ impl Store {
         self.unresolved = unresolved;
         self.active_unresolved = active_unresolved;
         self.previous_unresolved = previous_unresolved;
+    }
+}
+/// The runtime a new store's engine reports to: the process-wide one in the
+/// app (the supervisor, the EventBus and the commands use it too). Each
+/// unit-test store gets its own, so parallel tests never share pause
+/// reasons or health.
+fn engine_runtime() -> Arc<Runtime> {
+    if cfg!(test) {
+        Arc::new(Runtime::new(Arc::new(
+            quicker_platform::traits::SystemClock,
+        )))
+    } else {
+        quicker_platform::runtime::current()
     }
 }
 /// `config_corrupt` fault: damages `active.json` before the load, as an

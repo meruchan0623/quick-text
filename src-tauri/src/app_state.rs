@@ -31,15 +31,18 @@ pub struct AppState {
 }
 impl Store {
     pub fn state(&self) -> AppState {
+        // Derived from the runtime, the pause authority: paused is "not
+        // listening", whatever holds it (a reason or the engine not up).
+        let listening = self.runtime.engine_state().listening;
         AppState {
             draft: self.draft.clone(),
             active: self.active.clone(),
             revision: self.active.revision,
             dirty: self.draft != self.active,
-            paused: self.engine.paused.load(Ordering::SeqCst),
+            paused: !listening,
             engine_status: if self.engine.busy.load(Ordering::SeqCst) {
                 "running"
-            } else if self.engine.paused.load(Ordering::SeqCst) {
+            } else if !listening {
                 "paused"
             } else {
                 "listening"

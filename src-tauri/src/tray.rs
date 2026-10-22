@@ -1,7 +1,7 @@
 //! Tray icon, its menu, and the status watcher that drives the tooltip and
 //! failure notifications.
 use crate::{app_state::Managed, events};
-use quicker_platform::Shared;
+use quicker_platform::{health::PauseReasons, Shared};
 use std::sync::{atomic::Ordering, Arc};
 use tauri::{AppHandle, Manager};
 
@@ -91,24 +91,22 @@ pub fn build(app: &tauri::App) -> tauri::Result<()> {
             "pause" => {
                 let state = app.state::<Managed>();
                 let s = state.lock();
-                let old = s.engine.paused.load(Ordering::SeqCst);
-                // Safe mode keeps the engine paused (B-04).
-                if old
-                    && (s.safe_mode().is_some()
-                        || !quicker_platform::runtime::accepts_resume()
-                        || s.engine.recording.lock().unwrap().is_some())
+                // Toggles the manual reason only, as `set_paused` does: a
+                // listening engine pauses, anything else asks to resume
+                // (refused in safe mode or while the engine is not up).
+                let pause = s.runtime.engine_state().listening;
+                if s.set_manual_pause(pause, quicker_platform::engine_ready)
+                    .is_err()
                 {
                     return;
                 }
-                s.engine.paused.store(!old, Ordering::SeqCst);
-                s.engine.generation.fetch_add(1, Ordering::SeqCst);
                 events::emit_engine_status(app, s.state());
             }
             "quit" => {
                 let state = app.state::<Managed>();
                 let s = state.lock();
                 s.engine.cancel.store(true, Ordering::SeqCst);
-                s.engine.paused.store(true, Ordering::SeqCst);
+                s.runtime.set_pause(PauseReasons::MANUAL, true);
                 crate::store::clear_run_marker_on_session_end();
                 app.exit(0)
             }

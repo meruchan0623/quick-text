@@ -164,6 +164,11 @@ struct PauseState {
     /// The value this runtime last wrote to `Shared::paused` (`None` until a
     /// `Shared` is attached).
     written: Option<bool>,
+    /// Whether the stored health accepts resume (Healthy/Degraded). Kept
+    /// here, under `pause`, because `sync_legacy` runs with only `pause`
+    /// held; `store_health` updates it together with the snapshot. False
+    /// until the first Healthy/Degraded publish (the default is Starting).
+    engine_up: bool,
 }
 
 /// Lock order, for every path that holds more than one of these at a time:
@@ -213,9 +218,10 @@ impl Runtime {
         &self.clock
     }
 
-    /// Connects the engine's `Shared` state. The legacy `Shared::paused` flag
-    /// becomes a mirror of "any pause reason is set"; its current value is
-    /// adopted as the MANUAL reason (the engine starts paused).
+    /// Connects the engine's `Shared` state. `Shared::paused` becomes the
+    /// derived "not listening" flag (see [`Runtime::sync_legacy`]); its
+    /// current value is adopted as the MANUAL reason (the engine starts
+    /// paused).
     pub fn attach(&self, shared: &Arc<Shared>) {
         self.shared.store(Some(Arc::clone(shared)));
         {
@@ -451,6 +457,7 @@ impl Runtime {
             } else {
                 pause.reasons.without(PauseReasons::ENGINE_DOWN)
             };
+            pause.engine_up = snapshot.state.accepts_resume();
             self.sync_legacy(&mut pause);
             health.clone_from(&snapshot);
             (health.state, pause.reasons)
@@ -491,18 +498,22 @@ impl Runtime {
         pause.reasons
     }
 
-    /// Two-way bridge to the legacy `Shared::paused` flag, which detection
-    /// and `guarded_context` still read and older callers (main.rs
-    /// `set_paused`/publish, `start_recording`, the RawInput loop) still
-    /// write. A value that differs from what this runtime last wrote came
-    /// from such a writer and is adopted as MANUAL on/off; then the flag is
-    /// set to "any reason present". The compare-exchange retries if a legacy
-    /// writer races the update.
+    /// The one place `Shared::paused` is derived (P5 item 2). The pause
+    /// reasons here are the authority; the flag, which the detection and
+    /// execution gates read (Windows: rawinput, hook, actions, input), is
+    /// set to "not listening": any reason present, or a health that does not
+    /// accept resume (Starting/Recovering/Failed). So no automatic expansion
+    /// runs while the engine is not up, without a user-visible reason for
+    /// Starting (the Health row expresses it, contract §3).
     ///
-    /// A legacy write of the value the flag already holds is invisible (for
-    /// example a legacy pause while ENGINE_DOWN already holds the flag), and
-    /// main.rs `publish` restores its saved value afterwards; both are
-    /// reasons for callers to move to [`Runtime::set_pause`].
+    /// The src-tauri shell no longer writes the flag. The remaining writers
+    /// are platform code paths that stop detection on their own (Windows
+    /// hook installation failure, the macOS event tap) and tests: a value
+    /// that differs from what this runtime last wrote is adopted as MANUAL
+    /// on/off, then the flag is re-derived. The compare-exchange retries if
+    /// such a writer races the update. A write of the value the flag
+    /// already holds is invisible (for example a pause while ENGINE_DOWN or
+    /// Starting already holds the flag).
     fn sync_legacy(&self, pause: &mut PauseState) {
         let Some(shared) = self.shared.load_full() else {
             return;
@@ -516,7 +527,7 @@ impl Runtime {
                     pause.reasons.without(PauseReasons::MANUAL)
                 };
             }
-            let want = !pause.reasons.is_empty();
+            let want = !pause.reasons.is_empty() || !pause.engine_up;
             if shared
                 .paused
                 .compare_exchange(current, want, Ordering::SeqCst, Ordering::SeqCst)
@@ -967,6 +978,59 @@ mod tests {
         let state = runtime.engine_state();
         assert!(state.listening);
         assert_eq!(state.paused_reasons, PauseReasons::empty());
+    }
+
+    /// P5 item 2: the flag the gates read is exactly "not listening". A
+    /// health that does not accept resume holds it without adding a pause
+    /// reason, so Starting stays off the user-visible "paused" row.
+    #[test]
+    fn the_legacy_flag_is_not_listening_and_starting_holds_it_without_a_reason() {
+        let (runtime, _) = runtime();
+        let shared = Shared::new();
+        runtime.attach(&shared);
+        runtime.set_pause(PauseReasons::MANUAL, false);
+        let flag = || shared.paused.load(Ordering::SeqCst);
+        assert_eq!(runtime.pause_reasons(), PauseReasons::empty());
+        assert!(flag(), "Starting: no expansion before the engine is up");
+        assert_eq!(runtime.status_text(), StatusText::Starting);
+        for (state, listening) in [
+            (HealthState::Healthy, true),
+            (HealthState::Degraded, true),
+            (HealthState::Recovering, false),
+            (HealthState::Starting, false),
+            (HealthState::Healthy, true),
+            (HealthState::Failed, false),
+        ] {
+            runtime.publish_health(snapshot(state));
+            let engine = runtime.engine_state();
+            assert_eq!(engine.listening, listening, "{state:?}");
+            assert_eq!(flag(), !listening, "{state:?}");
+            assert!(
+                !engine.paused_reasons.intersects(PauseReasons::USER_VISIBLE),
+                "{state:?}"
+            );
+        }
+        // A resume written to the flag while Failed is overruled (and, being
+        // a resume, adds no reason), so the engine listens again only when
+        // the health comes back.
+        shared.paused.store(false, Ordering::SeqCst);
+        assert!(runtime.pause_reasons().contains(PauseReasons::ENGINE_DOWN));
+        assert!(flag(), "Failed re-asserts the flag");
+        runtime.publish_health(snapshot(HealthState::Healthy));
+        assert!(!flag());
+        assert!(runtime.engine_state().listening);
+        // Each reason alone holds it while healthy.
+        for reason in [
+            PauseReasons::MANUAL,
+            PauseReasons::RECORDING,
+            PauseReasons::SAFE_MODE,
+            PauseReasons::SELF_TEST,
+        ] {
+            runtime.set_pause(reason, true);
+            assert!(flag(), "{reason:?}");
+            runtime.set_pause(reason, false);
+            assert!(!flag(), "{reason:?}");
+        }
     }
 
     #[test]

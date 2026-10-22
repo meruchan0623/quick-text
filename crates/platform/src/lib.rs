@@ -166,6 +166,10 @@ mod capabilities;
 pub use capabilities::{
     capabilities, capabilities_for, Capability, CapabilityReason, CapabilityStatus, PlatformReason,
 };
+/// Starts a recording session. Pausing detection for its duration is the
+/// caller's job, through the runtime's `PauseReasons::RECORDING` (the shell
+/// sets it before this call and clears it once no recording is active), so
+/// `Shared::paused` stays a value derived only by the runtime.
 pub fn start_recording(shared: &Arc<Shared>) -> Result<(), String> {
     // Recording needs a running engine (B-03: `accepts_resume` replaces
     // `native_ready`).
@@ -180,7 +184,6 @@ pub fn start_recording(shared: &Arc<Shared>) -> Result<(), String> {
     if r.is_some() {
         return Err("Recording already active".into());
     }
-    shared.paused.store(true, Ordering::SeqCst);
     shared.cancel.store(false, Ordering::SeqCst);
     shared.generation.fetch_add(1, Ordering::SeqCst);
     // A new recording session, under the recording lock (M2).
