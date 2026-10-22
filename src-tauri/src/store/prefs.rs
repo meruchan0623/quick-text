@@ -12,7 +12,7 @@ use quicker_platform::{
     clipboard_options::set_lease_options,
     traits::{LeaseOptions, RestorePolicy, DEFAULT_RESTORE_DELAY},
 };
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use std::{
     fs, io,
@@ -271,8 +271,7 @@ fn load_unlocked(dir: &Path, after_read: impl FnOnce()) -> Result<Prefs, Command
         Err(e) => return Err(CommandError::io(IoOp::Read, Some(&path), &e)),
     };
     after_read();
-    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
-    match serde_json::from_slice(bytes) {
+    match parse_prefs(&bytes) {
         Ok(prefs) => Ok(prefs),
         Err(e) => {
             quarantine(&path, &e)
@@ -280,6 +279,13 @@ fn load_unlocked(dir: &Path, after_read: impl FnOnce()) -> Result<Prefs, Command
             Ok(Prefs::default())
         }
     }
+}
+
+/// Parses `prefs.json` as every load does: a leading UTF-8 BOM (Notepad
+/// writes one) is skipped. The diagnostics bundle parses with this too, so
+/// a file the app reads never shows there as unparsable.
+pub(crate) fn parse_prefs<T: DeserializeOwned>(bytes: &[u8]) -> serde_json::Result<T> {
+    serde_json::from_slice(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes))
 }
 
 /// Writes `prefs.json` atomically (temp file + replace), unknown fields

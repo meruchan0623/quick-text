@@ -22,7 +22,7 @@ use crate::{
     app_state::capabilities,
     events::legacy_status,
     store::{
-        prefs::{civil_from_days, utc_stamp},
+        prefs::{civil_from_days, parse_prefs, utc_stamp},
         replace_file,
     },
 };
@@ -530,7 +530,7 @@ pub fn summarize(data_dir: &Path) -> ConfigSummary {
         // load quarantines shows up as missing or as the damaged file it was.
         // A stale read costs the bundle this one entry, and nothing is
         // written back.
-        prefs: read_json::<serde_json::Value>(&data_dir.join("prefs.json")).0,
+        prefs: prefs_file(&data_dir.join("prefs.json")).0,
         revisions_on_disk,
         quarantined_files: names
             .iter()
@@ -547,7 +547,21 @@ fn config_file(path: &Path) -> ConfigFile {
     }
 }
 
+/// prefs.json is parsed by the loader's own `parse_prefs` (it skips a
+/// UTF-8 BOM), so the bundle and the app agree on whether it parses. As a
+/// `Value`, not `Prefs`: the bundle reports the file, it does not apply it.
+fn prefs_file(path: &Path) -> (FileState, Option<serde_json::Value>) {
+    read_json_with(path, parse_prefs)
+}
+
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> (FileState, Option<T>) {
+    read_json_with(path, |bytes: &[u8]| serde_json::from_slice(bytes))
+}
+
+fn read_json_with<T>(
+    path: &Path,
+    parse: impl FnOnce(&[u8]) -> serde_json::Result<T>,
+) -> (FileState, Option<T>) {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return (FileState::Missing, None),
@@ -559,7 +573,7 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> (FileState, Option<
             return (state, None);
         }
     };
-    match serde_json::from_slice(&bytes) {
+    match parse(&bytes) {
         Ok(value) => (FileState::Ok, Some(value)),
         Err(e) => {
             let category = match e.classify() {
@@ -1227,6 +1241,40 @@ mod tests {
         assert_eq!(manifest["skipped"][0]["file"], "active.json");
         assert_eq!(manifest["skipped"][0]["reason"], "NotFound");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn prefs_with_a_bom_parse_in_the_bundle_as_they_load() {
+        use crate::store::prefs::{load_prefs, Prefs};
+        const BOM: &[u8] = b"\xEF\xBB\xBF";
+        let mut prefs = Prefs::default();
+        prefs.app.auto_listen_on_start = true;
+        prefs.ui = serde_json::json!({ "theme": "dark" });
+        let json = serde_json::to_vec(&prefs).unwrap();
+        for bom in [BOM, &b""[..]] {
+            let dir = temp_dir();
+            let path = dir.join("prefs.json");
+            fs::write(&path, [bom, &json[..]].concat()).unwrap();
+            let with_bom = !bom.is_empty();
+            assert_eq!(summarize(&dir).prefs, FileState::Ok, "BOM: {with_bom}");
+            let (state, value) = prefs_file(&path);
+            assert_eq!(state, FileState::Ok, "BOM: {with_bom}");
+            // The app reads the same file the same way, and keeps it.
+            let loaded = load_prefs(&dir).unwrap();
+            assert_eq!(loaded, prefs, "BOM: {with_bom}");
+            assert_eq!(value, Some(serde_json::to_value(&loaded).unwrap()));
+            assert!(path.exists(), "BOM: {with_bom}: quarantined");
+            fs::remove_dir_all(dir).unwrap();
+        }
+        // A damaged file still shows as damaged, with a BOM or without.
+        for bom in [BOM, &b""[..]] {
+            let dir = temp_dir();
+            fs::write(dir.join("prefs.json"), [bom, &b"{\"app\":"[..]].concat()).unwrap();
+            let state = serde_json::to_value(summarize(&dir).prefs).unwrap();
+            assert_eq!(state["status"], "unparsable", "{state}");
+            assert_eq!(state["category"], "eof", "{state}");
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]
