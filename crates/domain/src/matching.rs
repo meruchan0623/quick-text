@@ -259,6 +259,52 @@ pub fn compile_config(config: &Config) -> Result<CompiledConfig, Vec<Diagnostic>
         rules,
     })
 }
+/// Result of [`compile_config_lenient`].
+#[derive(Debug, Clone)]
+pub struct LenientCompile {
+    /// The whole configuration with every rule that compiled.
+    pub compiled: CompiledConfig,
+    /// IDs of enabled rules that did not compile and stay off at runtime, in list order.
+    /// Together with [`Config::unreadable_rules`] these are the `rules_skipped` problem.
+    pub skipped_rule_ids: Vec<String>,
+    /// Why: the diagnostics [`compile_config`] reports for those rules (and for disabled
+    /// rules with an empty or duplicate ID, which are off anyway).
+    pub diagnostics: Vec<Diagnostic>,
+}
+/// Compiles rule by rule for loading stored configuration (B-43, `load_or_fallback`): a rule
+/// that does not compile is only switched off at runtime. Errors that concern the whole
+/// configuration (version, global terminators) still fail.
+pub fn compile_config_lenient(config: &Config) -> Result<LenientCompile, Vec<Diagnostic>> {
+    let errors = config_errors(config);
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    let mut rules = vec![];
+    let mut skipped_rule_ids = vec![];
+    let mut diagnostics = vec![];
+    let mut ids = BTreeSet::new();
+    let positions = config.rule_positions();
+    for (order, (rule, position)) in config.rules.iter().zip(positions).enumerate() {
+        match compile_rule(rule, order, position, &mut ids) {
+            Ok(Some(compiled)) => rules.push(compiled),
+            Ok(None) => {}
+            Err(rule_errors) => {
+                if rule.enabled {
+                    skipped_rule_ids.push(rule.id.clone());
+                }
+                diagnostics.extend(rule_errors);
+            }
+        }
+    }
+    Ok(LenientCompile {
+        compiled: CompiledConfig {
+            config: config.clone(),
+            rules,
+        },
+        skipped_rule_ids,
+        diagnostics,
+    })
+}
 /// Errors that concern the whole configuration rather than one rule.
 fn config_errors(config: &Config) -> Vec<Diagnostic> {
     let mut errors = vec![];
