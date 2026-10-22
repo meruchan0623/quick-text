@@ -35,28 +35,64 @@ pub struct SubscriptionId(u64);
 
 type Listeners = Arc<RwLock<Vec<(u64, Listener)>>>;
 
-/// Capacity of the queue between emitters and the event thread. Bounded so
-/// a blocked listener cannot grow memory without limit; emitters never wait
-/// on it (see [`Runtime::subscribe`] for what happens when it is full).
+/// Capacity of the `Execution` queue between [`Runtime::record`] and the
+/// event thread. Bounded so a blocked listener cannot grow memory without
+/// limit; emitters never wait on it (see [`Runtime::subscribe`] for what
+/// happens when it is full). Health and State do not use it.
 const EVENT_QUEUE_CAPACITY: usize = 1024;
 
-/// What did not fit in the event queue, shared between emitters and the
-/// event thread.
-#[derive(Default)]
-struct Overflow {
-    /// Latest Health/State that could not be queued. While one is parked,
-    /// later events of the same kind replace it instead of being queued, so
-    /// the queue never holds a newer value than the parked one.
-    health: Option<HealthSnapshot>,
+/// The latest published Health and State. Every change bumps `version` in
+/// the same critical section that changes the values, and the event thread
+/// copies all three at once, so the Health and State it delivers always
+/// belong to one version and a newer version can never be followed by an
+/// older one.
+#[derive(Clone, Default)]
+struct Latest {
+    version: u64,
+    health: HealthSnapshot,
+    /// `None` until the first publish or refresh.
     state: Option<EngineState>,
-    /// Execution events dropped since the event thread last drained.
-    dropped: u64,
 }
 
+/// Shared between the runtime and its event thread.
 #[derive(Default)]
-struct EventQueue {
-    tx: Option<mpsc::SyncSender<EngineEvent>>,
-    overflow: Arc<Mutex<Overflow>>,
+struct Outbox {
+    latest: Mutex<Latest>,
+    /// `Execution` events dropped on a full queue since the event thread
+    /// last reported them.
+    dropped: AtomicU64,
+}
+
+/// The emitters' side of a running event thread.
+struct EventThread {
+    /// Capacity 1: a full channel means a wake-up is already pending, which
+    /// will pick up whatever changed since.
+    wake: mpsc::SyncSender<()>,
+    executions: mpsc::SyncSender<HistoryEntry>,
+}
+
+impl EventThread {
+    /// Queues `execution` (a full queue drops and counts it) and wakes the
+    /// thread, never blocking. Returns false if the thread is gone; an
+    /// execution that could not be handed over is then left in `execution`.
+    fn post(&self, execution: &mut Option<HistoryEntry>, dropped: &AtomicU64) -> bool {
+        if let Some(entry) = execution.take() {
+            match self.executions.try_send(entry) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(_)) => {
+                    dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(mpsc::TrySendError::Disconnected(entry)) => {
+                    *execution = Some(entry);
+                    return false;
+                }
+            }
+        }
+        !matches!(
+            self.wake.try_send(()),
+            Err(mpsc::TrySendError::Disconnected(()))
+        )
+    }
 }
 
 #[derive(Default)]
@@ -68,20 +104,23 @@ struct PauseState {
 }
 
 /// Lock order, for every path that holds more than one of these at a time:
-/// `last_state` → `health` → `pause` → `events` → the event queue's
-/// `Overflow` (the event thread takes only `Overflow`). `process` is only taken
-/// with at most `last_state` held, and `history` alone. Listeners run on the
-/// event thread with none of these held; the process probe never runs with
-/// `health`, `pause` or `events` held.
+/// the outbox's `latest` → `health` → `pause`. `events` is never held
+/// together with any of them, and the event thread takes only `latest`,
+/// just long enough to copy it. `process` is only taken with at most
+/// `latest` held, and `history` alone. Listeners run on the event thread
+/// with none of these held; the process probe never runs with `health` or
+/// `pause` held.
 pub struct Runtime {
     clock: Arc<dyn Clock>,
     history: History,
     listeners: Listeners,
     next_listener: AtomicU64,
-    events: Mutex<EventQueue>,
+    outbox: Arc<Outbox>,
+    /// `None` until the first event with a listener (or after the event
+    /// thread exited).
+    events: Mutex<Option<EventThread>>,
     health: Mutex<HealthSnapshot>,
     pause: Mutex<PauseState>,
-    last_state: Mutex<Option<EngineState>>,
     shared: ArcSwapOption<Shared>,
     process: RwLock<Option<ProcessProbe>>,
 }
@@ -93,10 +132,10 @@ impl Runtime {
             history: History::new(),
             listeners: Arc::default(),
             next_listener: AtomicU64::new(1),
-            events: Mutex::default(),
+            outbox: Arc::default(),
+            events: Mutex::new(None),
             health: Mutex::new(HealthSnapshot::default()),
             pause: Mutex::new(PauseState::default()),
-            last_state: Mutex::new(None),
             shared: ArcSwapOption::empty(),
             process: RwLock::new(None),
         }
@@ -145,13 +184,21 @@ impl Runtime {
     /// limiting (P5) belongs outside the listener, e.g. forward events to
     /// your own channel and throttle there.
     ///
-    /// If a listener blocks anyway, memory stays bounded: emitters never
-    /// wait, and the queue holds at most `EVENT_QUEUE_CAPACITY` (1024)
-    /// events. When it is full, `Execution` events are dropped and counted
-    /// (one `runtime.events_dropped` warning per backlog), while `Health` and
-    /// `State` are coalesced to their latest value and delivered once the
-    /// backlog drains. Every subscriber therefore eventually sees the latest
-    /// Health and State, and never an older one after a newer one.
+    /// Delivery semantics:
+    /// - `Health` and `State` carry **latest values**. Each subscriber
+    ///   eventually sees the latest Health and State, and they only move
+    ///   forward: an older value never arrives after a newer one, and a
+    ///   State never arrives before the Health it was computed with. Values
+    ///   that are replaced quickly (a fast round trip, or anything published
+    ///   while a listener blocks) may be merged away and never delivered.
+    /// - `Execution` events are delivered in queue order. If a listener
+    ///   blocks, at most `EVENT_QUEUE_CAPACITY` (1024) of them wait; beyond
+    ///   that they are dropped and counted (one `runtime.events_dropped`
+    ///   warning per backlog). Read the history to catch up.
+    /// - There is no ordering between `Execution` and `Health`/`State`.
+    ///
+    /// Emitters never wait on listeners, and a blocked listener holds at
+    /// most a full `Execution` queue plus one Health/State snapshot.
     pub fn subscribe(&self, listener: Box<dyn Fn(EngineEvent) + Send + Sync>) -> SubscriptionId {
         let id = self.next_listener.fetch_add(1, Ordering::Relaxed);
         self.listeners.write().push((id, Arc::from(listener)));
@@ -162,40 +209,70 @@ impl Runtime {
         self.listeners.write().retain(|(other, _)| *other != id.0);
     }
 
-    /// Queues `event` for the event thread without blocking, starting the
-    /// thread on first use (or after it exited).
-    fn emit(&self, event: EngineEvent) {
+    /// Wakes the event thread without blocking, first queueing `execution`
+    /// if given; starts the thread on first use (or after it exited). Never
+    /// called with `latest`, `health` or `pause` held.
+    fn post(&self, mut execution: Option<HistoryEntry>) {
         if self.listeners.read().is_empty() {
             return;
         }
-        let mut queue = self.events.lock();
-        let event = match queue.tx.as_ref() {
-            Some(tx) => match offer(tx, &queue.overflow, event) {
-                None => return,
-                Some(event) => event,
-            },
-            None => event,
-        };
-        queue.tx = None;
-        let (tx, rx) = mpsc::sync_channel::<EngineEvent>(EVENT_QUEUE_CAPACITY);
+        let mut thread = self.events.lock();
+        if let Some(running) = thread.as_ref() {
+            if running.post(&mut execution, &self.outbox.dropped) {
+                return;
+            }
+        }
+        *thread = self.start_event_thread();
+        if let Some(started) = thread.as_ref() {
+            started.post(&mut execution, &self.outbox.dropped);
+        }
+    }
+
+    fn start_event_thread(&self) -> Option<EventThread> {
+        let (wake, wake_rx) = mpsc::sync_channel::<()>(1);
+        let (executions, executions_rx) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
         let listeners = Arc::clone(&self.listeners);
-        let overflow = Arc::clone(&queue.overflow);
+        let outbox = Arc::clone(&self.outbox);
         let spawned = std::thread::Builder::new()
             .name("qt-engine-events".into())
-            .spawn(move || run_event_thread(&rx, &listeners, &overflow));
+            .spawn(move || run_event_thread(&wake_rx, &executions_rx, &outbox, &listeners));
         match spawned {
-            Ok(_) => {
-                let _ = offer(&tx, &queue.overflow, event);
-                queue.tx = Some(tx);
+            Ok(_) => Some(EventThread { wake, executions }),
+            // Never deliver inline: a listener could re-enter the runtime.
+            // Health/State stay in the outbox for the next attempt;
+            // listeners resynchronise from `get_runtime_snapshot`.
+            Err(_) => {
+                tracing::warn!(
+                    event = "runtime.event_dropped",
+                    "event thread could not start; event dropped"
+                );
+                None
             }
-            // Never deliver inline: callers emit while holding state locks
-            // that a listener could re-enter. Listeners resynchronise from
-            // `get_runtime_snapshot`; the next emit retries the spawn.
-            Err(_) => tracing::warn!(
-                event = "runtime.event_dropped",
-                "event thread could not start; event dropped"
-            ),
         }
+    }
+
+    /// Stores `health` (if given) and `state` as the latest values, bumping
+    /// the version if either changed. Returns whether it did.
+    fn store_latest(
+        latest: &mut Latest,
+        health: Option<HealthSnapshot>,
+        state: EngineState,
+    ) -> bool {
+        let mut changed = false;
+        if let Some(health) = health {
+            if latest.health != health {
+                latest.health = health;
+                changed = true;
+            }
+        }
+        if latest.state.as_ref() != Some(&state) {
+            latest.state = Some(state);
+            changed = true;
+        }
+        if changed {
+            latest.version += 1;
+        }
+        changed
     }
 
     // ---- health -------------------------------------------------------
@@ -205,38 +282,41 @@ impl Runtime {
     }
 
     /// Stores a new snapshot (from the supervisor). ENGINE_DOWN follows the
-    /// state: set in Recovering/Failed, cleared otherwise. Emits `Health`
-    /// when the snapshot changed and `State` when the engine state changed.
+    /// state: set in Recovering/Failed, cleared otherwise. Subscribers get
+    /// `Health` if the snapshot changed and `State` if the engine state
+    /// changed (latest-value semantics, see [`Runtime::subscribe`]).
     ///
-    /// The snapshot, the ENGINE_DOWN bit and both events are updated in one
-    /// critical section (`last_state` → `health` → `pause`, see [`Runtime`]),
-    /// so concurrent publishers cannot leave ENGINE_DOWN disagreeing with
-    /// the stored health or enqueue their events out of order.
+    /// The snapshot, the ENGINE_DOWN bit and the latest Health/State (with
+    /// their version) are updated in one critical section (`latest` →
+    /// `health` → `pause`, see [`Runtime`]), so concurrent publishers cannot
+    /// leave ENGINE_DOWN disagreeing with the stored health, nor pair a
+    /// Health with another publish's State.
     pub fn publish_health(&self, snapshot: HealthSnapshot) {
         let engine_down = matches!(
             snapshot.state,
             HealthState::Recovering | HealthState::Failed
         );
-        let mut last = self.last_state.lock();
-        let (health, reasons) = {
-            let mut health = self.health.lock();
-            let mut pause = self.pause.lock();
-            self.sync_legacy(&mut pause);
-            pause.reasons = if engine_down {
-                pause.reasons.with(PauseReasons::ENGINE_DOWN)
-            } else {
-                pause.reasons.without(PauseReasons::ENGINE_DOWN)
+        let changed = {
+            let mut latest = self.outbox.latest.lock();
+            let (health, reasons) = {
+                let mut health = self.health.lock();
+                let mut pause = self.pause.lock();
+                self.sync_legacy(&mut pause);
+                pause.reasons = if engine_down {
+                    pause.reasons.with(PauseReasons::ENGINE_DOWN)
+                } else {
+                    pause.reasons.without(PauseReasons::ENGINE_DOWN)
+                };
+                self.sync_legacy(&mut pause);
+                health.clone_from(&snapshot);
+                (health.state, pause.reasons)
             };
-            self.sync_legacy(&mut pause);
-            if *health != snapshot {
-                *health = snapshot.clone();
-                self.emit(EngineEvent::Health(snapshot));
-            }
-            (health.state, pause.reasons)
+            let state = self.state_from(health, reasons);
+            Self::store_latest(&mut latest, Some(snapshot), state)
         };
-        // `last_state` is still held: no other publish or refresh can slip
-        // a State between this Health and this State.
-        self.emit_state_if_changed(&mut last, self.state_from(health, reasons));
+        if changed {
+            self.post(None);
+        }
     }
 
     // ---- pause --------------------------------------------------------
@@ -342,18 +422,18 @@ impl Runtime {
         }
     }
 
-    /// Recomputes the engine state and emits `State` if it changed. The
-    /// emit happens under `last_state` so listeners see states in order.
+    /// Recomputes the engine state and, if it changed, stores it as the
+    /// latest State (under `latest`, so it is versioned with the health it
+    /// was computed from) and wakes the event thread.
     pub fn refresh_state(&self) {
-        let mut last = self.last_state.lock();
-        let (health, reasons) = self.health_and_pause();
-        self.emit_state_if_changed(&mut last, self.state_from(health, reasons));
-    }
-
-    fn emit_state_if_changed(&self, last: &mut Option<EngineState>, state: EngineState) {
-        if last.as_ref() != Some(&state) {
-            *last = Some(state.clone());
-            self.emit(EngineEvent::State(state));
+        let changed = {
+            let mut latest = self.outbox.latest.lock();
+            let (health, reasons) = self.health_and_pause();
+            let state = self.state_from(health, reasons);
+            Self::store_latest(&mut latest, None, state)
+        };
+        if changed {
+            self.post(None);
         }
     }
 
@@ -370,7 +450,7 @@ impl Runtime {
         let entry = self
             .history
             .push(record, self.clock.now(), self.clock.wall_ms());
-        self.emit(EngineEvent::Execution(entry.clone()));
+        self.post(Some(entry.clone()));
         entry
     }
 
@@ -392,96 +472,49 @@ impl Runtime {
     }
 }
 
-/// Hands `event` to the event thread without blocking. A full queue drops
-/// an `Execution` (counted) and parks a `Health`/`State` in `overflow`.
-/// Returns the event back only if the event thread is gone.
-///
-/// Parking and the full check happen under the `overflow` lock, which the
-/// event thread takes before it goes back to waiting on an empty queue. So
-/// a value is only ever parked while the queue is full (or another value of
-/// its kind is already parked), and the event thread always wakes up again
-/// to deliver it.
-fn offer(
-    tx: &mpsc::SyncSender<EngineEvent>,
-    overflow: &Mutex<Overflow>,
-    event: EngineEvent,
-) -> Option<EngineEvent> {
-    let mut overflow = overflow.lock();
-    let event = match event {
-        EngineEvent::Health(health) if overflow.health.is_some() => {
-            overflow.health = Some(health);
-            return None;
-        }
-        EngineEvent::State(state) if overflow.state.is_some() => {
-            overflow.state = Some(state);
-            return None;
-        }
-        event => event,
-    };
-    match tx.try_send(event) {
-        Ok(()) => None,
-        Err(mpsc::TrySendError::Full(event)) => {
-            match event {
-                EngineEvent::Health(health) => overflow.health = Some(health),
-                EngineEvent::State(state) => overflow.state = Some(state),
-                EngineEvent::Execution(_) => overflow.dropped += 1,
-            }
-            None
-        }
-        Err(mpsc::TrySendError::Disconnected(event)) => Some(event),
-    }
-}
-
-/// The event thread: delivers queued events in order; whenever the backlog
-/// is drained, delivers what was coalesced meanwhile before waiting again.
+/// The event thread. Each wake-up first takes the latest Health/State (one
+/// copy under `latest`, so both come from the same version) and delivers
+/// whichever differs from what it delivered last, Health before State; then
+/// it drains the `Execution` queue and reports drops. The wake-up token is
+/// consumed before `latest` is read, so a change made after that read sends
+/// a new token and is picked up by the next round. Exits when the runtime
+/// (and with it the sending side) is gone.
 fn run_event_thread(
-    rx: &mpsc::Receiver<EngineEvent>,
+    wake: &mpsc::Receiver<()>,
+    executions: &mpsc::Receiver<HistoryEntry>,
+    outbox: &Outbox,
     listeners: &RwLock<Vec<(u64, Listener)>>,
-    overflow: &Mutex<Overflow>,
 ) {
-    loop {
-        let event = match rx.try_recv() {
-            Ok(event) => event,
-            Err(mpsc::TryRecvError::Empty) => {
-                if flush_overflow(listeners, overflow) {
-                    continue;
-                }
-                match rx.recv() {
-                    Ok(event) => event,
-                    Err(mpsc::RecvError) => return,
+    let mut delivered = Latest::default();
+    while wake.recv().is_ok() {
+        let latest = {
+            let latest = outbox.latest.lock();
+            (latest.version != delivered.version).then(|| latest.clone())
+        };
+        if let Some(latest) = latest {
+            debug_assert!(latest.version > delivered.version);
+            if latest.health != delivered.health {
+                deliver(listeners, &EngineEvent::Health(latest.health.clone()));
+            }
+            if latest.state != delivered.state {
+                if let Some(state) = &latest.state {
+                    deliver(listeners, &EngineEvent::State(state.clone()));
                 }
             }
-            Err(mpsc::TryRecvError::Disconnected) => return,
-        };
-        deliver(listeners, &event);
+            delivered = latest;
+        }
+        while let Ok(entry) = executions.try_recv() {
+            deliver(listeners, &EngineEvent::Execution(entry));
+        }
+        let dropped = outbox.dropped.swap(0, Ordering::Relaxed);
+        if dropped > 0 {
+            tracing::warn!(
+                event = "runtime.events_dropped",
+                dropped,
+                "execution queue was full; execution events dropped"
+            );
+        }
     }
-}
-
-/// Delivers the parked Health/State (latest values) and reports dropped
-/// executions once. Returns whether anything was parked.
-fn flush_overflow(listeners: &RwLock<Vec<(u64, Listener)>>, overflow: &Mutex<Overflow>) -> bool {
-    let Overflow {
-        health,
-        state,
-        dropped,
-    } = std::mem::take(&mut *overflow.lock());
-    if dropped > 0 {
-        tracing::warn!(
-            event = "runtime.events_dropped",
-            dropped,
-            "event queue was full; execution events dropped"
-        );
-    }
-    let parked = [
-        health.map(EngineEvent::Health),
-        state.map(EngineEvent::State),
-    ];
-    let mut any = false;
-    for event in parked.into_iter().flatten() {
-        deliver(listeners, &event);
-        any = true;
-    }
-    any
 }
 
 fn deliver(listeners: &RwLock<Vec<(u64, Listener)>>, event: &EngineEvent) {
@@ -761,6 +794,9 @@ mod tests {
         let events = collect(&runtime);
         runtime.publish_health(snapshot(HealthState::Healthy));
         runtime.publish_health(snapshot(HealthState::Healthy));
+        // Health/State are latest values: wait for this State before the
+        // next change, or the two could be merged into one delivery.
+        wait_until("health and state", || events.lock().len() >= 2);
         runtime.set_pause(PauseReasons::MANUAL, true);
         runtime.set_pause(PauseReasons::MANUAL, true);
         wait_until("three events", || events.lock().len() >= 3);
@@ -850,14 +886,39 @@ mod tests {
         }
     }
 
-    /// One listener blocks the event thread while events keep coming: the
-    /// queue stays bounded, executions beyond it are dropped, and once the
-    /// listener returns every subscriber sees the latest Health and State,
-    /// with Health never going backwards.
-    #[test]
-    fn blocked_listener_keeps_queue_bounded_and_coalesces_health_state() {
+    fn execution(rule: &str) -> Record {
+        Record::new(
+            rule,
+            TriggerKind::Immediate,
+            Outcome::Succeeded,
+            ReasonCode::Ok,
+        )
+    }
+
+    fn healths(events: &[EngineEvent]) -> Vec<HealthSnapshot> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::Health(health) => Some(health.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn states(events: &[EngineEvent]) -> Vec<EngineState> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::State(state) => Some(state.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Subscribes a listener that blocks the event thread inside the first
+    /// event it receives. Send on the returned sender to let it go.
+    fn block_event_thread(runtime: &Runtime) -> mpsc::Sender<()> {
         use std::sync::atomic::AtomicBool;
-        let (runtime, _) = runtime();
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let release_rx = Mutex::new(release_rx);
@@ -868,22 +929,124 @@ mod tests {
                 release_rx.lock().recv().unwrap();
             }
         }));
-        let events = collect(&runtime);
-        let execution = |rule: &str| {
-            Record::new(
-                rule,
-                TriggerKind::Immediate,
-                Outcome::Succeeded,
-                ReasonCode::Ok,
-            )
-        };
-        runtime.record(execution("first"));
+        runtime.record(execution("block"));
         entered_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("event thread blocked in the listener");
+        release_tx
+    }
 
+    /// The event thread is held up before it reads the snapshot while
+    /// H1/S1 and then H2/S2 are published: once it runs again, subscribers
+    /// get exactly H2 and S2. H1/S1 are merged away, so H1 can never show up
+    /// after H2.
+    #[test]
+    fn delivery_after_a_stall_starts_from_the_latest_snapshot() {
+        let (runtime, _) = runtime();
+        let release = block_event_thread(&runtime);
+        let events = collect(&runtime);
+        let h1 = numbered(HealthState::Recovering, 1);
+        runtime.publish_health(h1);
+        let s1 = runtime.engine_state();
+        let h2 = numbered(HealthState::Healthy, 2);
+        runtime.publish_health(h2.clone());
+        let s2 = runtime.engine_state();
+        assert_ne!(s1, s2);
+        release.send(()).unwrap();
+
+        wait_until("H2 and S2", || {
+            let events = events.lock();
+            healths(&events).last() == Some(&h2) && states(&events).last() == Some(&s2)
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let events = events.lock().clone();
+        assert_eq!(healths(&events), [h2]);
+        assert_eq!(states(&events), [s2]);
+    }
+
+    /// Publishers race Recovering/Healthy and MANUAL on/off against a slow
+    /// listener. Every State the listener gets agrees with the Health it got
+    /// last (ENGINE_DOWN iff Recovering), so no State ever overtakes its
+    /// Health, and the last values delivered are the runtime's final ones.
+    #[test]
+    fn health_and_state_are_delivered_from_one_version() {
+        use HealthState::{Healthy, Recovering};
+        let (runtime, _) = runtime();
+        let mismatches = Arc::new(Mutex::new(Vec::<String>::new()));
+        let events = Arc::new(Mutex::new(Vec::<EngineEvent>::new()));
+        {
+            let (mismatches, events) = (Arc::clone(&mismatches), Arc::clone(&events));
+            let last_health = Mutex::new(HealthSnapshot::default());
+            runtime.subscribe(Box::new(move |event| {
+                match &event {
+                    EngineEvent::Health(health) => *last_health.lock() = health.clone(),
+                    EngineEvent::State(state) => {
+                        let health = last_health.lock().state;
+                        if state.paused_reasons.contains(PauseReasons::ENGINE_DOWN)
+                            != (health == Recovering)
+                        {
+                            mismatches.lock().push(format!("{health:?} {state:?}"));
+                        }
+                    }
+                    EngineEvent::Execution(_) => {}
+                }
+                events.lock().push(event);
+                std::thread::sleep(Duration::from_micros(200));
+            }));
+        }
+        let mut workers: Vec<_> = [(Recovering, Healthy), (Healthy, Recovering)]
+            .into_iter()
+            .map(|(even, odd)| {
+                let runtime = Arc::clone(&runtime);
+                std::thread::spawn(move || {
+                    for i in 0..2000 {
+                        runtime.publish_health(snapshot(if i % 2 == 0 { even } else { odd }));
+                    }
+                })
+            })
+            .collect();
+        workers.push({
+            let runtime = Arc::clone(&runtime);
+            std::thread::spawn(move || {
+                for i in 0..2000 {
+                    runtime.set_pause(PauseReasons::MANUAL, i % 2 == 0);
+                }
+            })
+        });
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let (final_health, final_state) = (runtime.health(), runtime.engine_state());
+        wait_until("final health and state", || {
+            let events = events.lock();
+            healths(&events).last() == Some(&final_health)
+                && states(&events).last() == Some(&final_state)
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let events = events.lock().clone();
+        assert_eq!(healths(&events).last(), Some(&final_health));
+        assert_eq!(states(&events).last(), Some(&final_state));
+        assert!(
+            states(&events).len() > 1,
+            "{} states",
+            states(&events).len()
+        );
+        let mismatches = mismatches.lock();
+        assert!(mismatches.is_empty(), "{:?}", &mismatches[..]);
+    }
+
+    /// One listener blocks the event thread while events keep coming. The
+    /// backlog is bounded: at most `EVENT_QUEUE_CAPACITY` executions wait
+    /// (the rest are dropped) and Health/State occupy one snapshot, so after
+    /// the block every subscriber gets the queued executions in order plus
+    /// exactly one Health and one State, the latest.
+    #[test]
+    fn blocked_listener_holds_a_bounded_backlog() {
+        let (runtime, _) = runtime();
+        let release = block_event_thread(&runtime);
+        let events = collect(&runtime);
         let executions = 3 * EVENT_QUEUE_CAPACITY;
-        let states = [
+        let states_cycle = [
             HealthState::Healthy,
             HealthState::Recovering,
             HealthState::Degraded,
@@ -891,7 +1054,7 @@ mod tests {
         for i in 0..executions {
             runtime.record(execution("burst"));
             if i % 4 == 0 {
-                runtime.publish_health(numbered(states[i % 3], i));
+                runtime.publish_health(numbered(states_cycle[i % 3], i));
                 runtime.set_pause(PauseReasons::MANUAL, i % 8 == 0);
             }
         }
@@ -900,53 +1063,23 @@ mod tests {
         runtime.set_pause(PauseReasons::TIMED, true);
         let final_state = runtime.engine_state();
         assert!(!final_state.listening);
-        release_tx.send(()).unwrap();
+        // Health/State wait as one snapshot, whatever happened meanwhile.
+        assert_eq!(runtime.outbox.latest.lock().health, final_health);
+        assert_eq!(
+            runtime.outbox.latest.lock().state.as_ref(),
+            Some(&final_state)
+        );
+        release.send(()).unwrap();
 
-        let last_of = |events: &[EngineEvent]| {
-            let health = events.iter().rev().find_map(|event| match event {
-                EngineEvent::Health(health) => Some(health.clone()),
-                _ => None,
-            });
-            let state = events.iter().rev().find_map(|event| match event {
-                EngineEvent::State(state) => Some(state.clone()),
-                _ => None,
-            });
-            (health, state)
-        };
         wait_until("latest health and state", || {
-            last_of(&events.lock()) == (Some(final_health.clone()), Some(final_state.clone()))
+            let events = events.lock();
+            healths(&events).last() == Some(&final_health)
+                && states(&events).last() == Some(&final_state)
         });
         std::thread::sleep(Duration::from_millis(50));
         let events = events.lock().clone();
-        assert_eq!(
-            last_of(&events),
-            (Some(final_health), Some(final_state)),
-            "nothing older arrives after the latest values"
-        );
-        // Bounded: one event in the blocked listener, at most a full queue,
-        // plus the parked Health and State.
-        assert!(
-            events.len() <= 1 + EVENT_QUEUE_CAPACITY + 2,
-            "{} events delivered",
-            events.len()
-        );
-        let delivered_executions = events
-            .iter()
-            .filter(|event| matches!(event, EngineEvent::Execution(_)))
-            .count();
-        assert!(delivered_executions <= 1 + EVENT_QUEUE_CAPACITY);
-        assert!(delivered_executions < 1 + executions, "some were dropped");
-        let health_order: Vec<i64> = events
-            .iter()
-            .filter_map(|event| match event {
-                EngineEvent::Health(health) => Some(health.components[0].since_ms),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            health_order.windows(2).all(|pair| pair[0] < pair[1]),
-            "{health_order:?}"
-        );
+        assert_eq!(healths(&events), [final_health]);
+        assert_eq!(states(&events), [final_state]);
         let seqs: Vec<u64> = events
             .iter()
             .filter_map(|event| match event {
@@ -954,7 +1087,16 @@ mod tests {
                 _ => None,
             })
             .collect();
+        // Exactly a full queue of the burst (this subscriber came after the
+        // execution the blocked listener holds); the rest was dropped.
+        assert_eq!(seqs.len(), EVENT_QUEUE_CAPACITY);
         assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(events.len(), EVENT_QUEUE_CAPACITY + 2);
+        assert_eq!(
+            runtime.outbox.dropped.load(Ordering::Relaxed),
+            0,
+            "reported"
+        );
 
         // The thread keeps working normally once the backlog is gone.
         let sink = collect(&runtime);
