@@ -1,21 +1,68 @@
-//! Output primitives (SendInput and the vendored injector) with fail-stop
-//! accounting of accepted events.
+//! Output layer over the [`Injector`] port with fail-stop accounting of
+//! accepted events, plus the Windows adapter (SendInput and the vendored
+//! Espanso injector).
+use super::keystate::physical;
 use super::*;
-use super::{actions::guarded, keystate::physical};
+use crate::traits::{Clock, Injector};
+
+extern "C" {
+    fn inject_string(text: *const u16) -> u32;
+    fn inject_separate_vkeys(keys: *const i32, len: i32) -> u32;
+    fn inject_vkeys_combination(keys: *const i32, len: i32) -> u32;
+}
 thread_local! {
     pub(super) static SENT_EFFECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
-fn send(inputs: &[INPUT]) -> Result<(), String> {
-    unsafe {
-        let accepted = SendInput(
-            inputs.len() as u32,
-            inputs.as_ptr(),
-            size_of::<INPUT>() as i32,
-        );
-        record_send_result(accepted, inputs.len() as u32)?;
-    }
-    Ok(())
+
+/// Production [`Injector`]: text, taps and chords go through the vendored
+/// injector; single key transitions and mouse events through `SendInput`.
+pub(super) struct WinInjector;
+fn send_input(input: INPUT) -> u32 {
+    unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) }
 }
+fn vkeys(keys: &[u16]) -> Vec<i32> {
+    keys.iter().map(|v| i32::from(*v)).collect()
+}
+impl Injector for WinInjector {
+    fn send_text(&self, text: &str) -> u32 {
+        let encoded = wide(text);
+        unsafe { inject_string(encoded.as_ptr()) }
+    }
+    fn send_keys(&self, keys: &[u16]) -> u32 {
+        let keys = vkeys(keys);
+        unsafe { inject_separate_vkeys(keys.as_ptr(), keys.len() as i32) }
+    }
+    fn send_chord(&self, keys: &[u16]) -> u32 {
+        let keys = vkeys(keys);
+        unsafe { inject_vkeys_combination(keys.as_ptr(), keys.len() as i32) }
+    }
+    fn send_key(&self, key: u16, up: bool) -> u32 {
+        let mut input: INPUT = unsafe { zeroed() };
+        input.r#type = INPUT_KEYBOARD;
+        input.Anonymous.ki = KEYBDINPUT {
+            wVk: key,
+            wScan: 0,
+            dwFlags: if up { KEYEVENTF_KEYUP } else { 0 },
+            time: 0,
+            dwExtraInfo: MARK,
+        };
+        send_input(input)
+    }
+    fn send_mouse(&self, flags: u32, data: u32, x: i32, y: i32) -> u32 {
+        let mut input: INPUT = unsafe { zeroed() };
+        input.r#type = INPUT_MOUSE;
+        input.Anonymous.mi = MOUSEINPUT {
+            dx: x,
+            dy: y,
+            mouseData: data,
+            dwFlags: flags,
+            time: 0,
+            dwExtraInfo: MARK,
+        };
+        send_input(input)
+    }
+}
+
 // no-regression #6: an injected-count mismatch fails the step and stops the action.
 pub(super) fn record_send_result(accepted: u32, requested: u32) -> Result<(), String> {
     if accepted > 0 {
@@ -45,53 +92,85 @@ pub(super) fn release_owned(
     owned.remove(&v);
     Ok(())
 }
-pub(super) fn key(v: u16, up: bool) -> Result<(), String> {
-    let mut input: INPUT = unsafe { zeroed() };
-    input.r#type = INPUT_KEYBOARD;
-    input.Anonymous.ki = KEYBDINPUT {
-        wVk: v,
-        wScan: 0,
-        dwFlags: if up { KEYEVENTF_KEYUP } else { 0 },
-        time: 0,
-        dwExtraInfo: MARK,
-    };
-    send(&[input])
+pub(super) fn key(injector: &impl Injector, v: u16, up: bool) -> Result<(), String> {
+    record_send_result(injector.send_key(v, up), 1)
 }
-pub(super) fn press(v: u16) -> Result<(), String> {
-    rawinput::press_keys(&[v])
+pub(super) fn press(injector: &impl Injector, v: u16) -> Result<(), String> {
+    press_keys(injector, &[v])
+}
+pub(super) fn press_keys(injector: &impl Injector, keys: &[u16]) -> Result<(), String> {
+    let result = record_send_result(injector.send_keys(keys), keys.len() as u32 * 2);
+    cleanup_submission(keys, result, physical, |v| key(injector, v, true))
+}
+pub(super) fn combination(injector: &impl Injector, keys: &[u16]) -> Result<(), String> {
+    let result = record_send_result(injector.send_chord(keys), keys.len() as u32 * 2);
+    cleanup_submission(keys, result, physical, |v| key(injector, v, true))
+}
+fn cleanup_submission(
+    keys: &[u16],
+    result: Result<(), String>,
+    mut held: impl FnMut(u16) -> bool,
+    mut release: impl FnMut(u16) -> Result<(), String>,
+) -> Result<(), String> {
+    if let Err(mut error) = result {
+        for &v in keys.iter().rev() {
+            if !held(v) {
+                if let Err(cleanup) = release(v) {
+                    error.push_str(&format!("; key release failed: {cleanup}"));
+                }
+            }
+        }
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+pub(super) fn text(injector: &impl Injector, value: &str) -> Result<(), String> {
+    let requested = value
+        .encode_utf16()
+        .count()
+        .checked_mul(2)
+        .ok_or("Text too long")? as u32;
+    if value.contains('\0') {
+        return Err("Unicode injection cannot contain NUL".into());
+    }
+    record_send_result(injector.send_text(value), requested)
 }
 
-pub(super) fn send_terminator(t: &str) -> Result<(), String> {
+pub(super) fn send_terminator(injector: &impl Injector, t: &str) -> Result<(), String> {
     if t == "semicolon" {
-        return rawinput::text(";");
+        return text(injector, ";");
     }
-    press(match t {
-        "space" => VK_SPACE,
-        "tab" => VK_TAB,
-        "enter" => VK_RETURN,
-        _ => return Ok(()),
-    })
+    press(
+        injector,
+        match t {
+            "space" => VK_SPACE,
+            "tab" => VK_TAB,
+            "enter" => VK_RETURN,
+            _ => return Ok(()),
+        },
+    )
 }
+/// Types `value` one scalar at a time, running `guard` before each one.
 pub(super) fn unicode(
-    text: &str,
-    s: &Shared,
-    target: &Foreground,
-    generation: u64,
+    injector: &impl Injector,
+    value: &str,
+    mut guard: impl FnMut() -> Result<(), String>,
 ) -> Result<(), String> {
     // Preserve Keys scalar order, without per-character UIA readback.
-    let mut chars = text.chars().peekable();
+    let mut chars = value.chars().peekable();
     while let Some(ch) = chars.next() {
-        guarded(s, target, generation)?;
+        guard()?;
         match ch {
             '\r' => {
                 if chars.peek() == Some(&'\n') {
                     chars.next();
                 }
-                press(VK_RETURN)?;
+                press(injector, VK_RETURN)?;
             }
-            '\n' => press(VK_RETURN)?,
-            '\t' => press(VK_TAB)?,
-            _ => rawinput::text(&ch.to_string())?,
+            '\n' => press(injector, VK_RETURN)?,
+            '\t' => press(injector, VK_TAB)?,
+            _ => text(injector, &ch.to_string())?,
         }
     }
     Ok(())
@@ -157,28 +236,29 @@ pub(super) fn vk(k: &Key) -> Result<u16, String> {
         }
     }
 }
-pub(super) fn hotkey(keys: &[Key]) -> Result<(), String> {
+pub(super) fn hotkey(injector: &impl Injector, keys: &[Key]) -> Result<(), String> {
     let values = keys.iter().map(vk).collect::<Result<Vec<_>, _>>()?;
     if values.iter().any(|v| physical(*v)) {
         return Err("Physical key conflicts with requested hotkey; action stopped".into());
     }
-    rawinput::combination(&values)
+    combination(injector, &values)
 }
 
-pub(super) fn mouse_input(flags: u32, data: u32, x: i32, y: i32) -> Result<(), String> {
-    let mut input: INPUT = unsafe { zeroed() };
-    input.r#type = INPUT_MOUSE;
-    input.Anonymous.mi = MOUSEINPUT {
-        dx: x,
-        dy: y,
-        mouseData: data,
-        dwFlags: flags,
-        time: 0,
-        dwExtraInfo: MARK,
-    };
-    send(&[input])
+pub(super) fn mouse_input(
+    injector: &impl Injector,
+    flags: u32,
+    data: u32,
+    x: i32,
+    y: i32,
+) -> Result<(), String> {
+    record_send_result(injector.send_mouse(flags, data, x, y), 1)
 }
-pub(super) fn button(button: MouseButton, state: ButtonState) -> Result<(), String> {
+pub(super) fn button(
+    injector: &impl Injector,
+    clock: &impl Clock,
+    button: MouseButton,
+    state: ButtonState,
+) -> Result<(), String> {
     let (down, up, data) = match button {
         MouseButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, 0),
         MouseButton::Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, 0),
@@ -187,22 +267,60 @@ pub(super) fn button(button: MouseButton, state: ButtonState) -> Result<(), Stri
         MouseButton::X2 => (MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, 2),
     };
     match state {
-        ButtonState::Down => mouse_input(down, data, 0, 0),
-        ButtonState::Up => mouse_input(up, data, 0, 0),
+        ButtonState::Down => mouse_input(injector, down, data, 0, 0),
+        ButtonState::Up => mouse_input(injector, up, data, 0, 0),
         ButtonState::Click => {
-            mouse_input(down, data, 0, 0)?;
-            mouse_input(up, data, 0, 0)
+            mouse_input(injector, down, data, 0, 0)?;
+            mouse_input(injector, up, data, 0, 0)
         }
         ButtonState::DoubleClick => {
-            button_fn(down, up, data)?;
-            std::thread::sleep(Duration::from_millis(80));
-            button_fn(down, up, data)
+            button_fn(injector, down, up, data)?;
+            clock.sleep(Duration::from_millis(80));
+            button_fn(injector, down, up, data)
         }
     }
 }
-fn button_fn(d: u32, u: u32, data: u32) -> Result<(), String> {
-    mouse_input(d, data, 0, 0)?;
-    mouse_input(u, data, 0, 0)
+fn button_fn(injector: &impl Injector, d: u32, u: u32, data: u32) -> Result<(), String> {
+    mouse_input(injector, d, data, 0, 0)?;
+    mouse_input(injector, u, data, 0, 0)
+}
+
+/// Trigger erasure derived from a match proof: how many characters to
+/// delete and when the final trigger key was observed.
+#[derive(Clone, Debug)]
+pub(super) struct Erasure {
+    pub(super) count: usize,
+    pub(super) at: Instant,
+    pub(super) ime_unverified: bool,
+}
+fn erase_count(
+    count: usize,
+    mut guard: impl FnMut() -> Result<(), String>,
+    mut send: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    for _ in 0..count {
+        guard()?;
+        send()?;
+    }
+    Ok(())
+}
+/// Deletes the trigger with backspaces, running `guard` before each one.
+pub(super) fn erase(
+    injector: &impl Injector,
+    clock: &impl Clock,
+    erasure: &Erasure,
+    guard: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    // Let the foreground process consume the final key; no UIA readback loop.
+    let elapsed = clock.now().saturating_duration_since(erasure.at);
+    if let Some(remaining) = Duration::from_millis(25).checked_sub(elapsed) {
+        clock.sleep(remaining);
+    }
+    erase_count(erasure.count, guard, || press_keys(injector, &[VK_BACK]))?;
+    if erasure.ime_unverified {
+        gate("IME physical-letter erasure submitted; target composition/consumption unknown");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -237,5 +355,70 @@ mod tests {
         mark_external_effect(); // EmptyClipboard succeeded before SetClipboardData failed.
         assert!(SENT_EFFECT.with(|flag| flag.get()));
         SENT_EFFECT.with(|flag| flag.set(false));
+    }
+    // Moved from rawinput.rs with the output functions (S-23).
+    #[test]
+    fn deletion_stops_on_submission_failure_or_cancel_before_more_backspaces() {
+        let mut sent = 0;
+        let result = erase_count(
+            5,
+            || Ok(()),
+            || {
+                sent += 1;
+                if sent == 2 {
+                    Err("send failed".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(sent, 2);
+        let mut sent = 0;
+        let result = erase_count(
+            5,
+            || Err("cancelled".into()),
+            || {
+                sent += 1;
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(sent, 0);
+    }
+    // Moved from rawinput.rs with the output functions (S-23).
+    #[test]
+    fn partial_combination_releases_unheld_keys_in_reverse_and_reports_cleanup_failure() {
+        let mut released = vec![];
+        let result = cleanup_submission(
+            &[17, 65],
+            Err("accepted 1/4".into()),
+            |v| v == 65,
+            |v| {
+                released.push(v);
+                Ok(())
+            },
+        );
+        assert_eq!(released, vec![17]);
+        assert_eq!(result, Err("accepted 1/4".into()));
+        let mut released = vec![];
+        let result = cleanup_submission(
+            &[17, 65],
+            Err("accepted 1/4".into()),
+            |_| false,
+            |v| {
+                released.push(v);
+                Err("blocked".into())
+            },
+        );
+        assert_eq!(released, vec![65, 17]);
+        assert!(result.unwrap_err().contains("key release failed"));
+        let result = cleanup_submission(
+            &[17, 65],
+            Ok(()),
+            |_| panic!("no cleanup on success"),
+            |_| panic!("no cleanup on success"),
+        );
+        assert!(result.is_ok());
     }
 }

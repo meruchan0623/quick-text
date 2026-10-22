@@ -1,5 +1,7 @@
 //! Foreground window identity and cursor geometry.
+use super::protection::{native_input_protection, protection_block};
 use super::*;
+use crate::traits::ForegroundProbe;
 pub fn cursor() -> serde_json::Value {
     unsafe {
         let mut p: POINT = zeroed();
@@ -52,5 +54,16 @@ pub(super) fn focus_handle(window: HWND) -> HWND {
         } else {
             window
         }
+    }
+}
+/// Production [`ForegroundProbe`]: the focused window plus the native-edit
+/// and cached UIA protection verdicts.
+pub(super) struct WinForeground;
+impl ForegroundProbe for WinForeground {
+    fn foreground(&self) -> Foreground {
+        foreground()
+    }
+    fn protection(&self) -> Option<String> {
+        native_input_protection().or_else(protection_block)
     }
 }

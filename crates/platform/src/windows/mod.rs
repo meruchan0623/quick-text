@@ -27,6 +27,8 @@ mod inject;
 mod input;
 mod keystate;
 mod observer;
+#[cfg(test)]
+mod pipeline_tests;
 mod protection;
 mod rawinput;
 mod recording;

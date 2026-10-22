@@ -1,6 +1,8 @@
-//! Clipboard lease: backup, verified writes and verified restore.
+//! Clipboard lease over the [`ClipboardBackend`] port: backup, verified
+//! writes and verified restore, plus the Windows adapter.
 use super::inject::mark_external_effect;
 use super::*;
+use crate::traits::ClipboardBackend;
 fn clipboard_operation(operation: &Operation) -> bool {
     matches!(
         operation,
@@ -90,54 +92,152 @@ pub(super) fn clipboard_formats(op: &Operation) -> Result<Option<ClipboardFormat
         _ => return Ok(None),
     }))
 }
-pub(super) struct PreparedClipboard {
-    handles: Vec<(u32, HGLOBAL)>,
-    expected: Vec<(u32, Vec<u8>)>,
+/// Production [`ClipboardBackend`]: a message-only owner window per lease.
+pub(super) struct WinClipboard {
+    window: HWND,
 }
-impl PreparedClipboard {
-    pub(super) fn new(formats: Vec<(u32, Vec<u8>)>) -> Result<Self, String> {
-        let mut result = Self {
-            handles: vec![],
-            expected: vec![],
+impl WinClipboard {
+    pub(super) fn new() -> Result<Self, String> {
+        let window = unsafe {
+            CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                wide("QuickerText Clipboard").as_ptr(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                (-3isize) as HWND,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
         };
-        for (f, b) in formats {
-            unsafe {
-                let h = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, b.len());
-                if h.is_null() {
-                    return Err("Clipboard allocation failed before deletion".into());
-                }
-                let p = GlobalLock(h);
-                if p.is_null() {
-                    GlobalFree(h);
-                    return Err("Clipboard allocation lock failed before deletion".into());
-                }
-                std::ptr::copy_nonoverlapping(b.as_ptr(), p as *mut u8, b.len());
-                result.expected.push((
-                    f,
-                    std::slice::from_raw_parts(p as *const u8, GlobalSize(h)).to_vec(),
-                ));
-                GlobalUnlock(h);
-                result.handles.push((f, h));
-            }
+        if window.is_null() {
+            return Err("Clipboard owner window creation failed".into());
         }
-        Ok(result)
+        Ok(Self { window })
     }
 }
-impl Drop for PreparedClipboard {
+impl Drop for WinClipboard {
     fn drop(&mut self) {
-        for (_, h) in self.handles.drain(..) {
+        unsafe {
+            DestroyWindow(self.window);
+        }
+    }
+}
+/// Global allocation not yet handed to the clipboard; freed on drop.
+pub(super) struct WinStaged(HGLOBAL);
+impl WinStaged {
+    fn into_raw(mut self) -> HGLOBAL {
+        std::mem::replace(&mut self.0, std::ptr::null_mut())
+    }
+}
+impl Drop for WinStaged {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
             unsafe {
-                GlobalFree(h);
+                GlobalFree(self.0);
             }
         }
     }
+}
+impl ClipboardBackend for WinClipboard {
+    type Staged = WinStaged;
+    fn identity(&self) -> u64 {
+        self.window as u64
+    }
+    fn owner(&self) -> u64 {
+        unsafe { GetClipboardOwner() as u64 }
+    }
+    fn sequence(&self) -> u32 {
+        unsafe { GetClipboardSequenceNumber() }
+    }
+    fn locked<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
+        unsafe {
+            if OpenClipboard(self.window) == 0 {
+                return None;
+            }
+            let result = f();
+            CloseClipboard();
+            Some(result)
+        }
+    }
+    fn formats(&self) -> Vec<u32> {
+        let mut formats = Vec::new();
+        let mut format = 0;
+        loop {
+            format = unsafe { EnumClipboardFormats(format) };
+            if format == 0 {
+                break;
+            }
+            formats.push(format);
+        }
+        formats
+    }
+    fn read(&self, format: u32, limit: usize) -> Result<Option<Vec<u8>>, String> {
+        unsafe {
+            let handle = GetClipboardData(format);
+            if handle.is_null() {
+                return Ok(None);
+            }
+            let size = GlobalSize(handle);
+            if size == 0 || size > limit {
+                return Ok(None);
+            }
+            let pointer = GlobalLock(handle);
+            if pointer.is_null() {
+                return Err("Clipboard data lock failed".into());
+            }
+            let bytes = std::slice::from_raw_parts(pointer as *const u8, size).to_vec();
+            GlobalUnlock(handle);
+            Ok(Some(bytes))
+        }
+    }
+    fn clear(&self) -> bool {
+        unsafe { EmptyClipboard() != 0 }
+    }
+    fn stage(&self, bytes: &[u8]) -> Result<(WinStaged, Vec<u8>), String> {
+        unsafe {
+            let handle = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes.len());
+            if handle.is_null() {
+                return Err("Clipboard allocation failed".into());
+            }
+            let staged = WinStaged(handle);
+            let pointer = GlobalLock(handle);
+            if pointer.is_null() {
+                return Err("Clipboard allocation lock failed".into());
+            }
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer as *mut u8, bytes.len());
+            let reported =
+                std::slice::from_raw_parts(pointer as *const u8, GlobalSize(handle)).to_vec();
+            GlobalUnlock(handle);
+            Ok((staged, reported))
+        }
+    }
+    fn set(&self, format: u32, staged: WinStaged) -> bool {
+        unsafe {
+            let handle = staged.into_raw();
+            if SetClipboardData(format, handle).is_null() {
+                GlobalFree(handle);
+                return false;
+            }
+            true
+        }
+    }
+}
+/// Payloads allocated before trigger deletion; unused ones free on drop.
+pub(super) struct PreparedClipboard<S> {
+    handles: Vec<(u32, S)>,
+    expected: ClipboardFormats,
 }
 // no-regression #1: restore only after sequence, owner and payload re-verify.
-pub(super) struct ClipboardLease {
-    backup: Vec<(u32, Vec<u8>)>,
-    owned_payload: Vec<(u32, Vec<u8>)>,
+pub(super) struct ClipboardLease<C: ClipboardBackend> {
+    backend: C,
+    backup: ClipboardFormats,
+    owned_payload: ClipboardFormats,
     written: Option<u32>,
-    owner: HWND,
     dirty: bool,
 }
 fn finish_clipboard_restore<T>(
@@ -160,34 +260,24 @@ fn retry_clipboard_verification<T>(
     }
     Err("Clipboard ownership could not be verified within the retry limit".into())
 }
-impl ClipboardLease {
-    unsafe fn verified_sequence(
+impl<C: ClipboardBackend> ClipboardLease<C> {
+    fn verified_sequence(
         &self,
-        owner: HWND,
+        owner: u64,
         expected: &[(u32, Vec<u8>)],
         exact_formats: bool,
     ) -> Result<u32, String> {
+        let backend = &self.backend;
         retry_clipboard_verification(
             || {
-                if OpenClipboard(self.owner) == 0 {
-                    return Ok(None);
-                }
-                let verified: Result<u32, String> = (|| {
-                    if GetClipboardOwner() != owner {
+                let Some(verified) = backend.locked(|| -> Result<u32, String> {
+                    if backend.owner() != owner {
                         return Err(
                             "Clipboard owner changed externally; clipboard preserved".into()
                         );
                     }
                     if exact_formats {
-                        let mut formats = Vec::new();
-                        let mut format = 0;
-                        loop {
-                            format = EnumClipboardFormats(format);
-                            if format == 0 {
-                                break;
-                            }
-                            formats.push(format);
-                        }
+                        let formats = backend.formats();
                         if formats.len() != expected.len()
                             || formats
                                 .iter()
@@ -199,30 +289,23 @@ impl ClipboardLease {
                         }
                     }
                     for (format, bytes) in expected {
-                        let handle = GetClipboardData(*format);
-                        if handle.is_null() || GlobalSize(handle) != bytes.len() {
-                            return Err(
-                                "Clipboard payload changed externally; clipboard preserved".into(),
-                            );
-                        }
-                        let pointer = GlobalLock(handle);
-                        if pointer.is_null() {
-                            return Err("Clipboard payload cannot be verified".into());
-                        }
-                        let matches =
-                            std::slice::from_raw_parts(pointer as *const u8, bytes.len()) == bytes;
-                        GlobalUnlock(handle);
-                        if !matches {
-                            return Err(
-                                "Clipboard payload changed externally; clipboard preserved".into(),
-                            );
+                        match backend.read(*format, bytes.len()) {
+                            Err(_) => return Err("Clipboard payload cannot be verified".into()),
+                            Ok(Some(current)) if current == *bytes => {}
+                            Ok(_) => {
+                                return Err(
+                                    "Clipboard payload changed externally; clipboard preserved"
+                                        .into(),
+                                )
+                            }
                         }
                     }
-                    Ok(GetClipboardSequenceNumber())
-                })();
-                CloseClipboard();
+                    Ok(backend.sequence())
+                }) else {
+                    return Ok(None);
+                };
                 let sequence = verified?;
-                if GetClipboardSequenceNumber() == sequence && GetClipboardOwner() == owner {
+                if backend.sequence() == sequence && backend.owner() == owner {
                     return Ok(Some(sequence));
                 }
                 Ok(None)
@@ -233,196 +316,159 @@ impl ClipboardLease {
     pub(super) fn verify_current(&self) -> Result<(), String> {
         if self
             .written
-            .is_none_or(|seq| unsafe { GetClipboardSequenceNumber() } != seq)
+            .is_none_or(|seq| self.backend.sequence() != seq)
         {
             return Err("Clipboard changed externally before paste; no paste was sent".into());
         }
         Ok(())
     }
+    /// Allocates `formats` up front so allocation cannot fail after deletion.
+    pub(super) fn prepare(
+        &self,
+        formats: ClipboardFormats,
+    ) -> Result<PreparedClipboard<C::Staged>, String> {
+        let mut prepared = PreparedClipboard {
+            handles: vec![],
+            expected: vec![],
+        };
+        for (format, bytes) in formats {
+            let (staged, reported) = self
+                .backend
+                .stage(&bytes)
+                .map_err(|error| format!("{error} before deletion"))?;
+            prepared.expected.push((format, reported));
+            prepared.handles.push((format, staged));
+        }
+        Ok(prepared)
+    }
     pub(super) fn write_prepared(
         &mut self,
-        prepared: &mut PreparedClipboard,
+        prepared: &mut PreparedClipboard<C::Staged>,
     ) -> Result<(), String> {
-        unsafe {
-            if OpenClipboard(self.owner) == 0 {
-                return Err("Clipboard is busy".into());
+        let Self {
+            backend,
+            owned_payload,
+            written,
+            dirty,
+            ..
+        } = self;
+        let result = backend.locked(|| -> Result<(), String> {
+            if written.is_some_and(|seq| backend.sequence() != seq) {
+                return Err("Clipboard changed externally; stopped without overwriting it".into());
             }
-            let result: Result<(), String> = (|| {
-                if self
-                    .written
-                    .is_some_and(|seq| GetClipboardSequenceNumber() != seq)
+            if !backend.clear() {
+                return Err("Clipboard clear failed".into());
+            }
+            *dirty = true;
+            owned_payload.clear();
+            mark_external_effect();
+            while !prepared.handles.is_empty() {
+                let (f, h) = prepared.handles.remove(0);
+                if !backend.set(f, h) {
+                    *written = Some(backend.sequence());
+                    return Err("Clipboard write failed".into());
+                }
+                if let Some((_, bytes)) = prepared.expected.iter().find(|(format, _)| *format == f)
                 {
-                    return Err(
-                        "Clipboard changed externally; stopped without overwriting it".into(),
-                    );
+                    owned_payload.push((f, bytes.clone()));
                 }
-                if EmptyClipboard() == 0 {
-                    return Err("Clipboard clear failed".into());
-                }
-                self.dirty = true;
-                self.owned_payload.clear();
-                mark_external_effect();
-                self.written = Some(GetClipboardSequenceNumber());
-                while !prepared.handles.is_empty() {
-                    let (f, h) = prepared.handles.remove(0);
-                    if SetClipboardData(f, h).is_null() {
-                        GlobalFree(h);
-                        self.written = Some(GetClipboardSequenceNumber());
-                        return Err("Clipboard write failed".into());
-                    }
-                    if let Some((_, bytes)) =
-                        prepared.expected.iter().find(|(format, _)| *format == f)
-                    {
-                        self.owned_payload.push((f, bytes.clone()));
-                    }
-                }
-                self.written = Some(GetClipboardSequenceNumber());
-                Ok(())
-            })();
-            CloseClipboard();
-            result?;
-            self.written = Some(self.verified_sequence(self.owner, &prepared.expected, false)?);
+            }
+            *written = Some(backend.sequence());
             Ok(())
-        }
+        });
+        result.ok_or("Clipboard is busy")??;
+        self.written =
+            Some(self.verified_sequence(self.backend.identity(), &prepared.expected, false)?);
+        Ok(())
     }
-    pub(super) fn new() -> Result<Self, String> {
-        unsafe {
-            let owner = CreateWindowExW(
-                0,
-                wide("STATIC").as_ptr(),
-                wide("QuickerText Clipboard").as_ptr(),
-                0,
-                0,
-                0,
-                0,
-                0,
-                (-3isize) as HWND,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            );
-            if owner.is_null() {
-                return Err("Clipboard owner window creation failed".into());
-            }
-            if OpenClipboard(owner) == 0 {
-                DestroyWindow(owner);
-                return Err("Clipboard is busy; trigger preserved".into());
-            }
-            let original_owner = GetClipboardOwner();
-            let result = (|| {
-                let mut backup = vec![];
-                let mut format = 0;
-                loop {
-                    format = EnumClipboardFormats(format);
-                    if format == 0 {
-                        break;
-                    }
-                    if matches!(format, 2 | 3 | 9 | 14 | 0x80..=0x8f) {
-                        return Err("Existing clipboard contains handle-based rich formats that cannot be safely restored; trigger preserved".into());
-                    }
-                    let h = GetClipboardData(format);
-                    let n = GlobalSize(h);
-                    if n == 0 || n > 32 * 1024 * 1024 {
+    pub(super) fn new(backend: C) -> Result<Self, String> {
+        let Some(result) = backend.locked(|| -> Result<(u64, ClipboardFormats, u32), String> {
+            let original_owner = backend.owner();
+            let mut backup = vec![];
+            for format in backend.formats() {
+                if matches!(format, 2 | 3 | 9 | 14 | 0x80..=0x8f) {
+                    return Err("Existing clipboard contains handle-based rich formats that cannot be safely restored; trigger preserved".into());
+                }
+                match backend.read(format, 32 * 1024 * 1024) {
+                    Ok(Some(bytes)) => backup.push((format, bytes)),
+                    Ok(None) => {
                         return Err(
                             "Clipboard format cannot be safely backed up; trigger preserved".into(),
-                        );
+                        )
                     }
-                    let p = GlobalLock(h);
-                    if p.is_null() {
-                        return Err("Clipboard backup failed".into());
-                    }
-                    let bytes = std::slice::from_raw_parts(p as *const u8, n).to_vec();
-                    GlobalUnlock(h);
-                    backup.push((format, bytes));
+                    Err(_) => return Err("Clipboard backup failed".into()),
                 }
-                Ok(Self {
-                    backup,
-                    owned_payload: vec![],
-                    written: Some(GetClipboardSequenceNumber()),
-                    owner,
-                    dirty: false,
-                })
-            })();
-            CloseClipboard();
-            match result {
-                Ok(mut lease) => match lease.verified_sequence(original_owner, &lease.backup, true)
-                {
-                    Ok(sequence) => {
-                        lease.written = Some(sequence);
-                        Ok(lease)
-                    }
-                    Err(reason) => {
-                        lease.written = None;
-                        Err(reason)
-                    }
-                },
-                Err(reason) => {
-                    DestroyWindow(owner);
-                    Err(reason)
-                }
+            }
+            Ok((original_owner, backup, backend.sequence()))
+        }) else {
+            return Err("Clipboard is busy; trigger preserved".into());
+        };
+        let (original_owner, backup, sequence) = result?;
+        let mut lease = Self {
+            backend,
+            backup,
+            owned_payload: vec![],
+            written: Some(sequence),
+            dirty: false,
+        };
+        match lease.verified_sequence(original_owner, &lease.backup, true) {
+            Ok(sequence) => {
+                lease.written = Some(sequence);
+                Ok(lease)
+            }
+            Err(reason) => {
+                lease.written = None;
+                Err(reason)
             }
         }
     }
-    fn write(&mut self, formats: Vec<(u32, Vec<u8>)>) -> Result<(), String> {
-        unsafe {
-            if OpenClipboard(self.owner) == 0 {
-                return Err("Clipboard is busy".into());
-            }
-            let result = (|| {
-                if let Some(seq) = self.written {
-                    if GetClipboardSequenceNumber() != seq {
+    fn write(&mut self, formats: ClipboardFormats) -> Result<(), String> {
+        let Self {
+            backend,
+            owned_payload,
+            written,
+            ..
+        } = self;
+        backend
+            .locked(|| -> Result<(), String> {
+                if let Some(seq) = *written {
+                    if backend.sequence() != seq {
                         return Err(
                             "Clipboard changed externally; stopped without overwriting it".into(),
                         );
                     }
                 }
-                if EmptyClipboard() == 0 {
+                if !backend.clear() {
                     return Err("Clipboard clear failed".into());
                 }
                 mark_external_effect();
-                self.owned_payload.clear();
-                self.written = Some(GetClipboardSequenceNumber());
+                owned_payload.clear();
+                *written = Some(backend.sequence());
                 for (format, bytes) in formats {
-                    let h = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes.len());
-                    if h.is_null() {
-                        return Err("Clipboard allocation failed".into());
-                    }
-                    let p = GlobalLock(h);
-                    if p.is_null() {
-                        GlobalFree(h);
-                        return Err("Clipboard lock failed".into());
-                    }
-                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), p as *mut u8, bytes.len());
-                    let expected =
-                        std::slice::from_raw_parts(p as *const u8, GlobalSize(h)).to_vec();
-                    GlobalUnlock(h);
-                    if SetClipboardData(format, h).is_null() {
-                        GlobalFree(h);
+                    let (staged, expected) = backend.stage(&bytes)?;
+                    if !backend.set(format, staged) {
                         return Err("Clipboard write failed".into());
                     }
-                    self.owned_payload.push((format, expected));
+                    owned_payload.push((format, expected));
                 }
-                self.written = Some(GetClipboardSequenceNumber());
+                *written = Some(backend.sequence());
                 Ok(())
-            })();
-            CloseClipboard();
-            result
-        }
+            })
+            .unwrap_or_else(|| Err("Clipboard is busy".into()))
     }
     pub(super) fn restore(&mut self) -> Result<(), String> {
         if !self.dirty {
             return Ok(());
         }
-        unsafe {
-            if GetClipboardOwner() != self.owner {
-                return Ok(());
-            }
-            // Closing the clipboard or a listener requesting a synthesized
-            // format can advance the sequence after our writes. Re-establish
-            // ownership from the exact payload under a lock; never adopt a new
-            // sequence solely because the previous one is no longer current.
-            self.written = Some(self.verified_sequence(self.owner, &self.owned_payload, false)?);
+        if self.backend.owner() != self.backend.identity() {
+            return Ok(());
         }
+        // Closing the clipboard or a listener requesting a synthesized
+        // format can advance the sequence after our writes. Re-establish
+        // ownership from the exact payload under a lock; never adopt a new
+        // sequence solely because the previous one is no longer current.
+        self.written =
+            Some(self.verified_sequence(self.backend.identity(), &self.owned_payload, false)?);
         let result = self.write(self.backup.clone());
         finish_clipboard_restore(&mut self.backup, result)?;
         self.written = None;
@@ -431,12 +477,10 @@ impl ClipboardLease {
         Ok(())
     }
 }
-impl Drop for ClipboardLease {
+impl<C: ClipboardBackend> Drop for ClipboardLease<C> {
     fn drop(&mut self) {
+        // The backend (owner window) is released after this restore attempt.
         let _ = self.restore();
-        unsafe {
-            DestroyWindow(self.owner);
-        }
     }
 }
 

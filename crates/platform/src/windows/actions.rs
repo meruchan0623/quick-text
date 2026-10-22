@@ -2,15 +2,16 @@
 //! cleanup, terminator and clipboard restore).
 use super::*;
 use super::{
-    clipboard::{acquire_clipboard, clipboard_formats, ClipboardLease, PreparedClipboard},
+    clipboard::{acquire_clipboard, clipboard_formats, ClipboardLease, WinClipboard},
     executor::CandidateProof,
+    foreground::WinForeground,
     inject::{
-        button, hotkey, key, mouse_input, press, release_owned, send_terminator, unicode, vk,
-        SENT_EFFECT,
+        button, erase, hotkey, key, mouse_input, press, release_owned, send_terminator, unicode,
+        vk, Erasure, WinInjector, SENT_EFFECT,
     },
     keystate::{modifiers_held, physical},
-    protection::{native_input_protection, protection_block},
 };
+use crate::traits::{ClipboardBackend, Clock, ForegroundProbe, Injector, SystemClock};
 thread_local! {
     static AUTOMATIC_EXECUTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -144,7 +145,12 @@ impl Drop for FenceLease {
     }
 }
 // no-regression #6: every step re-checks pause/cancel/generation/focus/protection.
-fn guarded_context(s: &Shared, target: &Foreground, generation: u64) -> Result<(), String> {
+fn guarded_context(
+    probe: &impl ForegroundProbe,
+    s: &Shared,
+    target: &Foreground,
+    generation: u64,
+) -> Result<(), String> {
     if pause_blocks_execution(
         s.paused.load(Ordering::SeqCst),
         AUTOMATIC_EXECUTION.with(|automatic| automatic.get()),
@@ -157,18 +163,23 @@ fn guarded_context(s: &Shared, target: &Foreground, generation: u64) -> Result<(
     if s.generation.load(Ordering::SeqCst) != generation {
         return Err("User input changed during action; stopped safely".into());
     }
-    let now = foreground();
-    if now.id != target.id || !now.process.eq_ignore_ascii_case(&target.process) {
+    let now = probe.foreground();
+    if !probe.same_window(&now, target) {
         return Err("Foreground window/process changed; stopped safely".into());
     }
     rawinput::guard(s)?;
-    if let Some(error) = native_input_protection().or_else(protection_block) {
+    if let Some(error) = probe.protection() {
         return Err(error);
     }
     Ok(())
 }
-pub(super) fn guarded(s: &Shared, target: &Foreground, generation: u64) -> Result<(), String> {
-    guarded_context(s, target, generation)?;
+fn guarded(
+    probe: &impl ForegroundProbe,
+    s: &Shared,
+    target: &Foreground,
+    generation: u64,
+) -> Result<(), String> {
+    guarded_context(probe, s, target, generation)?;
     if physical(VK_CONTROL)
         || physical(VK_MENU)
         || physical(VK_SHIFT)
@@ -199,17 +210,68 @@ pub fn execute(
 pub(super) fn execute_inner(
     s: Arc<Shared>,
     plan: ActionPlan,
-    mut target: Foreground,
+    target: Foreground,
     generation: u64,
     proof: Option<CandidateProof>,
     terminator: Option<String>,
     speed: f64,
 ) -> Result<ExecutionResult, String> {
+    let proof = proof.map(|proof| match proof {
+        CandidateProof::Espanso(proof) => proof,
+    });
+    let erasure = proof.as_ref().map(rawinput::Proof::erasure);
+    rawinput::install(proof);
+    run(
+        &Ports {
+            injector: &WinInjector,
+            foreground: &WinForeground,
+            clock: &SystemClock,
+            clipboard: WinClipboard::new,
+        },
+        &s,
+        plan,
+        target,
+        generation,
+        erasure,
+        terminator,
+        speed,
+    )
+}
+/// Ports one action run uses (S-23): production wires the Windows adapters,
+/// pipeline tests wire `crate::mock`.
+pub(super) struct Ports<'a, I, F, K, B> {
+    pub(super) injector: &'a I,
+    pub(super) foreground: &'a F,
+    pub(super) clock: &'a K,
+    /// Opens the backend for a clipboard lease (paste plans only).
+    pub(super) clipboard: B,
+}
+/// Runs a plan: optional trigger erasure, output steps, owned-input cleanup,
+/// terminator and clipboard restore. The caller installs the stamp proof.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "execute_inner's parameters plus the port bundle"
+)]
+pub(super) fn run<I, F, K, C, B>(
+    ports: &Ports<'_, I, F, K, B>,
+    s: &Shared,
+    plan: ActionPlan,
+    mut target: Foreground,
+    generation: u64,
+    erasure: Option<Erasure>,
+    terminator: Option<String>,
+    speed: f64,
+) -> Result<ExecutionResult, String>
+where
+    I: Injector,
+    F: ForegroundProbe,
+    K: Clock,
+    C: ClipboardBackend,
+    B: Fn() -> Result<C, String>,
+{
+    let (injector, probe, clock) = (ports.injector, ports.foreground, ports.clock);
     SENT_EFFECT.with(|flag| flag.set(false));
-    AUTOMATIC_EXECUTION.with(|automatic| automatic.set(proof.is_some()));
-    rawinput::install(proof.as_ref().map(|proof| match proof {
-        CandidateProof::Espanso(proof) => proof.clone(),
-    }));
+    AUTOMATIC_EXECUTION.with(|automatic| automatic.set(erasure.is_some()));
     let _fence_lease = FenceLease;
     if !speed.is_finite() || speed <= 0.0 {
         return Err("Replay speed must be positive and finite".into());
@@ -217,32 +279,34 @@ pub(super) fn execute_inner(
     preflight(&plan)?;
     // A shifted or AltGr trigger can match before the modifier is released.
     // Wait for release while keeping every cancellation and focus check active.
-    if proof.is_some() {
-        let wait = Instant::now();
-        while modifiers_held() && wait.elapsed() < Duration::from_secs(1) {
-            guarded_context(&s, &target, generation)?;
-            std::thread::sleep(Duration::from_millis(5));
+    if erasure.is_some() {
+        let wait = clock.now();
+        while modifiers_held()
+            && clock.now().saturating_duration_since(wait) < Duration::from_secs(1)
+        {
+            guarded_context(probe, s, &target, generation)?;
+            clock.sleep(Duration::from_millis(5));
         }
     }
-    guarded(&s, &target, generation)?;
+    guarded(probe, s, &target, generation)?;
     // All potentially failing source/format checks happen before trigger deletion.
-    let mut clipboard = acquire_clipboard(&plan, ClipboardLease::new)?;
+    let mut clipboard = acquire_clipboard(&plan, || ClipboardLease::new((ports.clipboard)()?))?;
     let mut payloads = std::collections::BTreeMap::new();
-    if clipboard.is_some() {
+    if let Some(lease) = clipboard.as_ref() {
         for (index, step) in plan.steps.iter().enumerate() {
             if let Some(formats) = clipboard_formats(&step.operation)? {
-                payloads.insert(index, PreparedClipboard::new(formats)?);
+                payloads.insert(index, lease.prepare(formats)?);
             }
         }
     }
-    guarded(&s, &target, generation)?;
+    guarded(probe, s, &target, generation)?;
     if let Some(lease) = clipboard.as_ref() {
         lease.verify_current()?;
     }
-    if let Some(proof) = &proof {
-        let erased = match proof {
-            CandidateProof::Espanso(proof) => rawinput::erase(&s, &target, generation, proof),
-        };
+    if let Some(erasure) = &erasure {
+        let erased = erase(injector, clock, erasure, || {
+            guarded(probe, s, &target, generation)
+        });
         if let Err(message) = erased {
             return Ok(ExecutionResult {
                 id: "erase".into(),
@@ -256,22 +320,20 @@ pub(super) fn execute_inner(
     let mut owned = BTreeSet::new();
     let mut owned_mouse = vec![];
     let mut completed = 0;
-    let started = Instant::now();
+    let started = clock.now();
     let mut failure = None;
     for step in &plan.steps {
-        if started.elapsed() > Duration::from_secs(120) {
+        if clock.now().saturating_duration_since(started) > Duration::from_secs(120) {
             failure = Some("Execution timeout".into());
             break;
         }
         if let TargetPolicy::Declared { process } = &step.target {
-            let now = foreground();
+            let now = probe.foreground();
             if !now.process.eq_ignore_ascii_case(process) {
                 failure = Some("Declared next target is not foreground".into());
                 break;
             }
-            if proof.is_some()
-                && (now.id != target.id || !now.process.eq_ignore_ascii_case(&target.process))
-            {
+            if erasure.is_some() && !probe.same_window(&now, &target) {
                 failure = Some(
                     "Automatic shortcut action changed its declared target; stopped safely".into(),
                 );
@@ -279,7 +341,7 @@ pub(super) fn execute_inner(
             }
             target = now;
         }
-        if let Err(e) = guarded(&s, &target, generation) {
+        if let Err(e) = guarded(probe, s, &target, generation) {
             failure = Some(e);
             break;
         }
@@ -289,7 +351,7 @@ pub(super) fn execute_inner(
                     text,
                     method: OutputMethod::Keys,
                 } => {
-                    unicode(text, &s, &target, generation)?;
+                    unicode(injector, text, || guarded(probe, s, &target, generation))?;
                 }
                 Operation::Text {
                     method: OutputMethod::Paste,
@@ -299,45 +361,46 @@ pub(super) fn execute_inner(
                 | Operation::PasteFiles { .. }
                 | Operation::PasteImage { .. } => {
                     if let Some(prepared) = payloads.get_mut(&completed) {
-                        guarded(&s, &target, generation)?;
+                        guarded(probe, s, &target, generation)?;
                         clipboard.as_mut().unwrap().write_prepared(prepared)?;
                     }
                     // Clipboard preparation/retry may take time: revalidate
                     // immediately before submitting the paste chord.
                     clipboard.as_ref().unwrap().verify_current()?;
-                    guarded(&s, &target, generation)?;
-                    hotkey(&[Key::named("CTRL"), Key::named("V")])?;
-                    std::thread::sleep(Duration::from_millis(150));
+                    guarded(probe, s, &target, generation)?;
+                    hotkey(injector, &[Key::named("CTRL"), Key::named("V")])?;
+                    clock.sleep(Duration::from_millis(150));
                 }
                 Operation::KeyDown { key: k } => {
                     let v = vk(k)?;
                     if physical(v) {
                         return Err("Requested key is physically held".into());
                     }
-                    key(v, false)?;
+                    key(injector, v, false)?;
                     owned.insert(v);
                 }
                 Operation::KeyUp { key: k } => {
                     let v = vk(k)?;
-                    release_owned(&mut owned, v, physical(v), || key(v, true))?;
+                    release_owned(&mut owned, v, physical(v), || key(injector, v, true))?;
                 }
                 Operation::KeyPress { key: k } => {
                     let v = vk(k)?;
                     if physical(v) {
                         return Err("Requested key is physically held".into());
                     }
-                    press(v)?;
+                    press(injector, v)?;
                 }
-                Operation::Hotkey { keys } => hotkey(keys)?,
+                Operation::Hotkey { keys } => hotkey(injector, keys)?,
 
                 Operation::Delay { ms } => {
-                    let until = Instant::now() + Duration::from_millis(*ms);
-                    while Instant::now() < until {
-                        if started.elapsed() > Duration::from_secs(120) {
+                    let until = clock.now() + Duration::from_millis(*ms);
+                    while clock.now() < until {
+                        if clock.now().saturating_duration_since(started) > Duration::from_secs(120)
+                        {
                             return Err("Execution timeout".into());
                         }
-                        guarded(&s, &target, generation)?;
-                        std::thread::sleep(Duration::from_millis(10));
+                        guarded(probe, s, &target, generation)?;
+                        clock.sleep(Duration::from_millis(10));
                     }
                 }
                 Operation::MouseMove {
@@ -347,7 +410,7 @@ pub(super) fn execute_inner(
                     percent,
                 } => {
                     if *relative {
-                        mouse_input(MOUSEEVENTF_MOVE, 0, *x as i32, *y as i32)?
+                        mouse_input(injector, MOUSEEVENTF_MOVE, 0, *x as i32, *y as i32)?
                     } else {
                         unsafe {
                             let (left, top, w, h) = (
@@ -365,6 +428,7 @@ pub(super) fn execute_inner(
                                 (*x, *y)
                             };
                             mouse_input(
+                                injector,
                                 MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                                 0,
                                 ((px - left as f64) * 65535.0 / (w - 1) as f64) as i32,
@@ -384,7 +448,7 @@ pub(super) fn execute_inner(
                     if physical(physical_key) {
                         return Err("Physical mouse button conflicts with action".into());
                     }
-                    button(*b, *state)?;
+                    button(injector, clock, *b, *state)?;
                     if *state == ButtonState::Down {
                         owned_mouse.push(*b)
                     }
@@ -393,6 +457,7 @@ pub(super) fn execute_inner(
                     }
                 }
                 Operation::Wheel { axis, amount, unit } => mouse_input(
+                    injector,
                     if *axis == WheelAxis::Vertical {
                         MOUSEEVENTF_WHEEL
                     } else {
@@ -412,7 +477,7 @@ pub(super) fn execute_inner(
                     working_directory,
                 } => open(target, args, working_directory)?,
                 Operation::Common { function } => {
-                    hotkey(&common_keys(function)?)?;
+                    hotkey(injector, &common_keys(function)?)?;
                 }
                 Operation::Reusable { .. } => return Err("Unregistered reusable action".into()),
             }
@@ -428,7 +493,7 @@ pub(super) fn execute_inner(
     }
     for v in owned {
         if !physical(v) {
-            if let Err(error) = key(v, true) {
+            if let Err(error) = key(injector, v, true) {
                 failure.get_or_insert_with(|| format!("Owned key cleanup failed: {error}"));
             }
         }
@@ -442,7 +507,7 @@ pub(super) fn execute_inner(
             MouseButton::X2 => VK_XBUTTON2,
         };
         if !physical(v) {
-            if let Err(error) = button(b, ButtonState::Up) {
+            if let Err(error) = button(injector, clock, b, ButtonState::Up) {
                 failure
                     .get_or_insert_with(|| format!("Owned mouse button cleanup failed: {error}"));
             }
@@ -450,7 +515,9 @@ pub(super) fn execute_inner(
     }
     if failure.is_none() {
         if let Some(t) = terminator {
-            if let Err(error) = guarded(&s, &target, generation).and_then(|_| send_terminator(&t)) {
+            if let Err(error) =
+                guarded(probe, s, &target, generation).and_then(|_| send_terminator(injector, &t))
+            {
                 failure = Some(error);
             }
         }
