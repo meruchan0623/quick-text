@@ -1,5 +1,5 @@
 //! Tauri-managed state and the `load_state` snapshot sent to the frontend.
-use crate::{autostart, store::Store};
+use crate::{autostart, error::SafeModeReason, startup::StartupProblem, store::Store};
 use quicker_domain::Config;
 use quicker_platform::ExecutionResult;
 use serde::Serialize;
@@ -22,6 +22,8 @@ pub struct AppState {
     autostart: bool,
     engine_detail: serde_json::Value,
     platform: String,
+    startup_problems: Vec<StartupProblem>,
+    safe_mode: Option<SafeModeReason>,
 }
 impl Store {
     pub fn state(&self) -> AppState {
@@ -49,6 +51,8 @@ impl Store {
                 "windows"
             }
             .into(),
+            startup_problems: self.startup_problems().to_vec(),
+            safe_mode: self.safe_mode(),
         }
     }
 }

@@ -1,0 +1,585 @@
+//! `load_or_fallback` (B-04, plan §7.2): chooses the configuration to start
+//! with, quarantines corrupt files and decides on safe mode. It never fails;
+//! every way the data directory can be broken ends in a [`LoadOutcome`].
+use super::{
+    atomic::atomic_json,
+    meta::{next_crash_count, parse_meta, RunMarker, StoreMeta, CRASH_LOOP_THRESHOLD, META_FILE},
+};
+use crate::{
+    error::{file_label, SafeModeReason},
+    faults,
+    startup::{ProblemKind, StartupProblem},
+};
+use quicker_domain::*;
+use quicker_platform::{
+    fault::FaultPoint,
+    traits::{Clock, SystemClock},
+};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+/// Backoff between reads that fail with an I/O error (sharing violation,
+/// permissions, a cloud placeholder, antivirus): an I/O failure is not
+/// corruption.
+const RETRY_DELAYS_MS: [u64; 4] = [100, 200, 400, 800];
+
+/// File access used while loading; tests substitute locks and failures.
+pub trait StoreIo: Send + Sync {
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+}
+
+/// The real file system. `fs::read` opens with every share mode on Windows,
+/// so reading never blocks another process that has the file open.
+pub struct FsIo;
+impl StoreIo for FsIo {
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        if path.file_name().is_some_and(|name| name == "active.json")
+            && faults::peek(FaultPoint::StoreLocked).is_some()
+        {
+            return Err(io::Error::other("injected store_locked"));
+        }
+        fs::read(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        fs::rename(from, to)
+    }
+}
+
+/// Everything `load_or_fallback` needs from the outside world.
+pub struct StoreEnv {
+    pub io: Box<dyn StoreIo>,
+    pub clock: Box<dyn Clock>,
+    /// Identifies the current boot; see [`super::meta::system_boot_id`].
+    pub boot_id: Option<u64>,
+    pub pid: u32,
+}
+impl StoreEnv {
+    pub fn system() -> Self {
+        let clock = SystemClock;
+        let boot_id = super::meta::system_boot_id(clock.wall_ms());
+        Self {
+            io: Box::new(FsIo),
+            clock: Box::new(clock),
+            boot_id,
+            pid: std::process::id(),
+        }
+    }
+}
+
+/// Where a recovered configuration came from (`recovered.args.from`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoverySource {
+    LastGood,
+    Revision,
+    Previous,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadOutcome {
+    /// `active.json` was read (or there is no data yet).
+    Normal,
+    /// `active.json` was unusable; another candidate was loaded.
+    Recovered {
+        from: RecoverySource,
+        revision: Option<u64>,
+    },
+    SafeMode(SafeModeReason),
+}
+
+/// The result of [`load_or_fallback`].
+pub struct LoadReport {
+    pub outcome: LoadOutcome,
+    pub active: Config,
+    /// `active` compiled rule by rule; rules that failed stay off (B-43).
+    pub compiled: CompiledConfig,
+    pub draft: Config,
+    pub previous: Option<Config>,
+    /// SHA-256 of `active.json` as read; `None` when it was not the source.
+    pub disk_hash: Option<Vec<u8>>,
+    /// The `safe_mode` problem, when present, comes first.
+    pub problems: Vec<StartupProblem>,
+    pub meta: StoreMeta,
+    /// Whether `store-meta.json` may be written this session.
+    pub meta_writable: bool,
+}
+impl LoadReport {
+    pub fn safe_mode(&self) -> Option<SafeModeReason> {
+        match self.outcome {
+            LoadOutcome::SafeMode(reason) => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+/// Loads the data directory (plan §7.2 `load_or_fallback`):
+///
+/// 1. Reads `store-meta.json`; a run marker left in the same boot less than
+///    5 minutes ago counts one more consecutive crash.
+/// 2. Tries `active.json`, then the last-known-good revision, then
+///    `revisions/<n>.json` newest first, then `previous.json`. Reads that
+///    fail with an I/O error are retried with backoff. `active.json` still
+///    unreadable is SafeMode(Locked): no fallback, no quarantine, no write;
+///    another candidate that stays unreadable is skipped.
+/// 3. Only content that does not parse is quarantined (renamed to
+///    `<name>.corrupt-<time>.json`); if that rename fails nothing may
+///    overwrite the file, so `active.json` and `draft.json` then also mean
+///    SafeMode(Locked). A newer schema is SafeMode(NewerSchema): read-only.
+/// 4. The chosen configuration is read leniently and compiled rule by rule.
+///    No usable candidate at all is SafeMode(NoValidConfig) with an empty
+///    configuration; two or more consecutive crashes are SafeMode(CrashLoop)
+///    with the data loaded for viewing.
+pub fn load_or_fallback(dir: &Path, env: &StoreEnv) -> LoadReport {
+    let mut loader = Loader {
+        dir,
+        env,
+        problems: vec![],
+    };
+    let (meta, meta_readable) = loader.read_meta();
+    let now = RunMarker {
+        boot_id: env.boot_id,
+        started_ms: env.clock.wall_ms(),
+        pid: env.pid,
+    };
+    let crash_count = next_crash_count(&meta, &now);
+
+    let active_path = dir.join("active.json");
+    let mut disk_hash = None;
+    let mut found = None;
+    let mut any_candidate = false;
+    match loader.candidate(&active_path) {
+        Candidate::Loaded(stored, bytes) => {
+            disk_hash = Some(Sha256::digest(bytes).to_vec());
+            found = Some((*stored, LoadOutcome::Normal));
+        }
+        Candidate::Missing => {}
+        Candidate::Corrupt { quarantined: true } => any_candidate = true,
+        Candidate::Unreadable | Candidate::Corrupt { quarantined: false } => {
+            return loader.read_only(SafeModeReason::Locked, meta)
+        }
+        Candidate::Newer => return loader.read_only(SafeModeReason::NewerSchema, meta),
+    }
+    if found.is_none() {
+        for (path, from) in loader.fallback_candidates(meta.last_good_revision) {
+            match loader.candidate(&path) {
+                Candidate::Loaded(stored, _) => {
+                    let revision =
+                        (from != RecoverySource::Previous).then_some(stored.config.revision);
+                    tracing::warn!(
+                        event = "store.recovered",
+                        file = %label(&path),
+                        ?from,
+                        ?revision,
+                        "active.json unusable; recovered from another file"
+                    );
+                    loader.problem(ProblemKind::Recovered { from, revision });
+                    found = Some((*stored, LoadOutcome::Recovered { from, revision }));
+                    break;
+                }
+                Candidate::Missing => {}
+                Candidate::Unreadable | Candidate::Corrupt { .. } => any_candidate = true,
+                Candidate::Newer => return loader.read_only(SafeModeReason::NewerSchema, meta),
+            }
+        }
+    }
+    let (stored, mut outcome) = match found {
+        Some(found) => found,
+        None => {
+            let stored = StoredConfig {
+                config: Config::default(),
+                diagnostics: vec![],
+            };
+            if any_candidate {
+                (stored, LoadOutcome::SafeMode(SafeModeReason::NoValidConfig))
+            } else {
+                // A new data directory.
+                (stored, LoadOutcome::Normal)
+            }
+        }
+    };
+    log_read_diagnostics(&stored.diagnostics);
+    let active = stored.config;
+
+    let draft = match loader.candidate(&dir.join("draft.json")) {
+        Candidate::Loaded(stored, _) => stored.config,
+        Candidate::Missing | Candidate::Corrupt { quarantined: true } => active.clone(),
+        // An unpublished draft we could not read must not be overwritten.
+        Candidate::Unreadable | Candidate::Corrupt { quarantined: false } => {
+            return loader.read_only(SafeModeReason::Locked, meta)
+        }
+        Candidate::Newer => return loader.read_only(SafeModeReason::NewerSchema, meta),
+    };
+    let previous = loader.previous(&active);
+
+    // Rules that did not compile plus entries that did not read; entries
+    // without a string id count but have no id to list.
+    let (compiled, mut skipped) = compile_lenient(&active);
+    let count = skipped.len() + active.unreadable_rules.len();
+    skipped.extend(
+        active
+            .unreadable_rules
+            .iter()
+            .filter_map(|entry| entry.id().map(str::to_string)),
+    );
+    if count > 0 {
+        tracing::warn!(
+            event = "store.rules_skipped",
+            count,
+            "rules stay off at runtime"
+        );
+        loader.problem(ProblemKind::RulesSkipped {
+            count,
+            ids: skipped,
+        });
+    }
+    let keys = active.unsupported_terminators();
+    if !keys.is_empty() {
+        loader.problem(ProblemKind::TerminatorUnsupported { keys });
+    }
+
+    // A data problem is the more specific reason.
+    if !matches!(outcome, LoadOutcome::SafeMode(_)) && crash_count >= CRASH_LOOP_THRESHOLD {
+        tracing::warn!(
+            event = "store.crash_loop",
+            crash_count,
+            "consecutive crashes at startup"
+        );
+        outcome = LoadOutcome::SafeMode(SafeModeReason::CrashLoop);
+    }
+    let mut meta = meta;
+    meta.run_marker = Some(now);
+    meta.crash_count = crash_count;
+    if meta_readable {
+        if let Err(e) = atomic_json(&dir.join(META_FILE), &meta) {
+            tracing::warn!(event = "store.meta_write_failed", error = %e, "store-meta.json not written");
+        }
+    }
+    let mut problems = loader.problems;
+    if let LoadOutcome::SafeMode(reason) = outcome {
+        problems.insert(0, ProblemKind::SafeMode { reason }.into());
+    }
+    LoadReport {
+        outcome,
+        active,
+        compiled,
+        draft,
+        previous,
+        disk_hash,
+        problems,
+        meta,
+        meta_writable: meta_readable,
+    }
+}
+
+/// One more attempt while in SafeMode(Locked); `None` while still locked.
+pub fn retry_locked(dir: &Path, env: &StoreEnv) -> Option<LoadReport> {
+    let report = load_or_fallback(dir, env);
+    (report.outcome != LoadOutcome::SafeMode(SafeModeReason::Locked)).then_some(report)
+}
+
+enum Candidate {
+    Loaded(Box<StoredConfig>, Vec<u8>),
+    Missing,
+    /// Still failing with an I/O error after the retries.
+    Unreadable,
+    /// Did not parse; `quarantined` tells whether the rename succeeded.
+    Corrupt {
+        quarantined: bool,
+    },
+    Newer,
+}
+
+enum Read {
+    Bytes(Vec<u8>),
+    Missing,
+    Failed,
+}
+
+struct Loader<'a> {
+    dir: &'a Path,
+    env: &'a StoreEnv,
+    problems: Vec<StartupProblem>,
+}
+impl Loader<'_> {
+    fn problem(&mut self, kind: ProblemKind) {
+        self.problems.push(kind.into());
+    }
+
+    fn read(&self, path: &Path) -> Read {
+        let mut delays = RETRY_DELAYS_MS.iter();
+        loop {
+            match self.env.io.read(path) {
+                Ok(bytes) => return Read::Bytes(bytes),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Read::Missing,
+                Err(e) => match delays.next() {
+                    Some(ms) => self.env.clock.sleep(Duration::from_millis(*ms)),
+                    None => {
+                        tracing::warn!(
+                            event = "store.read_failed",
+                            file = %label(path),
+                            error = %e,
+                            "file stayed unreadable after retries"
+                        );
+                        return Read::Failed;
+                    }
+                },
+            }
+        }
+    }
+
+    fn read_meta(&mut self) -> (StoreMeta, bool) {
+        match self.read(&self.dir.join(META_FILE)) {
+            Read::Missing => (StoreMeta::default(), true),
+            // Never replace a file we could not read.
+            Read::Failed => (StoreMeta::default(), false),
+            Read::Bytes(bytes) => match parse_meta(&bytes) {
+                Some(meta) => (meta, true),
+                None => {
+                    tracing::warn!(
+                        event = "store.meta_reset",
+                        "store-meta.json unreadable; rebuilt"
+                    );
+                    self.problem(ProblemKind::StoreMetaReset {});
+                    (StoreMeta::default(), true)
+                }
+            },
+        }
+    }
+
+    fn candidate(&mut self, path: &Path) -> Candidate {
+        let bytes = match self.read(path) {
+            Read::Bytes(bytes) => bytes,
+            Read::Missing => return Candidate::Missing,
+            Read::Failed => return Candidate::Unreadable,
+        };
+        match read_stored_config(&bytes) {
+            Ok(stored) => Candidate::Loaded(Box::new(stored), bytes),
+            Err(StoredConfigError::NewerSchema { version }) => {
+                tracing::warn!(
+                    event = "store.newer_schema",
+                    file = %label(path),
+                    version,
+                    "written by a newer release; opening read-only"
+                );
+                Candidate::Newer
+            }
+            Err(e) => {
+                tracing::warn!(
+                    event = "store.corrupt",
+                    file = %label(path),
+                    code = e.code(),
+                    error = %e,
+                    "configuration file does not parse"
+                );
+                Candidate::Corrupt {
+                    quarantined: self.quarantine(path),
+                }
+            }
+        }
+    }
+
+    /// Renames a corrupt file to `<stem>.corrupt-<UTC time>.json` beside it.
+    fn quarantine(&mut self, path: &Path) -> bool {
+        let target = quarantine_target(path, self.env.clock.wall_ms());
+        match self.env.io.rename(path, &target) {
+            Ok(()) => {
+                tracing::warn!(
+                    event = "store.quarantine",
+                    file = %label(path),
+                    quarantined_as = %label(&target),
+                    "quarantined corrupt file"
+                );
+                self.problem(ProblemKind::ConfigQuarantined {
+                    file: label(path),
+                    quarantined_as: label(&target),
+                });
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    event = "store.quarantine_failed",
+                    file = %label(path),
+                    error = %e,
+                    "corrupt file could not be renamed; it will not be overwritten"
+                );
+                false
+            }
+        }
+    }
+
+    /// The last-known-good revision, then the other revisions newest first,
+    /// then `previous.json`.
+    fn fallback_candidates(&self, last_good: Option<u64>) -> Vec<(PathBuf, RecoverySource)> {
+        let revisions = self.dir.join("revisions");
+        let mut candidates = vec![];
+        if let Some(n) = last_good {
+            candidates.push((
+                revisions.join(format!("{n}.json")),
+                RecoverySource::LastGood,
+            ));
+        }
+        let mut numbers = revision_numbers(self.dir);
+        numbers.sort_unstable_by(|a, b| b.cmp(a));
+        candidates.extend(
+            numbers
+                .into_iter()
+                .filter(|n| Some(*n) != last_good)
+                .map(|n| {
+                    (
+                        revisions.join(format!("{n}.json")),
+                        RecoverySource::Revision,
+                    )
+                }),
+        );
+        candidates.push((self.dir.join("previous.json"), RecoverySource::Previous));
+        candidates
+    }
+
+    /// The configuration `rollback` returns to. Not a fallback candidate: a
+    /// file that does not read only makes rollback unavailable.
+    fn previous(&self, active: &Config) -> Option<Config> {
+        let historical = self
+            .dir
+            .join("revisions")
+            .join(format!("{}.json", active.revision.saturating_sub(1)));
+        let path = if active.revision > 0 && historical.exists() {
+            historical
+        } else {
+            self.dir.join("previous.json")
+        };
+        let Read::Bytes(bytes) = self.read(&path) else {
+            return None;
+        };
+        match read_stored_config(&bytes) {
+            Ok(stored) => Some(stored.config),
+            Err(e) => {
+                tracing::warn!(
+                    event = "store.previous_unreadable",
+                    file = %label(&path),
+                    code = e.code(),
+                    "previous configuration unavailable for rollback"
+                );
+                None
+            }
+        }
+    }
+
+    /// SafeMode(Locked) or SafeMode(NewerSchema): nothing is loaded and
+    /// nothing is written, `store-meta.json` included.
+    fn read_only(self, reason: SafeModeReason, meta: StoreMeta) -> LoadReport {
+        let active = Config::default();
+        let (compiled, _) = compile_lenient(&active);
+        let mut problems = vec![ProblemKind::SafeMode { reason }.into()];
+        problems.extend(self.problems);
+        LoadReport {
+            outcome: LoadOutcome::SafeMode(reason),
+            draft: active.clone(),
+            compiled,
+            active,
+            previous: None,
+            disk_hash: None,
+            problems,
+            meta,
+            meta_writable: false,
+        }
+    }
+}
+
+/// Compiles rule by rule. A configuration-level error (an empty global
+/// terminator) leaves every enabled rule off.
+fn compile_lenient(config: &Config) -> (CompiledConfig, Vec<String>) {
+    match compile_config_lenient(config) {
+        Ok(lenient) => {
+            if !lenient.diagnostics.is_empty() {
+                log_read_diagnostics(&lenient.diagnostics);
+            }
+            (lenient.compiled, lenient.skipped_rule_ids)
+        }
+        Err(diagnostics) => {
+            log_read_diagnostics(&diagnostics);
+            let skipped = config
+                .rules
+                .iter()
+                .filter(|rule| rule.enabled)
+                .map(|rule| rule.id.clone())
+                .collect();
+            let compiled = CompiledConfig {
+                config: config.clone(),
+                rules: vec![],
+            };
+            (compiled, skipped)
+        }
+    }
+}
+
+/// Codes and paths only: messages may echo configuration values.
+fn log_read_diagnostics(diagnostics: &[Diagnostic]) {
+    for d in diagnostics {
+        tracing::warn!(event = "store.diagnostic", code = %d.code, path = %d.path, "stored configuration diagnostic");
+    }
+}
+
+fn label(path: &Path) -> String {
+    file_label(path).unwrap_or_default()
+}
+
+/// Revision numbers that have a `revisions/<n>.json` file.
+pub(super) fn revision_numbers(dir: &Path) -> Vec<u64> {
+    let Ok(entries) = fs::read_dir(dir.join("revisions")) else {
+        return vec![];
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let stem = name.to_str()?.strip_suffix(".json")?;
+            if stem.is_empty() || !stem.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            stem.parse().ok()
+        })
+        .collect()
+}
+
+fn quarantine_target(path: &Path, wall_ms: i64) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stamp = utc_stamp(wall_ms);
+    let mut target = path.with_file_name(format!("{stem}.corrupt-{stamp}.json"));
+    let mut n = 1;
+    while target.exists() {
+        target = path.with_file_name(format!("{stem}.corrupt-{stamp}-{n}.json"));
+        n += 1;
+    }
+    target
+}
+
+/// `yyyymmdd-hhmmss` in UTC (same format as the prefs quarantine).
+fn utc_stamp(wall_ms: i64) -> String {
+    let secs = wall_ms.div_euclid(1000);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}{m:02}{d:02}-{:02}{:02}{:02}",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}

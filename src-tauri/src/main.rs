@@ -4,6 +4,8 @@ mod autostart;
 mod commands;
 mod error;
 mod events;
+mod faults;
+mod startup;
 mod store;
 mod tray;
 
@@ -35,9 +37,10 @@ fn main() {
                 Some(dir) => dir,
                 None => app.path().app_data_dir()?,
             };
-            let store = store::Store::load(dir).map_err(std::io::Error::other)?;
+            let store = store::Store::load(dir);
             let engine = store.engine.clone();
             app.manage(Managed::new(store));
+            startup::after_load(app.handle());
             tray::spawn_status_watcher(app.handle().clone(), engine.clone());
             if let Err(message) = quicker_platform::start_engine(engine.clone()) {
                 *engine.last.lock().unwrap() = Some(ExecutionResult {
@@ -85,8 +88,10 @@ fn main() {
             commands::rules::preview_image,
             commands::system::get_cursor,
             commands::system::capture_selection,
-            commands::system::exit_app
+            commands::system::exit_app,
+            commands::runtime::startup_problems
         ])
-        .run(tauri::generate_context!())
-        .expect("Quicker Text startup failed");
+        .build(tauri::generate_context!())
+        .expect("Quicker Text startup failed")
+        .run(startup::on_run_event);
 }

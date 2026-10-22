@@ -1,5 +1,6 @@
 //! Crash-safe writes: temp file + fsync + atomic replace.
 use crate::error::{CommandError, IoOp};
+use quicker_platform::fault::FaultPoint;
 use serde::Serialize;
 use std::{fs, path::Path};
 
@@ -12,6 +13,13 @@ pub fn atomic_json<T: Serialize + ?Sized>(path: &Path, config: &T) -> Result<(),
     f.write_all(&bytes).map_err(write)?;
     f.sync_all().map_err(write)?;
     drop(f);
+    // `store_write_fail` fault: the replace step fails, as with a full disk
+    // or a file held open without sharing; the target stays as it was.
+    if crate::faults::take(FaultPoint::StoreWriteFail).is_some() {
+        let _ = fs::remove_file(&tmp);
+        let e = std::io::Error::other("injected store_write_fail");
+        return Err(CommandError::io(IoOp::Rename, Some(path), &e));
+    }
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;

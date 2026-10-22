@@ -2,6 +2,7 @@
 use crate::{
     app_state::{AppState, Managed},
     error::CommandError,
+    startup::StartupProblem,
 };
 use quicker_domain::*;
 use quicker_platform::ExecutionResult;
@@ -12,10 +13,17 @@ use tauri::{Manager, State};
 pub fn load_state(store: State<Managed>) -> Result<AppState, CommandError> {
     Ok(store.lock().state())
 }
+/// Every problem found at startup (the `startup-problem` events in full).
+#[tauri::command]
+pub fn startup_problems(store: State<Managed>) -> Vec<StartupProblem> {
+    store.lock().startup_problems().to_vec()
+}
 #[tauri::command]
 pub fn set_paused(paused: bool, store: State<Managed>) -> Result<AppState, CommandError> {
     let s = store.lock();
     if !paused {
+        // Safe mode keeps the engine paused (B-04).
+        s.ensure_writable()?;
         if s.engine.recording.lock().unwrap().is_some() {
             // Recording owns the input until it stops.
             return Err(CommandError::Busy);
@@ -45,16 +53,20 @@ pub async fn execute_action(
     action: Action,
     app: tauri::AppHandle,
 ) -> Result<ExecutionResult, CommandError> {
-    let (engine, config, action, speed) = {
+    let (engine, compiled, action, speed) = {
         let state = app.state::<Managed>();
         let s = state.lock();
+        // Safe mode: the data is for viewing; nothing runs (B-04).
+        s.ensure_writable()?;
         if s.engine.busy.swap(true, Ordering::SeqCst) {
             return Err(CommandError::Busy);
         }
         s.engine.cancel.store(false, Ordering::SeqCst);
+        // The active rules as compiled at load or publish (B-43).
+        let compiled = s.engine.compiled.lock().unwrap().clone();
         (
             s.engine.clone(),
-            s.active.clone(),
+            compiled,
             action.clone(),
             match &action {
                 Action::Replay { speed, .. } => *speed,
@@ -84,13 +96,15 @@ pub async fn execute_action(
             .unwrap_or_default()
             .contains("{selection}")
             || matches!(action, Action::Reusable { .. })
-                && serde_json::to_string(&config)
+                && serde_json::to_string(&compiled.config)
                     .unwrap_or_default()
                     .contains("{selection}");
         if needs_selection {
             context.selection = quicker_platform::capture_selection().ok();
         }
-        let plan = expand_reusable(&action, &config, &context).map_err(CommandError::validation)?;
+        let plan = compiled
+            .expand_reusable(&action, &context)
+            .map_err(CommandError::validation)?;
         quicker_platform::execute(e, plan, target, generation, 0, None, speed)
             .map_err(CommandError::internal)
     })

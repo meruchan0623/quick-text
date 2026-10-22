@@ -1,6 +1,7 @@
 //! Publishing a configuration as a new revision, and rolling back to the previous one.
 use super::{
     atomic::atomic_json,
+    fallback::revision_numbers,
     load::{hash_file, read_config},
     metadata::metadata_for_config,
     Store,
@@ -15,16 +16,19 @@ impl Store {
         let metadata = metadata_for_config(&config, &self.unresolved);
         self.publish_with_metadata(config, metadata)
     }
+    /// In safe mode only the draft committed from an import may be
+    /// published; that ends safe mode.
     fn publish_with_metadata(
         &mut self,
         mut config: Config,
         metadata: Vec<MigrationItem>,
     ) -> Result<(), CommandError> {
-        config.revision = self.active.revision.checked_add(1).ok_or_else(|| {
-            CommandError::internal(
-                "Revision counter exhausted; preserve data and start a new profile",
-            )
-        })?;
+        if let Some(reason) = self.safe_mode {
+            if !(self.safe_import && config == self.draft) {
+                return Err(CommandError::SafeMode { reason });
+            }
+        }
+        config.revision = self.next_revision()?;
         let compiled = compile_config(&config).map_err(CommandError::validation)?;
         let active_path = self.dir.join("active.json");
         if hash_file(&active_path)? != self.disk_hash {
@@ -41,15 +45,6 @@ impl Store {
             self.engine.paused.store(was_paused, Ordering::SeqCst);
             return Err(CommandError::Busy);
         }
-        config.revision = match self.active.revision.checked_add(1) {
-            Some(revision) => revision,
-            None => {
-                self.engine.paused.store(was_paused, Ordering::SeqCst);
-                return Err(CommandError::internal(
-                    "Revision counter exhausted; preserve data and start a new profile",
-                ));
-            }
-        };
         let old = self.active.clone();
         let outcome = (|| {
             let revisions = self.dir.join("revisions");
@@ -102,9 +97,28 @@ impl Store {
             .to_vec(),
         );
         self.engine.paused.store(was_paused, Ordering::SeqCst);
+        if self.safe_mode.is_some() {
+            tracing::info!(event = "store.safe_mode_import", "import published");
+            self.set_safe_mode(None);
+        }
         Ok(())
     }
+    /// One above the active revision and every `revisions/<n>.json`, so that
+    /// after recovering from an older revision the newer snapshots are never
+    /// overwritten or mistaken for a conflict.
+    fn next_revision(&self) -> Result<u64, CommandError> {
+        revision_numbers(&self.dir)
+            .into_iter()
+            .fold(self.active.revision, u64::max)
+            .checked_add(1)
+            .ok_or_else(|| {
+                CommandError::internal(
+                    "Revision counter exhausted; preserve data and start a new profile",
+                )
+            })
+    }
     pub fn rollback_previous(&mut self) -> Result<(), CommandError> {
+        self.ensure_writable()?;
         let config = self
             .previous
             .clone()
@@ -124,7 +138,7 @@ mod tests {
     fn rollback_restores_revision_originals_after_reload() {
         let dir =
             std::env::temp_dir().join(format!("quicker-metadata-test-{}", uuid::Uuid::new_v4()));
-        let mut store = Store::load(dir.clone()).unwrap();
+        let mut store = Store::load(dir.clone());
         for marker in ["A", "B"] {
             let mut config = metadata_config(&["shared"]);
             config.rules[0].description = marker.into();
@@ -133,13 +147,13 @@ mod tests {
             store.publish(store.draft.clone()).unwrap();
         }
         drop(store);
-        let mut store = Store::load(dir.clone()).unwrap();
+        let mut store = Store::load(dir.clone());
         store.rollback_previous().unwrap();
         assert_eq!(store.active.revision, 3);
         assert_eq!(store.active.rules[0].description, "A");
         assert_eq!(store.unresolved[0].original["synthetic_source"], "A");
         drop(store);
-        let store = Store::load(dir.clone()).unwrap();
+        let store = Store::load(dir.clone());
         assert_eq!(store.active_unresolved[0].original["synthetic_source"], "A");
         assert_eq!(
             store.previous_unresolved[0].original["synthetic_source"],
@@ -150,7 +164,7 @@ mod tests {
     #[test]
     fn persistent_revision_conflict() {
         let dir = std::env::temp_dir().join(format!("quicker-text-test-{}", uuid::Uuid::new_v4()));
-        let mut s = Store::load(dir.clone()).unwrap();
+        let mut s = Store::load(dir.clone());
         s.publish(Config::default()).unwrap();
         assert_eq!(s.active.revision, 1);
         let mut altered = s.active.clone();
@@ -164,7 +178,7 @@ mod tests {
     #[test]
     fn failed_publish_preserves_active_and_pause() {
         let dir = std::env::temp_dir().join(format!("quicker-text-test-{}", uuid::Uuid::new_v4()));
-        let mut s = Store::load(dir.clone()).unwrap();
+        let mut s = Store::load(dir.clone());
         s.publish(Config::default()).unwrap();
         let old = s.active.clone();
         s.engine.paused.store(false, Ordering::SeqCst);
@@ -181,7 +195,7 @@ mod tests {
     #[test]
     fn rollback_revision_and_reload() {
         let dir = std::env::temp_dir().join(format!("quicker-text-test-{}", uuid::Uuid::new_v4()));
-        let mut s = Store::load(dir.clone()).unwrap();
+        let mut s = Store::load(dir.clone());
         s.publish(Config::default()).unwrap();
         let mut next = s.active.clone();
         next.enabled = false;
@@ -191,7 +205,7 @@ mod tests {
         assert_eq!(s.active.revision, 3);
         assert!(s.active.enabled);
         drop(s);
-        let s = Store::load(dir.clone()).unwrap();
+        let s = Store::load(dir.clone());
         assert_eq!(s.active.revision, 3);
         assert!(s.engine.paused.load(Ordering::SeqCst));
         fs::remove_dir_all(dir).unwrap();
@@ -199,7 +213,7 @@ mod tests {
     #[test]
     fn revision_overflow_is_error() {
         let dir = std::env::temp_dir().join(format!("quicker-text-test-{}", uuid::Uuid::new_v4()));
-        let mut s = Store::load(dir.clone()).unwrap();
+        let mut s = Store::load(dir.clone());
         s.active.revision = u64::MAX;
         assert!(s.publish(Config::default()).is_err());
         assert_eq!(s.active.revision, u64::MAX);
@@ -209,7 +223,7 @@ mod tests {
     #[test]
     fn publish_and_rollback_failures_use_specific_error_codes() {
         let dir = std::env::temp_dir().join(format!("quicker-text-test-{}", uuid::Uuid::new_v4()));
-        let mut s = Store::load(dir.clone()).unwrap();
+        let mut s = Store::load(dir.clone());
         assert!(matches!(
             s.rollback_previous(),
             Err(CommandError::NotFound {
