@@ -140,13 +140,16 @@ fn delta(seen: &mut u64, now: u64) -> u64 {
     new
 }
 
+/// A physical key transition one source saw: (source, virtual key, down).
+pub(super) type Sighting = (Source, u16, bool);
+
 /// Consumer state: the typed-key buffer, the logged lane counters and the
-/// physical key-downs each source saw since the last liveness tick.
+/// physical key transitions each source saw since the last liveness tick.
 #[derive(Default)]
 pub(super) struct Consumer {
     buffer: Buffer,
     reported: Reported,
-    seen: Vec<(Source, u16)>,
+    seen: Vec<Sighting>,
 }
 impl Consumer {
     /// Drains both lanes once and returns how many records were handled.
@@ -163,16 +166,17 @@ impl Consumer {
         while let Some(record) = hooks.lane().pop() {
             handled += 1;
             if let HookRecord::Key(key) = &record {
-                if key.down && key.hardware {
-                    self.seen.push((Source::Hook, key.vk));
+                if key.hardware {
+                    self.seen.push((Source::Hook, key.vk, key.down));
                 }
             }
             self.hook_record(shared, record, probe, enqueue);
         }
         while let Some(record) = raw.pop() {
             handled += 1;
-            // Every record is a hardware key-down, with or without context.
-            self.seen.push((Source::Raw, record.vk()));
+            // Every record is a hardware key transition, with or without
+            // context; only key-downs become text.
+            self.seen.push((Source::Raw, record.vk(), record.down()));
             if let Some(event) = event_from(shared, &record) {
                 self.detect(shared, event, probe, enqueue);
             }
@@ -180,8 +184,8 @@ impl Consumer {
         self.report(hooks.lane(), raw);
         handled
     }
-    /// Key-downs for [`Liveness::tick`], which drains them.
-    pub(super) fn seen(&mut self) -> &mut Vec<(Source, u16)> {
+    /// Key transitions for [`Liveness::tick`], which drains them.
+    pub(super) fn seen(&mut self) -> &mut Vec<Sighting> {
         &mut self.seen
     }
     fn hook_record(
@@ -724,9 +728,9 @@ pub(super) fn raw_lost() {
     wake();
 }
 
-/// The consumer side of B-06: feeds the key-downs each source saw into a
-/// [`CrossCheck`] and acts on its verdicts. One reattach per verdict; the
-/// supervisor retries what stays unhealthy.
+/// The consumer side of B-06: feeds the key transitions each source saw
+/// into a [`CrossCheck`] and acts on its verdicts. One reattach per
+/// verdict; the supervisor retries what stays unhealthy.
 pub(super) struct Liveness<'a, P: SourcePorts, C: Clock> {
     sources: &'a Sources<'a, P, C>,
     check: CrossCheck,
@@ -744,11 +748,7 @@ impl<'a, P: SourcePorts, C: Clock> Liveness<'a, P, C> {
     /// handles due verdicts. Returns when the next sighting expires. Keys
     /// seen before [`Sources::start`] (RawInput runs before the hooks are
     /// installed) are dropped.
-    pub(super) fn tick(
-        &mut self,
-        shared: &Shared,
-        seen: &mut Vec<(Source, u16)>,
-    ) -> Option<Instant> {
+    pub(super) fn tick(&mut self, shared: &Shared, seen: &mut Vec<Sighting>) -> Option<Instant> {
         self.inject_faults();
         if !self.sources.started.load(Ordering::SeqCst) {
             seen.clear();
@@ -760,8 +760,12 @@ impl<'a, P: SourcePorts, C: Clock> Liveness<'a, P, C> {
             self.check.forget();
         }
         let now = self.sources.clock.now();
-        for (source, vk) in seen.drain(..) {
-            self.check.saw(source, vk, now);
+        for (source, vk, down) in seen.drain(..) {
+            if down {
+                self.check.saw(source, vk, now);
+            } else {
+                self.check.released(source, vk);
+            }
         }
         while let Some(verdict) = self.check.expire(now) {
             self.act(shared, verdict);

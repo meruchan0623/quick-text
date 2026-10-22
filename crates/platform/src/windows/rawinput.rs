@@ -67,7 +67,19 @@ impl InputEvent {
             has_known_source: i32::from(hardware),
         }
     }
+    /// The matching key-up (no text).
+    #[cfg(test)]
+    pub(super) fn key_up(vk: u16, hardware: bool) -> Self {
+        Self {
+            status: INPUT_STATUS_RELEASED,
+            ..Self::key_down(vk, "", hardware)
+        }
+    }
 }
+/// The detector's `INPUT_EVENT_TYPE_KEYBOARD` and `INPUT_STATUS_*` (native.h).
+const INPUT_EVENT_TYPE_KEYBOARD: i32 = 1;
+const INPUT_STATUS_PRESSED: i32 = 1;
+const INPUT_STATUS_RELEASED: i32 = 2;
 #[repr(C)]
 struct InitOptions {
     keyboard_layout_cache_interval: i32,
@@ -85,10 +97,11 @@ extern "C" {
     fn detect_destroy(window: *mut c_void) -> i32;
 }
 pub(super) static READY: AtomicBool = AtomicBool::new(false);
-/// RawInput queue capacity in records. 待实测: about a second of fast typing
-/// plus autorepeat while the consumer is descheduled. A full queue drops the
-/// key; the generation it already took leaves a gap, so no later key joins
-/// the keys before it.
+/// RawInput queue capacity in records (key-downs and key-ups). 待实测:
+/// about a second of fast typing plus autorepeat while the consumer is
+/// descheduled. A full queue drops the key; the generation a key-down
+/// already took leaves a gap, so no later key joins the keys before it. A
+/// dropped key-up only delays the cross-check (`liveness::REPEAT_RUN`).
 pub(super) const RAW_QUEUE_CAPACITY: usize = 1024;
 /// no-regression #7: the detector re-reads the keyboard layout on every key.
 pub(super) const KEYBOARD_LAYOUT_CACHE_INTERVAL: i32 = 0;
@@ -216,15 +229,19 @@ fn stamp_of(context: InputContext, revision: u64) -> Stamp {
         layout: context.layout as usize,
     }
 }
-/// One hardware key-down, captured by the detector callback. Fixed size and
-/// `Copy`: building and queueing it never allocates.
+/// One hardware key transition, captured by the detector callback. Fixed
+/// size and `Copy`: building and queueing it never allocates.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct RawRecord {
     vk: u16,
+    /// A key-up only tells the hook cross-check (B-06, H4) that the next
+    /// down of the key is a new press: no text, no generation of its own.
+    down: bool,
     text: [u16; 24],
     len: usize,
-    /// `None` when the foreground input context could not be read; the key
-    /// still counts for the hook cross-check (B-06) but never becomes text.
+    /// `None` when the foreground input context could not be read (always
+    /// for a key-up); the key still counts for the hook cross-check (B-06)
+    /// but never becomes text.
     context: Option<InputContext>,
     pub(super) generation: u64,
     modified: bool,
@@ -235,19 +252,34 @@ impl RawRecord {
     pub(super) fn vk(&self) -> u16 {
         self.vk
     }
+    /// Key-down (true) or key-up.
+    pub(super) fn down(&self) -> bool {
+        self.down
+    }
 }
 /// Callback body: filters the detector event and captures everything the
 /// consumer needs. Atomics plus the probe's input context only. Every
-/// accepted key takes the next generation, so a key that is later lost
-/// leaves a gap instead of joining its neighbours.
+/// accepted key-down takes the next generation, so a key that is later lost
+/// leaves a gap instead of joining its neighbours. A key-up takes neither a
+/// generation nor the input context.
 pub(super) fn raw_record(
     shared: &Shared,
     keys: &KeyBits,
     event: &InputEvent,
     probe: &impl ForegroundProbe,
 ) -> Option<RawRecord> {
-    if !hardware_keydown(event.event_type, event.status, event.has_known_source) {
-        return None;
+    let down = hardware_key(event.event_type, event.status, event.has_known_source)?;
+    if !down {
+        return Some(RawRecord {
+            vk: event.key_code as u16,
+            down: false,
+            text: [0; 24],
+            len: 0,
+            context: None,
+            generation: shared.generation.load(Ordering::SeqCst),
+            modified: false,
+            allowed: false,
+        });
     }
     let generation = shared
         .generation
@@ -256,6 +288,7 @@ pub(super) fn raw_record(
     let context = probe.input_context();
     Some(RawRecord {
         vk: event.key_code as u16,
+        down: true,
         text: event.buffer,
         len: usize::try_from(event.buffer_len.clamp(0, 24)).unwrap_or(0),
         context,
@@ -268,11 +301,14 @@ pub(super) fn raw_record(
 pub(super) fn lane() -> &'static Lane<RawRecord> {
     RAW_LANE.get_or_init(|| Lane::new(RAW_QUEUE_CAPACITY, input::wake))
 }
-/// Consumer side: the matcher event for a captured hardware key. The
-/// configuration revision is read here; a poisoned compiler or a missing
-/// input context fails closed (the key is dropped and its generation gap
-/// clears the buffer).
+/// Consumer side: the matcher event for a captured hardware key-down (none
+/// for a key-up). The configuration revision is read here; a poisoned
+/// compiler or a missing input context fails closed (the key is dropped and
+/// its generation gap clears the buffer).
 pub(super) fn event_from(shared: &Shared, record: &RawRecord) -> Option<Event> {
+    if !record.down {
+        return None;
+    }
     let context = record.context?;
     let revision = shared.compiled.lock().ok()?.config.revision;
     let text = record
@@ -313,8 +349,18 @@ pub(super) fn acceptance_event(shared: &Shared, key: &KeyRecord) -> Option<Event
 pub(super) fn note_source(source: &'static str) {
     *LAST_SOURCE.lock().unwrap_or_else(PoisonError::into_inner) = source;
 }
-fn hardware_keydown(event_type: i32, status: i32, known_source: i32) -> bool {
-    event_type == 1 && status == 1 && known_source != 0
+/// Key-down (`Some(true)`) or key-up (`Some(false)`) from a real device;
+/// `None` for anything else, including our own injected keys, which reach
+/// RawInput with no device handle.
+fn hardware_key(event_type: i32, status: i32, known_source: i32) -> Option<bool> {
+    if event_type != INPUT_EVENT_TYPE_KEYBOARD || known_source == 0 {
+        return None;
+    }
+    match status {
+        INPUT_STATUS_PRESSED => Some(true),
+        INPUT_STATUS_RELEASED => Some(false),
+        _ => None,
+    }
 }
 fn match_buffer(
     compiler: &CompiledConfig,
@@ -776,10 +822,12 @@ mod tests {
         assert!(buffer.text.is_empty());
     }
     #[test]
-    fn raw_hardware_filter_rejects_own_or_external_orphan_input_and_keyup() {
-        assert!(hardware_keydown(1, 1, 1));
-        for args in [(1, 1, 0), (1, 2, 1), (2, 1, 1), (0, 0, 0)] {
-            assert!(!hardware_keydown(args.0, args.1, args.2));
+    fn raw_hardware_filter_rejects_own_or_external_orphan_input() {
+        assert_eq!(hardware_key(1, 1, 1), Some(true));
+        // H4: key-ups reach the hook cross-check (never the matcher).
+        assert_eq!(hardware_key(1, 2, 1), Some(false));
+        for args in [(1, 1, 0), (1, 2, 0), (2, 1, 1), (1, 0, 1), (0, 0, 0)] {
+            assert_eq!(hardware_key(args.0, args.1, args.2), None, "{args:?}");
         }
     }
     #[test]

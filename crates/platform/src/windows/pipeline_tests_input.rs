@@ -21,7 +21,7 @@ use super::keystate::{
     track_own_input, AsyncKeyProbe, KeyBits, OwnInput, INJECTION_QUIET, MODIFIER_VERIFY_AFTER,
     PHYSICAL,
 };
-use super::liveness::{MATCH_WINDOW, MISS_LIMIT};
+use super::liveness::{MATCH_WINDOW, MISS_LIMIT, REPEAT_RUN};
 use super::rawinput::{raw_record, InputEvent, RawRecord, KEYBOARD_LAYOUT_CACHE_INTERVAL};
 use super::session::{end_message, SessionEnd, SessionSignals, Signal};
 use super::*;
@@ -296,8 +296,10 @@ fn hook_and_raw_callback_bodies_neither_allocate_nor_block() {
         std::thread::spawn(move || {
             let measured = allocations(|| {
                 let event = InputEvent::key_down(0x42, "b", true);
+                let up = InputEvent::key_up(0x42, true);
                 let raw_queued = raw.contained(false, || {
                     raw_record(&shared, keys, &event, &probe).is_some_and(|r| raw.push(r))
+                        && raw_record(&shared, keys, &up, &probe).is_some_and(|r| raw.push(r))
                 });
                 let actions = [
                     handle_key(&plain, &shared, &probe, WM_KEYDOWN, hardware(0x42)),
@@ -368,7 +370,8 @@ fn hook_and_raw_callback_bodies_neither_allocate_nor_block() {
         })]
     ));
     assert!(keys.held(VK_LBUTTON), "the click updated the mirror");
-    assert!(raw.pop().is_some());
+    assert!(raw.pop().is_some_and(|record| record.down()));
+    assert!(raw.pop().is_some_and(|record| !record.down()));
 }
 
 #[test]
@@ -1094,6 +1097,10 @@ impl FakeSources {
             && *self.registration.lock().unwrap() == Registration::Ours
             && !self.raw_muted.load(Ordering::SeqCst)
     }
+    /// Whether both sources see physical keys.
+    fn whole(&self) -> bool {
+        self.hooked(HookSet::KEYBOARD) && self.raw_delivers()
+    }
     fn set_installable(&self, which: HookSet) {
         *self.installable.lock().unwrap() = which;
     }
@@ -1202,31 +1209,26 @@ impl Pipeline {
     /// source that works; not drained.
     fn type_text(&mut self, fake: &FakeSources, text: &str) {
         for ch in text.chars() {
-            let vk = ch.to_ascii_uppercase() as u16;
-            let hooked = fake.hooked(HookSet::KEYBOARD);
-            if hooked {
-                handle_key(
-                    &self.hooks,
-                    &self.shared,
-                    &self.probe,
-                    WM_KEYDOWN,
-                    hardware(vk),
-                );
-            }
-            if fake.raw_delivers() {
-                let event = InputEvent::key_down(vk, &ch.to_string(), true);
-                let record = raw_record(&self.shared, self.keys, &event, &self.probe).unwrap();
-                assert!(self.raw.push(record));
-            }
-            if hooked {
-                handle_key(
-                    &self.hooks,
-                    &self.shared,
-                    &self.probe,
-                    WM_KEYUP,
-                    hardware(vk),
-                );
-            }
+            let (vk, text) = (ch.to_ascii_uppercase() as u16, ch.to_string());
+            self.key(fake, vk, &text, true);
+            self.key(fake, vk, &text, false);
+        }
+    }
+    /// One physical key-down typing `text`, or key-up, of `vk`, captured
+    /// by every source that works; not drained.
+    fn key(&mut self, fake: &FakeSources, vk: u16, text: &str, down: bool) {
+        if fake.hooked(HookSet::KEYBOARD) {
+            let msg = if down { WM_KEYDOWN } else { WM_KEYUP };
+            handle_key(&self.hooks, &self.shared, &self.probe, msg, hardware(vk));
+        }
+        if fake.raw_delivers() {
+            let event = if down {
+                InputEvent::key_down(vk, text, true)
+            } else {
+                InputEvent::key_up(vk, true)
+            };
+            let record = raw_record(&self.shared, self.keys, &event, &self.probe).unwrap();
+            assert!(self.raw.push(record));
         }
     }
     fn drain(&mut self) {
@@ -1617,6 +1619,142 @@ fn keys_both_sources_see_never_trigger_a_reattach() {
     assert_eq!(fake.installs(), [HookSet::ALL]);
     assert_eq!((fake.registers(), fake.rebuilds()), (0, 0));
     assert_eq!(signals.take().count(), 0);
+}
+
+/// Breaks a source the way the HookUnhook or RawinputUnregister fault does:
+/// through the fault point when it is compiled in, through the port it
+/// calls otherwise.
+fn break_source(
+    pipe: &mut Pipeline,
+    liveness: &mut Liveness<'_, FakeSources, FakeClock>,
+    fake: &FakeSources,
+    point: crate::fault::FaultPoint,
+) {
+    use crate::fault::FaultPoint;
+    #[cfg(feature = "fault-injection")]
+    {
+        crate::fault::debug_inject_fault(point, 0);
+        pipe.tick(liveness);
+        crate::fault::disarm(point);
+    }
+    #[cfg(not(feature = "fault-injection"))]
+    {
+        let _ = (pipe, liveness);
+        match point {
+            FaultPoint::HookUnhook => fake.drop_hooks(),
+            FaultPoint::RawinputUnregister => fake.unregister_raw(),
+            _ => unreachable!("not a source fault"),
+        }
+    }
+    let broken = match point {
+        FaultPoint::HookUnhook => !fake.hooked(HookSet::KEYBOARD) && fake.raw_delivers(),
+        _ => fake.hooked(HookSet::KEYBOARD) && !fake.raw_delivers(),
+    };
+    assert!(broken, "{point:?}");
+}
+/// The source faults H4 is tested under, with the reattach each one ends in.
+const SOURCE_FAULTS: [(crate::fault::FaultPoint, &str); 2] = [
+    (
+        crate::fault::FaultPoint::HookUnhook,
+        r#"event="input.reattach" component="keyboard_hook" reason="hook_missing" ok=true"#,
+    ),
+    (
+        crate::fault::FaultPoint::RawinputUnregister,
+        r#"event="input.reattach" component="raw_input" reason="raw_input_missing" ok=true"#,
+    ),
+];
+
+/// H4, S-06: after the HookUnhook or RawinputUnregister fault, the user
+/// presses Backspace fifty times. Each press is a down and an up on the
+/// source that still works, so each one counts: the lost source is found
+/// and repaired after K presses plus one match window, well within fifty
+/// keys and 10 s, and nothing more is reattached for the rest.
+#[test]
+fn fifty_presses_of_one_key_find_the_lost_source() {
+    let _serial = serial();
+    for (point, reattach) in SOURCE_FAULTS {
+        let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+        let sources = Sources::new(&fake, &clock, &signals);
+        sources.start();
+        let mut liveness = Liveness::new(&sources);
+        let mut pipe = Pipeline::new();
+        break_source(&mut pipe, &mut liveness, &fake, point);
+        let (repaired, lines) = capture::logs(|| {
+            let mut repaired = None;
+            for press in 1..=50u32 {
+                pipe.key(&fake, VK_BACK, "\u{8}", true);
+                pipe.key(&fake, VK_BACK, "\u{8}", false);
+                pipe.drain();
+                pipe.tick(&mut liveness);
+                if repaired.is_none() && fake.whole() {
+                    repaired = Some((press, clock.elapsed()));
+                }
+                clock.advance(GAP);
+            }
+            repaired
+        });
+        assert_eq!(count_of(&lines, reattach), 1, "{point:?} {lines:?}");
+        assert_eq!(count_of(&lines, "input.reattach"), 1, "{point:?} {lines:?}");
+        let (press, elapsed) = repaired.unwrap();
+        let window = (MATCH_WINDOW.as_millis() / GAP.as_millis()) as u32;
+        assert!(press <= MISS_LIMIT + window, "{point:?}: press {press}");
+        assert!(elapsed < Duration::from_secs(10));
+    }
+}
+
+/// Autorepeat interval of a held key (30 per second).
+const REPEAT_GAP: Duration = Duration::from_millis(33);
+
+/// H4: a key held down with autorepeat. While both sources work its
+/// repeats merge the same way on each side and pair up, so nothing is
+/// reattached however long it is held. After the HookUnhook or
+/// RawinputUnregister fault, holding it alone (its up comes only at the
+/// end) still finds the lost source within fifty repeats: every
+/// [`REPEAT_RUN`] downs with no up count as one press.
+#[test]
+fn a_held_autorepeating_key_pairs_up_and_still_finds_a_lost_source() {
+    let _serial = serial();
+    for (point, reattach) in SOURCE_FAULTS {
+        let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+        let sources = Sources::new(&fake, &clock, &signals);
+        sources.start();
+        let mut liveness = Liveness::new(&sources);
+        let mut pipe = Pipeline::new();
+        let hold = |pipe: &mut Pipeline,
+                    liveness: &mut Liveness<'_, FakeSources, FakeClock>,
+                    downs: u32| {
+            let mut repaired = None;
+            for down in 1..=downs {
+                let broken = !fake.whole();
+                pipe.key(&fake, VK_BACK, "\u{8}", true);
+                pipe.drain();
+                pipe.tick(liveness);
+                if broken && repaired.is_none() && fake.whole() {
+                    repaired = Some(down);
+                }
+                clock.advance(REPEAT_GAP);
+            }
+            pipe.key(&fake, VK_BACK, "", false);
+            pipe.drain();
+            pipe.tick(liveness);
+            repaired
+        };
+        let (_, lines) = capture::logs(|| {
+            hold(&mut pipe, &mut liveness, 50 * REPEAT_RUN);
+            pipe.settle(&clock, &mut liveness)
+        });
+        assert_eq!(count_of(&lines, "input."), 0, "{point:?} {lines:?}");
+        break_source(&mut pipe, &mut liveness, &fake, point);
+        let (repaired, lines) = capture::logs(|| {
+            let repaired = hold(&mut pipe, &mut liveness, 50);
+            pipe.settle(&clock, &mut liveness);
+            repaired
+        });
+        assert_eq!(count_of(&lines, reattach), 1, "{point:?} {lines:?}");
+        assert_eq!(count_of(&lines, "input.reattach"), 1, "{point:?} {lines:?}");
+        assert!(repaired.is_some_and(|down| down <= 50), "{point:?}");
+        assert!(fake.whole());
+    }
 }
 
 /// no-regression #4: our own tagged input reaches neither source as a

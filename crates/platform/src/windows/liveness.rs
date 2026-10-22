@@ -8,9 +8,10 @@
 //! seen by one source should be seen by the other within [`MATCH_WINDOW`].
 //!
 //! [`CrossCheck`] only counts. It never sees key text, only virtual-key
-//! codes (to collapse repeats), and takes time as an argument (the caller
-//! reads it from `traits::Clock`). [`HealthTable`] holds the per-component
-//! health the input facade reports. Nothing here makes a system call.
+//! codes and key-ups (to collapse autorepeat), and takes time as an
+//! argument (the caller reads it from `traits::Clock`). [`HealthTable`]
+//! holds the per-component health the input facade reports. Nothing here
+//! makes a system call.
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -43,6 +44,15 @@ pub(super) const PENDING_CAP: usize = 64;
 /// an elevated foreground window that only one source can see) is then
 /// retried ever more rarely instead of every K keys.
 pub(super) const MAX_STRIKE_SHIFT: u32 = 4;
+/// R: downs of one key with no up from the same source in between that
+/// count as one press; the next down counts again (H4). A key held down
+/// thus counts once per R autorepeats on each source alike, and a source
+/// that drops or never reports a key-up still reaches a verdict: K presses
+/// need at most `(K - 1) * R + 1` downs, 33 with K = 5 (S-06: 50 keys).
+/// 待实测: autorepeat runs at 2.5-30 downs per second, so both sources
+/// count a held key every 0.3-3 s and pair well inside [`MATCH_WINDOW`] as
+/// long as they report the same repeats.
+pub(super) const REPEAT_RUN: u32 = 8;
 
 /// The two sources that see physical key-downs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,8 +86,11 @@ const fn generic(vk: u16) -> u16 {
 struct Side {
     /// When each of this source's unmatched sightings happened.
     pending: VecDeque<Instant>,
-    /// The last code this source reported (repeat filter).
-    last: Option<u16>,
+    /// The key this source last reported down and has not reported up
+    /// since: another down of it is autorepeat.
+    held: Option<u16>,
+    /// Downs of `held` merged since the last one that counted.
+    merged: u32,
     /// Keys the other source saw and this one missed, in a row.
     misses: u32,
     /// Verdicts against this source since both sources last agreed on a key.
@@ -90,13 +103,17 @@ impl Side {
     }
 }
 
-/// Counts physical key-downs from both sources and pairs them up in order.
+/// Counts physical key presses from both sources and pairs them up in
+/// order.
 ///
 /// Matching is by count, not by code: the two sources disagree on some
 /// codes (sided modifiers, numpad, AltGr) but not on how many keys went
-/// down. A code equal to the source's previous one is skipped, on both
-/// sides alike, so autorepeat counts once whether or not a source reports
-/// repeats (待实测: RawInput and hook autorepeat behaviour).
+/// down. Each source's key-ups are tracked separately: a down after that
+/// source reported the key up (or after a different key) is a new press,
+/// and downs with no up in between are autorepeat, merged on both sides
+/// alike up to [`REPEAT_RUN`] at a time. Fifty presses of the same key are
+/// fifty presses, and a lost key-up only delays a verdict (H4; 待实测:
+/// RawInput and hook autorepeat behaviour).
 #[derive(Default)]
 pub(super) struct CrossCheck {
     hook: Side,
@@ -116,14 +133,19 @@ impl CrossCheck {
         }
     }
     /// Records a key-down `source` saw at `now`. Returns true when it paired
-    /// with a pending key from the other source.
+    /// with a pending key from the other source; false when it was merged
+    /// as autorepeat or is waiting for the other source.
     pub(super) fn saw(&mut self, source: Source, vk: u16, now: Instant) -> bool {
         let vk = generic(vk);
         let side = self.side(source);
-        if side.last == Some(vk) {
-            return false;
+        if side.held == Some(vk) {
+            side.merged = side.merged.saturating_add(1);
+            if side.merged < REPEAT_RUN {
+                return false;
+            }
         }
-        side.last = Some(vk);
+        side.held = Some(vk);
+        side.merged = 0;
         if self.other(source).pending.pop_front().is_some() {
             // Both sources are alive right now.
             for side in [&mut self.hook, &mut self.raw] {
@@ -139,6 +161,15 @@ impl CrossCheck {
             self.other(source).misses += 1;
         }
         false
+    }
+    /// Records a key-up `source` saw: its next down of that key is a new
+    /// press, not autorepeat.
+    pub(super) fn released(&mut self, source: Source, vk: u16) {
+        let side = self.side(source);
+        if side.held == Some(generic(vk)) {
+            side.held = None;
+            side.merged = 0;
+        }
     }
     /// Expires sightings older than [`MATCH_WINDOW`] and returns a verdict
     /// once a source missed [`MISS_LIMIT`] keys in a row (more after earlier
@@ -188,13 +219,16 @@ impl CrossCheck {
             Source::Raw => self.raw.pending.len(),
         }
     }
-    /// Forgets pending keys and misses after a source was reattached: what
-    /// the old source missed says nothing about the new one. Strikes stay
-    /// until both sources agree on a key.
+    /// Forgets pending keys, misses and held keys after a source was
+    /// reattached: what the old source missed (a key-up among it) says
+    /// nothing about the new one. Strikes stay until both sources agree on
+    /// a key.
     pub(super) fn forget(&mut self) {
         for side in [&mut self.hook, &mut self.raw] {
             side.pending.clear();
             side.misses = 0;
+            side.held = None;
+            side.merged = 0;
         }
     }
 }
@@ -323,7 +357,7 @@ mod tests {
     ) -> Instant {
         let mut now = start;
         for _ in 0..count {
-            let vk = if check.side(source).last == Some(A) {
+            let vk = if check.side(source).held == Some(A) {
                 B
             } else {
                 A
@@ -436,6 +470,107 @@ mod tests {
         assert_eq!(check.pending(Source::Hook), 0);
         assert_eq!(check.pending(Source::Raw), 0);
         assert_eq!(check.expire(t + Duration::from_secs(5)), None);
+    }
+
+    /// `count` presses of `vk` seen by `source` only, `gap` apart; each
+    /// down is followed by its up when `ups`.
+    fn same_key(
+        check: &mut CrossCheck,
+        source: Source,
+        vk: u16,
+        start: Instant,
+        count: u32,
+        gap: Duration,
+        ups: bool,
+    ) -> Instant {
+        let mut now = start;
+        for _ in 0..count {
+            check.saw(source, vk, now);
+            if ups {
+                check.released(source, vk);
+            }
+            now += gap;
+        }
+        now
+    }
+
+    /// H4: fifty presses of one key (Backspace, Enter) that only one
+    /// source sees reach a verdict after K of them, like K different keys.
+    #[test]
+    fn presses_of_the_same_key_each_count() {
+        for (source, verdict) in [
+            (Source::Raw, Verdict::HookLost),
+            (Source::Hook, Verdict::RawLost),
+        ] {
+            let mut check = CrossCheck::default();
+            let t = Instant::now();
+            let vk = 0x08;
+            let end = same_key(&mut check, source, vk, t, MISS_LIMIT - 1, ms(50), true);
+            assert_eq!(check.pending(source), MISS_LIMIT as usize - 1);
+            assert_eq!(check.expire(end + MATCH_WINDOW), None, "{source:?}");
+            let end = same_key(&mut check, source, vk, end, 1, ms(50), true);
+            assert_eq!(
+                check.expire(end + MATCH_WINDOW),
+                Some(verdict),
+                "{source:?}"
+            );
+        }
+    }
+
+    /// H4: a source that never reports a key-up (or lost them) still
+    /// reaches a verdict on sustained input of one key: every
+    /// [`REPEAT_RUN`] downs count as one press, (K - 1) * R + 1 downs make
+    /// K presses.
+    #[test]
+    fn downs_without_ups_merge_only_up_to_a_bound() {
+        let mut check = CrossCheck::default();
+        let t = Instant::now();
+        let downs = (MISS_LIMIT - 1) * REPEAT_RUN;
+        let end = same_key(&mut check, Source::Raw, A, t, downs, ms(30), false);
+        assert_eq!(check.pending(Source::Raw), MISS_LIMIT as usize - 1);
+        assert_eq!(check.expire(end + MATCH_WINDOW), None);
+        let end = same_key(&mut check, Source::Raw, A, end, 1, ms(30), false);
+        assert_eq!(check.expire(end + MATCH_WINDOW), Some(Verdict::HookLost));
+        assert!(downs < 50, "S-06: within 50 keys");
+    }
+
+    /// A key held down with autorepeat on both sources: the downs merge the
+    /// same way on each side and pair up, however long it is held; its up
+    /// on either side ends the run there only.
+    #[test]
+    fn a_held_key_both_sources_see_pairs_up_for_as_long_as_it_is_held() {
+        let mut check = CrossCheck::default();
+        let t = Instant::now();
+        let mut now = t;
+        for _ in 0..50 * REPEAT_RUN {
+            check.saw(Source::Hook, VK_LSHIFT, now);
+            check.saw(Source::Raw, VK_SHIFT, now);
+            now += ms(33);
+            assert_eq!(check.expire(now), None);
+        }
+        assert_eq!(check.pending(Source::Hook), 0);
+        assert_eq!(check.pending(Source::Raw), 0);
+        check.released(Source::Hook, VK_LSHIFT);
+        check.released(Source::Raw, VK_SHIFT);
+        // Released on both sides: the next press counts on both.
+        assert!(!check.saw(Source::Hook, VK_RSHIFT, now));
+        assert!(check.saw(Source::Raw, VK_SHIFT, now));
+        // An up of another key does not end a run.
+        check.released(Source::Raw, A);
+        assert!(!check.saw(Source::Raw, VK_SHIFT, now));
+        assert_eq!(check.pending(Source::Raw), 0, "still merged");
+    }
+
+    #[test]
+    fn forget_ends_runs_so_the_next_down_counts_on_both_sides() {
+        let mut check = CrossCheck::default();
+        let t = Instant::now();
+        check.saw(Source::Hook, A, t);
+        assert!(check.saw(Source::Raw, A, t));
+        check.forget();
+        // The ups went missing while a source was being reattached.
+        assert!(!check.saw(Source::Hook, A, t));
+        assert!(check.saw(Source::Raw, A, t));
     }
 
     #[test]
