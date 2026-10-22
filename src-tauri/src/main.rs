@@ -10,7 +10,7 @@ mod tray;
 
 use app_state::Managed;
 use quicker_platform::ExecutionResult;
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 use tauri::Manager;
 
 fn main() {
@@ -45,6 +45,11 @@ fn main() {
                 debug_build = cfg!(debug_assertions),
                 "Quicker Text starting"
             );
+            app.manage(diagnostics::level::LogLevelControl::start(
+                dir.clone(),
+                Arc::new(quicker_platform::traits::SystemClock),
+                Arc::new(diagnostics::logging::apply_level),
+            ));
             let store = store::Store::load(dir).map_err(std::io::Error::other)?;
             let engine = store.engine.clone();
             app.manage(Managed::new(store));
@@ -95,7 +100,8 @@ fn main() {
             commands::rules::preview_image,
             commands::system::get_cursor,
             commands::system::capture_selection,
-            commands::system::exit_app
+            commands::system::exit_app,
+            commands::diagnostics::set_log_level
         ])
         .build(tauri::generate_context!())
         .expect("Quicker Text startup failed")

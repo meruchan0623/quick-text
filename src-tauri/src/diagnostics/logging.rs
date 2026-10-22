@@ -13,8 +13,8 @@
 //! # Levels
 //!
 //! The default is `info`. Our crates (`quicker_text`, `quicker_platform`,
-//! `quicker_domain`) follow the runtime level (the reload handle in
-//! [`Built::filter`]); everything else (tauri, wry, ...) stays capped at
+//! `quicker_domain`) follow the runtime level ([`apply_level`], driven by
+//! [`super::level`] and the command `set_log_level`); everything else (tauri, wry, ...) stays capped at
 //! `info`, so raising the level never logs IPC payloads.
 //!
 //! # Event naming
@@ -38,6 +38,12 @@
 //! | `command.io` | warn | `CommandError::Io`; operation, file name, OS error |
 //! | `engine.unavailable` | warn | the platform refused to start or resume |
 //! | `log.file_unavailable` | error | log files could not be opened; stderr only |
+//! | `log.level_set` | info | `set_log_level`; level and `until_ms` |
+//! | `log.level_restored` | info | a saved temporary level was re-applied at startup |
+//! | `log.level_expired` | info | a temporary level ended; back to info |
+//! | `log.level_restore_failed` | warn | prefs unreadable at startup; default level |
+//! | `log.reload_failed` | error | the filter could not be swapped |
+//! | `log.expiry_thread_failed` | error | the expiry thread did not start |
 //! | `store.quarantine` | warn | a damaged file was renamed aside |
 //! | `store.quarantine_failed` | error | the rename failed; the file stays in place |
 //!
@@ -171,6 +177,15 @@ pub fn init(data_dir: &Path) {
             error = %e,
             "log files unavailable; logging to stderr only"
         );
+    }
+}
+
+/// Changes the level of our crates at runtime. Does nothing before [`init`].
+pub fn apply_level(level: LevelFilter) {
+    if let Some(handle) = FILTER.get() {
+        if let Err(e) = handle.reload(targets(level)) {
+            tracing::error!(event = "log.reload_failed", error = %e, "log level not changed");
+        }
     }
 }
 
