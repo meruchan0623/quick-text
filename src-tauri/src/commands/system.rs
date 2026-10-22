@@ -34,5 +34,6 @@ pub fn exit_app(app: tauri::AppHandle) {
     let s = state.lock();
     s.engine.cancel.store(true, Ordering::SeqCst);
     s.engine.paused.store(true, Ordering::SeqCst);
+    crate::store::clear_run_marker_on_session_end();
     app.exit(0)
 }
