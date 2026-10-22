@@ -76,10 +76,22 @@ impl From<&HistoryEntry> for MissExplanation {
     }
 }
 
+/// Whether an entry recorded at `at` is past [`MAX_AGE`] at `now`. An `at`
+/// later than `now` (the caller sampled `now` before another push took the
+/// lock) counts as age zero.
+fn expired(at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(at) > MAX_AGE
+}
+
 #[derive(Default)]
 struct Ring {
     /// Entries in ascending `seq`, each with the monotonic instant it was
     /// recorded at (age eviction never depends on wall-clock changes).
+    ///
+    /// The instants are *not* guaranteed to ascend: `push` receives an
+    /// instant sampled before the lock is taken, so two concurrent pushes can
+    /// store an earlier instant behind a later one. Eviction therefore sweeps
+    /// every entry, and readers filter by age entry by entry.
     entries: VecDeque<(Instant, HistoryEntry)>,
     last_seq: u64,
 }
@@ -89,13 +101,29 @@ impl Ring {
         while self.entries.len() > CAPACITY {
             self.entries.pop_front();
         }
+        // Fast path: the common in-order case stops at the first young entry.
         while self
             .entries
             .front()
-            .is_some_and(|(at, _)| now.saturating_duration_since(*at) > MAX_AGE)
+            .is_some_and(|(at, _)| expired(*at, now))
         {
             self.entries.pop_front();
         }
+        // Out-of-order instants can leave an expired entry behind a young
+        // head; at most CAPACITY entries, so a full sweep is cheap.
+        if self.entries.iter().any(|(at, _)| expired(*at, now)) {
+            self.entries.retain(|(at, _)| !expired(*at, now));
+        }
+    }
+
+    /// Retained entries that are not past [`MAX_AGE`] at `now`, in `seq`
+    /// order. Readers go through this, so their result never depends on
+    /// how far eviction got.
+    fn live(&self, now: Instant) -> impl DoubleEndedIterator<Item = &HistoryEntry> {
+        self.entries
+            .iter()
+            .filter(move |(at, _)| !expired(*at, now))
+            .map(|(_, entry)| entry)
     }
 }
 
@@ -138,11 +166,12 @@ impl History {
         let mut ring = self.ring.lock();
         ring.evict(now);
         let since = since_seq.unwrap_or(0);
-        ring.entries
-            .iter()
-            .filter(|(_, entry)| entry.seq > since)
-            .map(|(_, entry)| entry.clone())
-            .collect()
+        let entries = ring
+            .live(now)
+            .filter(|entry| entry.seq > since)
+            .cloned()
+            .collect();
+        entries
     }
 
     /// Drops every entry. Sequence numbers keep increasing, so a client that
@@ -155,11 +184,12 @@ impl History {
     pub fn last_miss(&self, now: Instant) -> Option<MissExplanation> {
         let mut ring = self.ring.lock();
         ring.evict(now);
-        ring.entries
-            .iter()
+        let miss = ring
+            .live(now)
             .rev()
-            .find(|(_, entry)| entry.outcome != Outcome::Succeeded)
-            .map(|(_, entry)| MissExplanation::from(entry))
+            .find(|entry| entry.outcome != Outcome::Succeeded)
+            .map(MissExplanation::from);
+        miss
     }
 
     /// Highest sequence number assigned so far (0 before the first entry).
@@ -214,6 +244,33 @@ mod tests {
         assert_eq!(history.last_miss(clock.now()), None, "the old miss expired");
         clock.advance(Duration::from_secs(20 * 60));
         assert!(history.list(None, clock.now()).is_empty());
+    }
+
+    /// Concurrent pushes can store instants out of order (the instant is
+    /// sampled before the lock). An expired entry behind a young head must
+    /// still never be returned.
+    #[test]
+    fn out_of_order_instants_never_leak_expired_entries() {
+        let (history, clock) = (History::new(), FakeClock::new());
+        let early = clock.now();
+        clock.advance(Duration::from_secs(10 * 60));
+        let late = clock.now();
+        // The push holding the later instant takes the lock first.
+        let young = history.push(record("young", Outcome::Succeeded), late, clock.wall_ms());
+        let stale = history.push(record("stale", Outcome::Failed), early, clock.wall_ms());
+        assert!(stale.seq > young.seq);
+        assert_eq!(history.list(None, late), vec![young.clone(), stale.clone()]);
+        assert_eq!(history.last_miss(late), Some(MissExplanation::from(&stale)));
+        // Only the later-inserted entry is past MAX_AGE now.
+        let now = early + MAX_AGE + Duration::from_millis(1);
+        assert_eq!(history.list(None, now), vec![young.clone()]);
+        assert!(history.list(Some(young.seq), now).is_empty());
+        assert_eq!(history.last_miss(now), None, "the stale miss expired");
+        // Still young at exactly MAX_AGE after `late`, gone 1 ms later.
+        assert_eq!(history.list(None, late + MAX_AGE), vec![young]);
+        assert!(history
+            .list(None, late + MAX_AGE + Duration::from_millis(1))
+            .is_empty());
     }
 
     #[test]
