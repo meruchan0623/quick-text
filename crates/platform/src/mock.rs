@@ -1,7 +1,7 @@
 //! Test doubles for the platform ports (S-23). Built for unit tests and, with
 //! `--features mock`, for downstream pipeline tests. Never touches the OS.
 use crate::health::{HealthState, ReasonCode};
-use crate::traits::{ClipboardBackend, Clock, ForegroundProbe, Injector, InputContext};
+use crate::traits::{ClipboardBackend, Clock, ForegroundProbe, FormatRead, Injector, InputContext};
 use crate::Foreground;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -147,6 +147,30 @@ struct ClipboardModel {
     health: Option<(HealthState, Option<ReasonCode>)>,
     /// Registered format names; ids start at 0xC000 like Win32's.
     registry: Vec<String>,
+    /// Sizes formats report instead of their byte count (virtual size).
+    sizes: Vec<(u32, usize)>,
+    /// The current owner stopped pumping messages.
+    owner_hung: bool,
+}
+
+/// Formats whose data is a GDI or owner-defined handle, never bytes.
+fn handle_format(format: u32) -> bool {
+    matches!(format, 2 | 3 | 9 | 0x80..=0x8F | 0x200..=0x3FF)
+}
+
+impl ClipboardModel {
+    /// Asserts a backup could read `format` on Windows without blocking or
+    /// misreading a handle as memory.
+    fn assert_readable(&self, format: u32) {
+        assert!(
+            !(self.owner_hung && self.owner != MockClipboard::LEASE),
+            "clipboard read from a hung owner (would block on delayed rendering)"
+        );
+        assert!(
+            !handle_format(format),
+            "handle format {format:#x} read as bytes"
+        );
+    }
 }
 
 /// In-memory clipboard following Win32 rules: clearing takes ownership and
@@ -180,6 +204,8 @@ impl MockClipboard {
                 read_delay: Duration::ZERO,
                 health: None,
                 registry: vec![],
+                sizes: vec![],
+                owner_hung: false,
             })),
         }
     }
@@ -206,6 +232,7 @@ impl MockClipboard {
         state.owner = owner;
         state.formats = formats;
         state.sequence += 2;
+        state.owner_hung = false;
     }
     /// The payload changes without an owner change.
     pub fn tamper(&self, formats: ClipboardFormats) {
@@ -259,6 +286,18 @@ impl MockClipboard {
         let index = state.registry.iter().position(|known| known == name)?;
         Some(0xC000 + index as u32)
     }
+    /// `format` reports `size` bytes without allocating them, so a read
+    /// limited below `size` sees it as too large. Meant for sizes above every
+    /// limit a lease uses: such a format is never read in full.
+    pub fn report_size(&self, format: u32, size: usize) {
+        self.state.lock().sizes.push((format, size));
+    }
+    /// The current owner stops (or resumes) pumping messages. Reading any
+    /// format while it owns the clipboard panics: on Windows a delay-rendered
+    /// format would block on it. Cleared when another owner takes over.
+    pub fn set_owner_hung(&self, hung: bool) {
+        self.state.lock().owner_hung = hung;
+    }
 }
 
 impl ClipboardBackend for MockClipboard {
@@ -309,6 +348,7 @@ impl ClipboardBackend for MockClipboard {
     }
     fn read(&self, format: u32, limit: usize) -> Result<Option<Vec<u8>>, String> {
         let mut state = self.open();
+        state.assert_readable(format);
         let delay = state.read_delay;
         state.elapsed += delay;
         Ok(state
@@ -358,6 +398,32 @@ impl ClipboardBackend for MockClipboard {
         let mut model = self.state.lock();
         assert!(!model.open, "health reported with the clipboard open");
         model.health = Some((state, reason));
+    }
+    fn read_format(&self, format: u32, limit: usize) -> FormatRead {
+        let mut state = self.open();
+        state.assert_readable(format);
+        let delay = state.read_delay;
+        state.elapsed += delay;
+        let Some((_, bytes)) = state.formats.iter().find(|(f, _)| *f == format) else {
+            return FormatRead::Missing;
+        };
+        let size = state
+            .sizes
+            .iter()
+            .find(|(f, _)| *f == format)
+            .map_or(bytes.len(), |(_, size)| *size);
+        if bytes.is_empty() {
+            FormatRead::Missing
+        } else if size > limit {
+            FormatRead::TooLarge
+        } else {
+            FormatRead::Data(bytes.clone())
+        }
+    }
+    fn owner_hung(&self, owner: u64) -> bool {
+        let state = self.state.lock();
+        assert!(!state.open, "hung-owner probe with the clipboard open");
+        state.owner_hung && owner == state.owner && owner != Self::LEASE
     }
     fn register_format(&self, name: &str) -> u32 {
         let mut state = self.state.lock();
@@ -459,7 +525,10 @@ impl ForegroundProbe for MockForeground {
 pub struct FakeClock {
     base: Instant,
     state: Mutex<(Duration, Vec<Duration>)>,
+    sleep_hook: Mutex<Option<SleepHook>>,
 }
+
+type SleepHook = Box<dyn FnMut(Duration) + Send>;
 
 impl FakeClock {
     /// Wall time at creation: 2026-01-01T00:00:00Z.
@@ -469,6 +538,7 @@ impl FakeClock {
         Self {
             base: Instant::now(),
             state: Mutex::new((Duration::ZERO, vec![])),
+            sleep_hook: Mutex::new(None),
         }
     }
     pub fn advance(&self, by: Duration) {
@@ -481,6 +551,11 @@ impl FakeClock {
     /// Every `sleep` request, in order.
     pub fn sleeps(&self) -> Vec<Duration> {
         self.state.lock().1.clone()
+    }
+    /// Runs `hook` with each `sleep` request, before time advances (e.g. to
+    /// check that nothing waits with the clipboard open).
+    pub fn on_sleep(&self, hook: impl FnMut(Duration) + Send + 'static) {
+        *self.sleep_hook.lock() = Some(Box::new(hook));
     }
 }
 
@@ -498,6 +573,12 @@ impl Clock for FakeClock {
         Self::WALL_START_MS + self.state.lock().0.as_millis() as i64
     }
     fn sleep(&self, duration: Duration) {
+        // Run the hook unlocked so it may read this clock.
+        let hook = self.sleep_hook.lock().take();
+        if let Some(mut hook) = hook {
+            hook(duration);
+            self.sleep_hook.lock().get_or_insert(hook);
+        }
         let mut state = self.state.lock();
         state.0 += duration;
         state.1.push(duration);
@@ -542,6 +623,49 @@ mod tests {
     fn clipboard_rejects_waiting_inside_the_critical_section() {
         let clipboard = MockClipboard::new(7, vec![]);
         clipboard.locked(|| clipboard.pause(Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn clipboard_reports_virtual_sizes_and_registers_formats() {
+        let clipboard = MockClipboard::new(7, vec![(0xC000, vec![1, 2])]);
+        clipboard.report_size(0xC000, 64);
+        let reads = clipboard
+            .locked(|| {
+                [
+                    clipboard.read_format(0xC000, 63),
+                    clipboard.read_format(0xC000, 64),
+                    clipboard.read_format(13, 64),
+                ]
+            })
+            .unwrap();
+        assert_eq!(
+            reads,
+            [
+                FormatRead::TooLarge,
+                FormatRead::Data(vec![1, 2]),
+                FormatRead::Missing
+            ]
+        );
+        let id = clipboard.register_format("Preferred DropEffect");
+        assert_eq!(clipboard.register_format("Preferred DropEffect"), id);
+        assert_eq!(clipboard.registered("Preferred DropEffect"), Some(id));
+        assert_eq!(clipboard.registered("HTML Format"), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "handle format 0x9 read as bytes")]
+    fn clipboard_rejects_reading_a_handle_format_as_bytes() {
+        let clipboard = MockClipboard::new(7, vec![(9, vec![1])]);
+        clipboard.locked(|| clipboard.read_format(9, 64));
+    }
+
+    #[test]
+    #[should_panic(expected = "clipboard read from a hung owner")]
+    fn clipboard_rejects_reading_from_a_hung_owner() {
+        let clipboard = MockClipboard::new(7, vec![(13, vec![1, 0])]);
+        clipboard.set_owner_hung(true);
+        assert!(clipboard.owner_hung(7));
+        clipboard.locked(|| clipboard.read(13, 64)).unwrap().ok();
     }
 
     #[test]

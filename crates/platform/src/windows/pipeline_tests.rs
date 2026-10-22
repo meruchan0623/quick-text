@@ -659,3 +659,6 @@ fn pasted(clipboard: &MockClipboard, text: &str) -> Vec<(u32, Vec<u8>)> {
     }
     formats
 }
+
+#[path = "pipeline_tests_clipboard.rs"]
+mod clipboard_cases;
