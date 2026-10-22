@@ -23,7 +23,10 @@ use super::{
     foreground::WinForeground,
     hook::{mouse_operation, pointer_move, test_input_enabled, HookPipe, HookRecord, HookSet},
     ime::ime_active,
-    keystate::{AsyncKeyProbe, KeyBits, ModifierWatch, SystemAsyncKeys, PHYSICAL},
+    keystate::{
+        own_input, AsyncKeyProbe, KeyBits, ModifierWatch, OwnInput, SystemAsyncKeys,
+        INJECTION_QUIET, PHYSICAL,
+    },
     liveness::{component_name, reason_name, CrossCheck, HealthTable, Source, Verdict},
     rawinput::{
         acceptance_event, detect_candidate, event_from, note_source, Buffer, Event, RawRecord,
@@ -264,16 +267,58 @@ impl Consumer {
 /// still in flight when the first one ran (B-05).
 pub(super) const RESYNC_SECOND_PASS: Duration = Duration::from_millis(200);
 
+/// The earlier of two optional deadlines.
+fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// When our own injections last changed, as the consumer observed them
+/// (H1): the asynchronous key state is only sampled after
+/// [`INJECTION_QUIET`] without any.
+struct Quiet {
+    /// [`OwnInput::seq`] at the last observation.
+    seen: u64,
+    /// When an injection was last seen starting, ending or in flight;
+    /// `None` when none has been seen since the monitor started.
+    since: Option<Instant>,
+}
+impl Quiet {
+    fn observe(&mut self, own: &OwnInput, now: Instant) {
+        let seq = own.seq();
+        if seq != self.seen || own.active() {
+            self.seen = seq;
+            self.since = Some(now);
+        }
+    }
+    /// `None` when sampling may start now, else when to look again.
+    fn wait(&self, now: Instant) -> Option<Instant> {
+        self.since
+            .and_then(|since| since.checked_add(INJECTION_QUIET))
+            .filter(|&ready| now < ready)
+    }
+}
+
 /// Consumer-side timers (B-05): the key-mirror resync after session signals
 /// and the stuck-modifier check. All time comes from `clock`; every system
 /// read goes through `ports`.
+///
+/// H1: a resync never imports our own output. It waits until no injection
+/// was in flight for [`INJECTION_QUIET`], masks the keys `own` holds, and
+/// is retried when an injection overlapped its sample.
 pub(super) struct Monitor<'a, P: AsyncKeyProbe, C: Clock> {
     keys: &'a KeyBits,
     ports: &'a P,
     clock: &'a C,
     signals: &'a SessionSignals,
+    own: &'a OwnInput,
     watch: ModifierWatch,
     second_pass: Option<Instant>,
+    /// A resync waiting for our injections to settle.
+    pending: Option<&'static str>,
+    quiet: Quiet,
 }
 impl<'a, P: AsyncKeyProbe, C: Clock> Monitor<'a, P, C> {
     pub(super) fn new(
@@ -281,20 +326,28 @@ impl<'a, P: AsyncKeyProbe, C: Clock> Monitor<'a, P, C> {
         ports: &'a P,
         clock: &'a C,
         signals: &'a SessionSignals,
+        own: &'a OwnInput,
     ) -> Self {
         Self {
             keys,
             ports,
             clock,
             signals,
+            own,
             watch: ModifierWatch::default(),
             second_pass: None,
+            pending: None,
+            quiet: Quiet {
+                seen: own.seq(),
+                since: None,
+            },
         }
     }
     /// Handles pending session signals and due checks. Returns when it next
     /// needs to run, if anything is scheduled.
     pub(super) fn tick(&mut self, shared: &Shared) -> Option<Instant> {
         let now = self.clock.now();
+        self.quiet.observe(self.own, now);
         let mut signalled = false;
         for signal in self.signals.take() {
             tracing::info!(event = "session.signal", signal = signal.name());
@@ -304,23 +357,41 @@ impl<'a, P: AsyncKeyProbe, C: Clock> Monitor<'a, P, C> {
             // Typing before and after a session change is not one word.
             shared.generation.fetch_add(1, Ordering::SeqCst);
             observer::CARET_EPOCH.fetch_add(1, Ordering::SeqCst);
-            self.resync("first");
-            self.second_pass = now.checked_add(RESYNC_SECOND_PASS);
+            self.pending = Some("first");
+            self.second_pass = None;
         } else if self.second_pass.is_some_and(|due| now >= due) {
             // Mirror only: a word typed right after an unlock stays intact.
             self.second_pass = None;
-            self.resync("second");
+            self.pending.get_or_insert("second");
         }
+        let retry = self.pending.and_then(|pass| self.run_pending(pass, now));
         let modifiers = self.watch.check(self.keys, self.ports, now);
-        match (self.second_pass, modifiers) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        earliest(earliest(self.second_pass, retry), modifiers)
     }
-    fn resync(&mut self, pass: &'static str) {
-        self.keys.resync(self.ports);
+    /// Runs the pending resync if our injections have settled. Returns when
+    /// to try again otherwise.
+    fn run_pending(&mut self, pass: &'static str, now: Instant) -> Option<Instant> {
+        if let Some(ready) = self.quiet.wait(now) {
+            return Some(ready);
+        }
+        if !self
+            .keys
+            .resync_unless_injected(self.ports, self.own, self.quiet.seen)
+        {
+            // An injection overlapped the sample: wait for quiet again,
+            // counted from now (one still in flight keeps extending it).
+            tracing::info!(event = "keystate.resync_deferred", pass);
+            self.quiet.seen = self.own.seq();
+            self.quiet.since = Some(now);
+            return now.checked_add(INJECTION_QUIET);
+        }
+        self.pending = None;
         self.watch.reset();
         tracing::info!(event = "keystate.resync", pass);
+        if pass == "first" {
+            self.second_pass = now.checked_add(RESYNC_SECOND_PASS);
+        }
+        None
     }
 }
 
@@ -743,7 +814,13 @@ fn run_consumer(
 ) {
     let clock = SystemClock;
     let mut consumer = Consumer::default();
-    let mut monitor = Monitor::new(&PHYSICAL, &SystemAsyncKeys, &clock, &session::SIGNALS);
+    let mut monitor = Monitor::new(
+        &PHYSICAL,
+        &SystemAsyncKeys,
+        &clock,
+        &session::SIGNALS,
+        own_input(),
+    );
     let mut liveness = Liveness::new(&SOURCES);
     while !shared.shutdown.load(Ordering::SeqCst) {
         let drained = catch_unwind(AssertUnwindSafe(|| {

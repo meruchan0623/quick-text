@@ -1,7 +1,7 @@
 //! Output layer over the [`Injector`] port with fail-stop accounting of
 //! accepted events, plus the Windows adapter (SendInput and the vendored
 //! Espanso injector).
-use super::keystate::physical;
+use super::keystate::{own_input, physical, Injecting};
 use super::*;
 use crate::traits::{Clock, Injector};
 
@@ -92,17 +92,31 @@ pub(super) fn release_owned(
     owned.remove(&v);
     Ok(())
 }
+// H1: every injector call below runs inside `own_input().begin()`, and the
+// key and button transitions the system accepted are noted, so the input
+// consumer never imports our own output into the physical key mirror.
 pub(super) fn key(injector: &impl Injector, v: u16, up: bool) -> Result<(), String> {
-    record_send_result(injector.send_key(v, up), 1)
+    let injecting = own_input().begin();
+    let accepted = injector.send_key(v, up);
+    if accepted == 1 {
+        if up {
+            injecting.released(v);
+        } else {
+            injecting.pressed(v);
+        }
+    }
+    record_send_result(accepted, 1)
 }
 pub(super) fn press(injector: &impl Injector, v: u16) -> Result<(), String> {
     press_keys(injector, &[v])
 }
 pub(super) fn press_keys(injector: &impl Injector, keys: &[u16]) -> Result<(), String> {
+    let _injecting = own_input().begin();
     let result = record_send_result(injector.send_keys(keys), keys.len() as u32 * 2);
     cleanup_submission(keys, result, physical, |v| key(injector, v, true))
 }
 pub(super) fn combination(injector: &impl Injector, keys: &[u16]) -> Result<(), String> {
+    let _injecting = own_input().begin();
     let result = record_send_result(injector.send_chord(keys), keys.len() as u32 * 2);
     cleanup_submission(keys, result, physical, |v| key(injector, v, true))
 }
@@ -134,6 +148,7 @@ pub(super) fn text(injector: &impl Injector, value: &str) -> Result<(), String> 
     if value.contains('\0') {
         return Err("Unicode injection cannot contain NUL".into());
     }
+    let _injecting = own_input().begin();
     record_send_result(injector.send_text(value), requested)
 }
 
@@ -251,7 +266,39 @@ pub(super) fn mouse_input(
     x: i32,
     y: i32,
 ) -> Result<(), String> {
-    record_send_result(injector.send_mouse(flags, data, x, y), 1)
+    let injecting = own_input().begin();
+    let accepted = injector.send_mouse(flags, data, x, y);
+    if accepted == 1 {
+        note_buttons(&injecting, flags, data);
+    }
+    record_send_result(accepted, 1)
+}
+/// Notes the mouse buttons one accepted `send_mouse` call pressed or
+/// released, as the virtual-key codes the asynchronous state reports.
+/// 「待实测」: with swapped mouse buttons, which code an injected
+/// `MOUSEEVENTF_LEFTDOWN` sets has not been checked on a real machine.
+fn note_buttons(injecting: &Injecting<'_>, flags: u32, data: u32) {
+    let xbutton = match data {
+        1 => VK_XBUTTON1,
+        2 => VK_XBUTTON2,
+        _ => 0,
+    };
+    for (down, up, vk) in [
+        (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, VK_LBUTTON),
+        (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, VK_RBUTTON),
+        (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, VK_MBUTTON),
+        (MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, xbutton),
+    ] {
+        if vk == 0 {
+            continue;
+        }
+        if flags & down != 0 {
+            injecting.pressed(vk);
+        }
+        if flags & up != 0 {
+            injecting.released(vk);
+        }
+    }
 }
 pub(super) fn button(
     injector: &impl Injector,
@@ -325,7 +372,49 @@ pub(super) fn erase(
 
 #[cfg(test)]
 mod tests {
+    use super::super::keystate::{track_own_input, OwnInput};
     use super::*;
+    use crate::mock::{FakeClock, MockInjector};
+
+    #[test]
+    fn injections_note_the_keys_and_buttons_the_system_accepted() {
+        let own: &'static OwnInput = Box::leak(Box::new(OwnInput::new()));
+        let _track = track_own_input(own);
+        let injector = MockInjector::new();
+        let in_flight = Arc::new(AtomicU64::new(0));
+        let calls = in_flight.clone();
+        injector.on_call(move |_| {
+            assert!(own.active(), "every call runs inside an injection");
+            calls.fetch_add(1, Ordering::SeqCst);
+        });
+        let seen = own.seq();
+        key(&injector, 0x41, false).unwrap();
+        assert!(own.holds(0x41) && !own.active() && !own.settled(seen));
+        // A rejected key-up leaves the key ours; a rejected key-down is not.
+        injector.short_count(1, 0);
+        assert!(key(&injector, 0x41, true).is_err());
+        assert!(own.holds(0x41));
+        key(&injector, 0x41, true).unwrap();
+        assert!(!own.holds(0x41));
+        injector.short_count(3, 0);
+        assert!(key(&injector, 0x42, false).is_err());
+        assert!(!own.holds(0x42));
+        let clock = FakeClock::new();
+        button(&injector, &clock, MouseButton::X2, ButtonState::Down).unwrap();
+        button(&injector, &clock, MouseButton::Left, ButtonState::Down).unwrap();
+        assert!(own.holds(VK_XBUTTON2) && own.holds(VK_LBUTTON) && !own.holds(VK_XBUTTON1));
+        button(&injector, &clock, MouseButton::X2, ButtonState::Up).unwrap();
+        button(&injector, &clock, MouseButton::Left, ButtonState::Click).unwrap();
+        assert!(!own.holds(VK_XBUTTON2) && !own.holds(VK_LBUTTON));
+        // Taps, chords and text leave nothing held but still count.
+        let seen = own.seq();
+        press_keys(&injector, &[VK_BACK]).unwrap();
+        combination(&injector, &[VK_CONTROL, 0x56]).unwrap();
+        text(&injector, "x").unwrap();
+        mouse_input(&injector, MOUSEEVENTF_MOVE, 0, 1, 1).unwrap();
+        assert!(!own.settled(seen) && !own.active() && !own.holds(VK_CONTROL));
+        assert_eq!(in_flight.load(Ordering::SeqCst), 13);
+    }
     #[test]
     fn failed_key_release_retains_ownership_for_cleanup() {
         let mut held = BTreeSet::from([VK_CONTROL]);

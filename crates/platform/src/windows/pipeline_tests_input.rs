@@ -8,6 +8,7 @@
     clippy::panic,
     clippy::indexing_slicing
 )]
+use super::actions::{execute_with_proof, Ports};
 use super::executor::Candidate;
 use super::hook::{
     classify, handle_key, handle_mouse, HookAction, HookPipe, HookRecord, HookSet, KeyInfo,
@@ -16,13 +17,16 @@ use super::hook::{
 use super::input::{
     Consumer, Lane, Liveness, Monitor, Registration, SourcePorts, Sources, RESYNC_SECOND_PASS,
 };
-use super::keystate::{AsyncKeyProbe, KeyBits, MODIFIER_VERIFY_AFTER};
+use super::keystate::{
+    track_own_input, AsyncKeyProbe, KeyBits, OwnInput, INJECTION_QUIET, MODIFIER_VERIFY_AFTER,
+    PHYSICAL,
+};
 use super::liveness::{MATCH_WINDOW, MISS_LIMIT};
 use super::rawinput::{raw_record, InputEvent, RawRecord, KEYBOARD_LAYOUT_CACHE_INTERVAL};
 use super::session::{end_message, SessionEnd, SessionSignals, Signal};
 use super::*;
 use crate::health::{Component, ComponentHealth, HealthState, ReasonCode};
-use crate::mock::{FakeClock, MockForeground};
+use crate::mock::{FakeClock, InjectCall, MockForeground, MockInjector};
 use crate::traits::{Clock, ForegroundProbe, InputContext};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -171,6 +175,8 @@ fn engine(trigger: &str) -> Arc<Shared> {
     *shared.config.lock().unwrap() = config;
     shared
 }
+/// Own-input tracking no injection ever touches.
+static NO_INJECTIONS: OwnInput = OwnInput::new();
 /// A seeded, empty key mirror owned by one test.
 fn leaked_keys() -> &'static KeyBits {
     let keys = Box::leak(Box::new(KeyBits::new()));
@@ -695,7 +701,7 @@ fn a_lost_ctrl_key_up_heals_after_thirty_seconds() {
     let clock = FakeClock::new();
     let released = FakeAsyncKeys::default();
     let signals = SessionSignals::new();
-    let mut monitor = Monitor::new(keys, &released, &clock, &signals);
+    let mut monitor = Monitor::new(keys, &released, &clock, &signals, &NO_INJECTIONS);
     let mut consumer = Consumer::default();
     handle_key(&hooks, &shared, &probe, WM_KEYDOWN, hardware(VK_LCONTROL));
     assert!(drain(&mut consumer, &shared, &hooks, &raw, &probe).is_empty());
@@ -738,7 +744,7 @@ fn a_ctrl_really_held_survives_the_check() {
     let clock = FakeClock::new();
     let held = FakeAsyncKeys::with(&[VK_RCONTROL]);
     let signals = SessionSignals::new();
-    let mut monitor = Monitor::new(keys, &held, &clock, &signals);
+    let mut monitor = Monitor::new(keys, &held, &clock, &signals, &NO_INJECTIONS);
     assert_eq!(monitor.tick(&shared), None);
     handle_key(&hooks, &shared, &probe, WM_KEYDOWN, hardware(VK_RCONTROL));
     monitor.tick(&shared);
@@ -770,7 +776,7 @@ fn after_an_unlock_a_trigger_works_immediately() {
     let clock = FakeClock::new();
     let async_keys = FakeAsyncKeys::with(&[VK_LWIN]);
     let signals = SessionSignals::new();
-    let mut monitor = Monitor::new(keys, &async_keys, &clock, &signals);
+    let mut monitor = Monitor::new(keys, &async_keys, &clock, &signals, &NO_INJECTIONS);
     let mut consumer = Consumer::default();
     handle_key(&hooks, &shared, &probe, WM_KEYDOWN, hardware(VK_LWIN));
     handle_key(&hooks, &shared, &probe, WM_KEYDOWN, hardware(0x4c));
@@ -820,6 +826,204 @@ fn after_an_unlock_a_trigger_works_immediately() {
     assert_eq!(next, None);
     type_word(&shared, keys, &raw, &probe, "w");
     assert_eq!(drain(&mut consumer, &shared, &hooks, &raw, &probe).len(), 1);
+}
+
+/// The executor's clock in [`an_action_releases_its_key_across_the_second_resync`]:
+/// every executor sleep advances the shared fake clock and then lets the
+/// input consumer's monitor run, interleaving the two threads
+/// deterministically.
+struct ConsumerTicks<'a> {
+    clock: &'a FakeClock,
+    shared: &'a Shared,
+    monitor: Mutex<Monitor<'a, FakeAsyncKeys, FakeClock>>,
+}
+impl Clock for ConsumerTicks<'_> {
+    fn now(&self) -> Instant {
+        self.clock.now()
+    }
+    fn wall_ms(&self) -> i64 {
+        self.clock.wall_ms()
+    }
+    fn sleep(&self, duration: Duration) {
+        self.clock.sleep(duration);
+        self.monitor.lock().unwrap().tick(self.shared);
+    }
+}
+
+/// H1: an action holds A (KeyDown, Delay, KeyUp) while the second resync
+/// after an unlock runs. The asynchronous key state shows A down because we
+/// injected it; the resync must not import it, so the KeyUp and the cleanup
+/// really release A and the mirror never reports A as physical.
+#[test]
+fn an_action_releases_its_key_across_the_second_resync() {
+    const A: u16 = 0x41;
+    let own: &'static OwnInput = Box::leak(Box::new(OwnInput::new()));
+    let _track = track_own_input(own);
+    // `physical()` in the executor reads the global mirror; nothing in the
+    // tests ever sets a bit there, and this test leaves it all up.
+    PHYSICAL.mark_seeded();
+    let shared = engine("btw");
+    let clock = FakeClock::new();
+    let async_keys = Arc::new(FakeAsyncKeys::default());
+    let signals = SessionSignals::new();
+    let injector = MockInjector::new();
+    {
+        // The asynchronous state follows our injected key.
+        let async_keys = async_keys.clone();
+        injector.on_call(move |call| {
+            if let InjectCall::Key { key, up } = *call {
+                let mut down = async_keys.down.lock().unwrap();
+                down.retain(|&vk| vk != key);
+                if !up {
+                    down.push(key);
+                }
+            }
+        });
+    }
+    let ticks = ConsumerTicks {
+        clock: &clock,
+        shared: &shared,
+        monitor: Mutex::new(Monitor::new(&PHYSICAL, &async_keys, &clock, &signals, own)),
+    };
+    // Unlock: the first resync runs now, the second is due in 200 ms.
+    signals.raise(Signal::Unlock);
+    assert_eq!(
+        ticks.monitor.lock().unwrap().tick(&shared),
+        Some(clock.now() + RESYNC_SECOND_PASS)
+    );
+    let start = clock.now();
+    let plan = ActionPlan {
+        steps: [
+            Operation::KeyDown {
+                key: Key::named("A"),
+            },
+            Operation::Delay { ms: 1000 },
+            Operation::KeyUp {
+                key: Key::named("A"),
+            },
+        ]
+        .into_iter()
+        .map(|operation| Step::new(operation, SourceSpan::default()))
+        .collect(),
+        ..Default::default()
+    };
+    let foreground = MockForeground::new(window());
+    let ports = Ports {
+        injector: &injector,
+        foreground: &foreground,
+        clock: &ticks,
+        clipboard: || -> Result<crate::mock::MockClipboard, String> { Err("unused".into()) },
+    };
+    let generation = shared.generation.load(Ordering::SeqCst);
+    let (result, lines) = capture::logs(|| {
+        execute_with_proof(&ports, &shared, plan, window(), generation, None, None, 1.0)
+    });
+    let result = result.unwrap();
+    // The second resync really ran while A was held, after the quiet period
+    // that followed the KeyDown.
+    assert_eq!(
+        count_of(&lines, "event=\"keystate.resync\" pass=\"second\""),
+        1,
+        "{lines:?}"
+    );
+    assert!(clock.now() - start >= RESYNC_SECOND_PASS + INJECTION_QUIET);
+    assert_eq!(result.status, "unknown", "{}", result.message);
+    assert_eq!(
+        injector.calls(),
+        [
+            InjectCall::Key { key: A, up: false },
+            InjectCall::Key { key: A, up: true },
+        ],
+        "the KeyUp released A"
+    );
+    assert!(!PHYSICAL.held(A), "our own A never became physical");
+    assert!(!own.holds(A));
+}
+
+/// H1: a resync never samples while our injections are in flight or within
+/// the quiet period after them (the asynchronous state lags behind a
+/// key-up we sent), and a sample an injection overlapped is thrown away.
+#[test]
+fn a_resync_waits_for_our_injections_to_settle() {
+    const V: u16 = 0x56;
+    let shared = engine("btw");
+    let keys = leaked_keys();
+    let own: &'static OwnInput = Box::leak(Box::new(OwnInput::new()));
+    let clock = FakeClock::new();
+    let async_keys = InjectWhileProbed {
+        keys: FakeAsyncKeys::default(),
+        own,
+        armed: AtomicBool::new(false),
+    };
+    let signals = SessionSignals::new();
+    let mut monitor = Monitor::new(keys, &async_keys, &clock, &signals, own);
+    // The executor is mid Ctrl+V when the session unlocks.
+    let chord = own.begin();
+    async_keys.keys.set(&[VK_LCONTROL, V]);
+    signals.raise(Signal::Unlock);
+    let (next, lines) = capture::logs(|| monitor.tick(&shared));
+    assert_eq!(count_of(&lines, "keystate.resync"), 0, "{lines:?}");
+    assert_eq!(next, Some(clock.now() + INJECTION_QUIET));
+    assert_eq!(async_keys.keys.reads(), 0, "not even sampled");
+    // The chord ends 10 ms later; the asynchronous state still shows it for
+    // another 100 ms.
+    clock.advance(Duration::from_millis(10));
+    drop(chord);
+    clock.advance(Duration::from_millis(10));
+    let ended = clock.now();
+    assert_eq!(monitor.tick(&shared), Some(ended + INJECTION_QUIET));
+    clock.advance(Duration::from_millis(90));
+    monitor.tick(&shared);
+    async_keys.keys.set(&[]);
+    clock.advance(INJECTION_QUIET - Duration::from_millis(91));
+    monitor.tick(&shared);
+    assert_eq!(async_keys.keys.reads(), 0, "still inside the quiet period");
+    assert!(!keys.held(VK_CONTROL) && !keys.held(V));
+    // Quiet at last, but another injection lands in the middle of the scan:
+    // the sample is discarded and retried after a fresh quiet period.
+    clock.advance(Duration::from_millis(1));
+    async_keys.armed.store(true, Ordering::SeqCst);
+    let (next, lines) = capture::logs(|| monitor.tick(&shared));
+    assert_eq!(
+        count_of(&lines, "event=\"keystate.resync_deferred\" pass=\"first\""),
+        1,
+        "{lines:?}"
+    );
+    assert_eq!(next, Some(clock.now() + INJECTION_QUIET));
+    assert!(
+        !keys.held(0x41),
+        "the lagging A from that injection was not imported"
+    );
+    async_keys.keys.set(&[]);
+    clock.advance(INJECTION_QUIET);
+    let (next, lines) = capture::logs(|| monitor.tick(&shared));
+    assert_eq!(
+        count_of(&lines, "event=\"keystate.resync\" pass=\"first\""),
+        1,
+        "{lines:?}"
+    );
+    assert_eq!(next, Some(clock.now() + RESYNC_SECOND_PASS));
+    assert!(!keys.held(VK_CONTROL) && !keys.held(V) && !keys.held(0x41));
+}
+
+/// Fake asynchronous state that, once armed, runs one of our injections
+/// (A pressed and released) in the middle of a scan; A then reads down for
+/// the rest of the scan, as the real state lags behind the key-up.
+struct InjectWhileProbed {
+    keys: FakeAsyncKeys,
+    own: &'static OwnInput,
+    armed: AtomicBool,
+}
+impl AsyncKeyProbe for InjectWhileProbed {
+    fn down(&self, vk: u16) -> bool {
+        if vk == 0x30 && self.armed.swap(false, Ordering::SeqCst) {
+            let injecting = self.own.begin();
+            injecting.pressed(0x41);
+            injecting.released(0x41);
+            self.keys.set(&[0x41]);
+        }
+        self.keys.down(vk)
+    }
 }
 
 /// The hook kinds behind [`FakeSources::hooked`], in order.

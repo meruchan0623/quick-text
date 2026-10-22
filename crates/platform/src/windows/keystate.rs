@@ -119,6 +119,13 @@ impl KeyBits {
     pub(super) fn seeded(&self) -> bool {
         self.seeded.load(Ordering::SeqCst)
     }
+    /// The resync without injection tracking: production always goes
+    /// through [`KeyBits::resync_unless_injected`].
+    #[cfg(test)]
+    pub(super) fn resync(&self, probe: &impl AsyncKeyProbe) {
+        Sample::take(self, probe, |_| false).apply(self);
+        self.seeded.store(true, Ordering::SeqCst);
+    }
     /// Re-reads every code from `probe` and marks the mirror seeded.
     ///
     /// Each key's state is sampled *before* it is probed, and the probe is
@@ -130,10 +137,34 @@ impl KeyBits {
     /// state of a generic code is "either side down", while the low-level
     /// hook reports the sided codes, so no key-up would ever clear a seeded
     /// generic bit. The sided bits already make [`KeyBits::held`] true.
-    pub(super) fn resync(&self, probe: &impl AsyncKeyProbe) {
-        let sample = Sample::take(self, probe);
+    ///
+    /// It never imports input this process injected (H1). The asynchronous
+    /// key state includes our own injected keys, which the hooks
+    /// deliberately ignore, so:
+    ///
+    /// - keys `own` holds are neither probed nor written: they keep the
+    ///   hook's value (a real press of the same key still shows there);
+    /// - the whole sample is discarded, and `false` returned, when any
+    ///   injection was in flight or started since `own` was observed at
+    ///   `seen` ([`OwnInput::seq`]). The caller retries after a quiet
+    ///   period, which also covers the lag of the asynchronous state behind
+    ///   a key-up we sent.
+    pub(super) fn resync_unless_injected(
+        &self,
+        probe: &impl AsyncKeyProbe,
+        own: &OwnInput,
+        seen: u64,
+    ) -> bool {
+        if !own.settled(seen) {
+            return false;
+        }
+        let sample = Sample::take(self, probe, |vk| own.holds(vk));
+        if !own.settled(seen) {
+            return false;
+        }
         sample.apply(self);
         self.seeded.store(true, Ordering::SeqCst);
+        true
     }
     /// Test rigs: treat the (empty) mirror as authoritative so readers never
     /// fall back to the real asynchronous key state.
@@ -144,36 +175,173 @@ impl KeyBits {
 }
 
 /// One resync pass: every key's state word, sampled before that key was
-/// probed, and the probe result. Lives on the stack; nothing is allocated.
+/// probed, and the probe result (`None`: skipped, the mirror keeps its
+/// value). Lives on the stack; nothing is allocated.
 struct Sample {
     seen: [u32; KEY_CODES],
-    down: [bool; KEY_CODES],
+    down: [Option<bool>; KEY_CODES],
 }
 impl Sample {
-    fn take(keys: &KeyBits, probe: &impl AsyncKeyProbe) -> Self {
+    fn take(keys: &KeyBits, probe: &impl AsyncKeyProbe, skip: impl Fn(u16) -> bool) -> Self {
         let mut sample = Self {
             seen: [0; KEY_CODES],
-            down: [false; KEY_CODES],
+            down: [None; KEY_CODES],
         };
         for ((vk, seen), down) in (0u16..)
             .zip(sample.seen.iter_mut())
             .zip(sample.down.iter_mut())
         {
+            if skip(vk) {
+                continue;
+            }
             // Sample first: a transition between this load and the probe
             // advances the version and makes `apply` skip the key.
             *seen = keys.state(vk);
-            *down = vk != 0 && !GENERIC_MODIFIERS.contains(&vk) && probe.down(vk);
+            *down = Some(vk != 0 && !GENERIC_MODIFIERS.contains(&vk) && probe.down(vk));
         }
         sample
     }
     /// Writes every probed value whose key has not changed since sampled.
     fn apply(&self, keys: &KeyBits) {
         for ((vk, &seen), &down) in (0u16..).zip(&self.seen).zip(&self.down) {
-            if (seen & DOWN != 0) != down {
-                keys.replace_if(vk, seen, down);
+            if let Some(down) = down {
+                if (seen & DOWN != 0) != down {
+                    keys.replace_if(vk, seen, down);
+                }
             }
         }
     }
+}
+
+/// Input this process injected (H1): which keys and mouse buttons it holds
+/// down, and whether an injection is in flight.
+///
+/// The output layer (`inject.rs`) brackets every injector call with
+/// [`OwnInput::begin`] and notes the transitions the system accepted. The
+/// hooks never see our input in the mirror (they skip `MARK`ed events),
+/// but the asynchronous key state does, so mirror corrections consult this:
+/// keys held here are never imported, and samples overlapping an injection
+/// are discarded. Lock- and allocation-free.
+pub(super) struct OwnInput {
+    held: [AtomicU64; 4],
+    /// Injections in flight.
+    active: AtomicU32,
+    /// Advanced when each injection starts and ends.
+    seq: AtomicU64,
+}
+impl OwnInput {
+    pub(super) const fn new() -> Self {
+        Self {
+            held: [const { AtomicU64::new(0) }; 4],
+            active: AtomicU32::new(0),
+            seq: AtomicU64::new(0),
+        }
+    }
+    /// Marks an injection in flight until the returned guard drops (also on
+    /// unwind).
+    pub(super) fn begin(&self) -> Injecting<'_> {
+        self.active.fetch_add(1, Ordering::SeqCst);
+        self.seq.fetch_add(1, Ordering::SeqCst);
+        Injecting { own: self }
+    }
+    /// Changes whenever an injection starts or ends.
+    pub(super) fn seq(&self) -> u64 {
+        self.seq.load(Ordering::SeqCst)
+    }
+    pub(super) fn active(&self) -> bool {
+        self.active.load(Ordering::SeqCst) > 0
+    }
+    /// No injection is in flight and none started or ended since `seen`.
+    pub(super) fn settled(&self, seen: u64) -> bool {
+        !self.active() && self.seq() == seen
+    }
+    fn slot(&self, vk: u16) -> Option<(&AtomicU64, u64)> {
+        self.held
+            .get(usize::from(vk >> 6))
+            .map(|word| (word, 1u64 << (vk & 63)))
+    }
+    fn note(&self, vk: u16, down: bool) {
+        if let Some((word, bit)) = self.slot(vk) {
+            if down {
+                word.fetch_or(bit, Ordering::SeqCst);
+            } else {
+                word.fetch_and(!bit, Ordering::SeqCst);
+            }
+        }
+    }
+    fn bit(&self, vk: u16) -> bool {
+        self.slot(vk)
+            .is_some_and(|(word, bit)| word.load(Ordering::SeqCst) & bit != 0)
+    }
+    /// We hold `vk` down. Modifiers count as one family: an injected generic
+    /// Ctrl shows up as the left Ctrl in the asynchronous state, and the
+    /// reverse.
+    pub(super) fn holds(&self, vk: u16) -> bool {
+        let family = match vk {
+            VK_CONTROL | VK_LCONTROL | VK_RCONTROL => [VK_CONTROL, VK_LCONTROL, VK_RCONTROL],
+            VK_SHIFT | VK_LSHIFT | VK_RSHIFT => [VK_SHIFT, VK_LSHIFT, VK_RSHIFT],
+            VK_MENU | VK_LMENU | VK_RMENU => [VK_MENU, VK_LMENU, VK_RMENU],
+            _ => [vk; 3],
+        };
+        family.iter().any(|&v| self.bit(v))
+    }
+}
+
+/// One injection in flight; see [`OwnInput::begin`].
+pub(super) struct Injecting<'a> {
+    own: &'a OwnInput,
+}
+impl Injecting<'_> {
+    /// The system accepted our key-down (or button-down) of `vk`.
+    pub(super) fn pressed(&self, vk: u16) {
+        self.own.note(vk, true);
+    }
+    /// The system accepted our key-up (or button-up) of `vk`.
+    pub(super) fn released(&self, vk: u16) {
+        self.own.note(vk, false);
+    }
+}
+impl Drop for Injecting<'_> {
+    fn drop(&mut self) {
+        self.own.seq.fetch_add(1, Ordering::SeqCst);
+        self.own.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// How long the input consumer waits after the last injection before it
+/// samples the asynchronous key state, so the state has caught up with a
+/// key-up we sent (H1). 「待实测」: the lag between `SendInput` returning
+/// and `GetAsyncKeyState` reflecting the event, with low-level hooks
+/// installed, has not been measured on real machines.
+pub(super) const INJECTION_QUIET: Duration = Duration::from_millis(250);
+
+static OWN: OwnInput = OwnInput::new();
+#[cfg(test)]
+thread_local! {
+    static OWN_OVERRIDE: std::cell::Cell<Option<&'static OwnInput>> =
+        const { std::cell::Cell::new(None) };
+}
+/// The process-wide [`OwnInput`]. A test may route the injections of its
+/// own thread to a private instance (`track_own_input`) so parallel tests
+/// do not see each other's output.
+pub(super) fn own_input() -> &'static OwnInput {
+    #[cfg(test)]
+    if let Some(own) = OWN_OVERRIDE.with(std::cell::Cell::get) {
+        return own;
+    }
+    &OWN
+}
+/// Test rigs: injections on this thread are tracked in `own` until the
+/// returned guard drops.
+#[cfg(test)]
+pub(super) fn track_own_input(own: &'static OwnInput) -> impl Drop {
+    struct Restore(Option<&'static OwnInput>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OWN_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    Restore(OWN_OVERRIDE.with(|cell| cell.replace(Some(own))))
 }
 
 /// Generic codes; the low-level hook reports the sided ones.
@@ -269,18 +437,23 @@ impl ModifierWatch {
 
 pub(super) static PHYSICAL: KeyBits = KeyBits::new();
 
+/// Seeds the mirror at engine start. Nothing has been injected yet; keys we
+/// hold are masked anyway.
 pub(super) fn seed_physical() {
-    PHYSICAL.resync(&SystemAsyncKeys);
+    let own = own_input();
+    Sample::take(&PHYSICAL, &SystemAsyncKeys, |vk| own.holds(vk)).apply(&PHYSICAL);
+    PHYSICAL.seeded.store(true, Ordering::SeqCst);
 }
-fn physical_in(keys: &KeyBits, probe: &impl AsyncKeyProbe, v: u16) -> bool {
+fn physical_in(keys: &KeyBits, probe: &impl AsyncKeyProbe, own: &OwnInput, v: u16) -> bool {
     if keys.seeded() {
         keys.held(v)
     } else {
-        probe.down(v)
+        // The asynchronous state includes keys we hold ourselves (H1).
+        !own.holds(v) && probe.down(v)
     }
 }
 pub(super) fn physical(v: u16) -> bool {
-    physical_in(&PHYSICAL, &SystemAsyncKeys, v)
+    physical_in(&PHYSICAL, &SystemAsyncKeys, own_input(), v)
 }
 pub(super) fn modifiers_held() -> bool {
     physical(VK_CONTROL)
@@ -552,13 +725,101 @@ mod tests {
     #[test]
     fn readers_use_the_probe_only_until_the_mirror_is_seeded() {
         let keys = KeyBits::new();
-        let probe = FakeKeys::new(&[VK_LWIN]);
-        assert!(physical_in(&keys, &probe, VK_LWIN));
+        let own = OwnInput::new();
+        let probe = FakeKeys::new(&[VK_LWIN, 0x41]);
+        assert!(physical_in(&keys, &probe, &own, VK_LWIN));
         assert_eq!(probe.reads.get(), 1);
+        // H1: a key we hold reads "down" asynchronously but is not physical.
+        own.begin().pressed(0x41);
+        assert!(!physical_in(&keys, &probe, &own, 0x41));
         keys.mark_seeded();
-        assert!(!physical_in(&keys, &probe, VK_LWIN));
+        assert!(!physical_in(&keys, &probe, &own, VK_LWIN));
         assert_eq!(probe.reads.get(), 1, "a seeded mirror never probes");
         keys.set(VK_LWIN, true);
-        assert!(physical_in(&keys, &probe, VK_LWIN));
+        assert!(physical_in(&keys, &probe, &own, VK_LWIN));
+    }
+
+    #[test]
+    fn injections_are_tracked_per_key_and_while_in_flight() {
+        let own = OwnInput::new();
+        let seen = own.seq();
+        assert!(own.settled(seen));
+        {
+            let injecting = own.begin();
+            assert!(own.active() && !own.settled(seen));
+            injecting.pressed(VK_CONTROL);
+            injecting.pressed(VK_LBUTTON);
+        }
+        assert!(!own.active());
+        assert!(!own.settled(seen), "an injection ended since `seen`");
+        assert!(own.settled(own.seq()));
+        // An injected generic Ctrl reads as the left Ctrl, and the reverse.
+        assert!(own.holds(VK_LCONTROL) && own.holds(VK_RCONTROL) && own.holds(VK_CONTROL));
+        assert!(own.holds(VK_LBUTTON) && !own.holds(VK_SHIFT) && !own.holds(0x41));
+        own.begin().released(VK_CONTROL);
+        assert!(!own.holds(VK_LCONTROL) && own.holds(VK_LBUTTON));
+        own.begin().pressed(256);
+        assert!(!own.holds(256), "out of range codes are ignored");
+        // The guard ends the injection on unwind too.
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _injecting = own.begin();
+            panic!("injector failed");
+        }));
+        assert!(unwound.is_err() && !own.active());
+    }
+
+    #[test]
+    fn resync_never_imports_keys_this_process_holds() {
+        let keys = KeyBits::new();
+        let own = OwnInput::new();
+        {
+            let injecting = own.begin();
+            injecting.pressed(0x41);
+            injecting.pressed(VK_CONTROL);
+        }
+        // The asynchronous state shows our A and our Ctrl (as LCONTROL),
+        // plus a Shift the user really holds.
+        let probe = FakeKeys::new(&[0x41, VK_CONTROL, VK_LCONTROL, VK_LSHIFT]);
+        assert!(keys.resync_unless_injected(&probe, &own, own.seq()));
+        assert!(keys.seeded());
+        assert!(!keys.held(0x41) && !keys.held(VK_CONTROL));
+        assert!(keys.held(VK_SHIFT));
+        // A real press of a key we also hold still shows: the mirror keeps
+        // the hook's value for owned keys.
+        keys.set(0x41, true);
+        assert!(keys.resync_unless_injected(&FakeKeys::new(&[]), &own, own.seq()));
+        assert!(keys.held(0x41), "owned keys are left to the hook");
+    }
+
+    /// Our injection presses and releases A while the scan is half done;
+    /// the asynchronous state still shows A down afterwards (the lag).
+    struct InjectsWhileProbed<'a> {
+        own: &'a OwnInput,
+    }
+    impl AsyncKeyProbe for InjectsWhileProbed<'_> {
+        fn down(&self, vk: u16) -> bool {
+            if vk == 0x30 {
+                let injecting = self.own.begin();
+                injecting.pressed(0x41);
+                injecting.released(0x41);
+            }
+            vk == 0x41
+        }
+    }
+
+    #[test]
+    fn a_sample_that_overlaps_an_injection_is_discarded() {
+        let keys = KeyBits::new();
+        let own = OwnInput::new();
+        let seen = own.seq();
+        assert!(!keys.resync_unless_injected(&InjectsWhileProbed { own: &own }, &own, seen));
+        assert!(!keys.held(0x41) && !keys.seeded(), "nothing applied");
+        // An injection still in flight: not even probed.
+        let injecting = own.begin();
+        let probe = FakeKeys::new(&[0x41]);
+        assert!(!keys.resync_unless_injected(&probe, &own, own.seq()));
+        assert_eq!(probe.reads.get(), 0);
+        drop(injecting);
+        assert!(keys.resync_unless_injected(&FakeKeys::new(&[]), &own, own.seq()));
     }
 }
