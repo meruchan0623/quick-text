@@ -567,8 +567,10 @@ fn mouse_at(msg: u32, x: i32, y: i32, time: u32) -> MouseInfo {
 fn begin_recording(shared: &Shared) {
     *shared.recording.lock().unwrap() = Some(vec![]);
 }
-/// Ends the recording on `shared` and returns what it recorded.
-fn recorded(shared: &Shared) -> Vec<Operation> {
+/// Ends the recording on `shared` the way the app does (finish, then take)
+/// and returns what it recorded.
+fn recorded(shared: &Arc<Shared>) -> Vec<Operation> {
+    finish_recording(shared);
     let steps = shared.recording.lock().unwrap().take().unwrap();
     steps.into_iter().map(|step| step.operation).collect()
 }
@@ -626,6 +628,7 @@ fn recorded_delays_keep_capture_intervals_when_the_consumer_drains_late() {
             delay(80),
             left(ButtonState::Up),
             key_down(0x42),
+            key_up(0x42),
         ]
     );
 }
@@ -680,8 +683,163 @@ fn input_aimed_at_our_own_windows_is_not_recorded() {
     );
     assert_eq!(
         recorded(&shared),
-        [key_down(0x41), delay(30), left(ButtonState::Down)]
+        [
+            key_down(0x41),
+            delay(30),
+            left(ButtonState::Down),
+            // Released when the recording ends.
+            key_up(0x41),
+            left(ButtonState::Up),
+        ]
     );
+}
+
+/// Presses Ctrl+Shift+Esc at tick `time`; returns what the Esc hook did
+/// and how many allocations it made.
+fn stop_gesture(
+    hooks: &HookPipe,
+    shared: &Shared,
+    probe: &impl ForegroundProbe,
+    time: u32,
+) -> (HookAction, usize) {
+    handle_key(hooks, shared, probe, WM_KEYDOWN, key_at(VK_LCONTROL, time));
+    handle_key(hooks, shared, probe, WM_KEYDOWN, key_at(VK_LSHIFT, time));
+    allocations(|| handle_key(hooks, shared, probe, WM_KEYDOWN, key_at(VK_ESCAPE, time)))
+}
+/// Releases the gesture, types `vk` and clicks (input after a stop),
+/// calling `each` after every event.
+fn after_stop(
+    hooks: &HookPipe,
+    shared: &Shared,
+    probe: &impl ForegroundProbe,
+    vk: u16,
+    each: &mut dyn FnMut(),
+) {
+    for (msg, key) in [
+        (WM_KEYUP, VK_ESCAPE),
+        (WM_KEYUP, VK_LSHIFT),
+        (WM_KEYUP, VK_LCONTROL),
+        (WM_KEYDOWN, vk),
+        (WM_KEYUP, vk),
+    ] {
+        handle_key(hooks, shared, probe, msg, key_at(key, 5_000));
+        each();
+    }
+    for (msg, time) in [(WM_LBUTTONDOWN, 5_100), (WM_LBUTTONUP, 5_200)] {
+        handle_mouse(hooks, shared, mouse_at(msg, 5, 5, time));
+        each();
+    }
+}
+
+/// M2: a full hook queue drops the stop gesture's record, but not the stop.
+/// The consumer takes it before the next record, and nothing after it
+/// reaches the macro.
+#[test]
+fn a_stop_gesture_on_a_full_hook_queue_still_stops_the_recording() {
+    let _serial = serial();
+    let shared = engine("btw");
+    begin_recording(&shared);
+    let hooks = HookPipe::new(leaked_keys(), 3, false, nothing);
+    let raw = Lane::new(4, nothing);
+    let probe = FixedProbe(context());
+    let mut consumer = Consumer::with_windows(NOT_OURS);
+    handle_key(&hooks, &shared, &probe, WM_KEYDOWN, key_at(0x41, 0));
+    handle_key(&hooks, &shared, &probe, WM_KEYUP, key_at(0x41, 50));
+    drain(&mut consumer, &shared, &hooks, &raw, &probe);
+    // The consumer stalls: B and the gesture's Ctrl and Shift fill the
+    // queue, and the Esc that stops the recording finds no room.
+    handle_key(&hooks, &shared, &probe, WM_KEYDOWN, key_at(0x42, 100));
+    let (action, allocated) = stop_gesture(&hooks, &shared, &probe, 120);
+    assert_eq!(action, HookAction::Swallow);
+    assert_eq!(allocated, 0, "the overflow path stays allocation-free");
+    assert_eq!(hooks.lane().dropped(), 1, "the stop's record was dropped");
+    // The consumer catches up, then keeps pace with what follows.
+    drain(&mut consumer, &shared, &hooks, &raw, &probe);
+    after_stop(&hooks, &shared, &probe, 0x43, &mut || {
+        drain(&mut consumer, &shared, &hooks, &raw, &probe);
+    });
+    assert_eq!(
+        hooks.lane().dropped(),
+        1,
+        "everything after the stop arrived"
+    );
+    assert_eq!(
+        recorded(&shared),
+        [key_down(0x41), delay(50), key_up(0x41)],
+        "nothing queued or typed after the stop entered the macro"
+    );
+}
+
+/// M2 with room in the queue: the stop keeps its place, so what came before
+/// it is recorded even when the consumer is behind, nothing after it is,
+/// and ending the recording afterwards adds nothing (one stop per
+/// recording).
+#[test]
+fn a_queued_stop_gesture_keeps_its_place_and_stops_once() {
+    let _serial = serial();
+    let shared = engine("btw");
+    begin_recording(&shared);
+    let hooks = HookPipe::new(leaked_keys(), 32, false, nothing);
+    let raw = Lane::new(4, nothing);
+    let probe = FixedProbe(context());
+    handle_key(&hooks, &shared, &probe, WM_KEYDOWN, key_at(0x41, 0));
+    handle_key(&hooks, &shared, &probe, WM_KEYDOWN, key_at(0x42, 40));
+    handle_key(&hooks, &shared, &probe, WM_KEYUP, key_at(0x42, 90));
+    assert_eq!(
+        stop_gesture(&hooks, &shared, &probe, 90).0,
+        HookAction::Swallow
+    );
+    after_stop(&hooks, &shared, &probe, 0x43, &mut || {});
+    assert_eq!(hooks.lane().dropped(), 0);
+    let mut consumer = Consumer::with_windows(NOT_OURS);
+    drain(&mut consumer, &shared, &hooks, &raw, &probe);
+    // The gesture's Ctrl and Shift are dropped; A, still held, is released
+    // once.
+    assert_eq!(
+        recorded(&shared),
+        [
+            key_down(0x41),
+            delay(40),
+            key_down(0x42),
+            delay(50),
+            key_up(0x42),
+            key_up(0x41),
+        ]
+    );
+}
+
+/// M2: a stop before anything was recorded (the recording was started from
+/// our own window, which still has the focus) holds too, and the next
+/// recording starts from scratch.
+#[test]
+fn a_stop_before_the_first_recorded_event_still_holds() {
+    let _serial = serial();
+    let shared = engine("btw");
+    let hooks = HookPipe::new(leaked_keys(), 32, false, nothing);
+    let raw = Lane::new(4, nothing);
+    let probe = FixedProbe(context());
+    let focused = OwnWindows {
+        foreground: || true,
+        at: |_, _| false,
+    };
+    begin_recording(&shared);
+    stop_gesture(&hooks, &shared, &probe, 0);
+    drain(
+        &mut Consumer::with_windows(focused),
+        &shared,
+        &hooks,
+        &raw,
+        &probe,
+    );
+    // The user moves on to another window and keeps typing.
+    let mut consumer = Consumer::with_windows(NOT_OURS);
+    after_stop(&hooks, &shared, &probe, 0x43, &mut || {});
+    drain(&mut consumer, &shared, &hooks, &raw, &probe);
+    assert!(recorded(&shared).is_empty());
+    begin_recording(&shared);
+    handle_key(&hooks, &shared, &probe, WM_KEYDOWN, key_at(0x44, 9_000));
+    drain(&mut consumer, &shared, &hooks, &raw, &probe);
+    assert_eq!(recorded(&shared), [key_down(0x44), key_up(0x44)]);
 }
 
 /// no-regression #7: the detector never caches the layout, and each key

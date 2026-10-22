@@ -95,6 +95,10 @@ impl<T> Lane<T> {
     pub(super) fn pop(&self) -> Option<T> {
         self.queue.pop()
     }
+    /// Wakes the consumer without queueing anything.
+    pub(super) fn wake(&self) {
+        (self.wake)();
+    }
     /// Runs a callback body; a panic is counted and `fallback` returned.
     pub(super) fn contained<R>(&self, fallback: R, body: impl FnOnce() -> R) -> R {
         match catch_unwind(AssertUnwindSafe(body)) {
@@ -211,12 +215,22 @@ impl Consumer {
         let mut handled = 0;
         while let Some(record) = hooks.lane().pop() {
             handled += 1;
+            // M2: a stop gesture that overflowed the queue ends the
+            // recording before this record is accepted. Checked after the
+            // pop: a record pushed after the stop then always sees it.
+            if hooks.take_stop() {
+                stop_record_events(shared);
+            }
             if let HookRecord::Key(key) = &record {
                 if key.hardware {
                     self.seen.push((Source::Hook, key.vk, key.down));
                 }
             }
             self.hook_record(shared, record, probe, enqueue);
+        }
+        // ...and with nothing queued behind it.
+        if hooks.take_stop() {
+            stop_record_events(shared);
         }
         while let Some(record) = raw.pop() {
             handled += 1;

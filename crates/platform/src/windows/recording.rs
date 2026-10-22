@@ -5,9 +5,35 @@ struct RecordMeta {
     at: u32,
     held: BTreeSet<Key>,
     buttons: Vec<MouseButton>,
+    /// Nothing more goes into the current recording.
     stopped: bool,
+    /// [`finish_recording`] closed the last recording: the next event or
+    /// stop belongs to a new one.
+    ended: bool,
 }
-static RECORD_META: OnceLock<Mutex<RecordMeta>> = OnceLock::new();
+impl RecordMeta {
+    const fn new(ended: bool) -> Self {
+        Self {
+            at: 0,
+            held: BTreeSet::new(),
+            buttons: Vec::new(),
+            stopped: false,
+            ended,
+        }
+    }
+    /// Drops what an earlier recording left behind when `rows` (the active
+    /// recording) has nothing yet and either the last one was closed by
+    /// [`finish_recording`] or nothing stopped. A stop before the first
+    /// recorded event (M2) is kept, so it still holds; a closed recording
+    /// that has not been taken yet stays stopped.
+    fn begin(&mut self, rows: &[Step]) {
+        if rows.is_empty() && (self.ended || !self.stopped) {
+            *self = Self::new(false);
+        }
+    }
+}
+/// No recording has run yet.
+static RECORD_META: Mutex<RecordMeta> = Mutex::new(RecordMeta::new(true));
 /// The delay to record between two events captured at hook ticks `from`
 /// and `to` (ms). The tick count wraps, so the gap is taken modulo 2^32; a
 /// gap of more than half the range means `to` came first and counts as no
@@ -30,23 +56,8 @@ pub(super) fn record_event(shared: &Shared, operation: Operation, time: u32) {
     let Some(rows) = recorded.as_mut() else {
         return;
     };
-    let mut meta = RECORD_META
-        .get_or_init(|| {
-            Mutex::new(RecordMeta {
-                at: time,
-                held: BTreeSet::new(),
-                buttons: vec![],
-                stopped: false,
-            })
-        })
-        .lock()
-        .unwrap();
-    if rows.is_empty() {
-        meta.at = time;
-        meta.held.clear();
-        meta.buttons.clear();
-        meta.stopped = false;
-    }
+    let mut meta = RECORD_META.lock().unwrap();
+    meta.begin(rows);
     if meta.stopped || rows.len() + 2 >= MAX_STEPS {
         return;
     }
@@ -86,41 +97,52 @@ pub(super) fn record_event(shared: &Shared, operation: Operation, time: u32) {
     }
     rows.push(Step::new(operation, SourceSpan::default()));
 }
+/// Stops the active recording (Ctrl+Shift+Esc or [`finish_recording`]):
+/// drops the gesture's own Ctrl/Shift presses and releases whatever is
+/// still held. Once per recording; a second stop adds nothing. A stop
+/// before anything was recorded holds as well (M2).
 pub(super) fn stop_record_events(shared: &Shared) {
     let mut recorded = shared.recording.lock().unwrap();
-    if let Some(rows) = recorded.as_mut() {
-        if let Some(meta) = RECORD_META.get() {
-            let mut meta = meta.lock().unwrap();
-            meta.stopped = true;
-            let stop_keys = [
-                VK_CONTROL,
-                VK_LCONTROL,
-                VK_RCONTROL,
-                VK_SHIFT,
-                VK_LSHIFT,
-                VK_RSHIFT,
-            ];
-            rows.retain(|s|!matches!(&s.operation,Operation::KeyDown{key:Key::WindowsCode{code}} if stop_keys.contains(code)&&meta.held.contains(&Key::WindowsCode{code:*code})));
-            for key in &meta.held {
-                if !matches!(key,Key::WindowsCode{code}if stop_keys.contains(code)) {
-                    rows.push(Step::new(
-                        Operation::KeyUp { key: key.clone() },
-                        SourceSpan::default(),
-                    ));
-                }
-            }
-            for button in &meta.buttons {
-                rows.push(Step::new(
-                    Operation::MouseButton {
-                        button: *button,
-                        state: ButtonState::Up,
-                    },
-                    SourceSpan::default(),
-                ));
-            }
+    let Some(rows) = recorded.as_mut() else {
+        return;
+    };
+    let mut meta = RECORD_META.lock().unwrap();
+    meta.begin(rows);
+    if meta.stopped {
+        return;
+    }
+    meta.stopped = true;
+    let stop_keys = [
+        VK_CONTROL,
+        VK_LCONTROL,
+        VK_RCONTROL,
+        VK_SHIFT,
+        VK_LSHIFT,
+        VK_RSHIFT,
+    ];
+    rows.retain(|s|!matches!(&s.operation,Operation::KeyDown{key:Key::WindowsCode{code}} if stop_keys.contains(code)&&meta.held.contains(&Key::WindowsCode{code:*code})));
+    for key in &meta.held {
+        if !matches!(key,Key::WindowsCode{code}if stop_keys.contains(code)) {
+            rows.push(Step::new(
+                Operation::KeyUp { key: key.clone() },
+                SourceSpan::default(),
+            ));
         }
     }
+    for button in &meta.buttons {
+        rows.push(Step::new(
+            Operation::MouseButton {
+                button: *button,
+                state: ButtonState::Up,
+            },
+            SourceSpan::default(),
+        ));
+    }
 }
+/// Stops the recording before the caller takes it, and marks it closed so
+/// the next recording starts from scratch (src-tauri's `stop_recording`
+/// always calls this first).
 pub fn finish_recording(shared: &Arc<Shared>) {
     stop_record_events(shared);
+    RECORD_META.lock().unwrap().ended = true;
 }

@@ -119,7 +119,9 @@ pub(super) enum HookRecord {
     Key(KeyRecord),
     /// An external injected key was filtered (no-regression #4).
     External,
-    /// Ctrl+Shift+Esc cancelled the running action.
+    /// Ctrl+Shift+Esc cancelled the running action and stops a recording
+    /// here, in queue order. When this record does not fit, the stop
+    /// travels as [`HookPipe::take_stop`] instead (M2).
     Cancel,
     /// A click or wheel message, with its capture time.
     Mouse {
@@ -144,6 +146,10 @@ pub(super) struct HookPipe<'k> {
     keys: &'k KeyBits,
     /// Acceptance mode, fixed at startup (reading it may allocate).
     test_mode: bool,
+    /// A recording stop whose [`HookRecord::Cancel`] did not fit in the
+    /// queue (M2). A flag cannot be dropped; the consumer takes it before it
+    /// accepts the next record.
+    stop: AtomicBool,
 }
 impl<'k> HookPipe<'k> {
     pub(super) fn new(keys: &'k KeyBits, capacity: usize, test_mode: bool, wake: fn()) -> Self {
@@ -151,10 +157,16 @@ impl<'k> HookPipe<'k> {
             lane: Lane::new(capacity, wake),
             keys,
             test_mode,
+            stop: AtomicBool::new(false),
         }
     }
     pub(super) fn lane(&self) -> &Lane<HookRecord> {
         &self.lane
+    }
+    /// Consumer side: whether a stop gesture overflowed the queue since the
+    /// last call.
+    pub(super) fn take_stop(&self) -> bool {
+        self.stop.swap(false, Ordering::SeqCst)
     }
 }
 /// The production pipe over the global key mirror; created once, before the
@@ -200,7 +212,13 @@ pub(super) fn on_key(
         shared.cancel.store(true, Ordering::SeqCst);
         shared.generation.fetch_add(1, Ordering::SeqCst);
         observer::CARET_EPOCH.fetch_add(1, Ordering::SeqCst);
-        pipe.lane.push(HookRecord::Cancel);
+        if !pipe.lane.push(HookRecord::Cancel) {
+            // M2: a full queue must not swallow the stop. Set before any
+            // later record is pushed, so the consumer sees it no later
+            // than the first record that follows the gesture.
+            pipe.stop.store(true, Ordering::SeqCst);
+            pipe.lane.wake();
+        }
         return HookAction::Swallow;
     }
     let generation = if down && (injected || shared.busy.load(Ordering::SeqCst)) {
