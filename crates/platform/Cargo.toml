@@ -12,6 +12,12 @@ arboard = { version = "3", features = ["image-data"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "tiff", "webp"] }
 chrono = "0.4"
 encoding_rs = "0.8"
+parking_lot = "0.12"
+arc-swap = "1"
+crossbeam-queue = "0.3"
+thiserror = "2"
+smallvec = "1"
+tracing = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_UI_Input_Ime", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_Shell"] }
@@ -19,3 +25,16 @@ windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_Access
 
 [build-dependencies]
 cc = "1"
+
+[dev-dependencies]
+proptest = "1"
+criterion = { version = "0.8", default-features = false }
+
+[features]
+# Mock ports for pipeline tests outside `cfg(test)` (B-52).
+mock = []
+# Fault injection points (§11). Never enabled in release builds.
+fault-injection = []
+
+[lints]
+workspace = true

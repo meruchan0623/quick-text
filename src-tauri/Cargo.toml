@@ -8,6 +8,8 @@ default-run = "quicker-text"
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+mock = ["quicker-platform/mock"]
+fault-injection = ["quicker-platform/fault-injection"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -26,6 +28,16 @@ uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "tiff", "webp"] }
 arboard = "3"
+parking_lot = "0.12"
+arc-swap = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "registry", "smallvec", "tracing-log"] }
+tracing-appender = "0.2"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
+
+[lints]
+workspace = true

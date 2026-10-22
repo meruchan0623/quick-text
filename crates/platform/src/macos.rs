@@ -1,5 +1,8 @@
 //! macOS native adapter. One suppressible event tap feeds the shared Rust matcher.
 //! Event callbacks do not read files, run actions, or query Accessibility.
+// macOS stays experimental (ADR-f); its unwrap/expect are exempt from the 0.4
+// lint ramp until the backend is reworked.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
 use std::{
     collections::{BTreeMap, BTreeSet},

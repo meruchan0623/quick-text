@@ -95,6 +95,9 @@ impl Shared {
         })
     }
 }
+pub mod fault;
+pub mod health;
+pub mod traits;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]

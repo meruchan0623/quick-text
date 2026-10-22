@@ -7,7 +7,21 @@ edition = "2021"
 version = "0.3.1"
 license = "GPL-3.0-or-later"
 
+[workspace.lints.clippy]
+# 0.4: warn; 0.5 promotes these to deny in domain/engine/platform (§7.5).
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "deny"
+todo = "deny"
+# Collapsing `if` into a match guard changes fall-through semantics when a
+# later arm matches the same pattern; keep the explicit nested form.
+collapsible_match = "allow"
+
 [profile.release]
 opt-level = "s"
 lto = "thin"
-strip = true
+# B-01: catch_unwind isolation of the executor, hooks and supervisor relies on unwinding.
+panic = "unwind"
+# PDBs are archived per release for offline symbolication of crash-*.txt (B-09).
+strip = "none"
+debug = "line-tables-only"
