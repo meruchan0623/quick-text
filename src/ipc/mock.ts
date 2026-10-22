@@ -260,6 +260,8 @@ export class MockBackend {
   problems: StartupProblem[];
   history: HistoryEntry[] = [];
   autostart = false;
+  /** S-09 `auto_listen_on_start`; a 0.3 backend has no such setting. */
+  autoListen = false;
   recording = false;
   #seq = 0;
   #historySeq = 0;
@@ -614,6 +616,12 @@ export class MockBackend {
           }
         : null;
     },
+    // S-09: a setting, so safe mode refuses it like set_autostart in the backend.
+    set_auto_listen: (args) => {
+      this.#guardSafeMode();
+      this.autoListen = args.enabled === true;
+      return this.autoListen;
+    },
   };
 
   // ---- internals ----
@@ -641,6 +649,7 @@ export class MockBackend {
     return {
       ...legacy,
       capabilities: this.#capabilities(),
+      auto_listen_on_start: this.autoListen,
       health: clone(this.health),
       engine_state: clone(this.engine),
       startup_problems: clone(this.problems),

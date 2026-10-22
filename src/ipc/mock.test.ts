@@ -223,6 +223,35 @@ describe('mock backend commands', () => {
     expect(legacy.capabilities.every((c) => c.status === undefined)).toBe(true);
   });
 
+  it('keeps auto_listen_on_start with set_auto_listen (S-09), refused in safe mode, absent in 0.3', async () => {
+    const backend = new MockBackend({ rules: 0 });
+    use(backend);
+    expect(
+      (await invoke<{ auto_listen_on_start?: unknown }>('load_state')).auto_listen_on_start,
+    ).toBe(false);
+    expect(await invoke('set_auto_listen', { enabled: true })).toBe(true);
+    expect(
+      (await invoke<{ auto_listen_on_start?: unknown }>('load_state')).auto_listen_on_start,
+    ).toBe(true);
+    expect(await invoke('set_auto_listen', { enabled: false })).toBe(false);
+    expect(backend.autoListen).toBe(false);
+
+    use(new MockBackend({ rules: 0, safeMode: 'locked' }));
+    const refused: unknown = await invoke('set_auto_listen', { enabled: true }).catch(
+      (e: unknown) => e,
+    );
+    expect(refused).toEqual({ code: 'safe_mode', detail: { reason: 'locked' } });
+
+    use(new MockBackend({ rules: 0, legacy: true }));
+    const missing: unknown = await invoke('set_auto_listen', { enabled: true }).catch(
+      (e: unknown) => e,
+    );
+    expect(isMissingCommand(missing)).toBe(true);
+    expect(
+      (await invoke<{ auto_listen_on_start?: unknown }>('load_state')).auto_listen_on_start,
+    ).toBeUndefined();
+  });
+
   it('toggles only the manual pause reason', async () => {
     const backend = new MockBackend({ rules: 0, safeMode: 'crash_loop' });
     use(backend);

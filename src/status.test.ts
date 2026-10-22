@@ -161,7 +161,7 @@ describe('problemText', () => {
       [
         'self_test_failed',
         { checks: ['raw_input', 'hook_heartbeat'] },
-        '启动自检未通过：原始键盘输入、键盘监听心跳。文本指令可能无法触发，可在「运行状态与恢复」中查看详情或导出诊断包。',
+        '启动自检未通过：原始键盘输入、键盘监听心跳，没有自动开始监听。可在「运行状态与恢复」中查看详情或导出诊断包；排除问题后可点「恢复监听」。',
       ],
       ['log_level_elevated', { level: 'debug', until_ms: null }, '日志已临时调为「调试」级别。'],
       ['store_meta_reset', {}, '启动记录文件无法读取，已重新建立；连续启动失败的计数已清零。'],

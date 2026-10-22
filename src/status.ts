@@ -178,7 +178,8 @@ export function problemText(problem: StartupProblem): string {
     case 'self_test_failed': {
       const checks = strs(a.checks).map((c) => label(selfTestNames, c));
       const which = checks.length > 0 ? `：${checks.join('、')}` : '';
-      return `启动自检未通过${which}。文本指令可能无法触发，可在「运行状态与恢复」中查看详情或导出诊断包。`;
+      // S-09 / B-10: a failed self-test keeps the engine paused instead of starting to listen.
+      return `启动自检未通过${which}，没有自动开始监听。可在「运行状态与恢复」中查看详情或导出诊断包；排除问题后可点「恢复监听」。`;
     }
     case 'log_level_elevated': {
       const until = num(a.until_ms);

@@ -51,6 +51,8 @@ export interface State extends Data {
   engine_status: string;
   last_result: any;
   capabilities: any;
+  /** S-09 「启动时自动开始监听」; absent on a 0.3 backend. */
+  auto_listen_on_start?: boolean;
 }
 export const emptyConfig = (): Config => ({
   version: 1,

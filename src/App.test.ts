@@ -515,6 +515,103 @@ describe('rule list, editor and settings (F-04)', () => {
   });
 });
 
+describe('启动时自动开始监听 (S-09)', () => {
+  const AUTO_LISTEN = '启动时自动开始监听';
+
+  /** The checkbox of the `<label>` reading `text`, or null when there is none. */
+  const checkbox = (container: HTMLElement, text: string): HTMLInputElement | null =>
+    [...container.querySelectorAll('label')]
+      .find((l) => l.textContent.trim() === text)
+      ?.querySelector<HTMLInputElement>('input[type="checkbox"]') ?? null;
+
+  /** Mount, wait for load_state and open the settings page. */
+  async function openSettings(
+    options: MockOptions = {},
+    setup?: (backend: MockBackend) => void,
+  ): Promise<Mounted> {
+    const mounted = await mount(options, setup);
+    await waitFor(mounted, () => {
+      expect(callsOf(mounted.backend, 'load_state')).toHaveLength(1);
+    });
+    await click(mounted, '文本指令参数设置');
+    return mounted;
+  }
+
+  async function toggle(mounted: Mounted): Promise<void> {
+    const box = checkbox(mounted.container, AUTO_LISTEN);
+    if (!box) throw new Error(`no checkbox 「${AUTO_LISTEN}」`);
+    await mounted.act(() => {
+      box.click();
+    });
+  }
+
+  it('starts from load_state.auto_listen_on_start and saves with set_auto_listen', async () => {
+    const mounted = await openSettings({}, (backend) => {
+      backend.autoListen = true;
+    });
+    const { backend, container } = mounted;
+    expect(checkbox(container, AUTO_LISTEN)?.checked).toBe(true);
+    expect(checkbox(container, AUTO_LISTEN)?.disabled).toBe(false);
+    await toggle(mounted);
+    await waitFor(mounted, () => {
+      expect(checkbox(container, AUTO_LISTEN)?.checked).toBe(false);
+    });
+    await toggle(mounted);
+    await waitFor(mounted, () => {
+      expect(checkbox(container, AUTO_LISTEN)?.checked).toBe(true);
+    });
+    expect(callsOf(backend, 'set_auto_listen').map((c) => c.args)).toEqual([
+      { enabled: false },
+      { enabled: true },
+    ]);
+    expect(backend.autoListen).toBe(true);
+    expect(container.querySelector('.alert.error')).toBeNull();
+  });
+
+  it('keeps the old value and says why when safe mode refuses', async () => {
+    const mounted = await openSettings({ safeMode: 'crash_loop' });
+    const { backend, container } = mounted;
+    expect(checkbox(container, AUTO_LISTEN)?.checked).toBe(false);
+    await toggle(mounted);
+    await waitFor(mounted, () => {
+      expect(container.querySelector('.alert.error')?.textContent).toMatch(
+        /^当前处于安全模式（.+），暂时不能修改设置。/,
+      );
+    });
+    expect(checkbox(container, AUTO_LISTEN)?.checked).toBe(false);
+    // A refusal is not a missing command: the toggle stays usable for later.
+    expect(checkbox(container, AUTO_LISTEN)?.disabled).toBe(false);
+    expect(backend.autoListen).toBe(false);
+  });
+
+  it('is not shown by a 0.3 backend, which has no such setting', async () => {
+    const mounted = await openSettings({ legacy: true });
+    const { backend, container } = mounted;
+    expect(checkbox(container, '登录后自动启动')).not.toBeNull();
+    expect(checkbox(container, AUTO_LISTEN)).toBeNull();
+    expect(container.textContent.includes(AUTO_LISTEN)).toBe(false);
+    expect(callsOf(backend, 'set_auto_listen')).toHaveLength(0);
+  });
+
+  it('turns disabled, without crashing, when the backend lacks set_auto_listen', async () => {
+    const mounted = await openSettings();
+    const { backend, container } = mounted;
+    backend.failures.set('set_auto_listen', 'Command set_auto_listen not found');
+    await toggle(mounted);
+    await waitFor(mounted, () => {
+      expect(container.querySelector('.alert.error')?.textContent).toMatch(/不支持此功能/);
+    });
+    const box = checkbox(container, AUTO_LISTEN);
+    expect(box?.checked).toBe(false);
+    expect(box?.disabled).toBe(true);
+    expect(box?.closest('label')?.title).toBe('当前版本的桌面引擎不支持此设置');
+    expect(backend.autoListen).toBe(false);
+    // The rest of the page still works.
+    await click(mounted, '文本指令管理');
+    expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
+  });
+});
+
 describe('tolerant reading (B-43)', () => {
   // Rules are [;s1 (with an unknown field), unreadable with id, ;s2, ;s3, 'not a rule', null].
   type Saved = Record<string, unknown> & {

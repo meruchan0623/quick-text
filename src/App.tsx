@@ -1,6 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { call } from './ipc/transport';
-import { errorText as describe, diagnosticText, parseCommandError } from './ipc/errors';
+import {
+  errorText as describe,
+  diagnosticText,
+  isMissingCommand,
+  parseCommandError,
+} from './ipc/errors';
 import {
   actionLabel,
   clone,
@@ -147,7 +152,8 @@ export default function App() {
       null,
     ),
     [sort, setSort] = useState<'match' | 'group'>('match'),
-    [localDirty, setLocalDirty] = useState(false);
+    [localDirty, setLocalDirty] = useState(false),
+    [autoListenMissing, setAutoListenMissing] = useState(false);
   const [editingErrors, setEditingErrors] = useState<Data[]>([]);
   // Clear the editor's validation errors when another rule is opened.
   const [errorsFor, setErrorsFor] = useState(editing?.id);
@@ -281,6 +287,20 @@ export default function App() {
     });
   const openDir = (command: 'open_log_dir' | 'open_data_dir') => run(() => call(command));
   const platform: string | undefined = state?.platform ?? state?.engine_detail?.platform;
+  // S-09: a 0.3 backend has no such setting and load_state leaves the field out; the toggle is hidden.
+  const autoListen: boolean | null =
+    typeof state?.auto_listen_on_start === 'boolean' ? state.auto_listen_on_start : null;
+  const setAutoListen = (enabled: boolean) =>
+    run(async () => {
+      try {
+        const value = await call<boolean>('set_auto_listen', { enabled });
+        setState((s) => (s ? { ...s, auto_listen_on_start: value } : s));
+      } catch (e) {
+        // A backend that reports the setting but lacks the command: say so once, then disable.
+        if (isMissingCommand(e)) setAutoListenMissing(true);
+        throw e;
+      }
+    });
   // The rule as opened, to tell whether closing the editor would lose changes (F-04).
   const editingBase = useRef('');
   const openEditor = (rule: Rule) => {
@@ -819,6 +839,23 @@ export default function App() {
               />
               登录后自动启动
             </label>
+            {autoListen !== null && (
+              <label
+                title={
+                  autoListenMissing
+                    ? '当前版本的桌面引擎不支持此设置'
+                    : '启动后先完成自检，全部通过才开始监听；未通过时保持暂停并提示原因。'
+                }
+              >
+                <input
+                  type="checkbox"
+                  checked={autoListen}
+                  disabled={autoListenMissing}
+                  onChange={(e) => setAutoListen(e.target.checked)}
+                />
+                启动时自动开始监听
+              </label>
+            )}
           </div>
           <button className="primary" onClick={() => run(() => save(), '参数已保存到草稿')}>
             保存参数草稿
