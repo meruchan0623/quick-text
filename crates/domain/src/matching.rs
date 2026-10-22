@@ -240,132 +240,16 @@ impl CompiledConfig {
     }
 }
 pub fn compile_config(config: &Config) -> Result<CompiledConfig, Vec<Diagnostic>> {
-    let mut errors = vec![];
+    let mut errors = config_errors(config);
     let mut rules = vec![];
     let mut ids = BTreeSet::new();
-    if config.version != SCHEMA_VERSION {
-        errors.push(diag(
-            "schema_version",
-            "Unsupported configuration version",
-            "version",
-        ));
-    }
-    if config.globals.terminators.iter().any(|t| t.is_empty()) {
-        errors.push(diag(
-            "terminator",
-            "Empty terminator is invalid",
-            "globals.terminators",
-        ));
-    }
-    for (order, rule) in config.rules.iter().enumerate() {
-        let base = format!("rules[{order}]");
-        if rule.id.trim().is_empty() || !ids.insert(rule.id.clone()) {
-            errors.push(diag(
-                "rule_id",
-                "Rule ID must be nonempty and unique",
-                &format!("{base}.id"),
-            ));
+    let positions = config.rule_positions();
+    for (order, (rule, position)) in config.rules.iter().zip(positions).enumerate() {
+        match compile_rule(rule, order, position, &mut ids) {
+            Ok(Some(compiled)) => rules.push(compiled),
+            Ok(None) => {}
+            Err(rule_errors) => errors.extend(rule_errors),
         }
-        if !rule.enabled {
-            continue;
-        }
-        if rule.match_spec.value.is_empty() {
-            errors.push(diag(
-                "match_empty",
-                "Trigger must not be empty",
-                &format!("{base}.match.value"),
-            ));
-            continue;
-        }
-        if rule.match_spec.value.len() > 8192 {
-            errors.push(diag(
-                "match_limit",
-                "Trigger exceeds 8192 bytes",
-                &format!("{base}.match.value"),
-            ));
-            continue;
-        }
-        if rule.trigger_mode == TriggerMode::Immediate && rule.match_spec.kind == MatchKind::Regex {
-            errors.push(diag(
-                "immediate_regex",
-                "Immediate mode requires a literal trigger",
-                &format!("{base}.trigger_mode"),
-            ));
-        }
-        if rule
-            .terminator
-            .as_ref()
-            .is_some_and(|t| t.keys.is_empty() || t.keys.iter().any(String::is_empty))
-        {
-            errors.push(diag(
-                "terminator",
-                "Override requires nonempty terminators; use null to inherit",
-                &format!("{base}.terminator"),
-            ));
-        }
-        let pattern = match rule.match_spec.kind {
-            MatchKind::Literal => format!("{}$", regex::escape(&rule.match_spec.value)),
-            MatchKind::Regex => format!("(?:{})$", rule.match_spec.value),
-        };
-        let re = match RegexBuilder::new(&pattern)
-            .case_insensitive(rule.ignore_case)
-            .size_limit(1_048_576)
-            .build()
-        {
-            Ok(re) => re,
-            Err(_) => {
-                errors.push(diag("regex_unsupported","Invalid/unsupported Rust regex; .NET lookaround and backreferences need rewriting",&format!("{base}.match.value")));
-                continue;
-            }
-        };
-        if re.is_match("") {
-            errors.push(diag(
-                "empty_match",
-                "Regex must not match an empty input",
-                &format!("{base}.match.value"),
-            ));
-        }
-        match &rule.parameter {
-            ParameterSource::FirstCapture if re.captures_len() < 2 => errors.push(diag(
-                "capture_missing",
-                "First capture requires regex group 1",
-                &format!("{base}.parameter"),
-            )),
-            ParameterSource::CaptureTemplate { template } => match capture_indices(template) {
-                Ok(indices) => {
-                    if indices.iter().any(|i| *i >= re.captures_len()) {
-                        errors.push(diag(
-                            "capture_missing",
-                            "Template references a nonexistent capture",
-                            &format!("{base}.parameter"),
-                        ));
-                    }
-                }
-                Err(m) => errors.push(diag("capture_template", m, &format!("{base}.parameter"))),
-            },
-            _ => {}
-        }
-        for mut d in validate_action(&rule.action) {
-            d.path = format!(
-                "{base}.action{}",
-                if d.path.is_empty() {
-                    String::new()
-                } else {
-                    format!(".{}", d.path)
-                }
-            );
-            errors.push(d);
-        }
-        let (regex, literal) = match rule.match_spec.kind {
-            MatchKind::Regex => (Some(re), None),
-            MatchKind::Literal => (None, Some(re)),
-        };
-        rules.push(CompiledRule {
-            rule: rule.clone(),
-            regex,
-            literal,
-            order,
-        });
     }
     if !errors.is_empty() {
         return Err(errors);
@@ -374,6 +258,164 @@ pub fn compile_config(config: &Config) -> Result<CompiledConfig, Vec<Diagnostic>
         config: config.clone(),
         rules,
     })
+}
+/// Errors that concern the whole configuration rather than one rule.
+fn config_errors(config: &Config) -> Vec<Diagnostic> {
+    let mut errors = vec![];
+    if !(1..=SUPPORTED_SCHEMA_VERSION).contains(&config.version) {
+        // B-43: a newer schema has its own code so hosts can open it read-only.
+        errors.push(if config.version > SUPPORTED_SCHEMA_VERSION {
+            diag(
+                diagnostic_code::SCHEMA_NEWER,
+                "Configuration was written by a newer release",
+                "version",
+            )
+        } else {
+            diag(
+                diagnostic_code::SCHEMA_VERSION,
+                "Unsupported configuration version",
+                "version",
+            )
+        });
+    }
+    if config.globals.terminators.iter().any(|t| t.is_empty()) {
+        errors.push(diag(
+            "terminator",
+            "Empty terminator is invalid",
+            "globals.terminators",
+        ));
+    }
+    errors
+}
+/// Compiles one rule; `Ok(None)` for a disabled rule, of which only the ID is checked.
+/// `order` is the rule's index in `Config::rules`; `position` its index in the serialized
+/// `rules` array (which also holds unreadable entries), used in diagnostic paths.
+fn compile_rule(
+    rule: &Rule,
+    order: usize,
+    position: usize,
+    ids: &mut BTreeSet<String>,
+) -> Result<Option<CompiledRule>, Vec<Diagnostic>> {
+    let base = format!("rules[{position}]");
+    let mut errors = vec![];
+    if rule.id.trim().is_empty() || !ids.insert(rule.id.clone()) {
+        errors.push(diag(
+            "rule_id",
+            "Rule ID must be nonempty and unique",
+            &format!("{base}.id"),
+        ));
+    }
+    if !rule.enabled {
+        return if errors.is_empty() {
+            Ok(None)
+        } else {
+            Err(errors)
+        };
+    }
+    if rule.match_spec.value.is_empty() {
+        errors.push(diag(
+            "match_empty",
+            "Trigger must not be empty",
+            &format!("{base}.match.value"),
+        ));
+        return Err(errors);
+    }
+    if rule.match_spec.value.len() > 8192 {
+        errors.push(diag(
+            "match_limit",
+            "Trigger exceeds 8192 bytes",
+            &format!("{base}.match.value"),
+        ));
+        return Err(errors);
+    }
+    if rule.trigger_mode == TriggerMode::Immediate && rule.match_spec.kind == MatchKind::Regex {
+        errors.push(diag(
+            "immediate_regex",
+            "Immediate mode requires a literal trigger",
+            &format!("{base}.trigger_mode"),
+        ));
+    }
+    if rule
+        .terminator
+        .as_ref()
+        .is_some_and(|t| t.keys.is_empty() || t.keys.iter().any(String::is_empty))
+    {
+        errors.push(diag(
+            "terminator",
+            "Override requires nonempty terminators; use null to inherit",
+            &format!("{base}.terminator"),
+        ));
+    }
+    let pattern = match rule.match_spec.kind {
+        MatchKind::Literal => format!("{}$", regex::escape(&rule.match_spec.value)),
+        MatchKind::Regex => format!("(?:{})$", rule.match_spec.value),
+    };
+    let re = match RegexBuilder::new(&pattern)
+        .case_insensitive(rule.ignore_case)
+        .size_limit(1_048_576)
+        .build()
+    {
+        Ok(re) => re,
+        Err(_) => {
+            errors.push(diag(
+                "regex_unsupported",
+                "Invalid/unsupported Rust regex; .NET lookaround and backreferences need rewriting",
+                &format!("{base}.match.value"),
+            ));
+            return Err(errors);
+        }
+    };
+    if re.is_match("") {
+        errors.push(diag(
+            "empty_match",
+            "Regex must not match an empty input",
+            &format!("{base}.match.value"),
+        ));
+    }
+    match &rule.parameter {
+        ParameterSource::FirstCapture if re.captures_len() < 2 => errors.push(diag(
+            "capture_missing",
+            "First capture requires regex group 1",
+            &format!("{base}.parameter"),
+        )),
+        ParameterSource::CaptureTemplate { template } => match capture_indices(template) {
+            Ok(indices) => {
+                if indices.iter().any(|i| *i >= re.captures_len()) {
+                    errors.push(diag(
+                        "capture_missing",
+                        "Template references a nonexistent capture",
+                        &format!("{base}.parameter"),
+                    ));
+                }
+            }
+            Err(m) => errors.push(diag("capture_template", m, &format!("{base}.parameter"))),
+        },
+        _ => {}
+    }
+    for mut d in validate_action(&rule.action) {
+        d.path = format!(
+            "{base}.action{}",
+            if d.path.is_empty() {
+                String::new()
+            } else {
+                format!(".{}", d.path)
+            }
+        );
+        errors.push(d);
+    }
+    let (regex, literal) = match rule.match_spec.kind {
+        MatchKind::Regex => (Some(re), None),
+        MatchKind::Literal => (None, Some(re)),
+    };
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    Ok(Some(CompiledRule {
+        rule: rule.clone(),
+        regex,
+        literal,
+        order,
+    }))
 }
 pub fn validate_action(action: &Action) -> Vec<Diagnostic> {
     let mut errors = vec![];

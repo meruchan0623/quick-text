@@ -146,6 +146,14 @@ fn import_native_value(value: serde_json::Value) -> Result<ImportReport, Vec<Dia
             SourceSpan::default(),
         )]
     })?;
+    // Stored configuration keeps unknown fields (B-43); imports stay strict (plan §9).
+    if !config.extra.is_empty() || !config.globals.extra.is_empty() {
+        return Err(vec![Diagnostic::error(
+            "config_schema",
+            "Configuration has incompatible fields; source remains untouched",
+            SourceSpan::default(),
+        )]);
+    }
     if config.version != SCHEMA_VERSION {
         return Err(vec![Diagnostic::error(
             "schema_version",
@@ -176,9 +184,12 @@ fn import_native_value(value: serde_json::Value) -> Result<ImportReport, Vec<Dia
                 SourceSpan::default(),
             )]);
         }
-        let mut rule: Rule = match serde_json::from_value(original.clone()) {
-            Ok(rule) => rule,
-            Err(_) => {
+        let parsed = serde_json::from_value::<Rule>(original.clone())
+            .ok()
+            .filter(|rule| rule.extra.is_empty());
+        let mut rule = match parsed {
+            Some(rule) => rule,
+            None => {
                 let item=MigrationItem{rule_id:id.clone(),status:MigrationStatus::NeedsRewrite,diagnostics:vec![Diagnostic::error("rule_schema","Unknown rule fields/action are preserved in unresolved entries; rewrite explicitly",SourceSpan::default())],original:original.clone()};
                 unresolved.push(item.clone());
                 items.push(item);
