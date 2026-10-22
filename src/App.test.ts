@@ -970,6 +970,220 @@ describe('tolerant reading (B-43)', () => {
   });
 });
 
+// The editor never writes or sends a number its Rust type and validation refuse, nor one past the
+// IPC number contract (Codex round 4): the text typed stays with an inline error, and 保存 and the
+// tests refuse before anything leaves the editor.
+describe('number fields of the editor', () => {
+  const rule = (match: string, action: Record<string, unknown>) => ({
+    id: `rule-${match.slice(1)}`,
+    enabled: true,
+    group: '默认',
+    description: '',
+    ignore_case: false,
+    match: { kind: 'literal', value: match },
+    trigger_mode: 'immediate',
+    terminator: null,
+    ime_erasure: null,
+    action,
+    parameter: { type: 'default_match' },
+    notification: { enabled: false, message: '' },
+  });
+  const steps = (operation: Record<string, unknown>) => ({
+    type: 'steps',
+    plan: {
+      version: 1,
+      dialect: 'structured',
+      source: null,
+      steps: [{ operation, span: { line: 0, column: 0, length: 0 }, target: { type: 'locked' } }],
+    },
+  });
+  const EDITOR = '编辑文本指令';
+  const JSON_RANGE = '-9007199254740991 到 9007199254740991 之间的数字';
+
+  function input(root: ParentNode | null, label: string): HTMLInputElement {
+    const found = root?.querySelector<HTMLInputElement>(`input[aria-label="${label}"]`);
+    if (!found) throw new Error(`no input 「${label}」`);
+    return found;
+  }
+
+  async function choose(mounted: Mounted, label: string, value: string): Promise<void> {
+    const select = dialog(mounted.container, EDITOR)?.querySelector<HTMLSelectElement>(
+      `select[aria-label="${label}"]`,
+    );
+    if (!select) throw new Error(`no select 「${label}」`);
+    await mounted.act(() => {
+      select.value = value;
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  }
+
+  /** Mount with `extra` rules (matched `;a-…`, so listed first) and open the first one. */
+  async function editFirst(...extra: ReturnType<typeof rule>[]): Promise<Mounted> {
+    const mounted = await mount({}, (backend) => {
+      backend.draft.rules.push(...structuredClone(extra));
+    });
+    await waitFor(mounted, () => {
+      expect(mounted.container.querySelectorAll('tbody tr')).toHaveLength(3 + extra.length);
+    });
+    expect(mounted.container.querySelectorAll('tbody tr.unreadable-row')).toHaveLength(0);
+    await click(mounted, '编辑');
+    return mounted;
+  }
+
+  /** The field keeps the text typed and says what it takes. */
+  function expectInvalid(field: HTMLInputElement, text: string, error: string): void {
+    expect(field.value).toBe(text);
+    expect(field.getAttribute('aria-invalid')).toBe('true');
+    const message = document.getElementById(field.getAttribute('aria-describedby') ?? '');
+    expect(message?.textContent).toBe(error);
+  }
+
+  /** 保存 is refused before anything is sent; the editor stays open and lists the problem. */
+  async function expectSaveRefused(mounted: Mounted, listed: string): Promise<void> {
+    const { backend, container } = mounted;
+    await clickIn(mounted, dialog(container, EDITOR), '保存');
+    await waitFor(mounted, () => {
+      expect(container.querySelector('.alert.error')?.textContent).toMatch(/有设置需要修改/);
+    });
+    const items = [...container.querySelectorAll('.action-diagnostics button')].map(
+      (b) => b.textContent,
+    );
+    expect(items).toContain(listed);
+    expect(dialog(container, EDITOR)).not.toBeNull();
+    expect(callsOf(backend, 'validate_config')).toHaveLength(0);
+    expect(callsOf(backend, 'save_draft')).toHaveLength(0);
+  }
+
+  /** 保存 goes through; the action of the rule saved last. */
+  async function save(mounted: Mounted): Promise<unknown> {
+    await clickIn(mounted, dialog(mounted.container, EDITOR), '保存');
+    await waitFor(mounted, () => {
+      expect(callsOf(mounted.backend, 'save_draft')).toHaveLength(1);
+    });
+    await waitFor(mounted, () => {
+      expect(dialog(mounted.container, EDITOR)).toBeNull();
+    });
+    const { rules } = callsOf(mounted.backend, 'save_draft')[0]?.args.config as {
+      rules: { action: unknown }[];
+    };
+    return rules.at(-1)?.action;
+  }
+
+  it('refuses a reusable number parameter past 2^53−1 in a new rule, keeping it editable', async () => {
+    const mounted = await mount();
+    const { backend, container } = mounted;
+    await waitFor(mounted, () => {
+      expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
+    });
+    await click(mounted, '＋ 添加指令');
+    const editor = dialog(container, EDITOR);
+    await type(mounted, field(editor ?? container, '缩写词'), ';big');
+    await choose(mounted, '操作类型', 'reusable');
+    await choose(mounted, '复用已保存指令', 'mock-rule-1');
+    await clickIn(mounted, editor, '＋ 添加参数');
+    await choose(mounted, '参数类型', 'number');
+    await type(mounted, input(editor, '参数值'), '9007199254740993');
+    // Not turned into 9007199254740992 by Number().
+    expectInvalid(input(editor, '参数值'), '9007199254740993', `请输入 ${JSON_RANGE}。`);
+
+    await clickIn(mounted, editor, '测试动作（真实执行）');
+    await waitFor(mounted, () => {
+      expect(container.querySelector('.alert.error')?.textContent).toMatch(/有数值需要修改/);
+    });
+    expect(callsOf(backend, 'execute_action')).toHaveLength(0);
+    const listed = `操作设置 · 参数「param1」的值应为 ${JSON_RANGE}。`;
+    await expectSaveRefused(mounted, listed);
+    expect(backend.draft.rules).toHaveLength(3);
+    // Still editable: the largest safe integer goes through as typed.
+    expectInvalid(input(editor, '参数值'), '9007199254740993', `请输入 ${JSON_RANGE}。`);
+    await type(mounted, input(editor, '参数值'), '9007199254740991');
+    expect(input(editor, '参数值').getAttribute('aria-invalid')).toBeNull();
+    expect(await save(mounted)).toEqual({
+      type: 'reusable',
+      action_id: 'mock-rule-1',
+      parameters: { param1: 9007199254740991 },
+    });
+  });
+
+  it('refuses the same when editing an existing reusable rule, which stays editable', async () => {
+    const reuse = rule(';a-reuse', {
+      type: 'reusable',
+      action_id: 'mock-rule-1',
+      parameters: { count: 5 },
+    });
+    const mounted = await editFirst(reuse);
+    const { backend, container } = mounted;
+    const editor = dialog(container, EDITOR);
+    expect(input(editor, '参数值').value).toBe('5');
+    await type(mounted, input(editor, '参数值'), '9007199254740993');
+    expectInvalid(input(editor, '参数值'), '9007199254740993', `请输入 ${JSON_RANGE}。`);
+    await expectSaveRefused(mounted, `操作设置 · 参数「count」的值应为 ${JSON_RANGE}。`);
+    expect(backend.draft.rules.at(-1)).toEqual(reuse);
+    // 检查这段文字能否触发 sends the rule too: refused before it asks for the text.
+    await clickIn(mounted, editor, '检查这段文字能否触发（不会执行操作）');
+    await mounted.act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+    expect(dialog(container, '用哪段文字检查？')).toBeNull();
+    expect(callsOf(backend, 'test_rule')).toHaveLength(0);
+
+    // The rule is not turned read-only: it can be fixed and saved, and is listed as editable.
+    await type(mounted, input(editor, '参数值'), '-12');
+    expect(await save(mounted)).toEqual({ ...reuse.action, parameters: { count: -12 } });
+    expect(container.querySelectorAll('tbody tr.unreadable-row')).toHaveLength(0);
+  });
+
+  it('refuses a delay past MAX_DELAY_MS', async () => {
+    const mounted = await editFirst(rule(';a-delay', steps({ type: 'delay', ms: 100 })));
+    const editor = dialog(mounted.container, EDITOR);
+    const ms = input(editor, '等待时间（毫秒）');
+    expect(ms.value).toBe('100');
+    await type(mounted, ms, '3600001');
+    expectInvalid(ms, '3600001', '请输入 0 到 3600000 之间的整数。');
+    await expectSaveRefused(mounted, '步骤 1 · 等待时间（毫秒）应为 0 到 3600000 之间的整数。');
+    await type(mounted, ms, '3600000');
+    expect(await save(mounted)).toEqual(steps({ type: 'delay', ms: 3600000 }));
+  });
+
+  it('refuses a coordinate past i32, for 保存 and 单步测试', async () => {
+    const move = { type: 'mouse_move', x: 10, y: 20, relative: false, percent: false };
+    const mounted = await editFirst(rule(';a-move', steps(move)));
+    const { backend, container } = mounted;
+    const editor = dialog(container, EDITOR);
+    const x = input(editor, '左右位置 X');
+    await type(mounted, x, '2147483648');
+    expectInvalid(x, '2147483648', '请输入 -2147483648 到 2147483647 之间的数字。');
+    await clickIn(mounted, editor, '单步测试（真实执行）');
+    await waitFor(mounted, () => {
+      expect(container.querySelector('.alert.error')?.textContent).toMatch(/有数值需要修改/);
+    });
+    expect(callsOf(backend, 'execute_action')).toHaveLength(0);
+    await expectSaveRefused(
+      mounted,
+      '步骤 1 · 左右位置 X应为 -2147483648 到 2147483647 之间的数字。',
+    );
+    // Back in range, the step runs and saves.
+    await type(mounted, x, '-2147483648');
+    await clickIn(mounted, editor, '单步测试（真实执行）');
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'execute_action')).toHaveLength(1);
+    });
+    expect(await save(mounted)).toEqual(steps({ ...move, x: -2147483648 }));
+  });
+
+  it('refuses a Windows key code past 1..=255, keeping the text', async () => {
+    const press = { type: 'key_press', key: { type: 'named', name: 'Enter' } };
+    const mounted = await editFirst(rule(';a-key', steps(press)));
+    const editor = dialog(mounted.container, EDITOR);
+    const name = input(editor, '按键名称');
+    await type(mounted, name, '#300');
+    expectInvalid(name, '#300', '以 # 开头表示 Windows 键码，请输入 1 到 255 之间的整数。');
+    await expectSaveRefused(mounted, '步骤 1 · 键码应为 1 到 255 之间的整数。');
+    await type(mounted, name, '#13');
+    expect(await save(mounted)).toEqual(
+      steps({ type: 'key_press', key: { type: 'windows_code', code: 13 } }),
+    );
+  });
+});
+
 describe('production build outside the desktop app', () => {
   it('shows 「未连接到桌面后端」 instead of falling back to sample data', async () => {
     // What a release bundle sees when opened in a plain browser: no Tauri and no mock.

@@ -962,6 +962,16 @@ dialog.overlay::backdrop {
   margin: 6px 0 0;
   padding-left: 18px;
 }
+/* A number field holding no number its Rust type accepts (src/NumberField.tsx); the text stays. */
+input[aria-invalid='true'] {
+  border-color: #d9826a;
+}
+.number-error {
+  display: block;
+  flex-basis: 100%;
+  color: #8f3a26;
+  font-size: 12px;
+}
 .license {
   max-width: 640px;
   line-height: 1.7;

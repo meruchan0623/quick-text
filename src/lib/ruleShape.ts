@@ -15,16 +15,76 @@
 //   or of an `Option` type may be absent; `withRuleDefaults` fills in the same default Rust would.
 //   A field without one must be there. `null` is only valid for an `Option`.
 // - Numbers. Integers are checked against their Rust type (u16, u32, i32, u64/usize) and floats must
-//   be finite. A u64 past 2^53−1 is outside the IPC number contract and not readable: it was
-//   already rounded when the IPC JSON was parsed. `isReadableRule` (./rules.ts) goes further: a
-//   number past the contract anywhere in an entry, `serde_json::Value` fields and rule-level keys
-//   included, makes it unreadable, and the list says why.
+//   be finite, by the `ranges` table the editor's number fields share. Limits of Rust's validation
+//   (a delay of at most an hour, say) are left to it here, so that such a rule stays editable and
+//   can be fixed; the editor applies them to what it writes (./numberFields.ts). A u64 past 2^53−1
+//   is outside the IPC number contract and not readable: it was already rounded when the IPC JSON
+//   was parsed. `isReadableRule` (./rules.ts) goes further: a number past the contract anywhere in
+//   an entry, `serde_json::Value` fields and rule-level keys included, makes it unreadable, and the
+//   list says why.
 
 /** A runtime type check for one JSON value. */
 export type Guard = (value: unknown) => boolean;
 
 export const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
+
+// ---- Number ranges -------------------------------------------------------------------------
+// One table for both sides: the shape check below reads numbers by their Rust type, and the
+// editor's number fields (src/NumberField.tsx, src/lib/numberFields.ts) take only what Rust reads
+// and its validation accepts, so the editor never produces a value the backend cannot read.
+
+/** `MAX_DELAY_MS` in crates/domain/src/model.rs: validate_plan refuses a longer delay. */
+export const MAX_DELAY_MS = 3_600_000;
+/** `MAX_STEPS` in crates/domain: the step limit, and the most a `{key count}` may repeat. */
+export const MAX_STEPS = 10_000;
+
+/** The numbers a field takes, both ends included. */
+export interface NumberRange {
+  readonly min: number;
+  readonly max: number;
+  /** Whole numbers only. */
+  readonly integer: boolean;
+}
+
+const whole = (min: number, max: number): NumberRange => ({ min, max, integer: true });
+const real = (min: number, max: number): NumberRange => ({ min, max, integer: false });
+const I32_MIN = -0x8000_0000;
+const I32_MAX = 0x7fff_ffff;
+
+export const ranges = {
+  u16: whole(0, 0xffff),
+  u32: whole(0, 0xffff_ffff),
+  i32: whole(I32_MIN, I32_MAX),
+  /** u64 and usize, within the IPC number contract (docs/ipc-contract-0.4.md §6). */
+  u64: whole(0, Number.MAX_SAFE_INTEGER),
+  /** f64: any finite number (JSON has no NaN or Infinity). */
+  f64: real(-Number.MAX_VALUE, Number.MAX_VALUE),
+  /** A JSON number (`serde_json::Value`) within the IPC number contract. */
+  json: real(-Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER),
+  /** `Delay.ms`: a u64 that validate_plan allows up to MAX_DELAY_MS. */
+  delayMs: whole(0, MAX_DELAY_MS),
+  /** `Key::WindowsCode.code`: a u16 that validate_key (and parse_key) allows in 1..=255. */
+  windowsKeyCode: whole(1, 255),
+  /** `MouseMove.x`/`y` in pixels: an f64 the platform layer sends to the OS as an i32. */
+  coordinate: real(I32_MIN, I32_MAX),
+  /** `MouseMove.x`/`y` with `percent`: validate_plan allows 0..=100. */
+  percent: real(0, 100),
+  /** `Wheel.amount`: an i32. */
+  wheelAmount: whole(I32_MIN, I32_MAX),
+  /** Replay `speed`: an f64 that scale_replay wants positive (MIN_VALUE: the least one above 0). */
+  replaySpeed: real(Number.MIN_VALUE, Number.MAX_VALUE),
+  /** The count of a `{key count}` (parse_sendkeys): 1..=MAX_STEPS. */
+  repeat: whole(1, MAX_STEPS),
+} as const satisfies Record<string, NumberRange>;
+
+/** Whether `value` is a finite number within `range`. */
+export const inRange = (range: NumberRange, value: unknown): value is number =>
+  typeof value === 'number' &&
+  Number.isFinite(value) &&
+  (!range.integer || Number.isInteger(value)) &&
+  value >= range.min &&
+  value <= range.max;
 
 /** The check for one JSON value, and how to fill in the serde defaults of a value that passed it. */
 interface Spec {
@@ -44,17 +104,13 @@ const leaf = (check: Guard): Spec => ({ check, fill: same });
 
 const str = leaf((value) => typeof value === 'string');
 const bool = leaf((value) => typeof value === 'boolean');
+const number = (range: NumberRange): Spec => leaf((value) => inRange(range, value));
 /** f64: JSON numbers are finite; NaN or Infinity cannot have come from the backend. */
-const f64 = leaf((value) => typeof value === 'number' && Number.isFinite(value));
-const integer = (min: number, max: number): Spec =>
-  leaf(
-    (value) => typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max,
-  );
-const u16 = integer(0, 0xffff);
-const u32 = integer(0, 0xffff_ffff);
-const i32 = integer(-0x8000_0000, 0x7fff_ffff);
-/** u64 and usize, within the IPC number contract (docs/ipc-contract-0.4.md §6). */
-const u64 = integer(0, Number.MAX_SAFE_INTEGER);
+const f64 = number(ranges.f64);
+const u16 = number(ranges.u16);
+const u32 = number(ranges.u32);
+const i32 = number(ranges.i32);
+const u64 = number(ranges.u64);
 
 const oneOf = (...values: string[]): Spec =>
   leaf((value) => typeof value === 'string' && values.includes(value));
@@ -80,7 +136,7 @@ const scalar = leaf(
     value === null ||
     typeof value === 'string' ||
     typeof value === 'boolean' ||
-    (typeof value === 'number' && Number.isFinite(value)),
+    inRange(ranges.f64, value),
 );
 
 /** A field with a serde default: absent is read as `missing()`. */

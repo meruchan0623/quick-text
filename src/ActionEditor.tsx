@@ -1,9 +1,12 @@
-import { useRef, useState } from 'react';
+import { Fragment, useId, useRef, useState } from 'react';
 import { call } from './ipc/transport';
 import { diagnosticText, parseCommandError } from './ipc/errors';
 import { actionChoice, actionLabel, actionOptions, clone, Data, Rule } from './model';
 import { moveItem, withoutKey } from './lib/list';
+import { actionDiagnostics, parseNumber, rangeError } from './lib/numberFields';
+import { inRange, ranges } from './lib/ruleShape';
 import { LinesInput } from './LinesInput';
+import { NumberField } from './NumberField';
 type Props = {
   platform?: string | undefined;
   rules: Rule[];
@@ -14,14 +17,25 @@ type Props = {
   run: (f: () => Promise<any>, s?: string) => Promise<any>;
   show: (d: { title: string; data: any }) => void;
 };
+// 「#13」 is a Windows key code. Its text is checked against the code's range (1..=255) before it
+// is converted; NaN marks text that is not such a code, which the editor refuses to save or send
+// (src/lib/numberFields.ts), so it never writes a code past u16 that the backend cannot read.
 const key = (name: string) =>
   name === '$primary'
     ? { type: 'platform_primary' }
     : name.startsWith('#')
-      ? { type: 'windows_code', code: Number(name.slice(1)) }
+      ? { type: 'windows_code', code: parseNumber(name.slice(1), ranges.windowsKeyCode) ?? NaN }
       : { type: 'named', name };
 const keyValue = (k: Data) =>
-  k.type === 'platform_primary' ? '$primary' : k.type === 'windows_code' ? `#${k.code}` : k.name;
+  k.type === 'platform_primary'
+    ? '$primary'
+    : k.type === 'windows_code'
+      ? Number.isNaN(k.code)
+        ? '#'
+        : `#${k.code}`
+      : k.name;
+const sameKey = (x: Data, y: Data) =>
+  x.type === y.type && Object.is(x.code, y.code) && x.name === y.name;
 const namedKeys = [
   'Ctrl',
   'Shift',
@@ -198,14 +212,28 @@ function defaultAction(t: string): Data {
   }
 }
 function KeySelect({ value, onChange }: { value: Data; onChange: (k: Data) => void }) {
+  // As in NumberField: the text typed stays while it still stands for `value`.
+  const errorId = useId();
+  const [typed, setTyped] = useState<string | null>(null);
+  const invalid = value.type === 'windows_code' && !inRange(ranges.windowsKeyCode, value.code);
   return (
     <>
       <input
         aria-label="按键名称"
+        aria-invalid={invalid || undefined}
+        aria-describedby={invalid ? errorId : undefined}
         list="keynames"
-        value={keyValue(value)}
-        onChange={(e) => onChange(key(e.target.value))}
+        value={typed !== null && sameKey(key(typed), value) ? typed : keyValue(value)}
+        onChange={(e) => {
+          setTyped(e.target.value);
+          onChange(key(e.target.value));
+        }}
       />
+      {invalid && (
+        <small id={errorId} className="number-error">
+          以 # 开头表示 Windows 键码，{rangeError(ranges.windowsKeyCode)}
+        </small>
+      )}
       <datalist id="keynames">
         {namedKeys.map((k) => (
           <option key={k} value={k}>
@@ -313,6 +341,15 @@ export default function ActionEditor({
       if (error.code === 'validation') setDiagnostics(error.detail.diagnostics);
       throw e;
     }
+  };
+  // A test sends nothing the editor would refuse to save: the same checks run first, and their
+  // diagnostics go where the backend's would.
+  const execute = (action: Data, found: Data[]) => {
+    if (found.length > 0) {
+      setDiagnostics(found);
+      throw new Error('有数值需要修改，请按提示改正后再测试；已填写的内容会保留。');
+    }
+    return perform('execute_action', { action });
   };
   const focusDiagnostic = (d: Data) => {
     const index = String(d.path || '').match(/steps\[(\d+)\]/);
@@ -679,16 +716,15 @@ export default function ActionEditor({
                   value={bKey}
                   onChange={(e) => setBKey(e.target.value)}
                 />
-                <input
+                <NumberField
                   aria-label="重复次数"
                   className="number"
-                  type="number"
-                  min={1}
-                  max={10000}
+                  range={ranges.repeat}
                   value={repeat}
-                  onChange={(e) => setRepeat(+e.target.value)}
+                  onChange={setRepeat}
                 />
                 <button
+                  disabled={!inRange(ranges.repeat, repeat)}
                   onClick={() =>
                     edit({
                       source: {
@@ -933,20 +969,21 @@ export default function ActionEditor({
                         <option value="true">是</option>
                         <option value="false">否</option>
                       </select>
+                    ) : typeof value === 'number' ? (
+                      // Any JSON number within the IPC number contract (Rust takes a JSON value).
+                      <NumberField
+                        aria-label="参数值"
+                        range={ranges.json}
+                        value={value}
+                        onChange={(n) => edit({ parameters: { ...a.parameters, [name]: n } })}
+                      />
                     ) : (
                       <input
                         aria-label="参数值"
                         disabled={value === null}
-                        type={typeof value === 'number' ? 'number' : 'text'}
-                        value={value === null ? '' : String(value)}
+                        value={value === null ? '' : value}
                         onChange={(e) =>
-                          edit({
-                            parameters: {
-                              ...a.parameters,
-                              [name]:
-                                typeof value === 'number' ? Number(e.target.value) : e.target.value,
-                            },
-                          })
+                          edit({ parameters: { ...a.parameters, [name]: e.target.value } })
                         }
                       />
                     )}
@@ -991,13 +1028,12 @@ export default function ActionEditor({
             {a.type === 'replay' && (
               <label>
                 倍速{' '}
-                <input
+                <NumberField
                   className="number"
-                  type="number"
-                  min={0.01}
+                  range={ranges.replaySpeed}
                   step={0.1}
                   value={a.speed}
-                  onChange={(e) => edit({ speed: +e.target.value })}
+                  onChange={(n) => edit({ speed: n })}
                 />
               </label>
             )}
@@ -1057,7 +1093,17 @@ export default function ActionEditor({
                     </option>
                   ))}
                 </select>
-                <button onClick={addStep}>＋ 添加步骤</button>
+                <button
+                  disabled={
+                    (a.type === 'steps' &&
+                      command === 'sendkeys' &&
+                      !inRange(ranges.repeat, repeat)) ||
+                    (a.type === 'replay' && !inRange(ranges.delayMs, eventDelay))
+                  }
+                  onClick={addStep}
+                >
+                  ＋ 添加步骤
+                </button>
                 <button
                   onClick={() => {
                     const sample = [
@@ -1105,13 +1151,12 @@ export default function ActionEditor({
                     value={bKey}
                     onChange={(e) => setBKey(e.target.value)}
                   />
-                  <input
+                  <NumberField
                     className="number"
                     aria-label="此步骤重复次数"
-                    type="number"
-                    min={1}
+                    range={ranges.repeat}
                     value={repeat}
-                    onChange={(e) => setRepeat(+e.target.value)}
+                    onChange={setRepeat}
                   />
                   <small>选好按键和重复次数后，点击“添加步骤”。</small>
                 </div>
@@ -1119,13 +1164,7 @@ export default function ActionEditor({
               {a.type === 'replay' && (
                 <label className="field">
                   <span>执行新增操作前等待多久（毫秒，1000 毫秒是 1 秒）</span>
-                  <input
-                    type="number"
-                    min={0}
-                    max={3600000}
-                    value={eventDelay}
-                    onChange={(e) => setEventDelay(Number(e.target.value))}
-                  />
+                  <NumberField range={ranges.delayMs} value={eventDelay} onChange={setEventDelay} />
                   <small>
                     会添加一个等待步骤。调整倍速只改变等待时间，鼠标位置和滚动距离保持不变。
                   </small>
@@ -1176,7 +1215,8 @@ export default function ActionEditor({
                       先选择操作并点击“添加步骤”，再在这里填写文字、按键或鼠标位置。按从上到下的顺序执行，可拖动步骤调整顺序。
                     </p>
                   ) : (
-                    <>
+                    // Keyed by step: text typed into one step's fields is not shown for another.
+                    <Fragment key={stepIndex}>
                       <h4>
                         步骤 {stepIndex + 1} · {stepLabel(o)}
                       </h4>
@@ -1201,12 +1241,11 @@ export default function ActionEditor({
                       {o.type === 'delay' && (
                         <label>
                           等待多久（毫秒）{' '}
-                          <input
-                            type="number"
-                            min={0}
-                            max={3600000}
+                          <NumberField
+                            aria-label="等待时间（毫秒）"
+                            range={ranges.delayMs}
                             value={o.ms}
-                            onChange={(e) => setOp({ ms: +e.target.value })}
+                            onChange={(n) => setOp({ ms: n })}
                           />
                         </label>
                       )}
@@ -1225,18 +1264,20 @@ export default function ActionEditor({
                           <div className="inline">
                             <label>
                               左右位置 X{' '}
-                              <input
-                                type="number"
+                              <NumberField
+                                aria-label="左右位置 X"
+                                range={o.percent ? ranges.percent : ranges.coordinate}
                                 value={o.x}
-                                onChange={(e) => setOp({ x: +e.target.value })}
+                                onChange={(n) => setOp({ x: n })}
                               />
                             </label>
                             <label>
                               上下位置 Y{' '}
-                              <input
-                                type="number"
+                              <NumberField
+                                aria-label="上下位置 Y"
+                                range={o.percent ? ranges.percent : ranges.coordinate}
                                 value={o.y}
-                                onChange={(e) => setOp({ y: +e.target.value })}
+                                onChange={(n) => setOp({ y: n })}
                               />
                             </label>
                           </div>
@@ -1317,11 +1358,11 @@ export default function ActionEditor({
                             <option value="vertical">上下滚动</option>
                             <option value="horizontal">左右滚动</option>
                           </select>
-                          <input
+                          <NumberField
                             aria-label="滚动量"
-                            type="number"
+                            range={ranges.wheelAmount}
                             value={o.amount}
-                            onChange={(e) => setOp({ amount: +e.target.value })}
+                            onChange={(n) => setOp({ amount: n })}
                           />
                           <select
                             aria-label="滚动单位"
@@ -1455,8 +1496,8 @@ export default function ActionEditor({
                           run(async () =>
                             show({
                               title: '单步执行结果',
-                              data: await perform('execute_action', {
-                                action: {
+                              data: await execute(
+                                {
                                   type: 'steps',
                                   plan: {
                                     version: 1,
@@ -1465,14 +1506,17 @@ export default function ActionEditor({
                                     steps: [current],
                                   },
                                 },
-                              }),
+                                actionDiagnostics(a).filter((d) =>
+                                  d.path.startsWith(`plan.steps[${stepIndex}].`),
+                                ),
+                              ),
                             }),
                           )
                         }
                       >
                         单步测试（真实执行）
                       </button>
-                    </>
+                    </Fragment>
                   )}
                 </div>
               </div>
@@ -1535,7 +1579,7 @@ export default function ActionEditor({
         <button
           onClick={() =>
             run(async () =>
-              show({ title: '动作测试结果', data: await perform('execute_action', { action: a }) }),
+              show({ title: '动作测试结果', data: await execute(a, actionDiagnostics(a)) }),
             )
           }
         >

@@ -37,6 +37,7 @@ import {
   unreadableEntries,
 } from './lib/rules';
 import { effectiveTerminators, unsupportedTerminators } from './lib/terminators';
+import { ruleEditDiagnostics } from './lib/numberFields';
 
 // `null` from describe() means the user cancelled: show nothing.
 const errorText = (e: unknown) => describe(e) ?? '';
@@ -387,9 +388,20 @@ export default function App() {
       setDialog({ title: '导入预览 · 确认后写入草稿', data: r.report, importConfig: r.config });
       setMessage('请核对导入报告后确认');
     });
+  const reject = (diagnostics: Data[]) => {
+    setEditingErrors(diagnostics);
+    return new Error('有设置需要修改，请查看编辑框中的提示；已填写的内容会保留。');
+  };
+  // The editor's own checks (src/lib/numberFields.ts) come before anything leaves it: a number
+  // field holding no number its Rust type and validation accept (NaN marks invalid text), or a
+  // shape the backend would not read as meant. Only the edited rule is checked; unreadable
+  // entries are written back as received, untouched by it.
+  const editProblems = (rule: Rule) => ruleEditDiagnostics(rule, editingIndex);
   const commitEdit = () =>
     run(async () => {
       if (!editing) return;
+      const problems = editProblems(editing);
+      if (problems.length > 0) throw reject(problems);
       const found = indexOfRule(editing.id);
       const c = {
         ...config,
@@ -397,10 +409,6 @@ export default function App() {
           found >= 0
             ? config.rules.map((r, i) => (i === found ? editing : r))
             : [...config.rules, editing],
-      };
-      const reject = (diagnostics: Data[]) => {
-        setEditingErrors(diagnostics);
-        return new Error('有设置需要修改，请查看编辑框中的提示；已填写的内容会保留。');
       };
       const v = await call('validate_config', { config: c });
       if (!v.valid) throw reject(v.errors);
@@ -1122,6 +1130,11 @@ export default function App() {
                 )}
                 <button
                   onClick={async () => {
+                    const problems = editProblems(editing);
+                    if (problems.length > 0) {
+                      void run(() => Promise.reject(reject(problems)));
+                      return;
+                    }
                     const input = await askValue({
                       title: '用哪段文字检查？',
                       confirm: '检查',
