@@ -55,6 +55,9 @@ pub struct LogLevelOverride {
     pub level: String,
     /// Unix time in milliseconds.
     pub until_ms: i64,
+    /// Fields this version does not know, kept and written back unchanged.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Reads `prefs.json` leniently. A missing file gives defaults; a file that
@@ -189,6 +192,7 @@ mod tests {
                 log_level: Some(LogLevelOverride {
                     level: "debug".into(),
                     until_ms: 1_792_664_493_000,
+                    extra: Map::new(),
                 }),
                 ..AppPrefs::default()
             },
@@ -230,6 +234,36 @@ mod tests {
         assert_eq!(written["app"]["auto_listen_on_start"], true);
         assert_eq!(written["app"]["stats"], original["app"]["stats"]);
         assert_eq!(written["future_section"], original["future_section"]);
+        assert!(quarantined(&dir).is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unknown_log_level_fields_survive_unrelated_edits() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let original = json!({
+            "app": {
+                "auto_listen_on_start": false,
+                "log_level": {
+                    "level": "debug",
+                    "until_ms": 1_792_664_493_000_i64,
+                    "set_by": "settings",
+                    "scope": {"targets": ["engine", "store"], "sample": {"rate": 0.5}}
+                }
+            },
+            "ui": {}
+        });
+        fs::write(dir.join(FILE), serde_json::to_vec(&original).unwrap()).unwrap();
+        let mut prefs = load_prefs(&dir).unwrap();
+        let level = prefs.app.log_level.as_ref().unwrap();
+        assert_eq!(level.level, "debug");
+        assert_eq!(level.extra["scope"]["sample"]["rate"], 0.5);
+        prefs.app.auto_listen_on_start = true;
+        save_prefs(&dir, &prefs).unwrap();
+        let written: Value = serde_json::from_slice(&fs::read(dir.join(FILE)).unwrap()).unwrap();
+        assert_eq!(written["app"]["auto_listen_on_start"], true);
+        assert_eq!(written["app"]["log_level"], original["app"]["log_level"]);
         assert!(quarantined(&dir).is_empty());
         fs::remove_dir_all(dir).unwrap();
     }
