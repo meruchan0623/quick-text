@@ -13,7 +13,7 @@
 )]
 use super::actions::{Ports, Stage, StageMarks};
 use super::executor::{
-    classify, run_candidate, stage_timings, Candidate, ExecutorCore, Runner, TaskScope,
+    classify, run_candidate, stage_timings, Candidate, ExecutorCore, Pause, Runner, TaskScope,
     STALL_BUDGET,
 };
 use super::pipeline_tests::SERIAL;
@@ -891,4 +891,155 @@ fn stage_timings_measure_each_stage_in_microseconds() {
     assert_eq!(timings.erase_us, Some(3_000));
     assert_eq!(timings.output_us, None);
     assert_eq!(timings.total_us, Some(4_000));
+}
+
+/// Holds one thread at a chosen point: the thread calls the `waiter` (from
+/// a hook), which marks its arrival and blocks until the hold is dropped.
+struct Hold {
+    arrived: Arc<AtomicBool>,
+    gate: Gate,
+}
+impl Hold {
+    fn new() -> Self {
+        Self {
+            arrived: Arc::new(AtomicBool::new(false)),
+            gate: Gate(Arc::new(AtomicBool::new(false))),
+        }
+    }
+    fn waiter(&self) -> impl Fn() + Send + Sync + 'static {
+        let (arrived, open) = (Arc::clone(&self.arrived), Arc::clone(&self.gate.0));
+        move || {
+            arrived.store(true, Ordering::SeqCst);
+            while !open.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    fn wait_arrived(&self, what: &str) {
+        wait_until(what, || self.arrived.load(Ordering::SeqCst));
+    }
+}
+
+/// Holds the first injector call (on whichever thread makes it).
+fn hold_first_send(injector: &MockInjector) -> Hold {
+    let hold = Hold::new();
+    let wait = hold.waiter();
+    let first = AtomicBool::new(false);
+    injector.on_call(move |_| {
+        if !first.swap(true, Ordering::SeqCst) {
+            wait();
+        }
+    });
+    hold
+}
+
+fn is_thread(name: &str) -> bool {
+    std::thread::current().name() == Some(name)
+}
+
+/// Lifecycle ruling: the fence decides ownership in one hold of the
+/// lifecycle lock. Held right after the bump, it lets the old task finish:
+/// that task records nothing and publishes nothing; the fence then writes
+/// the only history entry of the run.
+#[test]
+fn a_fence_held_after_the_bump_writes_the_only_entry() {
+    let mut rig = ExecRig::new(vec![text_rule("btw", OutputMethod::Keys, BODY)]);
+    let in_send = hold_first_send(&rig.injector);
+    let decided = Hold::new();
+    let wait = decided.waiter();
+    rig.core.on_pause(move |at| {
+        if at == Pause::FenceDecided {
+            wait();
+        }
+    });
+    assert!(rig.trigger("btw"));
+    in_send.wait_arrived("the task's first send");
+    let epoch = rig.core.epoch();
+    let core = Arc::clone(&rig.core);
+    let fencer = std::thread::spawn(move || core.fence(epoch));
+    decided.wait_arrived("the fence, after the bump");
+    assert_eq!(rig.core.epoch(), epoch + 1);
+    assert!(!rig.shared.busy.load(Ordering::SeqCst));
+    assert_eq!(rig.core.running_task(), None, "the fence took the run");
+
+    drop(in_send);
+    assert!(
+        rig.core.join_retired(Duration::from_secs(5)),
+        "the old task finished"
+    );
+    assert!(rig.history().is_empty(), "the old task recorded nothing");
+    assert!(rig
+        .shared
+        .last
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_none());
+
+    drop(decided);
+    assert!(fencer.join().unwrap());
+    let history = rig.history();
+    assert_eq!(history.len(), 1, "exactly one entry");
+    assert_eq!(
+        (history[0].outcome, history[0].reason),
+        (Outcome::Failed, ReasonCode::ExecutorTimeout)
+    );
+    assert_eq!(history[0].rule_id, "rule-btw");
+    assert!(history[0].side_effects);
+}
+
+/// Lifecycle ruling: the busy guard compares (epoch and run id) before it
+/// clears. Held just before that, while a fence retires its run and a
+/// replacement starts, it must leave the replacement's `running` and `busy`
+/// alone, and write neither history nor `last`.
+#[test]
+fn a_guard_held_before_the_clear_leaves_the_replacement_alone() {
+    let mut rig = ExecRig::new(vec![
+        text_rule("btw", OutputMethod::Keys, BODY),
+        text_rule("kw", OutputMethod::Keys, TYPED),
+    ]);
+    let before_clear = Hold::new();
+    let wait = before_clear.waiter();
+    rig.core.on_pause(move |at| {
+        if at == Pause::GuardBeforeClear && is_thread("qt-executor-0") {
+            wait();
+        }
+    });
+    assert!(rig.trigger("btw"));
+    before_clear.wait_arrived("the first task's guard");
+    assert!(rig.core.fence(rig.core.epoch()));
+    rig.core.respawn().expect("a new worker");
+    let in_send = hold_first_send(&rig.injector);
+    assert!(rig.trigger("kw"));
+    in_send.wait_arrived("the replacement's first send");
+    let replacement = rig.core.running_task().expect("the replacement runs");
+    assert_eq!(replacement.1, "rule-kw");
+
+    drop(before_clear);
+    assert!(
+        rig.core.join_retired(Duration::from_secs(5)),
+        "the old worker exited"
+    );
+    assert_eq!(rig.core.running_task(), Some(replacement));
+    assert!(rig.shared.busy.load(Ordering::SeqCst), "busy untouched");
+    assert!(rig
+        .shared
+        .last
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_none());
+    let history = rig.history();
+    assert_eq!(history.len(), 1, "only the fence's entry");
+    assert_eq!(
+        (history[0].outcome, history[0].reason),
+        (Outcome::Failed, ReasonCode::ExecutorTimeout)
+    );
+
+    drop(in_send);
+    rig.wait_idle();
+    let entry = rig.last_entry();
+    assert_eq!(
+        (entry.rule_id.as_str(), entry.outcome),
+        ("rule-kw", Outcome::Succeeded)
+    );
+    assert_eq!(rig.history().len(), 2);
 }

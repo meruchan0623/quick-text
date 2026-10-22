@@ -24,6 +24,26 @@
 //!   plan B-01 (5) suggested that, but it contradicts no-regression #2
 //!   ("paste never degrades to typing"), and the coordinator ruled for #2.
 //!   Key output runs as usual.
+//! * Task lifecycle: one lock (`ExecutorCore::life`) guards the triple
+//!   {epoch, running task, busy}. `epoch` and `shared.busy` are atomics so
+//!   senders, the stamp guard and the RawInput dispatcher read them without
+//!   locking, but the executor writes them only while holding `life`, and
+//!   always together with `running`. The fence bumps the epoch and takes
+//!   `running` in one hold, which makes it the owner of the run's history
+//!   entry. A finishing task compares first (epoch still its own AND
+//!   `running` still holds its run id), and only then takes `running`,
+//!   publishes `last`, writes its history entry and frees `busy`, all in
+//!   one hold; if either comparison fails it leaves silently (no history,
+//!   no `last`, `busy` untouched), so a fenced task never clears state that
+//!   a newer run owns. The busy guard's drop does the same.
+//!   (`src-tauri`'s manual `execute_action` still flips `busy` itself
+//!   around a manual run, outside this lock; that code is not ours to
+//!   change, and `enqueue` only ever compare-exchanges `busy`.)
+//! * Lock order, only ever nested this way: `send_lock` → `life` →
+//!   `worker` → leaves (`fault`, `shared.last`, the history). Nothing takes
+//!   `send_lock` while holding `life`. `Runtime::record` never calls back
+//!   into the executor (it delivers events on its own thread), so it may
+//!   run under `life`.
 use super::actions::{
     begin_trace, current_stage, execute_with_proof, set_stage, stage_marks, Ports, Stage,
     StageMarks,
@@ -311,14 +331,39 @@ struct Worker {
     retired: Vec<JoinHandle<()>>,
 }
 
-/// The task on the worker. Whoever takes it out of `ExecutorCore::running`
-/// (the worker when the run ends, or the fence) writes its history entry,
-/// so each run is recorded exactly once.
+/// The task on the worker. Whoever takes it out of `Life::running` (the
+/// worker when the run ends, or the fence) writes its history entry, so
+/// each run is recorded exactly once.
 struct Running {
+    /// Unique per run, so a stale owner never matches a newer run of the
+    /// same epoch.
+    id: u64,
     epoch: u64,
     task: Task,
     started_at: Instant,
+    /// At least one event of the run was accepted (shared with its scope).
+    sent: Arc<AtomicBool>,
 }
+
+/// Lifecycle state behind `ExecutorCore::life`. The lock also guards every
+/// write of `ExecutorCore::epoch` and of `shared.busy` (see the module doc).
+#[derive(Default)]
+struct Life {
+    running: Option<Running>,
+}
+
+/// Points where a test can hold a thread (no-ops outside tests).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Pause {
+    /// In [`ExecutorCore::fence`]: epoch bumped and `running` taken, the
+    /// keys not yet released, the history entry not yet written.
+    FenceDecided,
+    /// In the busy guard: keys released, about to compare and clear.
+    GuardBeforeClear,
+}
+
+#[cfg(test)]
+type PauseHook = Arc<dyn Fn(Pause) + Send + Sync>;
 
 /// Keys (and mouse buttons, by their VK) that this program pressed and has
 /// not released yet. The executor only reaches the bitmap through this
@@ -398,7 +443,9 @@ pub(super) struct ExecutorCore {
     origin: Instant,
     /// Last progress of the running task, nanoseconds after `origin`.
     beat_ns: AtomicU64,
-    running: PlMutex<Option<Running>>,
+    /// The lifecycle lock over {epoch, running, busy}.
+    life: PlMutex<Life>,
+    next_id: AtomicU64,
     worker: PlMutex<Worker>,
     /// Serializes "check epoch, then send" against the fence.
     send_lock: PlMutex<()>,
@@ -408,9 +455,8 @@ pub(super) struct ExecutorCore {
     fault: PlMutex<Option<ReasonCode>>,
     /// Execution history (B-35); production uses `runtime::current()`.
     runtime: Arc<Runtime>,
-    /// The running task got at least one event accepted (for the history
-    /// entry the fence writes on its behalf).
-    task_sent: AtomicBool,
+    #[cfg(test)]
+    pause_hook: PlMutex<Option<PauseHook>>,
 }
 
 impl ExecutorCore {
@@ -431,21 +477,50 @@ impl ExecutorCore {
             release,
             budget,
             runtime,
-            task_sent: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
             held: Box::new(AtomicHeldKeys::default()),
             origin,
             beat_ns: AtomicU64::new(0),
-            running: PlMutex::new(None),
+            life: PlMutex::new(Life::default()),
+            next_id: AtomicU64::new(1),
             worker: PlMutex::new(Worker::default()),
             send_lock: PlMutex::new(()),
             clipboard_holder: AtomicU64::new(0),
             fault: PlMutex::new(None),
+            #[cfg(test)]
+            pause_hook: PlMutex::new(None),
         })
     }
 
     pub(super) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// Lets a test hold threads at the [`Pause`] points.
+    #[cfg(test)]
+    pub(super) fn on_pause(&self, hook: impl Fn(Pause) + Send + Sync + 'static) {
+        *self.pause_hook.lock() = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    fn pause(&self, at: Pause) {
+        let hook = self.pause_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook(at);
+        }
+    }
+
+    #[cfg(not(test))]
+    fn pause(&self, _at: Pause) {}
+
+    /// The running task as (run id, rule id) (tests).
+    #[cfg(test)]
+    pub(super) fn running_task(&self) -> Option<(u64, String)> {
+        self.life
+            .lock()
+            .running
+            .as_ref()
+            .map(|running| (running.id, running.task.rule_id.clone()))
     }
 
     #[cfg(all(test, feature = "fault-injection"))]
@@ -471,38 +546,46 @@ impl ExecutorCore {
     /// action runs, `skipped` while the executor waits for its rebuild.
     pub(super) fn enqueue(&self, candidate: Candidate) -> bool {
         let task = Task::of(&candidate, self.clock.now());
-        if self
-            .shared
-            .busy
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            self.runtime.record(task.record(
-                Verdict::new(Outcome::DroppedBusy, ReasonCode::DroppedBusy, false),
-                StageTimings::default(),
-            ));
-            return false;
-        }
-        self.shared.cancel.store(false, Ordering::SeqCst);
         let job = Job {
             candidate,
             task: task.clone(),
         };
-        let worker = self.worker.lock();
-        let queued = match worker.sender.as_ref() {
-            Some(sender) => sender.try_send(job).is_ok(),
-            None => false,
+        // `busy` is set and, when the queue is closed, reset in one hold of
+        // the lifecycle lock (life → worker).
+        let queued = {
+            let _life = self.life.lock();
+            if self
+                .shared
+                .busy
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                None
+            } else {
+                self.shared.cancel.store(false, Ordering::SeqCst);
+                let queued = self
+                    .worker
+                    .lock()
+                    .sender
+                    .as_ref()
+                    .is_some_and(|sender| sender.try_send(job).is_ok());
+                if !queued {
+                    self.shared.busy.store(false, Ordering::SeqCst);
+                }
+                Some(queued)
+            }
         };
-        drop(worker);
-        if !queued {
-            self.shared.busy.store(false, Ordering::SeqCst);
-            let reason = self.fault.lock().unwrap_or(ReasonCode::EngineDown);
-            self.runtime.record(task.record(
-                Verdict::new(Outcome::Skipped, reason, false),
-                StageTimings::default(),
-            ));
-        }
-        queued
+        let verdict = match queued {
+            Some(true) => return true,
+            None => Verdict::new(Outcome::DroppedBusy, ReasonCode::DroppedBusy, false),
+            Some(false) => {
+                let reason = self.fault.lock().unwrap_or(ReasonCode::EngineDown);
+                Verdict::new(Outcome::Skipped, reason, false)
+            }
+        };
+        self.runtime
+            .record(task.record(verdict, StageTimings::default()));
+        false
     }
 
     /// Makes the executor serve again. A live worker in the middle of a task
@@ -515,21 +598,24 @@ impl ExecutorCore {
         let Some(me) = self.me.upgrade() else {
             return Err("executor is shutting down".into());
         };
+        let mut life = self.life.lock();
         let mut worker = self.worker.lock();
         let alive =
             worker.sender.is_some() && worker.handle.as_ref().is_some_and(|h| !h.is_finished());
-        let running = self.running.lock().as_ref().map(|r| r.epoch);
-        match running {
+        match life.running.as_ref().map(|running| running.epoch) {
             Some(epoch) if alive && epoch == self.epoch() => {
                 drop(worker);
                 *self.fault.lock() = None;
+                drop(life);
                 tracing::info!(event = "executor.rebuilt", epoch, reused = true);
                 return Ok(());
             }
             Some(epoch) => {
                 // The worker died under a task: retire that task first.
                 drop(worker);
+                drop(life);
                 self.fence(epoch);
+                life = self.life.lock();
                 worker = self.worker.lock();
             }
             None => {}
@@ -547,6 +633,7 @@ impl ExecutorCore {
         worker.sender = Some(sender);
         drop(worker);
         *self.fault.lock() = None;
+        drop(life);
         tracing::info!(event = "executor.rebuilt", epoch, reused = false);
         Ok(())
     }
@@ -556,17 +643,22 @@ impl ExecutorCore {
     /// frees the busy flag and closes the queue until the next rebuild.
     /// False when the epoch had already moved on.
     pub(super) fn fence(&self, epoch: u64) -> bool {
+        // One hold of the lifecycle lock decides everything: the epoch moves
+        // on, `busy` is freed, the queue closes, and taking `running` makes
+        // this fence the only writer of the run's history entry.
+        let running = {
+            let mut life = self.life.lock();
+            if self.epoch() != epoch {
+                return false;
+            }
+            self.epoch.store(epoch + 1, Ordering::SeqCst);
+            self.shared.busy.store(false, Ordering::SeqCst);
+            self.worker.lock().sender = None;
+            *self.fault.lock() = Some(ReasonCode::ExecutorTimeout);
+            life.running.take()
+        };
+        self.pause(Pause::FenceDecided);
         let send = self.send_guard();
-        if self
-            .epoch
-            .compare_exchange(epoch, epoch + 1, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return false;
-        }
-        *self.fault.lock() = Some(ReasonCode::ExecutorTimeout);
-        self.worker.lock().sender = None;
-        let running = self.running.lock().take();
         let released = self.release_held();
         let send_lock_busy = send.is_none();
         drop(send);
@@ -574,7 +666,7 @@ impl ExecutorCore {
             // The stalled thread will never record this run itself. A send
             // still in flight (send lock held) may have reached the target.
             let now = self.clock.now();
-            let sent = self.task_sent.load(Ordering::SeqCst) || released > 0 || send_lock_busy;
+            let sent = running.sent.load(Ordering::SeqCst) || released > 0 || send_lock_busy;
             self.runtime.record(running.task.record(
                 Verdict::new(Outcome::Failed, ReasonCode::ExecutorTimeout, sent),
                 StageTimings {
@@ -584,7 +676,6 @@ impl ExecutorCore {
                 },
             ));
         }
-        self.shared.busy.store(false, Ordering::SeqCst);
         tracing::warn!(
             event = "executor.fenced",
             epoch = epoch + 1,
@@ -597,7 +688,13 @@ impl ExecutorCore {
 
     /// Fences the running task when it made no progress within the budget.
     fn fence_if_stalled(&self, now: Instant) {
-        let Some(epoch) = self.running.lock().as_ref().map(|running| running.epoch) else {
+        let running = self
+            .life
+            .lock()
+            .running
+            .as_ref()
+            .map(|running| running.epoch);
+        let Some(epoch) = running else {
             return;
         };
         if epoch != self.epoch() {
@@ -680,17 +777,21 @@ impl ExecutorCore {
         }
     }
 
-    /// Waits up to `timeout` for replaced worker threads to exit (tests).
+    /// Waits up to `timeout` for replaced worker threads, and a current one
+    /// whose queue is closed, to exit (tests).
     #[cfg(test)]
     pub(super) fn join_retired(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
-            let done = self
-                .worker
-                .lock()
-                .retired
-                .iter()
-                .all(JoinHandle::is_finished);
+            let done = {
+                let worker = self.worker.lock();
+                let closed = worker.handle.as_ref().filter(|_| worker.sender.is_none());
+                worker
+                    .retired
+                    .iter()
+                    .chain(closed)
+                    .all(JoinHandle::is_finished)
+            };
             if done {
                 return true;
             }
@@ -703,12 +804,9 @@ impl ExecutorCore {
 
     fn work(self: Arc<Self>, jobs: mpsc::Receiver<Job>, epoch: u64) {
         for job in jobs {
-            if self.epoch() != epoch {
-                break;
-            }
             self.run(job, epoch);
             if self.epoch() != epoch {
-                // Fenced while running: the fence already cleaned up.
+                // Fenced: the fence already cleaned up.
                 tracing::info!(event = "executor.retired", epoch);
                 break;
             }
@@ -718,17 +816,39 @@ impl ExecutorCore {
     fn run(self: &Arc<Self>, job: Job, epoch: u64) {
         let Job { candidate, task } = job;
         let started = self.clock.now();
-        self.task_sent.store(false, Ordering::SeqCst);
-        *self.running.lock() = Some(Running {
-            epoch,
-            task,
-            started_at: started,
-        });
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let sent = Arc::new(AtomicBool::new(false));
+        {
+            let mut life = self.life.lock();
+            if self.epoch() != epoch {
+                // Queued just before a fence, which already freed `busy`.
+                drop(life);
+                let reason = self.fault.lock().unwrap_or(ReasonCode::ExecutorTimeout);
+                self.runtime.record(task.record(
+                    Verdict::new(Outcome::Skipped, reason, false),
+                    StageTimings::default(),
+                ));
+                return;
+            }
+            life.running = Some(Running {
+                id,
+                epoch,
+                task,
+                started_at: started,
+                sent: Arc::clone(&sent),
+            });
+        }
         self.beat();
-        let guard = BusyGuard { core: self, epoch };
+        let mut guard = BusyGuard {
+            core: self,
+            epoch,
+            id,
+            done: false,
+        };
         let scope = Arc::new(TaskScope {
             core: Arc::clone(self),
             epoch,
+            sent,
         });
         let installed = ScopeLease::install(Arc::clone(&scope));
         begin_trace();
@@ -736,9 +856,7 @@ impl ExecutorCore {
         let outcome = catch_unwind(AssertUnwindSafe(|| (self.runner)(&candidate, &scope)));
         drop(installed);
         let end = self.clock.now();
-        let current = self.epoch() == epoch;
         let stage = current_stage();
-        let sent = SENT_EFFECT.with(Cell::get) || self.task_sent.load(Ordering::SeqCst);
         let mut panicked = false;
         let result = match outcome {
             Ok(report) => report.result,
@@ -758,86 +876,117 @@ impl ExecutorCore {
                     epoch,
                     "executor task panicked; the worker keeps serving"
                 );
-                if current {
+                if self.epoch() == epoch {
                     *self.fault.lock() = Some(ReasonCode::ExecutorPanic);
                 }
                 Err("Executor task panicked; stopped".into())
             }
         };
-        // Record exactly once: whoever takes `running` owns the history entry.
-        // A fenced task finds it gone (the fence recorded ExecutorTimeout).
-        let running = {
-            let mut slot = self.running.lock();
-            if slot.as_ref().is_some_and(|r| r.epoch == epoch) {
-                slot.take()
-            } else {
-                None
-            }
+        let released = guard.release();
+        let sent = SENT_EFFECT.with(Cell::get) || scope.sent.load(Ordering::SeqCst) || released > 0;
+        let verdict = if panicked {
+            Verdict::new(Outcome::Failed, ReasonCode::ExecutorPanic, sent)
+        } else {
+            classify(&result, stage, sent)
         };
-        let owned = running.is_some();
-        if let Some(running) = running {
-            let verdict = if panicked {
-                Verdict::new(Outcome::Failed, ReasonCode::ExecutorPanic, sent)
-            } else {
-                classify(&result, stage, sent)
-            };
-            let timings = stage_timings(
-                Some(running.task.queued_at),
-                running.started_at,
-                end,
-                &stage_marks(),
-            );
-            self.runtime.record(running.task.record(verdict, timings));
-        }
-        if owned && self.epoch() == epoch {
-            let id = format!("{}:{}", candidate.rule.id, candidate.generation);
-            let last = match result {
-                Ok(mut completed) => {
-                    completed.id = id;
-                    completed
-                }
-                Err(message) => ExecutionResult {
-                    id,
-                    status: "failed".into(),
-                    message,
-                    completed_steps: 0,
-                    side_effects: false,
-                },
-            };
-            *self
-                .shared
-                .last
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = Some(last);
-        }
-        drop(guard);
+        let id = format!("{}:{}", candidate.rule.id, candidate.generation);
+        let last = match result {
+            Ok(mut completed) => {
+                completed.id = id;
+                completed
+            }
+            Err(message) => ExecutionResult {
+                id,
+                status: "failed".into(),
+                message,
+                completed_steps: 0,
+                side_effects: false,
+            },
+        };
+        guard.settle(verdict, Some(last), end);
     }
 }
 
-/// Ends a task: frees the busy flag, releases keys the task still holds
-/// (MARK key-ups) and returns a clipboard claim it never gave back. Runs on
-/// normal return and on unwind; does nothing once the task was fenced,
-/// because the fence did all of it (and a newer task may own them now).
+/// Ends a task in two steps, each comparing before it clears, so the guard
+/// of a fenced (or otherwise replaced) task never touches a newer run.
+/// * [`release`](Self::release): under the send lock, and only while the
+///   epoch is still the task's, the MARK key-ups for keys it left pressed;
+///   then its clipboard claim (its own token only) goes back.
+/// * [`settle`](Self::settle): under `life`, only if the epoch is still the
+///   task's AND `running` still holds its run id: takes `running`,
+///   publishes `last`, writes the history entry and frees `busy`, in one
+///   hold. Otherwise it leaves silently: no history, no `last`, `busy`
+///   untouched (the fence recorded the run and freed `busy`).
+///
+/// Dropped before `settle` (unwinding) it does both, recording the run as
+/// failed (`Internal`).
 struct BusyGuard<'a> {
     core: &'a ExecutorCore,
     epoch: u64,
+    id: u64,
+    done: bool,
 }
 
-impl Drop for BusyGuard<'_> {
-    fn drop(&mut self) {
+impl BusyGuard<'_> {
+    /// Releases what the task still holds; the number of key-ups sent.
+    fn release(&self) -> usize {
         let core = self.core;
         let send = core.send_guard();
-        if core.epoch() != self.epoch {
-            return;
-        }
-        core.release_held();
+        let released = if core.epoch() == self.epoch {
+            core.release_held()
+        } else {
+            0
+        };
         drop(send);
         let token = self.epoch + 1;
         let _ =
             core.clipboard_holder
                 .compare_exchange(token, 0, Ordering::SeqCst, Ordering::SeqCst);
-        core.running.lock().take();
+        released
+    }
+
+    fn settle(&mut self, verdict: Verdict, last: Option<ExecutionResult>, end: Instant) {
+        self.done = true;
+        let core = self.core;
+        core.pause(Pause::GuardBeforeClear);
+        let mut life = core.life.lock();
+        if core.epoch() != self.epoch {
+            return;
+        }
+        let Some(running) = life.running.take_if(|running| running.id == self.id) else {
+            return;
+        };
+        if let Some(last) = last {
+            *core
+                .shared
+                .last
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(last);
+        }
+        let timings = stage_timings(
+            Some(running.task.queued_at),
+            running.started_at,
+            end,
+            &stage_marks(),
+        );
+        core.runtime.record(running.task.record(verdict, timings));
         core.shared.busy.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let released = self.release();
+        tracing::error!(event = "executor.unwound", epoch = self.epoch, released);
+        let end = self.core.clock.now();
+        self.settle(
+            Verdict::new(Outcome::Failed, ReasonCode::Internal, true),
+            None,
+            end,
+        );
     }
 }
 
@@ -845,6 +994,8 @@ impl Drop for BusyGuard<'_> {
 pub(super) struct TaskScope {
     core: Arc<ExecutorCore>,
     epoch: u64,
+    /// At least one event was accepted (shared with `Running::sent`).
+    sent: Arc<AtomicBool>,
 }
 
 impl TaskScope {
@@ -935,6 +1086,12 @@ pub(super) fn checkpoint() -> Result<(), String> {
     SCOPE.with(|slot| slot.borrow().as_ref().map_or(Ok(()), |scope| scope.check()))
 }
 
+/// True on a worker thread while it runs an executor task. Such a task
+/// publishes its result through its busy guard, under the lifecycle lock.
+pub(super) fn in_task() -> bool {
+    SCOPE.with(|slot| slot.borrow().is_some())
+}
+
 /// Injector of one task: re-checks the epoch before every send (refusing
 /// with 0 accepted events once it changed, which fail-stops the run) and
 /// mirrors pressed keys and buttons into [`HeldKeys`]. The epoch fence lives
@@ -958,7 +1115,7 @@ impl<I: Injector> Fenced<'_, I> {
         let accepted = send();
         if accepted > 0 {
             // Side effects of a run the fence may have to record.
-            core.task_sent.store(true, Ordering::SeqCst);
+            self.scope.sent.store(true, Ordering::SeqCst);
         }
         settle(accepted);
         accepted

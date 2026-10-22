@@ -628,8 +628,9 @@ where
         completed_steps: completed,
         side_effects: SENT_EFFECT.with(|flag| flag.get()) || completed > 0,
     };
-    // A task fenced by the supervisor no longer owns the "last result".
-    if super::executor::checkpoint().is_ok() {
+    // An executor task publishes its result itself, from its busy guard and
+    // only while it still owns the run (B-01); manual runs publish here.
+    if !super::executor::in_task() {
         *s.last
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.clone());
