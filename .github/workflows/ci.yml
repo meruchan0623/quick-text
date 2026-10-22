@@ -61,6 +61,13 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
+      # S-02 / B-02: the hook and RawInput callback modules must keep their module-level
+      # #![deny(clippy::unwrap_used, ...)]. It is the only thing that still enforces those
+      # lints in them, because the clippy step below passes -A for two of them.
+      # Fails when crates/platform/src/windows/{hook,rawinput}.rs are missing.
+      - name: Hook-module lints (S-02)
+        run: pwsh -NoProfile -File scripts/check-hook-lints.ps1
+
       # 0.5 removes the two -A flags (plan section 7.5).
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings -A clippy::unwrap_used -A clippy::expect_used
