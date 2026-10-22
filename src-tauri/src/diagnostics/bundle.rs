@@ -18,15 +18,19 @@ use super::{
     logging::{log_dir, FILE_PREFIX, FILE_SUFFIX, MAX_LOG_FILES},
     redact::redact_user_paths,
 };
-use crate::store::prefs::{civil_from_days, utc_stamp};
+use crate::store::{
+    prefs::{civil_from_days, utc_stamp},
+    replace_file,
+};
 use quicker_domain::{compile_config, Config, Severity};
 use quicker_platform::{health::HealthSnapshot, Capability, ExecutionResult};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
     fs,
     io::{self, Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
     time::SystemTime,
 };
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
@@ -215,28 +219,80 @@ pub fn build_bundle<W: Write + Seek>(
     Ok((writer, bundle.entries))
 }
 
-/// [`build_bundle`] into a new file at `target`, removed again if building
-/// fails.
+/// [`build_bundle`] into `target`. The zip goes to a fresh temp file beside
+/// it (`.<name>.<pid>.<random>.tmp`), is synced, then moved over `target` in
+/// one step: a file already at `target` is either kept byte for byte or
+/// replaced by a complete bundle. On failure only the temp file is removed.
 pub fn write_bundle_file(
     target: &Path,
     data_dir: &Path,
     redaction: Redaction,
     snapshot: &Snapshot,
 ) -> io::Result<Vec<String>> {
-    let file = fs::File::create(target)?;
-    let written = build_bundle(data_dir, redaction, io::BufWriter::new(file), snapshot).and_then(
-        |(writer, entries)| {
-            writer
-                .into_inner()
-                .map_err(io::IntoInnerError::into_error)?
-                .sync_all()?;
-            Ok(entries)
-        },
-    );
+    write_replacing(target, |file| file, data_dir, redaction, snapshot)
+}
+
+/// The temp file [`write_bundle_file`] writes into; tests wrap it to inject
+/// write and sync failures.
+trait DurableWrite: Write + Seek {
+    fn sync(&mut self) -> io::Result<()>;
+}
+
+impl DurableWrite for fs::File {
+    fn sync(&mut self) -> io::Result<()> {
+        self.sync_all()
+    }
+}
+
+fn write_replacing<S: DurableWrite>(
+    target: &Path,
+    wrap: impl FnOnce(fs::File) -> S,
+    data_dir: &Path,
+    redaction: Redaction,
+    snapshot: &Snapshot,
+) -> io::Result<Vec<String>> {
+    let (temp, file) = create_temp_beside(target)?;
+    let written = build_bundle(
+        data_dir,
+        redaction,
+        io::BufWriter::new(wrap(file)),
+        snapshot,
+    )
+    .and_then(|(writer, entries)| {
+        let mut sink = writer
+            .into_inner()
+            .map_err(io::IntoInnerError::into_error)?;
+        sink.sync()?;
+        // The handle must be closed before Windows lets the file move.
+        drop(sink);
+        replace_file(&temp, target)?;
+        Ok(entries)
+    });
     if written.is_err() {
-        let _ = fs::remove_file(target);
+        let _ = fs::remove_file(&temp);
     }
     written
+}
+
+/// A new, uniquely named file in the directory of `target`, so the final
+/// move stays on one volume and never clobbers anything but `target`.
+fn create_temp_beside(target: &Path) -> io::Result<(PathBuf, fs::File)> {
+    let name = target.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the bundle target has no file name",
+        )
+    })?;
+    let random = uuid::Uuid::new_v4().simple().to_string();
+    let mut temp_name = OsString::from(".");
+    temp_name.push(name);
+    temp_name.push(format!(".{}.{}.tmp", std::process::id(), &random[..12]));
+    let temp = target.with_file_name(temp_name);
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    Ok((temp, file))
 }
 
 struct Bundle<'a, W: Write + Seek> {
@@ -875,6 +931,119 @@ mod tests {
         assert!(write_bundle_file(&blocked, &dir, Redaction::Summary, &snapshot(&[])).is_err());
         assert!(!blocked.exists());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The temp file, failing on demand.
+    struct Faulty {
+        file: fs::File,
+        /// Bytes accepted before every write fails; `None` never fails.
+        write_budget: Option<usize>,
+        fail_sync: bool,
+    }
+
+    impl Write for Faulty {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            match &mut self.write_budget {
+                Some(0) => Err(io::Error::other("injected write failure")),
+                Some(left) => {
+                    let n = self.file.write(&buf[..buf.len().min(*left)])?;
+                    *left -= n;
+                    Ok(n)
+                }
+                None => self.file.write(buf),
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.file.flush()
+        }
+    }
+
+    impl Seek for Faulty {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.file.seek(pos)
+        }
+    }
+
+    impl DurableWrite for Faulty {
+        fn sync(&mut self) -> io::Result<()> {
+            if self.fail_sync {
+                return Err(io::Error::other("injected sync failure"));
+            }
+            self.file.sync_all()
+        }
+    }
+
+    fn names_in(dir: &Path) -> BTreeSet<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_failed_write_or_sync_keeps_the_existing_bundle_and_removes_the_temp_file() {
+        const OLD: &[u8] = b"the previous bundle, byte for byte";
+        let data = populated_dir();
+        let out = temp_dir();
+        let target = out.join("bundle.zip");
+        let only_target = BTreeSet::from(["bundle.zip".to_string()]);
+        for (case, write_budget, fail_sync) in [("write", Some(100), false), ("sync", None, true)] {
+            fs::write(&target, OLD).unwrap();
+            let mut during = BTreeSet::new();
+            let result = write_replacing(
+                &target,
+                |file| {
+                    during = names_in(&out);
+                    Faulty {
+                        file,
+                        write_budget,
+                        fail_sync,
+                    }
+                },
+                &data,
+                Redaction::Summary,
+                &snapshot(&[]),
+            );
+            let error = result.expect_err(case);
+            assert!(
+                format!("{error} {error:?}").contains(&format!("injected {case} failure")),
+                "{case}: {error:?}"
+            );
+            assert_eq!(fs::read(&target).unwrap(), OLD, "{case}");
+            assert_eq!(names_in(&out), only_target, "{case}");
+            // The temp file sat beside the target while it was written.
+            let temps: Vec<_> = during.difference(&only_target).collect();
+            let prefix = format!(".bundle.zip.{}.", std::process::id());
+            assert!(
+                temps.len() == 1 && temps[0].starts_with(&prefix) && temps[0].ends_with(".tmp"),
+                "{case}: {during:?}"
+            );
+        }
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(out).unwrap();
+    }
+
+    #[test]
+    fn an_export_replaces_the_target_whole_or_not_at_all() {
+        let data = populated_dir();
+        let out = temp_dir();
+        let target = out.join("bundle.zip");
+        let only_target = BTreeSet::from(["bundle.zip".to_string()]);
+        fs::write(&target, b"the previous bundle").unwrap();
+        let entries =
+            write_bundle_file(&target, &data, Redaction::Summary, &snapshot(&[])).unwrap();
+        assert_eq!(unzip(fs::read(&target).unwrap()).len(), entries.len());
+        assert_eq!(names_in(&out), only_target);
+        // A target the move cannot replace (a directory) keeps it, and the
+        // finished temp file is removed.
+        fs::remove_file(&target).unwrap();
+        fs::create_dir(&target).unwrap();
+        assert!(write_bundle_file(&target, &data, Redaction::Summary, &snapshot(&[])).is_err());
+        assert!(target.is_dir());
+        assert_eq!(names_in(&out), only_target);
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_dir_all(out).unwrap();
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Crash-safe writes: temp file + fsync + atomic replace.
 use crate::error::{CommandError, IoOp};
 use serde::Serialize;
-use std::{fs, path::Path};
+use std::{fs, io, path::Path};
 
 pub fn atomic_json<T: Serialize + ?Sized>(path: &Path, config: &T) -> Result<(), CommandError> {
     let tmp = path.with_extension("json.tmp");
@@ -12,21 +12,27 @@ pub fn atomic_json<T: Serialize + ?Sized>(path: &Path, config: &T) -> Result<(),
     f.write_all(&bytes).map_err(write)?;
     f.sync_all().map_err(write)?;
     drop(f);
+    replace_file(&tmp, path).map_err(|e| CommandError::io(IoOp::Rename, Some(path), &e))
+}
+
+/// Moves `from` over `to` in one step, replacing `to` if it exists:
+/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` on
+/// Windows, `rename` elsewhere. Readers see either the old or the new file.
+pub fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
-        let from: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
-        let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
         unsafe {
             if windows_replace(from.as_ptr(), to.as_ptr()) == 0 {
-                let e = std::io::Error::last_os_error();
-                return Err(CommandError::io(IoOp::Rename, Some(path), &e));
+                return Err(io::Error::last_os_error());
             }
         }
+        Ok(())
     }
     #[cfg(not(windows))]
-    fs::rename(tmp, path).map_err(|e| CommandError::io(IoOp::Rename, Some(path), &e))?;
-    Ok(())
+    fs::rename(from, to)
 }
 #[cfg(windows)]
 #[link(name = "kernel32")]
