@@ -53,6 +53,11 @@ const LOAD_ATTEMPTS = 3;
 const OVERTAKEN = '读取期间状态一再变化，读到的内容已过时';
 const REFRESH_OVERTAKEN = `${OVERTAKEN}，这次没有刷新。请再点一次「刷新状态」。`;
 const NOT_READY = '还没有读取到当前配置，暂时不能修改指令和设置。';
+// A store revision this window has not read yet is read this many times in all, the retries
+// RECONCILE_RETRY_MS apart and doubling, before a notice offers 「重新读取」 (review C5).
+const RECONCILE_ATTEMPTS = 3;
+const RECONCILE_RETRY_MS = 400;
+const STALE_READ = '读到的仍是较早的版本';
 /** Commands that write the store and answer with the whole state. */
 type StoreWrite = 'save_draft' | 'apply_settings' | 'discard_draft' | 'rollback';
 function Field({
@@ -204,10 +209,14 @@ export default function App() {
       setEditing({ ...editing, trigger_mode: value, ...(cache ?? {}) });
     }
   };
-  // The revision of the state the editor's config was taken from, and a newer one that arrived
-  // while the editor held unsaved edits (shown as a notice until the user decides).
+  // The revision of the state the editor's config was taken from, and a newer one the editor has
+  // not taken in, shown as a notice until the user decides: one a load read while the editor held
+  // unsaved edits, or one whose draft a save then replaced (`saved`; save_draft has no revision
+  // check). Saving, applying and the other answers leave the notice standing (review C5); it goes
+  // with its buttons, or when the editor takes in the store's config: a load of a later revision,
+  // 放弃未应用草稿, 恢复上一个版本.
   const editorRevision = useRef<number | null>(null);
-  const [newerRevision, setNewerRevision] = useState<number | null>(null);
+  const [newer, setNewer] = useState<{ revision: number; saved: boolean } | null>(null);
   const receive = (s: State) => {
     setState(s);
     // A rule field with a serde default may be absent; the editor reads it filled in, as Rust does.
@@ -218,7 +227,6 @@ export default function App() {
     setLocalDirty(false);
     edited.current = false;
     editorRevision.current = s.revision;
-    setNewerRevision(null);
   };
   // Review C2: counts the times state was set from a command's answer (set_paused, set_autostart,
   // set_auto_listen, save_draft, discard_draft, rollback, apply_settings). A load_state sent before
@@ -232,6 +240,17 @@ export default function App() {
     answers.current += 1;
     setState(update);
   };
+  // Review C5: the store revision this window has caught up with, by an installed load_state or by
+  // the answer of a write that made that revision (apply_settings, rollback) or took the active one
+  // in (discard_draft). Not by save_draft or set_paused: they answer with the active revision, but
+  // the editor has not taken its config in, so a revision published elsewhere would pass as read.
+  const [reconciled, setReconciled] = useState<number | null>(null);
+  const reconciledRef = useRef<number | null>(null);
+  const reconcileTo = (revision: number) => {
+    if (reconciledRef.current !== null && reconciledRef.current >= revision) return;
+    reconciledRef.current = revision;
+    setReconciled(revision);
+  };
   // This window's writes of the store in flight. The store-state a write causes may arrive before
   // its answer; the answer carries the new revision, so no reload is needed for it (see below).
   const [writing, setWriting] = useState(0);
@@ -239,7 +258,23 @@ export default function App() {
     setWriting((n) => n + 1);
     try {
       const s = await call<State>(command, args);
+      const base = editorRevision.current;
       receiveAnswer(s);
+      if (command === 'save_draft') {
+        // Active revision newer than the editor's config: the save replaced the draft of a revision
+        // this window never took in. Said until acknowledged, as is a save over a notice standing.
+        setNewer((n) =>
+          n !== null
+            ? { revision: Math.max(n.revision, s.revision), saved: true }
+            : base !== null && s.revision > base
+              ? { revision: s.revision, saved: true }
+              : null,
+        );
+      } else {
+        reconcileTo(s.revision);
+        // Rollback and discard_draft put the store's config in the editor, applying keeps it.
+        if (command !== 'apply_settings') setNewer(null);
+      }
       return s;
     } finally {
       // In the same step as the answer, so no render sees the write done without its answer.
@@ -268,13 +303,21 @@ export default function App() {
   const editable = ready && safeMode === null;
   /** Apply a load_state snapshot; the first one initializes the editor and unlocks the writes. */
   const applySnapshot = (s: State) => {
+    reconcileTo(s.revision);
     if (loaded.current) {
-      if (!edited.current) receive(s);
-      else {
+      if (!edited.current) {
+        receive(s);
+        // A later revision is in the editor now: a notice about an earlier one is moot.
+        setNewer((n) => (n !== null && s.revision > n.revision ? null : n));
+      } else {
         // Unsaved local edits are kept, never replaced by a load. When the store moved on under
         // them, say so; the user loads the new config or keeps editing (and saving overwrites).
         setState(s);
-        if (s.revision !== editorRevision.current) setNewerRevision(s.revision);
+        const base = editorRevision.current;
+        if (base !== null && s.revision > base)
+          setNewer((n) =>
+            n !== null && n.revision >= s.revision ? n : { revision: s.revision, saved: false },
+          );
       }
       return;
     }
@@ -290,12 +333,22 @@ export default function App() {
    * carries would otherwise stay stale until the next focus. A load sent after a command answered
    * reads that command's change, so the next answer applies. The check and the apply run in one
    * step after the answer arrives, with nothing in between.
+   *
+   * Loads overlap (start, focus, 「刷新状态」, a revision read): each load_state takes the next read
+   * id. One answering after a later one was applied read the store before that one did: it is
+   * dropped, and resolves as applied, the later one standing for it (review C5).
    */
+  const reads = useRef(0);
+  const appliedRead = useRef(0);
   const load = async (): Promise<boolean> => {
     for (let attempt = 0; attempt < LOAD_ATTEMPTS; attempt++) {
+      reads.current += 1;
+      const read = reads.current;
       const generation = answers.current;
       const s = await call<State>('load_state');
+      if (read < appliedRead.current) return true;
       if (generation === answers.current) {
+        appliedRead.current = read;
         applySnapshot(s);
         return true;
       }
@@ -354,23 +407,68 @@ export default function App() {
     window.addEventListener('focus', onFocus);
     return () => window.removeEventListener('focus', onFocus);
   }, []);
-  // store-state moved the revision (runtime.revision): a change this window did not make (another
-  // window, a background Locked retry) is read with load_state. Each new revision is looked at
-  // once, when the first load has applied and no write of this window is in flight: a write's
-  // answer carries the revision it made, so its own store-state then matches and nothing is read.
-  // A backend without store-state moves runtime.revision only with a snapshot.
-  const storeRevision = runtime.revision;
-  const loadedRevision = state?.revision;
-  const seenRevision = useRef<number | null>(null);
+  // store-state moved the revision (runtime.revision, the target): a change this window did not
+  // make (another window, a background Locked retry) is read with load_state until `reconciled`
+  // reaches it (review C5). Read once the first load has applied and while no write of this window
+  // is in flight (its answer carries the revision it made, so its own store-state is caught up with
+  // and nothing is read), one read at a time: a target moving meanwhile is read after it. A read
+  // that fails, is overtaken every time or reaches less than the target it was sent for is retried
+  // after a pause; after RECONCILE_ATTEMPTS a notice says so until a load catches up (「重新读取」,
+  // focus) or a write of this window makes a revision as new. Never a loop: each read is sent for
+  // a target and either reaches it or counts as failed. A backend without store-state moves
+  // runtime.revision only with a snapshot.
+  const target = runtime.revision;
+  const behind = ready && target !== null && (reconciled === null || reconciled < target);
+  // Why the last read for the target failed, once the retries ran out; cleared when caught up.
+  const [readFailure, setReadFailure] = useState<string | null>(null);
+  if (readFailure !== null && !behind) setReadFailure(null);
+  const reconciling = useRef<{
+    reading: boolean;
+    failures: number;
+    retry: ReturnType<typeof setTimeout> | undefined;
+  }>({ reading: false, failures: 0, retry: undefined });
+  const [reconcileTick, setReconcileTick] = useState(0);
   useEffect(() => {
-    if (!ready || writing > 0 || storeRevision === null) return;
-    if (seenRevision.current === storeRevision) return;
-    seenRevision.current = storeRevision;
-    if (loadedRevision === storeRevision) return;
-    reloadRef.current().catch(() => {
-      // As on focus: the last known state stays; 「刷新状态」 reports errors.
-    });
-  }, [ready, writing, storeRevision, loadedRevision]);
+    const r = reconciling.current;
+    if (!behind) {
+      r.failures = 0;
+      return;
+    }
+    if (writing > 0 || r.reading || r.retry !== undefined || r.failures >= RECONCILE_ATTEMPTS)
+      return;
+    r.reading = true;
+    void reloadRef
+      .current()
+      .then(
+        (applied) => (applied ? null : OVERTAKEN),
+        (e: unknown) => errorText(e) || '读取被中断',
+      )
+      .then((failure) => {
+        r.reading = false;
+        const reached = reconciledRef.current !== null && reconciledRef.current >= target;
+        if (failure === null && reached) r.failures = 0;
+        else {
+          r.failures += 1;
+          if (r.failures >= RECONCILE_ATTEMPTS) setReadFailure(failure ?? STALE_READ);
+          else
+            r.retry = setTimeout(
+              () => {
+                r.retry = undefined;
+                setReconcileTick((t) => t + 1);
+              },
+              RECONCILE_RETRY_MS * 2 ** (r.failures - 1),
+            );
+        }
+        // Look again: the target may have moved on, or not been reached.
+        setReconcileTick((t) => t + 1);
+      });
+  }, [behind, target, writing, reconcileTick]);
+  useEffect(() => {
+    const r = reconciling.current;
+    return () => clearTimeout(r.retry);
+  }, []);
+  // The revision the notice says could not be read.
+  const unread = readFailure !== null && behind ? target : null;
   const refresh = () =>
     run(async () => {
       const applied = await reload();
@@ -628,21 +726,42 @@ export default function App() {
           </button>
         </div>
       )}
-      {newerRevision !== null && (
+      {unread !== null && (
+        // Not blocking either: were saving refused until a read succeeds, failing reads would lock
+        // the editor. Saving is not silent: the notice stands until a load catches up.
+        <div className="alert notice" role="status">
+          {`后台配置已更新为 v${unread}，但未能读取最新配置（${readFailure ?? ''}）。此时保存会以编辑器中的配置覆盖后台较新的配置。`}
+          <button disabled={busy} onClick={refresh}>
+            重新读取
+          </button>
+        </div>
+      )}
+      {newer !== null && (
         // Not blocking: the editor stays usable, and nothing changes until the user picks one.
         <div className="alert notice" role="status">
-          {`配置已在后台更新为 v${newerRevision}。编辑器中未保存的修改仍然保留，保存时会以它们覆盖草稿。`}
+          {newer.saved
+            ? `配置已在后台更新为 v${newer.revision}，保存已用编辑器中的配置覆盖了它的草稿。`
+            : `配置已在后台更新为 v${newer.revision}。编辑器中未保存的修改仍然保留，保存时会以它们覆盖草稿。`}
           <button
             onClick={() => {
-              editorRevision.current = newerRevision;
-              setNewerRevision(null);
+              editorRevision.current = Math.max(editorRevision.current ?? 0, newer.revision);
+              setNewer(null);
             }}
           >
-            保留我的修改
+            {newer.saved ? '知道了' : '保留我的修改'}
           </button>
-          <button disabled={busy || !state} onClick={() => state && receive(state)}>
-            放弃修改，载入新配置
-          </button>
+          {!newer.saved && (
+            <button
+              disabled={busy || !state}
+              onClick={() => {
+                if (!state) return;
+                receive(state);
+                setNewer(null);
+              }}
+            >
+              放弃修改，载入新配置
+            </button>
+          )}
         </div>
       )}
       {error && (

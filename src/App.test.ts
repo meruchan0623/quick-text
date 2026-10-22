@@ -1228,6 +1228,258 @@ describe('store revision and safe mode pushed with store-state', () => {
   });
 });
 
+describe('catching up with a revision published elsewhere (review C5)', () => {
+  const UNREAD = '未能读取最新配置';
+  const LOAD_FAILURE = '桌面引擎没有响应';
+  const OVERWRITTEN = '配置已在后台更新为 v2，保存已用编辑器中的配置覆盖了它的草稿';
+  const revisionText = (container: HTMLElement) =>
+    container.querySelector('.revision')?.textContent ?? '';
+  const notices = (container: HTMLElement) =>
+    [...container.querySelectorAll('.alert.notice')].map((n) => n.textContent).join('\n');
+  const separators = (container: HTMLElement) => field(container, '词分隔符').value;
+  const focus = (mounted: Mounted) =>
+    mounted.act(() => {
+      window.dispatchEvent(new Event('focus'));
+    });
+  /** Long enough for every retry a failed read could still have pending. */
+  const outwait = (mounted: Mounted) =>
+    mounted.act(() => new Promise((resolve) => setTimeout(resolve, 1000)));
+
+  /** Mount, load_state holdable when `hold` is given, and wait until the config is read. */
+  async function mountReady(hold?: LoadHold): Promise<Mounted> {
+    const mounted = await mount({}, (backend) => {
+      hold?.attach(backend);
+    });
+    await waitFor(mounted, () => {
+      expect(statusText(mounted.container)).toContain('已连接');
+      expect(callsOf(mounted.backend, 'startup_problems')).toHaveLength(1);
+    });
+    await settle(mounted);
+    return mounted;
+  }
+
+  /** Make the next `count` load_state calls reject. */
+  function failLoads(backend: MockBackend, count: number): void {
+    const handle = backend.handle.bind(backend);
+    let left = count;
+    backend.handle = (...[command, args]: Parameters<MockBackend['handle']>) => {
+      if (command === 'load_state' && left > 0) {
+        left -= 1;
+        backend.failures.set('load_state', LOAD_FAILURE);
+      }
+      return handle(command, args);
+    };
+  }
+
+  /** Another window publishes a revision with these word separators. */
+  const publish = (mounted: Mounted, value: string) =>
+    mounted.act(() => {
+      mounted.backend.publishExternally((config) => {
+        config.globals.word_separators = value;
+      });
+    });
+
+  it('retries a failed read of the new revision and then shows it', async () => {
+    const mounted = await mountReady();
+    const { backend, container } = mounted;
+    await click(mounted, '文本指令参数设置');
+    failLoads(backend, 1);
+    await publish(mounted, ',');
+    await waitFor(mounted, () => {
+      expect(separators(container)).toBe(',');
+    });
+    expect(revisionText(container)).toContain('当前生效 v2');
+    // The first load, the read that failed, the retry.
+    expect(callsOf(backend, 'load_state')).toHaveLength(3);
+    expect(notices(container)).toBe('');
+  });
+
+  it('says the new revision could not be read once the retries run out, until it is', async () => {
+    const mounted = await mountReady();
+    const { backend, container } = mounted;
+    await click(mounted, '文本指令参数设置');
+    const before = separators(container);
+    failLoads(backend, 3);
+    await publish(mounted, ',');
+    await waitFor(
+      mounted,
+      () => {
+        expect(notices(container)).toContain(`后台配置已更新为 v2，但${UNREAD}（${LOAD_FAILURE}）`);
+      },
+      3000,
+    );
+    expect(notices(container)).toContain('此时保存会以编辑器中的配置覆盖后台较新的配置');
+    expect(callsOf(backend, 'load_state')).toHaveLength(4);
+    expect(separators(container)).toBe(before);
+    expect(revisionText(container)).toContain('当前生效 v1');
+    // Not blocking: saving stays possible. And no more reads by themselves.
+    expect(button(container, '保存参数草稿')?.disabled).toBe(false);
+    await outwait(mounted);
+    expect(callsOf(backend, 'load_state')).toHaveLength(4);
+    await click(mounted, '重新读取');
+    await waitFor(mounted, () => {
+      expect(separators(container)).toBe(',');
+    });
+    expect(notices(container)).toBe('');
+    expect(revisionText(container)).toContain('当前生效 v2');
+    expect(callsOf(backend, 'load_state')).toHaveLength(5);
+  });
+
+  it('reads a bounded number of times while load_state answers an earlier revision', async () => {
+    const mounted = await mountReady();
+    const { backend, container } = mounted;
+    // store-state says v2; load_state keeps answering v1, as a backend lagging behind its event.
+    const handle = backend.handle.bind(backend);
+    backend.handle = async (...[command, args]: Parameters<MockBackend['handle']>) => {
+      const answer = await handle(command, args);
+      return command === 'load_state' ? { ...(answer as object), revision: 1 } : answer;
+    };
+    await publish(mounted, ',');
+    await waitFor(
+      mounted,
+      () => {
+        expect(notices(container)).toContain(`${UNREAD}（读到的仍是较早的版本）`);
+      },
+      3000,
+    );
+    await outwait(mounted);
+    expect(callsOf(backend, 'load_state')).toHaveLength(4);
+  });
+
+  it('reads one revision at a time and then the one that arrived meanwhile', async () => {
+    const hold = holdLoads();
+    const mounted = await mountReady(hold);
+    const { backend, container } = mounted;
+    await click(mounted, '文本指令参数设置');
+    hold.arm();
+    await publish(mounted, ',');
+    await waitFor(mounted, () => {
+      expect(hold.held[0]?.read).toBe(true);
+    });
+    await publish(mounted, '|');
+    await settle(mounted);
+    // v3 only moves the target while the read of v2 is on its way.
+    expect(callsOf(backend, 'load_state')).toHaveLength(2);
+    await answerHeld(mounted, hold, 0);
+    await waitFor(mounted, () => {
+      expect(separators(container)).toBe('|');
+    });
+    expect(revisionText(container)).toContain('当前生效 v3');
+    expect(callsOf(backend, 'load_state')).toHaveLength(3);
+  });
+
+  it('drops the read of v2 answering after a later read of v3 was shown', async () => {
+    const hold = holdLoads();
+    const mounted = await mountReady(hold);
+    const { backend, container } = mounted;
+    await click(mounted, '文本指令参数设置');
+    hold.arm();
+    await publish(mounted, ',');
+    await waitFor(mounted, () => {
+      expect(hold.held[0]?.read).toBe(true);
+    });
+    await publish(mounted, '|');
+    // A focus reload reads v3, and answers first.
+    await focus(mounted);
+    await waitFor(mounted, () => {
+      expect(separators(container)).toBe('|');
+    });
+    expect(revisionText(container)).toContain('当前生效 v3');
+    await answerHeld(mounted, hold, 0);
+    await settle(mounted);
+    expect(separators(container)).toBe('|');
+    expect(revisionText(container)).toContain('当前生效 v3');
+    expect(callsOf(backend, 'load_state')).toHaveLength(3);
+    expect(notices(container)).toBe('');
+  });
+
+  it('drops a focus reload that read the old config and answers after the revision read', async () => {
+    const hold = holdLoads();
+    const mounted = await mountReady(hold);
+    const { backend, container } = mounted;
+    await click(mounted, '文本指令参数设置');
+    expect(separators(container)).not.toBe(',');
+    hold.arm();
+    await focus(mounted);
+    await waitFor(mounted, () => {
+      expect(hold.held[0]?.read).toBe(true);
+    });
+    await publish(mounted, ',');
+    await waitFor(mounted, () => {
+      expect(separators(container)).toBe(',');
+    });
+    await answerHeld(mounted, hold, 0);
+    await settle(mounted);
+    expect(separators(container)).toBe(',');
+    expect(revisionText(container)).toContain('当前生效 v2');
+    expect(callsOf(backend, 'load_state')).toHaveLength(3);
+  });
+
+  it('keeps the unread notice through an unrelated save, and says the save overwrote', async () => {
+    const mounted = await mountReady();
+    const { backend, container } = mounted;
+    failLoads(backend, 3);
+    await publish(mounted, ',');
+    await waitFor(
+      mounted,
+      () => {
+        expect(notices(container)).toContain(UNREAD);
+      },
+      3000,
+    );
+    // 总开关 saves the editor's whole config, over the draft of v2.
+    await mounted.act(() => {
+      checkbox(container, '启用文本指令')?.click();
+    });
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+    });
+    await settle(mounted);
+    expect(notices(container)).toContain(`后台配置已更新为 v2，但${UNREAD}`);
+    expect(notices(container)).toContain(OVERWRITTEN);
+    expect(callsOf(backend, 'load_state')).toHaveLength(4);
+    // Caught up: the unread notice goes; the one about the save stays until acknowledged.
+    await click(mounted, '重新读取');
+    await waitFor(mounted, () => {
+      expect(notices(container)).not.toContain(UNREAD);
+    });
+    expect(notices(container)).toContain(OVERWRITTEN);
+    await click(mounted, '知道了');
+    expect(notices(container)).toBe('');
+  });
+
+  it('keeps the notice about unsaved edits through an unrelated save, and says it overwrote', async () => {
+    const mounted = await mountReady();
+    const { backend, container } = mounted;
+    await click(mounted, '文本指令参数设置');
+    await type(mounted, field(container, '词分隔符'), ' ;');
+    await publish(mounted, ',');
+    await waitFor(mounted, () => {
+      expect(notices(container)).toContain('配置已在后台更新为 v2。编辑器中未保存的修改仍然保留');
+    });
+    await click(mounted, '文本指令管理');
+    await mounted.act(() => {
+      checkbox(container, '启用文本指令')?.click();
+    });
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+    });
+    await settle(mounted);
+    const saved = callsOf(backend, 'save_draft')[0]?.args.config as {
+      globals: { word_separators: string };
+    };
+    expect(saved.globals.word_separators).toBe(' ;');
+    expect(notices(container)).toContain(OVERWRITTEN);
+    // Nor does a reload of the same revision take it away.
+    await focus(mounted);
+    await settle(mounted);
+    expect(notices(container)).toContain(OVERWRITTEN);
+    expect(callsOf(backend, 'load_state')).toHaveLength(3);
+    await click(mounted, '知道了');
+    expect(notices(container)).toBe('');
+  });
+});
+
 describe('action types by capability status (S-16, principle 5)', () => {
   const EDITOR = '编辑文本指令';
   const rule = (action: Record<string, unknown>) => ({
