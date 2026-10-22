@@ -1,10 +1,16 @@
 //! Thin bridge around the vendored Espanso Windows RawInput detector/injector.
 //! Matching remains Quicker Text's domain compiler; UIA only supplies optional vetoes.
 use super::*;
-use ::windows::Win32::{
-    System::{Com::*, Variant::*},
-    UI::Accessibility::*,
+use super::{
+    executor::{enqueue, Candidate, CandidateProof},
+    foreground::WinForeground,
+    hook::expected_key_text,
+    ime::ime_active,
+    inject::Erasure,
+    keystate::physical,
+    protection::{protection_block, protection_worker},
 };
+use crate::traits::ForegroundProbe;
 use std::ffi::c_void;
 
 #[repr(C)]
@@ -33,24 +39,20 @@ extern "C" {
         callback: extern "C" fn(*mut c_void, InputEvent),
     ) -> i32;
     fn detect_destroy(window: *mut c_void) -> i32;
-    fn inject_string(text: *const u16) -> u32;
-    fn inject_separate_vkeys(keys: *const i32, len: i32) -> u32;
-    fn inject_vkeys_combination(keys: *const i32, len: i32) -> u32;
 }
-static READY: AtomicBool = AtomicBool::new(false);
+pub(super) static READY: AtomicBool = AtomicBool::new(false);
 static EVENTS: OnceLock<mpsc::SyncSender<Event>> = OnceLock::new();
 static LAST_SOURCE: Mutex<&str> = Mutex::new("waiting_for_input");
 static LAST_PROCESS: Mutex<String> = Mutex::new(String::new());
-static PROTECTION: Mutex<Option<(u64, u64, String)>> = Mutex::new(None);
 thread_local! { static PROOF: std::cell::RefCell<Option<Proof>> = const {std::cell::RefCell::new(None)}; }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Stamp {
-    focus: u64,
-    epoch: u64,
-    caret: u64,
-    revision: u64,
-    layout: usize,
+pub(super) struct Stamp {
+    pub(super) focus: u64,
+    pub(super) epoch: u64,
+    pub(super) caret: u64,
+    pub(super) revision: u64,
+    pub(super) layout: usize,
 }
 #[derive(Clone)]
 pub(super) struct Proof {
@@ -59,27 +61,37 @@ pub(super) struct Proof {
     at: Instant,
     ime_unverified: bool,
 }
+impl Proof {
+    pub(super) fn erasure(&self) -> Erasure {
+        Erasure {
+            count: self.count,
+            at: self.at,
+            ime_unverified: self.ime_unverified,
+        }
+    }
+}
 #[derive(Clone, Debug)]
-enum Kind {
+pub(super) enum Kind {
     Text(String),
     Backspace,
     Neutral,
     Reset,
 }
-struct Event {
-    kind: Kind,
-    stamp: Stamp,
-    generation: u64,
-    source: &'static str,
-    captured_allowed: bool,
+pub(super) struct Event {
+    pub(super) kind: Kind,
+    pub(super) stamp: Stamp,
+    pub(super) generation: u64,
+    pub(super) source: &'static str,
+    pub(super) captured_allowed: bool,
 }
 #[derive(Default)]
-struct Buffer {
-    text: String,
+pub(super) struct Buffer {
+    pub(super) text: String,
     stamp: Option<Stamp>,
     generation: u64,
 }
 impl Buffer {
+    // no-regression #3: stamp or generation discontinuity clears the buffer.
     fn push(&mut self, event: &Event, allowed: bool) {
         if !allowed
             || self.stamp.as_ref() != Some(&event.stamp)
@@ -120,21 +132,21 @@ fn kind(vkey: u16, text: Option<String>, modified: bool) -> Kind {
             .unwrap_or(Kind::Reset),
     }
 }
-fn stamp(shared: &Shared) -> Option<Stamp> {
+/// Current transaction stamp: the probe's input context plus the compiled
+/// configuration revision. `None` when either cannot be read.
+pub(super) fn stamp(shared: &Shared, probe: &impl ForegroundProbe) -> Option<Stamp> {
     let revision = shared.compiled.try_lock().ok()?.config.revision;
-    unsafe {
-        let top = GetForegroundWindow();
-        Some(Stamp {
-            focus: focus_handle(top) as u64,
-            epoch: observer::FOCUS_EPOCH.load(Ordering::SeqCst),
-            caret: observer::CARET_EPOCH.load(Ordering::SeqCst),
-            revision,
-            layout: GetKeyboardLayout(GetWindowThreadProcessId(top, std::ptr::null_mut())) as usize,
-        })
-    }
+    let context = probe.input_context()?;
+    Some(Stamp {
+        focus: context.focus,
+        epoch: context.focus_epoch,
+        caret: context.caret_epoch,
+        revision,
+        layout: context.layout as usize,
+    })
 }
 fn submit(shared: &Shared, kind: Kind, generation: u64, source: &'static str) {
-    let Some(stamp) = stamp(shared) else {
+    let Some(stamp) = stamp(shared, &WinForeground) else {
         return;
     };
     if EVENTS.get().is_none_or(|tx| {
@@ -180,17 +192,6 @@ fn validate_stamp(original: &Stamp, current: Option<&Stamp>) -> Result<(), Strin
         Ok(())
     }
 }
-fn erase_count(
-    count: usize,
-    mut guard: impl FnMut() -> Result<(), String>,
-    mut send: impl FnMut() -> Result<(), String>,
-) -> Result<(), String> {
-    for _ in 0..count {
-        guard()?;
-        send()?;
-    }
-    Ok(())
-}
 extern "C" fn callback(context: *mut c_void, event: InputEvent) {
     // No panic may unwind across the C ABI; no COM, output or provider read here.
     let _ = std::panic::catch_unwind(|| {
@@ -220,7 +221,7 @@ pub(super) unsafe fn acceptance_key(shared: &Shared, event: &KBDLLHOOKSTRUCT, ge
         "acceptance_sendinput_hook",
     );
 }
-fn dispatch(shared: Arc<Shared>, rx: mpsc::Receiver<Event>) {
+fn dispatch(shared: Arc<Shared>, rx: mpsc::Receiver<Event>, probe: impl ForegroundProbe) {
     let mut buffer = Buffer::default();
     while !shared.shutdown.load(Ordering::SeqCst) {
         let event = match rx.recv_timeout(Duration::from_millis(30)) {
@@ -228,92 +229,94 @@ fn dispatch(shared: Arc<Shared>, rx: mpsc::Receiver<Event>) {
             Err(_) => continue,
         };
         *LAST_SOURCE.lock().unwrap() = event.source;
-        let allowed = event.captured_allowed
-            && !shared.paused.load(Ordering::SeqCst)
-            && !shared.busy.load(Ordering::SeqCst);
-        // Safe text terminators already reach the target: erase shortcut plus
-        // terminator. RawInput never claims to swallow Enter or Tab.
-        let terminator = match &event.kind {
-            Kind::Text(value) if value == " " => Some("space"),
-            Kind::Text(value) if value == ";" => Some("semicolon"),
-            _ => None,
-        };
-        let previous = if terminator.is_some()
-            && buffer.stamp.as_ref() == Some(&event.stamp)
-            && buffer.generation.checked_add(1) == Some(event.generation)
-        {
-            Some(buffer.text.clone())
-        } else {
-            None
-        };
-        buffer.push(&event, allowed);
-        if !allowed
-            || !matches!(event.kind, Kind::Text(_))
-            || event.generation != shared.generation.load(Ordering::SeqCst)
-        {
-            continue;
-        }
-        let target = foreground();
-        *LAST_PROCESS.lock().unwrap() = target.process.clone();
-        if target.id != event.stamp.focus
-            || target.process.is_empty()
-            || target.process.eq_ignore_ascii_case("quicker-text.exe")
-            || native_input_protection()
-                .or_else(protection_block)
-                .is_some()
-        {
-            continue;
-        }
-        let compiler = shared.compiled.lock().unwrap();
-        if compiler.config.revision != event.stamp.revision {
-            buffer.text.clear();
-            continue;
-        }
-        let foreground_context = ForegroundContext {
-            platform: Platform::Windows,
-            process: target.process.clone(),
-            bundle_id: String::new(),
-        };
-        let found = match_buffer(
-            &compiler,
-            &buffer.text,
-            previous.as_deref().zip(terminator),
-            &foreground_context,
-        );
-        let Some((matched, terminator)) = found else {
+        let Some(candidate) = detect_candidate(&shared, &mut buffer, event, &probe) else {
             continue;
         };
-        let risky = ime_active() || (event.stamp.layout & 0x3ff) == 4;
-        let Some(rule) = compiler
-            .config
-            .rules
-            .iter()
-            .find(|rule| rule.id == matched.rule_id)
-            .cloned()
-        else {
-            continue;
-        };
-        let proof = Proof {
-            stamp: event.stamp.clone(),
-            count: matched.erase_chars + usize::from(terminator.is_some()),
-            at: Instant::now(),
-            ime_unverified: risky,
-        };
-        drop(compiler);
-        if enqueue(
-            &shared,
-            Candidate {
-                rule,
-                matched,
-                proof: CandidateProof::Espanso(proof),
-                focus: target,
-                generation: event.generation,
-                terminator: terminator.map(str::to_owned),
-            },
-        ) {
+        if enqueue(&shared, candidate) {
             buffer.text.clear();
         }
     }
+}
+/// Match step: folds `event` into `buffer` and returns a candidate when a
+/// rule matches the current, unprotected target.
+pub(super) fn detect_candidate(
+    shared: &Shared,
+    buffer: &mut Buffer,
+    event: Event,
+    probe: &impl ForegroundProbe,
+) -> Option<Candidate> {
+    let allowed = event.captured_allowed
+        && !shared.paused.load(Ordering::SeqCst)
+        && !shared.busy.load(Ordering::SeqCst);
+    // Safe text terminators already reach the target: erase shortcut plus
+    // terminator. RawInput never claims to swallow Enter or Tab.
+    let terminator = match &event.kind {
+        Kind::Text(value) if value == " " => Some("space"),
+        Kind::Text(value) if value == ";" => Some("semicolon"),
+        _ => None,
+    };
+    // no-regression #3: a terminator match needs the contiguous, same-stamp prefix.
+    let previous = if terminator.is_some()
+        && buffer.stamp.as_ref() == Some(&event.stamp)
+        && buffer.generation.checked_add(1) == Some(event.generation)
+    {
+        Some(buffer.text.clone())
+    } else {
+        None
+    };
+    buffer.push(&event, allowed);
+    if !allowed
+        || !matches!(event.kind, Kind::Text(_))
+        || event.generation != shared.generation.load(Ordering::SeqCst)
+    {
+        return None;
+    }
+    let target = probe.foreground();
+    *LAST_PROCESS.lock().unwrap() = target.process.clone();
+    if target.id != event.stamp.focus
+        || target.process.is_empty()
+        || target.process.eq_ignore_ascii_case("quicker-text.exe")
+        || probe.protection().is_some()
+    {
+        return None;
+    }
+    let compiler = shared.compiled.lock().unwrap();
+    if compiler.config.revision != event.stamp.revision {
+        buffer.text.clear();
+        return None;
+    }
+    let foreground_context = ForegroundContext {
+        platform: Platform::Windows,
+        process: target.process.clone(),
+        bundle_id: String::new(),
+    };
+    let (matched, terminator) = match_buffer(
+        &compiler,
+        &buffer.text,
+        previous.as_deref().zip(terminator),
+        &foreground_context,
+    )?;
+    let risky = ime_active() || (event.stamp.layout & 0x3ff) == 4;
+    let rule = compiler
+        .config
+        .rules
+        .iter()
+        .find(|rule| rule.id == matched.rule_id)
+        .cloned()?;
+    let proof = Proof {
+        stamp: event.stamp.clone(),
+        count: matched.erase_chars + usize::from(terminator.is_some()),
+        at: Instant::now(),
+        ime_unverified: risky,
+    };
+    Some(Candidate {
+        rule,
+        matched,
+        proof: CandidateProof::Espanso(proof),
+        focus: target,
+        generation: event.generation,
+        terminator: terminator.map(str::to_owned),
+    })
 }
 pub(super) fn start(shared: Arc<Shared>) -> Result<(), String> {
     let (tx, rx) = mpsc::sync_channel(256);
@@ -321,12 +324,13 @@ pub(super) fn start(shared: Arc<Shared>) -> Result<(), String> {
         .set(tx)
         .map_err(|_| "Espanso dispatcher already started")?;
     let dispatch_shared = shared.clone();
-    std::thread::spawn(move || dispatch(dispatch_shared, rx));
+    std::thread::spawn(move || dispatch(dispatch_shared, rx, WinForeground));
     protection_worker(shared.clone());
     let (startup_tx, startup_rx) = mpsc::sync_channel(1);
     std::thread::spawn(move || unsafe {
         let context = Box::new(shared);
         let mut options = InitOptions {
+            // no-regression #7: re-read the keyboard layout on every key.
             keyboard_layout_cache_interval: 0,
         };
         let mut error = 0;
@@ -367,156 +371,15 @@ pub(super) fn start(shared: Arc<Shared>) -> Result<(), String> {
 pub(super) fn install(proof: Option<Proof>) {
     PROOF.with(|p| *p.borrow_mut() = proof);
 }
-pub(super) fn guard(shared: &Shared) -> Result<(), String> {
+/// Fails when this thread runs under a match proof whose stamp no longer
+/// equals the current one (focus, epochs, layout or revision changed).
+pub(super) fn guard(shared: &Shared, probe: &impl ForegroundProbe) -> Result<(), String> {
     PROOF.with(|p| {
         if let Some(proof) = p.borrow().as_ref() {
-            validate_stamp(&proof.stamp, stamp(shared).as_ref())?;
+            validate_stamp(&proof.stamp, stamp(shared, probe).as_ref())?;
         }
         Ok(())
     })
-}
-pub(super) fn erase(
-    shared: &Shared,
-    target: &Foreground,
-    generation: u64,
-    proof: &Proof,
-) -> Result<(), String> {
-    // Let the foreground process consume the final key; no UIA readback loop.
-    if let Some(remaining) = Duration::from_millis(25).checked_sub(proof.at.elapsed()) {
-        std::thread::sleep(remaining);
-    }
-    erase_count(
-        proof.count,
-        || guarded(shared, target, generation),
-        || press_keys(&[VK_BACK]),
-    )?;
-    if proof.ime_unverified {
-        gate("IME physical-letter erasure submitted; target composition/consumption unknown");
-    }
-    Ok(())
-}
-pub(super) fn text(value: &str) -> Result<(), String> {
-    let requested = value
-        .encode_utf16()
-        .count()
-        .checked_mul(2)
-        .ok_or("Text too long")? as u32;
-    if value.contains('\0') {
-        return Err("Unicode injection cannot contain NUL".into());
-    }
-    let encoded = wide(value);
-    record_send_result(unsafe { inject_string(encoded.as_ptr()) }, requested)
-}
-pub(super) fn press_keys(keys: &[u16]) -> Result<(), String> {
-    let keys: Vec<i32> = keys.iter().map(|v| i32::from(*v)).collect();
-    let result = record_send_result(
-        unsafe { inject_separate_vkeys(keys.as_ptr(), keys.len() as i32) },
-        keys.len() as u32 * 2,
-    );
-    cleanup_submission(
-        &keys,
-        result,
-        |v| physical(v as u16),
-        |v| key(v as u16, true),
-    )
-}
-pub(super) fn combination(keys: &[u16]) -> Result<(), String> {
-    let keys: Vec<i32> = keys.iter().map(|v| i32::from(*v)).collect();
-    let result = record_send_result(
-        unsafe { inject_vkeys_combination(keys.as_ptr(), keys.len() as i32) },
-        keys.len() as u32 * 2,
-    );
-    cleanup_submission(
-        &keys,
-        result,
-        |v| physical(v as u16),
-        |v| key(v as u16, true),
-    )
-}
-fn cleanup_submission(
-    keys: &[i32],
-    result: Result<(), String>,
-    mut held: impl FnMut(i32) -> bool,
-    mut release: impl FnMut(i32) -> Result<(), String>,
-) -> Result<(), String> {
-    if let Err(mut error) = result {
-        for &v in keys.iter().rev() {
-            if !held(v) {
-                if let Err(cleanup) = release(v) {
-                    error.push_str(&format!("; key release failed: {cleanup}"));
-                }
-            }
-        }
-        Err(error)
-    } else {
-        Ok(())
-    }
-}
-pub(super) fn protection_block() -> Option<String> {
-    let (focus, epoch, reason) = PROTECTION.try_lock().ok()?.clone()?;
-    (focus == focus_handle(unsafe { GetForegroundWindow() }) as u64
-        && epoch == observer::FOCUS_EPOCH.load(Ordering::SeqCst))
-    .then_some(reason)
-}
-unsafe fn text_readonly(element: &IUIAutomationElement) -> Option<&'static str> {
-    let pattern = element
-        .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
-        .ok()?;
-    let range = pattern.DocumentRange().ok()?;
-    let mut value = range.GetAttributeValue(UIA_IsReadOnlyAttributeId).ok()?;
-    let readonly = value.Anonymous.Anonymous.vt == VT_BOOL
-        && value.Anonymous.Anonymous.Anonymous.boolVal.0 != 0;
-    let _ = VariantClear(&mut value);
-    readonly.then_some("Read-only text control blocked")
-}
-fn protection_worker(shared: Arc<Shared>) {
-    std::thread::spawn(move || unsafe {
-        if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
-            return;
-        }
-        if let Ok(automation) =
-            CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
-        {
-            while !shared.shutdown.load(Ordering::SeqCst) {
-                let focus = focus_handle(GetForegroundWindow()) as u64;
-                let epoch = observer::FOCUS_EPOCH.load(Ordering::SeqCst);
-                if let Ok(element) = automation.GetFocusedElement() {
-                    let reason = if element.CurrentIsPassword().is_ok_and(|b| b.as_bool()) {
-                        Some("Password controls are blocked")
-                    } else if element.CurrentIsEnabled().is_ok_and(|b| !b.as_bool()) {
-                        Some("Disabled controls are blocked")
-                    } else if element
-                        .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
-                        .ok()
-                        .is_some_and(|p| p.CurrentIsReadOnly().is_ok_and(|b| b.as_bool()))
-                    {
-                        Some("Read-only ValuePattern control blocked")
-                    } else if element
-                        .GetCurrentPatternAs::<IUIAutomationLegacyIAccessiblePattern>(
-                            UIA_LegacyIAccessiblePatternId,
-                        )
-                        .ok()
-                        .is_some_and(|p| {
-                            p.CurrentState()
-                                .is_ok_and(|state| state & (0x40 | 0x20000000) != 0)
-                        })
-                    {
-                        Some("Read-only or protected accessibility control blocked")
-                    } else {
-                        text_readonly(&element)
-                    };
-                    if focus == focus_handle(GetForegroundWindow()) as u64
-                        && epoch == observer::FOCUS_EPOCH.load(Ordering::SeqCst)
-                    {
-                        *PROTECTION.lock().unwrap() =
-                            reason.map(|reason| (focus, epoch, reason.to_owned()));
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-        }
-        CoUninitialize();
-    });
 }
 pub(super) fn status() -> serde_json::Value {
     serde_json::json!({"backend":"espanso_win32_v2.4.1", "source":*LAST_SOURCE.lock().unwrap(),
@@ -622,69 +485,6 @@ mod tests {
             };
             assert!(validate_stamp(&s, Some(&other)).is_err());
         }
-    }
-    #[test]
-    fn deletion_stops_on_submission_failure_or_cancel_before_more_backspaces() {
-        let mut sent = 0;
-        let result = erase_count(
-            5,
-            || Ok(()),
-            || {
-                sent += 1;
-                if sent == 2 {
-                    Err("send failed".into())
-                } else {
-                    Ok(())
-                }
-            },
-        );
-        assert!(result.is_err());
-        assert_eq!(sent, 2);
-        let mut sent = 0;
-        let result = erase_count(
-            5,
-            || Err("cancelled".into()),
-            || {
-                sent += 1;
-                Ok(())
-            },
-        );
-        assert!(result.is_err());
-        assert_eq!(sent, 0);
-    }
-    #[test]
-    fn partial_combination_releases_unheld_keys_in_reverse_and_reports_cleanup_failure() {
-        let mut released = vec![];
-        let result = cleanup_submission(
-            &[17, 65],
-            Err("accepted 1/4".into()),
-            |v| v == 65,
-            |v| {
-                released.push(v);
-                Ok(())
-            },
-        );
-        assert_eq!(released, vec![17]);
-        assert_eq!(result, Err("accepted 1/4".into()));
-        let mut released = vec![];
-        let result = cleanup_submission(
-            &[17, 65],
-            Err("accepted 1/4".into()),
-            |_| false,
-            |v| {
-                released.push(v);
-                Err("blocked".into())
-            },
-        );
-        assert_eq!(released, vec![65, 17]);
-        assert!(result.unwrap_err().contains("key release failed"));
-        let result = cleanup_submission(
-            &[17, 65],
-            Ok(()),
-            |_| panic!("no cleanup on success"),
-            |_| panic!("no cleanup on success"),
-        );
-        assert!(result.is_ok());
     }
     #[test]
     fn semicolon_consumption_priority_and_immediate_fallback_preserve_contract() {
