@@ -6,17 +6,43 @@
 //!   the run counts as failed and the worker keeps serving; the supervisor
 //!   then sees the executor as down and swaps in a fresh worker.
 //! * Epoch: a task records the executor epoch when it starts. Every input it
-//!   sends goes through [`Fenced`], which re-checks the epoch first and
-//!   refuses once it changed; the stamp guard (`actions::guarded_context`)
-//!   checks it too, through [`checkpoint`]. The supervisor bumps the epoch
-//!   when a task makes no progress for [`STALL_BUDGET`]
-//!   ([`ExecutorCore::fence`]), so a hung thread that wakes up later sends
-//!   nothing and quietly exits.
+//!   sends goes through [`Fenced`], which re-checks the epoch and refuses
+//!   once it changed; the stamp guard (`actions::guarded_context`) checks it
+//!   too, through [`checkpoint`]. The supervisor bumps the epoch when a task
+//!   makes no progress for [`STALL_BUDGET`] ([`ExecutorCore::fence`]), so a
+//!   hung thread that wakes up later sends nothing and quietly exits.
 //! * Keys and mouse buttons pressed but not yet released are tracked in a
 //!   256-bit atomic bitmap behind the small [`HeldKeys`] interface, so
-//!   whoever ends the task (the busy guard on unwind, or the fence on a
-//!   stall) sends the matching MARK key-ups. At merge the implementation is
-//!   swapped for P1b's `keystate::OwnInput` (one source of truth).
+//!   whoever ends the task (the busy guard, or the fence on a stall) sends
+//!   the matching MARK key-ups. At merge the implementation is swapped for
+//!   P1b's `keystate::OwnInput` (one source of truth).
+//! * Send exclusion (`send_lock`). S1: every `SendInput` the executor makes
+//!   (task output, the plan's own cleanup, re-sent key-ups) runs while the
+//!   send lock is held, and the epoch check that allows it is made in the
+//!   same hold, right before the call. A sender that cannot get the lock
+//!   within [`SEND_LOCK_WAIT`] sends nothing: the call reports 0 accepted
+//!   events, the task fail-stops and the executor reports
+//!   Down(ExecutorTimeout). Nothing is ever sent without the lock. Manual
+//!   runs take the same lock ([`serialized`]).
+//!   S2: the held-key bitmap is settled in the same hold: every key-down of
+//!   the batch (taps and chords alike) is marked before the call; once
+//!   `SendInput` returns `k`, only the accepted prefix is replayed in order
+//!   (a down marks, an up clears), so a key-down past the prefix stays
+//!   marked (at worst one redundant MARK key-up later). Without a usable
+//!   `k` (a panic inside the call, or `k` above the batch size) every
+//!   key-down of the batch stays held.
+//!   S3: the fence's key-ups go through the same lock, so they follow the
+//!   old epoch's in-flight send. The fence first records a release debt
+//!   (`release_owed`); whoever holds the lock next pays it before doing
+//!   anything else, reading the bitmap inside that hold: the fence itself
+//!   when the lock is free, else the old thread when its send returns, the
+//!   next `enforce_budget`, the rebuild, or the new epoch's first send.
+//! * Fail closed: when a fenced thread never returns from `SendInput`, the
+//!   send lock stays held, so nothing can be sent again. The debt stays
+//!   unpaid and the executor reports Down(ExecutorTimeout); `rebuild`
+//!   refuses to start a new worker without the lock; a task of the current
+//!   epoch fails fast (no input, Failed/ExecutorTimeout); the supervisor's
+//!   retries run out and it ends in Failed.
 //! * Clipboard: a paste task claims the clipboard for its lease
 //!   ([`TaskScope::claim_clipboard`]). While a fenced (stalled) task still
 //!   holds the claim, paste actions fail with `ClipboardBusy` and the
@@ -83,9 +109,9 @@ pub(super) enum CandidateProof {
 /// for this long is fenced by the supervisor. 待基线确定: long clipboard
 /// retries and slow `Open` targets must stay below it on real machines.
 pub(super) const STALL_BUDGET: Duration = Duration::from_secs(10);
-/// How long a sender, the fence or the busy guard waits for a send already
-/// in flight before going ahead without the send lock (the holder is then a
-/// fenced thread stuck inside the OS call).
+/// How long a sender, the fence, the busy guard or the rebuild waits for a
+/// send already in flight. Past it the holder is taken to be stuck inside
+/// the OS call and the waiter gives up without sending (fail closed).
 const SEND_LOCK_WAIT: Duration = Duration::from_millis(250);
 const FENCED: &str = "Executor task was fenced after a stall; stopped without further input";
 const CLIPBOARD_HELD: &str =
@@ -355,6 +381,9 @@ struct Life {
 /// Points where a test can hold a thread (no-ops outside tests).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Pause {
+    /// In [`Fenced`]: the epoch check passed, the send lock not yet taken
+    /// (the in-lock re-check comes next).
+    BeforeSend,
     /// In [`ExecutorCore::fence`]: epoch bumped and `running` taken, the
     /// keys not yet released, the history entry not yet written.
     FenceDecided,
@@ -364,6 +393,9 @@ pub(super) enum Pause {
 
 #[cfg(test)]
 type PauseHook = Arc<dyn Fn(Pause) + Send + Sync>;
+
+/// A held send lock: whoever has one may call `SendInput` (S1).
+pub(super) type SendTurn<'a> = PlMutexGuard<'a, ()>;
 
 /// Keys (and mouse buttons, by their VK) that this program pressed and has
 /// not released yet. The executor only reaches the bitmap through this
@@ -447,8 +479,12 @@ pub(super) struct ExecutorCore {
     life: PlMutex<Life>,
     next_id: AtomicU64,
     worker: PlMutex<Worker>,
-    /// Serializes "check epoch, then send" against the fence.
+    /// Every `SendInput` of the executor and of manual runs happens while
+    /// this is held (S1); see the module doc.
     send_lock: PlMutex<()>,
+    /// A fence decided to release the held keys but has not sent the
+    /// key-ups yet; the next holder of `send_lock` pays it first (S3).
+    release_owed: AtomicBool,
     /// `epoch + 1` of the task holding a clipboard lease; 0 when free.
     clipboard_holder: AtomicU64,
     /// Why the executor is down until the next rebuild.
@@ -485,6 +521,7 @@ impl ExecutorCore {
             next_id: AtomicU64::new(1),
             worker: PlMutex::new(Worker::default()),
             send_lock: PlMutex::new(()),
+            release_owed: AtomicBool::new(false),
             clipboard_holder: AtomicU64::new(0),
             fault: PlMutex::new(None),
             #[cfg(test)]
@@ -523,13 +560,68 @@ impl ExecutorCore {
             .map(|running| (running.id, running.task.rule_id.clone()))
     }
 
-    #[cfg(all(test, feature = "fault-injection"))]
+    #[cfg(test)]
     pub(super) fn held_keys(&self) -> Vec<u16> {
         self.held.held_snapshot()
     }
 
-    fn send_guard(&self) -> Option<PlMutexGuard<'_, ()>> {
-        self.send_lock.try_lock_for(SEND_LOCK_WAIT)
+    /// Holds the send lock, as a sender stuck inside `SendInput` would
+    /// (tests).
+    #[cfg(test)]
+    pub(super) fn hold_send_lock(&self) -> SendTurn<'_> {
+        self.send_lock.lock()
+    }
+
+    /// Whether a fence's key-ups are still unpaid (tests).
+    #[cfg(test)]
+    pub(super) fn release_owed(&self) -> bool {
+        self.release_owed.load(Ordering::SeqCst)
+    }
+
+    /// Takes the send lock, waiting at most `wait`, and pays an outstanding
+    /// release debt first, inside the same hold (S3). `None`: the lock is
+    /// held elsewhere and the caller must not send.
+    fn lock_send(&self, wait: Duration) -> Option<SendTurn<'_>> {
+        let turn = self.send_lock.try_lock_for(wait)?;
+        self.pay_release(&turn);
+        Some(turn)
+    }
+
+    /// Sends the key-ups a fence left owed, if any; the count of key-ups
+    /// sent. A key-up that fails stays in the bitmap for the next owner of
+    /// the keys (the busy guard of a later task), the debt is not re-armed.
+    fn pay_release(&self, turn: &SendTurn<'_>) -> usize {
+        if !self.release_owed.swap(false, Ordering::SeqCst) {
+            return 0;
+        }
+        let released = self.release_held(turn);
+        tracing::info!(
+            event = "executor.release_paid",
+            released,
+            epoch = self.epoch()
+        );
+        released
+    }
+
+    /// A sender of `epoch` could not get the send lock: the holder is stuck
+    /// inside `SendInput`. While `epoch` is current the executor goes Down
+    /// (ExecutorTimeout) until a rebuild gets the lock; `owe_release` also
+    /// leaves the held keys' key-ups to the next holder of the lock. Checked
+    /// under `life`, so a stale thread never marks a newer epoch down.
+    fn fail_closed(&self, epoch: u64, owe_release: bool) {
+        let life = self.life.lock();
+        if self.epoch() == epoch {
+            *self.fault.lock() = Some(ReasonCode::ExecutorTimeout);
+            if owe_release {
+                self.release_owed.store(true, Ordering::SeqCst);
+            }
+        }
+        drop(life);
+        tracing::warn!(
+            event = "executor.send_refused",
+            epoch,
+            "send lock held by a stuck send; nothing sent"
+        );
     }
 
     fn beat(&self) {
@@ -594,31 +686,47 @@ impl ExecutorCore {
     /// exits once its queue closes. Uses only the executor's own locks, so it
     /// is safe without the supervisor's machine lock and concurrently with
     /// `probe`/`enforce_budget`.
+    ///
+    /// Fail closed: it first takes the send lock (paying a fence's key-ups
+    /// inside that hold). While a fenced thread is still inside `SendInput`
+    /// it gets no lock and refuses, so the executor stays Down until that
+    /// send returns, or for good, which ends the supervisor in Failed.
     pub(super) fn respawn(&self) -> Result<(), String> {
         let Some(me) = self.me.upgrade() else {
             return Err("executor is shutting down".into());
         };
-        let mut life = self.life.lock();
+        let alive = |worker: &Worker| {
+            worker.sender.is_some() && worker.handle.as_ref().is_some_and(|h| !h.is_finished())
+        };
+        let orphan = {
+            let life = self.life.lock();
+            let worker = self.worker.lock();
+            let live = alive(&worker);
+            life.running
+                .as_ref()
+                .map(|running| running.epoch)
+                .filter(|&epoch| !(live && epoch == self.epoch()))
+        };
+        if let Some(epoch) = orphan {
+            // The worker died under a task: retire that task first.
+            self.fence(epoch);
+        }
+        let Some(_turn) = self.lock_send(SEND_LOCK_WAIT) else {
+            tracing::warn!(event = "executor.rebuild_refused", epoch = self.epoch());
+            return Err(
+                "a send of a fenced task is still in flight; the executor stays closed".into(),
+            );
+        };
+        let life = self.life.lock();
         let mut worker = self.worker.lock();
-        let alive =
-            worker.sender.is_some() && worker.handle.as_ref().is_some_and(|h| !h.is_finished());
-        match life.running.as_ref().map(|running| running.epoch) {
-            Some(epoch) if alive && epoch == self.epoch() => {
+        if let Some(epoch) = life.running.as_ref().map(|running| running.epoch) {
+            if alive(&worker) && epoch == self.epoch() {
                 drop(worker);
                 *self.fault.lock() = None;
                 drop(life);
                 tracing::info!(event = "executor.rebuilt", epoch, reused = true);
                 return Ok(());
             }
-            Some(epoch) => {
-                // The worker died under a task: retire that task first.
-                drop(worker);
-                drop(life);
-                self.fence(epoch);
-                life = self.life.lock();
-                worker = self.worker.lock();
-            }
-            None => {}
         }
         let epoch = self.epoch();
         let (sender, jobs) = mpsc::sync_channel::<Job>(1);
@@ -655,13 +763,18 @@ impl ExecutorCore {
             self.shared.busy.store(false, Ordering::SeqCst);
             self.worker.lock().sender = None;
             *self.fault.lock() = Some(ReasonCode::ExecutorTimeout);
+            self.release_owed.store(true, Ordering::SeqCst);
             life.running.take()
         };
         self.pause(Pause::FenceDecided);
-        let send = self.send_guard();
-        let released = self.release_held();
-        let send_lock_busy = send.is_none();
-        drop(send);
+        // S3: the key-ups go through the send lock, so they follow the old
+        // epoch's send in flight. When that send does not return in time
+        // the debt stays for the next holder of the lock.
+        let (paid, released) = match self.send_lock.try_lock_for(SEND_LOCK_WAIT) {
+            Some(turn) => (true, self.pay_release(&turn)),
+            None => (false, 0),
+        };
+        let send_lock_busy = !paid;
         if let Some(running) = running {
             // The stalled thread will never record this run itself. A send
             // still in flight (send lock held) may have reached the target.
@@ -715,9 +828,10 @@ impl ExecutorCore {
     /// not physically held. The keys come only from `held_snapshot`, and the
     /// release injector is `WinInjector` in production, so every key-up
     /// carries MARK and the hooks ignore it. A key-up the system refuses
-    /// stays marked so the next release retries it. Callers hold the send
-    /// lock when they can.
-    fn release_held(&self) -> usize {
+    /// stays marked so the next release retries it. `_turn` proves the send
+    /// lock is held (S1), so the snapshot is read inside the same hold that
+    /// sends the key-ups, after any send of the old epoch returned (S3).
+    fn release_held(&self, _turn: &SendTurn<'_>) -> usize {
         let mut released = 0;
         for vk in self.held.held_snapshot() {
             if physical(vk) {
@@ -752,6 +866,10 @@ impl ExecutorCore {
         };
         let executor = match fault {
             Some(reason) => Status::Down(reason),
+            // Key-ups owed after a fence: a send is stuck holding the lock.
+            None if self.release_owed.load(Ordering::SeqCst) => {
+                Status::Down(ReasonCode::ExecutorTimeout)
+            }
             None if !alive => Status::Down(ReasonCode::Internal),
             None => Status::Ok,
         };
@@ -849,6 +967,7 @@ impl ExecutorCore {
             core: Arc::clone(self),
             epoch,
             sent,
+            refused: AtomicBool::new(false),
         });
         let installed = ScopeLease::install(Arc::clone(&scope));
         begin_trace();
@@ -886,6 +1005,9 @@ impl ExecutorCore {
         let sent = SENT_EFFECT.with(Cell::get) || scope.sent.load(Ordering::SeqCst) || released > 0;
         let verdict = if panicked {
             Verdict::new(Outcome::Failed, ReasonCode::ExecutorPanic, sent)
+        } else if scope.refused.load(Ordering::SeqCst) {
+            // A send found the lock held past SEND_LOCK_WAIT (S1).
+            Verdict::new(Outcome::Failed, ReasonCode::ExecutorTimeout, sent)
         } else {
             classify(&result, stage, sent)
         };
@@ -909,9 +1031,11 @@ impl ExecutorCore {
 
 /// Ends a task in two steps, each comparing before it clears, so the guard
 /// of a fenced (or otherwise replaced) task never touches a newer run.
-/// * [`release`](Self::release): under the send lock, and only while the
-///   epoch is still the task's, the MARK key-ups for keys it left pressed;
-///   then its clipboard claim (its own token only) goes back.
+/// * [`release`](Self::release): under the send lock, a fence's owed
+///   key-ups first, then, only while the epoch is still the task's, the
+///   MARK key-ups for keys it left pressed; then its clipboard claim (its
+///   own token only) goes back. Without the lock nothing is sent: the
+///   key-ups are owed and the executor goes Down.
 /// * [`settle`](Self::settle): under `life`, only if the epoch is still the
 ///   task's AND `running` still holds its run id: takes `running`,
 ///   publishes `last`, writes the history entry and frees `busy`, in one
@@ -931,13 +1055,20 @@ impl BusyGuard<'_> {
     /// Releases what the task still holds; the number of key-ups sent.
     fn release(&self) -> usize {
         let core = self.core;
-        let send = core.send_guard();
-        let released = if core.epoch() == self.epoch {
-            core.release_held()
-        } else {
-            0
+        let released = match core.send_lock.try_lock_for(SEND_LOCK_WAIT) {
+            // A fence's debt first (S3), then this task's own keys while
+            // its epoch is current; a fenced task leaves them to the fence.
+            Some(turn) if core.epoch() == self.epoch => {
+                core.pay_release(&turn) + core.release_held(&turn)
+            }
+            Some(turn) => core.pay_release(&turn),
+            None => {
+                // A send is stuck holding the lock: owe the key-ups, never
+                // send them without it.
+                core.fail_closed(self.epoch, true);
+                0
+            }
         };
-        drop(send);
         let token = self.epoch + 1;
         let _ =
             core.clipboard_holder
@@ -996,6 +1127,9 @@ pub(super) struct TaskScope {
     epoch: u64,
     /// At least one event was accepted (shared with `Running::sent`).
     sent: Arc<AtomicBool>,
+    /// A send found the send lock held past [`SEND_LOCK_WAIT`]; every later
+    /// send of the task is refused at once (fail-stop).
+    refused: AtomicBool,
 }
 
 impl TaskScope {
@@ -1092,87 +1226,156 @@ pub(super) fn in_task() -> bool {
     SCOPE.with(|slot| slot.borrow().is_some())
 }
 
-/// Injector of one task: re-checks the epoch before every send (refusing
-/// with 0 accepted events once it changed, which fail-stops the run) and
-/// mirrors pressed keys and buttons into [`HeldKeys`]. The epoch fence lives
-/// in this thin wrapper (and `checkpoint`); `inject.rs` is unchanged.
+/// One event of a batch as the held-key bitmap sees it: (vk, is key-up).
+type KeyEvent = (u16, bool);
+
+/// The events of `send_keys`: each key pressed and released in turn.
+fn taps(keys: &[u16]) -> Vec<KeyEvent> {
+    keys.iter()
+        .flat_map(|&vk| [(vk, false), (vk, true)])
+        .collect()
+}
+
+/// The events of `send_chord`: downs in order, then ups in reverse.
+fn chord(keys: &[u16]) -> Vec<KeyEvent> {
+    let downs = keys.iter().map(|&vk| (vk, false));
+    downs
+        .chain(keys.iter().rev().map(|&vk| (vk, true)))
+        .collect()
+}
+
+/// Injector of one task: every send runs under the send lock with the epoch
+/// re-checked in that hold (refusing with 0 accepted events once it changed
+/// or when the lock stays held, which fail-stops the run), and the held-key
+/// bitmap is settled in the same hold. The epoch fence lives in this thin
+/// wrapper (and `checkpoint`); `inject.rs` is unchanged.
 pub(super) struct Fenced<'a, I> {
     inner: &'a I,
     scope: &'a TaskScope,
 }
 
 impl<I: Injector> Fenced<'_, I> {
-    fn send(&self, keys: &[u16], send: impl FnOnce() -> u32, settle: impl FnOnce(u32)) -> u32 {
-        self.scope.faults();
-        let core = &self.scope.core;
-        let _send = core.send_guard();
-        if self.scope.check().is_err() {
+    /// Sends one batch whose key events are `events` (S1, S2).
+    fn send(&self, events: &[KeyEvent], send: impl FnOnce() -> u32) -> u32 {
+        let scope = self.scope;
+        let core = &scope.core;
+        scope.faults();
+        // A fenced or refused task leaves at once, without waiting.
+        if scope.refused.load(Ordering::SeqCst) || scope.check().is_err() {
             return 0;
         }
-        for key in keys {
-            core.held.mark_down(*key);
+        core.pause(Pause::BeforeSend);
+        let Some(_turn) = core.lock_send(SEND_LOCK_WAIT) else {
+            scope.refused.store(true, Ordering::SeqCst);
+            core.fail_closed(scope.epoch, false);
+            return 0;
+        };
+        // S1: the check that allows this send, in the same hold as the call.
+        if scope.check().is_err() {
+            return 0;
+        }
+        // S2: every key-down of the batch is held before the call...
+        for &(vk, up) in events {
+            if !up {
+                core.held.mark_down(vk);
+            }
         }
         let accepted = send();
         if accepted > 0 {
             // Side effects of a run the fence may have to record.
-            self.scope.sent.store(true, Ordering::SeqCst);
+            scope.sent.store(true, Ordering::SeqCst);
         }
-        settle(accepted);
+        // ...and after it only the accepted prefix is replayed, in order. A
+        // count above the batch size is unusable: every key-down stays held.
+        if let Some(prefix) = events.get(..accepted as usize) {
+            for &(vk, up) in prefix {
+                if up {
+                    core.held.mark_up(vk);
+                } else {
+                    core.held.mark_down(vk);
+                }
+            }
+        }
         accepted
     }
 }
 
 impl<I: Injector> Injector for Fenced<'_, I> {
     fn send_text(&self, text: &str) -> u32 {
-        self.send(&[], || self.inner.send_text(text), |_| {})
+        // Unicode events: no virtual keys to track.
+        self.send(&[], || self.inner.send_text(text))
     }
     fn send_keys(&self, keys: &[u16]) -> u32 {
-        // Taps: each key is pressed and released by the same call.
-        self.send(&[], || self.inner.send_keys(keys), |_| {})
+        self.send(&taps(keys), || self.inner.send_keys(keys))
     }
     fn send_chord(&self, keys: &[u16]) -> u32 {
-        let held = &self.scope.core.held;
-        let requested = keys.len() as u32 * 2;
-        self.send(
-            keys,
-            || self.inner.send_chord(keys),
-            |accepted| {
-                // A partial chord may leave keys down: keep them for release.
-                if accepted == requested {
-                    keys.iter().for_each(|key| held.mark_up(*key));
-                }
-            },
-        )
+        self.send(&chord(keys), || self.inner.send_chord(keys))
     }
     fn send_key(&self, key: u16, up: bool) -> u32 {
-        let held = &self.scope.core.held;
-        let pressing: &[u16] = if up { &[] } else { std::slice::from_ref(&key) };
-        self.send(
-            pressing,
-            || self.inner.send_key(key, up),
-            |accepted| {
-                if up == (accepted == 1) {
-                    held.mark_up(key);
-                }
-            },
-        )
+        self.send(&[(key, up)], || self.inner.send_key(key, up))
     }
     fn send_mouse(&self, flags: u32, data: u32, x: i32, y: i32) -> u32 {
-        let held = &self.scope.core.held;
-        let button = mouse_button(flags, data);
-        let pressing = match button {
-            Some((vk, true)) => vec![vk],
-            _ => vec![],
-        };
-        self.send(
-            &pressing,
-            || self.inner.send_mouse(flags, data, x, y),
-            |accepted| match button {
-                Some((vk, down)) if down == (accepted != 1) => held.mark_up(vk),
-                _ => {}
-            },
-        )
+        let events: Vec<KeyEvent> = mouse_button(flags, data)
+            .map(|(vk, down)| (vk, !down))
+            .into_iter()
+            .collect();
+        self.send(&events, || self.inner.send_mouse(flags, data, x, y))
     }
+}
+
+/// Injector of a manual run (`actions::execute_inner`): each send takes the
+/// executor's send lock (paying a fence's key-ups first), so manual output
+/// never interleaves with a task's or a fence's (S1). It refuses (0
+/// accepted, which fail-stops the run) while the lock stays held. Without
+/// an executor (`core` is `None`: not started, or direct pipeline tests)
+/// there is nothing to exclude and it sends directly. Manual runs carry no
+/// epoch and keep their own key cleanup, so the bitmap is not touched.
+pub(super) struct Serialized<'a, I> {
+    inner: &'a I,
+    core: Option<Arc<ExecutorCore>>,
+}
+
+impl<'a, I: Injector> Serialized<'a, I> {
+    pub(super) fn new(inner: &'a I, core: Option<Arc<ExecutorCore>>) -> Self {
+        Self { inner, core }
+    }
+
+    fn send(&self, send: impl FnOnce() -> u32) -> u32 {
+        let Some(core) = &self.core else {
+            return send();
+        };
+        let Some(_turn) = core.lock_send(SEND_LOCK_WAIT) else {
+            tracing::warn!(
+                event = "executor.manual_send_refused",
+                "send lock held by a stuck send; manual input not sent"
+            );
+            return 0;
+        };
+        send()
+    }
+}
+
+impl<I: Injector> Injector for Serialized<'_, I> {
+    fn send_text(&self, text: &str) -> u32 {
+        self.send(|| self.inner.send_text(text))
+    }
+    fn send_keys(&self, keys: &[u16]) -> u32 {
+        self.send(|| self.inner.send_keys(keys))
+    }
+    fn send_chord(&self, keys: &[u16]) -> u32 {
+        self.send(|| self.inner.send_chord(keys))
+    }
+    fn send_key(&self, key: u16, up: bool) -> u32 {
+        self.send(|| self.inner.send_key(key, up))
+    }
+    fn send_mouse(&self, flags: u32, data: u32, x: i32, y: i32) -> u32 {
+        self.send(|| self.inner.send_mouse(flags, data, x, y))
+    }
+}
+
+/// Wraps a manual run's injector with the executor's send lock.
+pub(super) fn serialized<I: Injector>(inner: &I) -> Serialized<'_, I> {
+    Serialized::new(inner, EXECUTOR.load_full())
 }
 
 /// A clipboard backend whose lease holds the task's clipboard claim; the
@@ -1227,6 +1430,11 @@ impl<C: ClipboardBackend> ClipboardBackend for Claimed<C> {
 
 impl ExecutorControl for ExecutorCore {
     fn enforce_budget(&self, now: Instant) {
+        if self.release_owed.load(Ordering::SeqCst) {
+            // Retry a fence's key-ups (S3); taking the lock pays them. Never
+            // waits: a send still stuck keeps the debt for the next try.
+            drop(self.lock_send(Duration::ZERO));
+        }
         self.fence_if_stalled(now);
     }
     fn probe(&self, _now: Instant) -> Vec<(Component, Status)> {

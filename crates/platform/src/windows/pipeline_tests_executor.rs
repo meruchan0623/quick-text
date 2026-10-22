@@ -13,8 +13,8 @@
 )]
 use super::actions::{Ports, Stage, StageMarks};
 use super::executor::{
-    classify, run_candidate, stage_timings, Candidate, ExecutorCore, Pause, Runner, TaskScope,
-    STALL_BUDGET,
+    classify, run_candidate, stage_timings, Candidate, ExecutorCore, Pause, Runner, Serialized,
+    TaskScope, STALL_BUDGET,
 };
 use super::pipeline_tests::SERIAL;
 use super::rawinput::{detect_candidate, Buffer, Event, Kind};
@@ -26,7 +26,7 @@ use crate::health::{
 use crate::mock::{FakeClock, InjectCall, MockClipboard, MockForeground, MockInjector};
 use crate::runtime::Runtime;
 use crate::supervisor::{ExecutorControl, InputSources, Status, Supervisor, BACKOFF};
-use crate::traits::Clock;
+use crate::traits::{Clock, Injector};
 use std::sync::{MutexGuard, PoisonError};
 
 const FOCUS: u64 = 0x2a;
@@ -162,6 +162,9 @@ struct ExecRig {
     buffer: Buffer,
     generation: u64,
     injector: Arc<MockInjector>,
+    /// The executor's release port (WinInjector, MARK, in production); the
+    /// same mock as `injector` unless built by [`ExecRig::with_release`].
+    release: Arc<MockInjector>,
     foreground: MockForeground,
     clipboard: MockClipboard,
     clock: Arc<FakeClock>,
@@ -172,6 +175,13 @@ struct ExecRig {
 }
 impl ExecRig {
     fn new(rules: Vec<Rule>) -> Self {
+        Self::build(rules, false)
+    }
+    /// A rig whose release port is a mock of its own.
+    fn with_release(rules: Vec<Rule>) -> Self {
+        Self::build(rules, true)
+    }
+    fn build(rules: Vec<Rule>, separate_release: bool) -> Self {
         let serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         keystate::PHYSICAL.set(Mutex::new(BTreeSet::new())).ok();
         let shared = Shared::new();
@@ -183,6 +193,11 @@ impl ExecRig {
         *shared.compiled.lock().unwrap() = compile_config(&config).unwrap();
         *shared.config.lock().unwrap() = config;
         let injector = Arc::new(MockInjector::new());
+        let release = if separate_release {
+            Arc::new(MockInjector::new())
+        } else {
+            Arc::clone(&injector)
+        };
         let foreground = MockForeground::new(MockForeground::window(FOCUS, APP));
         let clock = Arc::new(FakeClock::new());
         let clipboard = MockClipboard::new(7, vec![(13, utf16("original"))]);
@@ -191,7 +206,7 @@ impl ExecRig {
             Arc::clone(&shared),
             clock.clone(),
             mock_runner(&injector, &foreground, &clock, &clipboard),
-            injector.clone(),
+            release.clone(),
             STALL_BUDGET,
             Arc::clone(&runtime),
         );
@@ -207,6 +222,7 @@ impl ExecRig {
             buffer: Buffer::default(),
             generation: 0,
             injector,
+            release,
             foreground,
             clipboard,
             clock,
@@ -1042,4 +1058,302 @@ fn a_guard_held_before_the_clear_leaves_the_replacement_alone() {
         ("rule-kw", Outcome::Succeeded)
     );
     assert_eq!(rig.history().len(), 2);
+}
+
+/// Both injectors' calls in send order, labeled by port ("task" or
+/// "release"). Hooks run inside the send, so under the send lock.
+type Journal = Arc<std::sync::Mutex<Vec<(&'static str, InjectCall)>>>;
+
+/// Journals every call of the rig's task and release ports; `also` runs on
+/// each task call after it was journaled.
+fn journal(rig: &ExecRig, mut also: impl FnMut(&InjectCall) + Send + 'static) -> Journal {
+    let journal = Journal::default();
+    let log = Arc::clone(&journal);
+    rig.release.on_call(move |call| {
+        let mut log = log.lock().unwrap_or_else(PoisonError::into_inner);
+        log.push(("release", call.clone()));
+    });
+    let log = Arc::clone(&journal);
+    rig.injector.on_call(move |call| {
+        let entry = ("task", call.clone());
+        log.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(entry);
+        also(call);
+    });
+    journal
+}
+
+fn journaled(journal: &Journal) -> Vec<(&'static str, InjectCall)> {
+    journal
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+fn key_up(key: u16) -> InjectCall {
+    InjectCall::Key { key, up: true }
+}
+
+fn press_b() -> Rule {
+    steps_rule("kb", vec![Operation::KeyPress { key: code(KEY_B) }])
+}
+
+/// Send exclusion (a): a task stopped after its epoch check and before the
+/// send, then fenced, submits nothing once let go: the check is repeated
+/// inside the send lock, right before the call. The fence's MARK key-up
+/// (release port) comes first, then the new epoch's input.
+#[test]
+fn a_send_checked_before_the_fence_submits_nothing_after_it() {
+    let mut rig = ExecRig::with_release(vec![
+        steps_rule(
+            "hold",
+            vec![
+                Operation::KeyDown { key: code(KEY_A) },
+                Operation::KeyPress { key: code(KEY_B) },
+                Operation::KeyUp { key: code(KEY_A) },
+            ],
+        ),
+        text_rule("kw", OutputMethod::Keys, TYPED),
+    ]);
+    let journal = journal(&rig, |_| {});
+    let a_down = InjectCall::Key {
+        key: KEY_A,
+        up: false,
+    };
+    let checked = Hold::new();
+    let wait = checked.waiter();
+    let (injector, pressed) = (Arc::clone(&rig.injector), a_down.clone());
+    rig.core.on_pause(move |at| {
+        // The send after A's key-down: the tap of B.
+        if at == Pause::BeforeSend
+            && is_thread("qt-executor-0")
+            && injector.calls().contains(&pressed)
+        {
+            wait();
+        }
+    });
+    assert!(rig.trigger("hold"));
+    checked.wait_arrived("the old task, checked but not yet locked");
+    assert_eq!(rig.core.held_keys(), vec![KEY_A]);
+
+    assert!(rig.core.fence(rig.core.epoch()));
+    assert!(
+        rig.core.held_keys().is_empty(),
+        "the fence paid its key-ups"
+    );
+    assert!(!rig.core.release_owed());
+    rig.core.respawn().expect("a new worker");
+    let result = rig.run("kw");
+    assert_eq!(result.status, "unknown", "{}", result.message);
+
+    drop(checked);
+    assert!(
+        rig.core.join_retired(Duration::from_secs(5)),
+        "the old worker exited"
+    );
+    let entries = journaled(&journal);
+    assert!(
+        !entries
+            .iter()
+            .any(|(_, call)| *call == InjectCall::Keys(vec![KEY_B])),
+        "the old task submitted nothing: {entries:?}"
+    );
+    let at = entries
+        .iter()
+        .position(|entry| *entry == ("task", a_down.clone()))
+        .expect("A was pressed");
+    assert_eq!(entries[at + 1], ("release", key_up(KEY_A)), "{entries:?}");
+    let after = &entries[at + 2..];
+    assert!(after.iter().all(|(port, _)| *port == "task"), "{entries:?}");
+    assert!(after
+        .iter()
+        .any(|(_, call)| matches!(call, InjectCall::Text(_))));
+    assert_eq!(rig.injector.typed(), TYPED);
+    let ups = entries.iter().filter(|(_, call)| *call == key_up(KEY_A));
+    assert_eq!(ups.count(), 1);
+    let history = rig.history();
+    assert_eq!(history.len(), 2);
+    assert_eq!(
+        (
+            history[0].rule_id.as_str(),
+            history[0].outcome,
+            history[0].reason
+        ),
+        ("rule-hold", Outcome::Failed, ReasonCode::ExecutorTimeout)
+    );
+    assert_eq!(
+        (history[1].rule_id.as_str(), history[1].outcome),
+        ("rule-kw", Outcome::Succeeded)
+    );
+}
+
+/// Send exclusion (b): the injector takes a tap's key-down, then blocks
+/// inside the send. The fence cannot get the send lock: it owes the key-ups,
+/// the executor reports Down and the rebuild refuses (fail closed). The send
+/// then returns a partial count after the epoch moved on: the key stays
+/// held, the old task's own cleanup is refused, and the owed MARK key-up
+/// goes out exactly once through the release port, before any new input.
+#[test]
+fn a_partial_send_returning_after_the_fence_gets_its_key_up() {
+    let mut rig = ExecRig::with_release(vec![press_b()]);
+    let tap = InjectCall::Keys(vec![KEY_B]);
+    let warm = rig.run("kb");
+    assert_eq!(warm.status, "unknown", "{}", warm.message);
+    // The same run again takes the same path: short-count its tap.
+    let calls = rig.injector.calls();
+    let at = calls.iter().position(|call| *call == tap).expect("the tap");
+    rig.injector.short_count(calls.len() + at, 1);
+    let in_send = Hold::new();
+    let wait = in_send.waiter();
+    let (blocked, target) = (AtomicBool::new(false), tap.clone());
+    let journal = journal(&rig, move |call| {
+        if *call == target && !blocked.swap(true, Ordering::SeqCst) {
+            wait();
+        }
+    });
+    assert!(rig.trigger("kb"));
+    in_send.wait_arrived("the tap inside SendInput");
+    assert_eq!(rig.core.held_keys(), vec![KEY_B], "marked before the call");
+
+    assert!(rig.core.fence(rig.core.epoch()));
+    assert!(rig.core.release_owed(), "send lock held: key-ups owed");
+    assert!(matches!(
+        rig.executor_status(),
+        Status::Down(ReasonCode::ExecutorTimeout)
+    ));
+    let fenced = rig.last_entry();
+    assert_eq!(
+        (fenced.outcome, fenced.reason),
+        (Outcome::Failed, ReasonCode::ExecutorTimeout)
+    );
+    assert!(fenced.side_effects, "a send was in flight");
+    assert!(
+        rig.core.respawn().is_err(),
+        "no worker while a send is stuck"
+    );
+    assert!(!rig.trigger("kb"), "the queue stays closed");
+    assert_eq!(rig.last_entry().outcome, Outcome::Skipped);
+    assert!(
+        rig.release.calls().is_empty(),
+        "nothing sent without the lock"
+    );
+
+    drop(in_send);
+    assert!(
+        rig.core.join_retired(Duration::from_secs(5)),
+        "the old worker exited"
+    );
+    let entries = journaled(&journal);
+    assert_eq!(
+        entries.last(),
+        Some(&("release", key_up(KEY_B))),
+        "{entries:?}"
+    );
+    let ups = entries.iter().filter(|(_, call)| *call == key_up(KEY_B));
+    assert_eq!(ups.count(), 1, "{entries:?}");
+    assert!(rig.core.held_keys().is_empty());
+    assert!(!rig.core.release_owed());
+
+    rig.core.respawn().expect("the lock is free again");
+    assert!(matches!(rig.executor_status(), Status::Ok));
+    let result = rig.run("kb");
+    assert_eq!(result.status, "unknown", "{}", result.message);
+    let entries = journaled(&journal);
+    let released = entries
+        .iter()
+        .position(|entry| *entry == ("release", key_up(KEY_B)))
+        .unwrap();
+    let taps = entries[released + 1..]
+        .iter()
+        .filter(|(_, call)| *call == tap);
+    assert_eq!(taps.count(), 1, "the new tap follows the key-up");
+}
+
+/// Send exclusion (c): a panic inside the send of a tap leaves the key-down
+/// marked before the call in the bitmap (no usable count), and the busy
+/// guard releases it.
+#[test]
+fn a_panic_inside_a_tap_keeps_the_key_until_it_is_released() {
+    let mut rig = ExecRig::new(vec![press_b()]);
+    let core = Arc::downgrade(&rig.core);
+    let held_at_panic = Arc::new(std::sync::Mutex::new(None));
+    let seen = Arc::clone(&held_at_panic);
+    let fired = AtomicBool::new(false);
+    rig.injector.on_call(move |call| {
+        if *call == InjectCall::Keys(vec![KEY_B]) && !fired.swap(true, Ordering::SeqCst) {
+            let held = core.upgrade().map(|core| core.held_keys());
+            *seen.lock().unwrap_or_else(PoisonError::into_inner) = held;
+            panic!("injector panicked inside SendInput");
+        }
+    });
+    let failed = rig.run("kb");
+    assert_eq!(failed.status, "failed");
+    assert_eq!(
+        *held_at_panic.lock().unwrap_or_else(PoisonError::into_inner),
+        Some(vec![KEY_B])
+    );
+    let calls = rig.injector.calls();
+    let tap = calls
+        .iter()
+        .position(|call| *call == InjectCall::Keys(vec![KEY_B]))
+        .unwrap();
+    assert_eq!(&calls[tap + 1..], &[key_up(KEY_B)]);
+    assert!(rig.core.held_keys().is_empty());
+    let entry = rig.last_entry();
+    assert_eq!(
+        (entry.outcome, entry.reason),
+        (Outcome::Failed, ReasonCode::ExecutorPanic)
+    );
+    assert!(entry.side_effects);
+}
+
+/// Send exclusion (d) and fail closed: while the send lock stays held (a
+/// send stuck inside SendInput) nothing is sent at all. The task's sends are
+/// refused and it fails fast (ExecutorTimeout), its key-ups are owed, the
+/// executor reports Down, every rebuild refuses until the supervisor gives
+/// up (Failed), and manual output is refused too. Once the lock is free the
+/// rebuild succeeds and output works again.
+#[test]
+fn nothing_is_sent_without_the_send_lock() {
+    let mut rig = ExecRig::new(vec![text_rule("kw", OutputMethod::Keys, TYPED)]);
+    let manual = MockInjector::new();
+    let serialized = Serialized::new(&manual, Some(Arc::clone(&rig.core)));
+    let core = Arc::clone(&rig.core);
+    let stuck = core.hold_send_lock();
+    assert!(rig.trigger("kw"));
+    rig.wait_idle();
+    assert!(rig.injector.calls().is_empty(), "the task sent nothing");
+    let entry = rig.last_entry();
+    assert_eq!(
+        (entry.outcome, entry.reason),
+        (Outcome::Failed, ReasonCode::ExecutorTimeout)
+    );
+    assert!(!entry.side_effects);
+    assert!(rig.core.release_owed());
+    assert!(matches!(
+        rig.executor_status(),
+        Status::Down(ReasonCode::ExecutorTimeout)
+    ));
+    assert_eq!(serialized.send_text("manual"), 0);
+    assert!(manual.calls().is_empty(), "manual output refused too");
+
+    rig.supervisor.tick();
+    assert_eq!(rig.state(), HealthState::Recovering);
+    for delay in BACKOFF {
+        rig.clock.advance(delay);
+        rig.supervisor.tick();
+    }
+    assert_eq!(rig.state(), HealthState::Failed);
+    assert!(rig.injector.calls().is_empty());
+
+    drop(stuck);
+    rig.core.respawn().expect("the lock is free again");
+    assert!(!rig.core.release_owed());
+    assert!(matches!(rig.executor_status(), Status::Ok));
+    let result = rig.run("kw");
+    assert_eq!(result.status, "unknown", "{}", result.message);
+    assert_eq!(rig.injector.typed(), TYPED);
+    assert_eq!(serialized.send_text("manual"), 12);
+    assert_eq!(manual.calls(), vec![InjectCall::Text("manual".into())]);
 }

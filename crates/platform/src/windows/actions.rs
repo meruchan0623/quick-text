@@ -296,7 +296,8 @@ pub(super) fn execute_inner(
 ) -> Result<ExecutionResult, String> {
     execute_with_proof(
         &Ports {
-            injector: &WinInjector,
+            // Manual output takes the executor's send lock too (S1).
+            injector: &super::executor::serialized(&WinInjector),
             foreground: &WinForeground,
             clock: &SystemClock,
             clipboard: WinClipboard::new,
