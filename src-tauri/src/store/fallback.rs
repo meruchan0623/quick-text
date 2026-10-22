@@ -135,13 +135,17 @@ impl LoadReport {
 ///    No usable candidate at all is SafeMode(NoValidConfig) with an empty
 ///    configuration; two or more consecutive crashes are SafeMode(CrashLoop)
 ///    with the data loaded for viewing.
+/// 5. Outside the read-only safe modes `store-meta.json` gets the new run
+///    marker. One that did not parse is quarantined first; when that rename
+///    fails, or the file could not be read, it is not written this session
+///    and the marker and crash count stay in memory.
 pub fn load_or_fallback(dir: &Path, env: &StoreEnv) -> LoadReport {
     let mut loader = Loader {
         dir,
         env,
         problems: vec![],
     };
-    let (meta, meta_readable) = loader.read_meta();
+    let (meta, meta_file) = loader.read_meta();
     let now = RunMarker {
         boot_id: env.boot_id,
         started_ms: env.clock.wall_ms(),
@@ -255,10 +259,20 @@ pub fn load_or_fallback(dir: &Path, env: &StoreEnv) -> LoadReport {
     let mut meta = meta;
     meta.run_marker = Some(now);
     meta.crash_count = crash_count;
-    if meta_readable {
+    let meta_writable = match meta_file {
+        MetaFile::Usable => true,
+        MetaFile::Unreadable => false,
+        MetaFile::Corrupt => loader.quarantine_meta(),
+    };
+    if meta_writable {
         if let Err(e) = atomic_json(&dir.join(META_FILE), &meta) {
             tracing::warn!(event = "store.meta_write_failed", error = %e, "store-meta.json not written");
         }
+    } else {
+        tracing::warn!(
+            event = "store.meta_readonly",
+            "store-meta.json left untouched; run marker and crash count kept in memory"
+        );
     }
     let mut problems = loader.problems;
     if let LoadOutcome::SafeMode(reason) = outcome {
@@ -273,7 +287,7 @@ pub fn load_or_fallback(dir: &Path, env: &StoreEnv) -> LoadReport {
         disk_hash,
         problems,
         meta,
-        meta_writable: meta_readable,
+        meta_writable,
     }
 }
 
@@ -299,6 +313,16 @@ enum Read {
     Bytes(Vec<u8>),
     Missing,
     Failed,
+}
+
+/// What `store-meta.json` allows this session.
+enum MetaFile {
+    /// Parsed, or not there yet: it may be written.
+    Usable,
+    /// Reading failed: never replaced this session.
+    Unreadable,
+    /// Did not parse: replaced only once the original is quarantined.
+    Corrupt,
 }
 
 struct Loader<'a> {
@@ -333,23 +357,33 @@ impl Loader<'_> {
         }
     }
 
-    fn read_meta(&mut self) -> (StoreMeta, bool) {
+    /// Reads `store-meta.json`; nothing is renamed or written here, so the
+    /// read-only safe modes leave a corrupt file exactly as it is.
+    fn read_meta(&self) -> (StoreMeta, MetaFile) {
         match self.read(&self.dir.join(META_FILE)) {
-            Read::Missing => (StoreMeta::default(), true),
-            // Never replace a file we could not read.
-            Read::Failed => (StoreMeta::default(), false),
+            Read::Missing => (StoreMeta::default(), MetaFile::Usable),
+            Read::Failed => (StoreMeta::default(), MetaFile::Unreadable),
             Read::Bytes(bytes) => match parse_meta(&bytes) {
-                Some(meta) => (meta, true),
-                None => {
-                    tracing::warn!(
-                        event = "store.meta_reset",
-                        "store-meta.json unreadable; rebuilt"
-                    );
-                    self.problem(ProblemKind::StoreMetaReset {});
-                    (StoreMeta::default(), true)
-                }
+                Some(meta) => (meta, MetaFile::Usable),
+                None => (StoreMeta::default(), MetaFile::Corrupt),
             },
         }
+    }
+
+    /// Moves a corrupt `store-meta.json` aside so that the new default one
+    /// does not destroy it. False when the rename failed: the file must then
+    /// stay untouched for the rest of the session.
+    fn quarantine_meta(&mut self) -> bool {
+        let path = self.dir.join(META_FILE);
+        if self.rename_aside(&path).is_none() {
+            return false;
+        }
+        tracing::warn!(
+            event = "store.meta_reset",
+            "store-meta.json did not parse; quarantined and rebuilt"
+        );
+        self.problem(ProblemKind::StoreMetaReset {});
+        true
     }
 
     fn candidate(&mut self, path: &Path) -> Candidate {
@@ -384,8 +418,21 @@ impl Loader<'_> {
         }
     }
 
-    /// Renames a corrupt file to `<stem>.corrupt-<UTC time>.json` beside it.
+    /// Quarantines a corrupt configuration file and reports it.
     fn quarantine(&mut self, path: &Path) -> bool {
+        let Some(target) = self.rename_aside(path) else {
+            return false;
+        };
+        self.problem(ProblemKind::ConfigQuarantined {
+            file: label(path),
+            quarantined_as: label(&target),
+        });
+        true
+    }
+
+    /// Renames a corrupt file to `<stem>.corrupt-<UTC time>.json` beside it;
+    /// `None` when the rename failed.
+    fn rename_aside(&self, path: &Path) -> Option<PathBuf> {
         let target = quarantine_target(path, self.env.clock.wall_ms());
         match self.env.io.rename(path, &target) {
             Ok(()) => {
@@ -395,11 +442,7 @@ impl Loader<'_> {
                     quarantined_as = %label(&target),
                     "quarantined corrupt file"
                 );
-                self.problem(ProblemKind::ConfigQuarantined {
-                    file: label(path),
-                    quarantined_as: label(&target),
-                });
-                true
+                Some(target)
             }
             Err(e) => {
                 tracing::warn!(
@@ -408,7 +451,7 @@ impl Loader<'_> {
                     error = %e,
                     "corrupt file could not be renamed; it will not be overwritten"
                 );
-                false
+                None
             }
         }
     }
@@ -471,7 +514,7 @@ impl Loader<'_> {
     }
 
     /// SafeMode(Locked) or SafeMode(NewerSchema): nothing is loaded and
-    /// nothing is written, `store-meta.json` included.
+    /// nothing is written; `store-meta.json` is neither written nor renamed.
     fn read_only(self, reason: SafeModeReason, meta: StoreMeta) -> LoadReport {
         let active = Config::default();
         let (compiled, _) = compile_lenient(&active);

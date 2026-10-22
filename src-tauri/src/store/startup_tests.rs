@@ -610,18 +610,87 @@ fn rules_skipped_counts_unreadable_entries() {
     assert_eq!(report.active.unreadable_rules.len(), 2);
 }
 
+/// The `store-meta.corrupt-*.json` files in `dir`.
+fn meta_quarantine(dir: &Path) -> Vec<PathBuf> {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("store-meta.corrupt-")
+        })
+        .collect()
+}
+const CORRUPT_META: &[u8] = b"{\"last_good_revision\": 7, \"future\": [1], \"crash_count\": ";
+
+/// A `store-meta.json` that does not parse is quarantined byte for byte
+/// before the default one replaces it.
 #[test]
 fn unreadable_store_meta_is_reset() {
     let dir = TempDir::new();
     let world = world();
     write(&dir, "active.json", &bytes(&config_at(1)));
-    write(&dir, META_FILE, b"{\"crash_count\": ");
+    write(&dir, META_FILE, CORRUPT_META);
     let report = load_or_fallback(&dir, &env(&world));
     assert_eq!(report.outcome, LoadOutcome::Normal);
+    assert!(report.meta_writable);
     assert!(kinds(&report).contains(&&ProblemKind::StoreMetaReset {}));
+    let quarantine = meta_quarantine(&dir);
+    assert_eq!(quarantine.len(), 1);
+    assert_eq!(fs::read(&quarantine[0]).unwrap(), CORRUPT_META);
     let meta = meta_on_disk(&dir);
+    assert_eq!(meta.last_good_revision, None);
+    assert!(meta.extra.is_empty());
     assert_eq!(meta.crash_count, 0);
     assert_eq!(meta.run_marker.unwrap().pid, 4242);
+}
+
+/// When the corrupt `store-meta.json` cannot be renamed it is never
+/// overwritten: the run marker stays in memory and startup still completes.
+#[test]
+fn unrenamable_store_meta_is_left_untouched() {
+    let dir = TempDir::new();
+    let world = world();
+    write(&dir, "active.json", &bytes(&config_at(1)));
+    write(&dir, META_FILE, CORRUPT_META);
+    world.rename_fails.store(true, Ordering::SeqCst);
+    let report = load_or_fallback(&dir, &env(&world));
+    assert_eq!(report.outcome, LoadOutcome::Normal);
+    assert!(!report.meta_writable);
+    assert!(!kinds(&report).contains(&&ProblemKind::StoreMetaReset {}));
+    assert_eq!(report.meta.run_marker.as_ref().unwrap().pid, 4242);
+    assert_eq!(fs::read(dir.join(META_FILE)).unwrap(), CORRUPT_META);
+
+    // Through the store: neither the run marker nor LKG marking writes it.
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.safe_mode(), None);
+    assert_eq!(store.active, config_at(1));
+    store.publish(metadata_config(&["b"])).unwrap();
+    store.mark_last_good(store.active.revision).unwrap();
+    store.meta.clear_run_marker();
+    assert_eq!(fs::read(dir.join(META_FILE)).unwrap(), CORRUPT_META);
+    assert!(meta_quarantine(&dir).is_empty());
+}
+
+/// The read-only safe modes do not even quarantine a corrupt
+/// `store-meta.json`.
+#[test]
+fn read_only_safe_modes_leave_corrupt_store_meta_alone() {
+    let dir = TempDir::new();
+    let world = world();
+    write(&dir, "active.json", &bytes(&config_at(1)));
+    write(&dir, META_FILE, CORRUPT_META);
+    world.locked.lock().push("active.json");
+    let before = files(&dir);
+    let report = load_or_fallback(&dir, &env(&world));
+    assert_eq!(
+        report.outcome,
+        LoadOutcome::SafeMode(SafeModeReason::Locked)
+    );
+    assert!(!report.meta_writable);
+    assert_eq!(files(&dir), before);
 }
 
 /// LKG: the recorded revision is the first fallback candidate.
