@@ -48,10 +48,8 @@ fn main() {
                 "Quicker Text starting"
             );
             app.manage(DataDir(dir.clone()));
-            // The exact embedded keys, not `AssetResolver::get`: that falls
-            // back to `index.html` for any unknown path.
-            app.manage(commands::diagnostics::BundledAssets::new(
-                app.asset_resolver().iter().map(|(path, _)| path),
+            app.manage(commands::diagnostics::BundledAssets::embedded(
+                &app.asset_resolver(),
             ));
             app.manage(diagnostics::level::LogLevelControl::start(
                 dir.clone(),

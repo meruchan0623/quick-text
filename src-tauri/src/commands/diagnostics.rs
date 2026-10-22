@@ -18,7 +18,7 @@ use crate::{
     error::{CommandError, IoOp},
 };
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     fs, io,
     path::{Path, PathBuf},
     sync::atomic::Ordering,
@@ -162,28 +162,142 @@ pub fn log_frontend_error(
     record_frontend_error(&assets, &message, stack.as_deref(), source.as_deref());
 }
 
-/// The frontend files embedded in this binary, by path
-/// (`assets/index-D3f9Kq_x.js`): the trusted list a script location in a
-/// frontend error must be on to be logged. Empty (so every location is
-/// dropped) unless built from the app's assets; in dev builds the dev
-/// server serves the frontend and nothing is embedded.
+/// The Vite chunks embedded in this binary, by path
+/// (`assets/index-D3f9Kq_x.js`), each with its [`Extent`]: the trusted list
+/// a script location in a frontend error must be on, at a line and column
+/// inside the script, to be logged. Empty (so every location is dropped)
+/// unless built from the app's assets; in dev builds the dev server serves
+/// the frontend and nothing is embedded.
 #[derive(Debug, Default)]
-pub struct BundledAssets(HashSet<String>);
+pub struct BundledAssets(HashMap<String, Extent>);
 
 impl BundledAssets {
-    /// From asset keys as Tauri lists them (`/assets/index-D3f9Kq_x.js`),
-    /// `AssetResolver::iter` in production.
-    pub fn new<P: AsRef<str>>(paths: impl IntoIterator<Item = P>) -> Self {
-        let relative = |path: P| path.as_ref().trim_start_matches('/').to_string();
-        Self(paths.into_iter().map(relative).collect())
+    /// The app's embedded chunks. `AssetResolver::iter` gives the exact keys
+    /// (`AssetResolver::get` falls back to `index.html` for an unknown path,
+    /// so it cannot tell what exists) but compressed bytes; `get` of a key
+    /// `iter` gave returns that asset decompressed. Only chunks are read:
+    /// in a release build that is the app's JavaScript, read once.
+    pub fn embedded<R: tauri::Runtime>(resolver: &tauri::AssetResolver<R>) -> Self {
+        let chunks: Vec<String> = resolver
+            .iter()
+            .map(|(key, _)| key.into_owned())
+            .filter(|key| chunk_path(key).is_some())
+            .collect();
+        Self::new(chunks.into_iter().filter_map(|key| {
+            let asset = resolver.get(key.clone())?;
+            Some((key, asset.bytes))
+        }))
     }
 
-    fn contains(&self, path: &str) -> bool {
-        self.0.contains(path)
+    /// From `(key, contents)` pairs, keys as Tauri lists them
+    /// (`/assets/index-D3f9Kq_x.js`). Assets other than chunks are left out.
+    pub fn new<K: AsRef<str>, B: AsRef<[u8]>>(assets: impl IntoIterator<Item = (K, B)>) -> Self {
+        let measured = |(key, contents): (K, B)| {
+            let path = chunk_path(key.as_ref())?.to_string();
+            Some((path, Extent::measure(contents.as_ref())))
+        };
+        Self(assets.into_iter().filter_map(measured).collect())
+    }
+
+    fn extent(&self, path: &str) -> Option<&Extent> {
+        self.0.get(path)
     }
 }
 
+/// `assets/index-D3f9Kq_x.js` of an asset key `/assets/index-D3f9Kq_x.js`
+/// when it names a Vite chunk (see [`vite_chunk_hash`]).
+fn chunk_path(key: &str) -> Option<&str> {
+    let path = key.strip_prefix('/').unwrap_or(key);
+    vite_chunk_hash(path.strip_prefix("assets/")?).map(|_| path)
+}
+
+/// Above this many lines, an [`Extent`] keeps only the line count and the
+/// longest line (a minified Vite chunk has a few dozen lines).
+const MAX_LINE_TABLE: usize = 4096;
+
+/// The lines of a script, as JavaScript engines number them: a line ends
+/// at LF, CR, CRLF, U+2028 or U+2029. Lengths are in bytes, which is never
+/// less than the UTF-16 code units engines count columns in, so the bound
+/// is loose but never drops a real location.
+#[derive(Debug, PartialEq, Eq)]
+enum Extent {
+    /// The length of each line.
+    Lines(Box<[u32]>),
+    /// More than [`MAX_LINE_TABLE`] lines: how many, and the longest.
+    Long { lines: u32, longest: u32 },
+}
+
+impl Extent {
+    fn measure(script: &[u8]) -> Self {
+        let mut table = Vec::new();
+        let (mut lines, mut longest) = (0u32, 0u32);
+        for length in line_lengths(script) {
+            let length = u32::try_from(length).unwrap_or(u32::MAX);
+            lines = lines.saturating_add(1);
+            longest = longest.max(length);
+            if table.len() <= MAX_LINE_TABLE {
+                table.push(length);
+            }
+        }
+        if table.len() <= MAX_LINE_TABLE {
+            Self::Lines(table.into_boxed_slice())
+        } else {
+            Self::Long { lines, longest }
+        }
+    }
+
+    /// Whether `line` and `column`, both counted from one as V8 and WebKit
+    /// print them, fall inside the script; a column may be one past the end
+    /// of its line, where an engine reports an unexpected end.
+    fn admits(&self, line: u32, column: u32) -> bool {
+        let length = match self {
+            Self::Lines(lengths) => {
+                let index = (line as usize).checked_sub(1);
+                match index.and_then(|index| lengths.get(index)) {
+                    Some(&length) => length,
+                    None => return false,
+                }
+            }
+            Self::Long { lines, longest } if (1..=*lines).contains(&line) => *longest,
+            Self::Long { .. } => return false,
+        };
+        (1..=length.saturating_add(1)).contains(&column)
+    }
+}
+
+/// The byte length of each line of `script`, see [`Extent`].
+fn line_lengths(script: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    let mut rest = Some(script);
+    std::iter::from_fn(move || {
+        let text = rest?;
+        for (at, &byte) in text.iter().enumerate() {
+            let terminator = match byte {
+                b'\n' => 1,
+                b'\r' if text.get(at + 1) == Some(&b'\n') => 2,
+                b'\r' => 1,
+                0xE2 if matches!(text.get(at + 1..at + 3), Some([0x80, 0xA8 | 0xA9])) => 3,
+                _ => continue,
+            };
+            rest = Some(&text[at + terminator..]);
+            return Some(at);
+        }
+        rest = None;
+        Some(text.len())
+    })
+}
+
 /// [`log_frontend_error`] with the trusted asset list passed in.
+///
+/// Threat model: the input comes from the app's own frontend. A
+/// compromised frontend can read every phrase through `load_state` or
+/// `export_config` anyway, so a malicious caller is out of scope; what is
+/// guarded against is accidental leakage, an error message, `eval`ed code
+/// or a function name carrying phrase text into the log. So only fixed
+/// labels, lengths, fingerprints and script locations are kept, and a
+/// location only when it names a chunk embedded in the binary at a line and
+/// column inside that chunk, printed from the parsed numbers. Accepted
+/// residual risk: a number that falls inside a chunk's real extent is kept
+/// as a line or column.
 pub fn record_frontend_error(
     assets: &BundledAssets,
     message: &str,
@@ -209,7 +323,8 @@ pub fn record_frontend_error(
 /// error is supplied by the caller and can carry phrase content (a message
 /// built from a rule, a function or file name, a query string), so none of
 /// it is logged (S-08): only a fixed class label, the message's length and
-/// fingerprint, and the content hashes of scripts embedded in the binary.
+/// fingerprint, and the content hashes of scripts embedded in the binary
+/// with positions inside them (see [`record_frontend_error`]).
 #[derive(Debug, PartialEq, Eq)]
 struct FrontendError {
     class: ErrorClass,
@@ -356,25 +471,39 @@ const APP_ORIGINS: [&str; 3] = [
 /// `D3f9Kq_x.js:line:col` of `url:line:col` when `url` is one of the app's
 /// bundled scripts: served from an [`APP_ORIGINS`] origin, a Vite chunk
 /// (see [`vite_chunk_hash`]) directly under `/assets/`, and embedded in this
-/// binary ([`BundledAssets`]). The last check is what makes the hash safe to
-/// log: a caller can shape any text like a chunk name (`index-SECRETAB.js`),
-/// but only a real build output is on the list. Only the content hash is
-/// kept, which identifies the chunk (and its source map). Anything else
-/// (another host, the dev server, a relative path, `blob:`, `data:`, `eval`,
-/// `<anonymous>`, a query string or fragment) is `None`.
+/// binary ([`BundledAssets`]), with `line:col` inside that chunk
+/// ([`Extent::admits`]). Membership is what makes the hash safe to log: a
+/// caller can shape any text like a chunk name (`index-SECRETAB.js`), but
+/// only a real build output is on the list. The line and column are parsed
+/// ([`coordinate`]) and printed from the numbers, never copied. Only the
+/// content hash of the name is kept, which identifies the chunk (and its
+/// source map). Anything else (another host, the dev server, a relative
+/// path, `blob:`, `data:`, `eval`, `<anonymous>`, a query string or
+/// fragment, a position outside the chunk) is `None`.
 fn asset_location(assets: &BundledAssets, location: &str) -> Option<String> {
-    let (rest, col) = location.trim().rsplit_once(':')?;
+    let (rest, column) = location.trim().rsplit_once(':')?;
     let (url, line) = rest.rsplit_once(':')?;
-    if !is_number(line) || !is_number(col) {
-        return None;
-    }
+    let (line, column) = (coordinate(line)?, coordinate(column)?);
     let path = APP_ORIGINS
         .into_iter()
         .find_map(|origin| url.strip_prefix(origin))?;
     let hash = vite_chunk_hash(path.strip_prefix("assets/")?)?;
     assets
-        .contains(path)
-        .then(|| format!("{hash}:{line}:{col}"))
+        .extent(path)?
+        .admits(line, column)
+        .then(|| format!("{hash}:{line}:{column}"))
+}
+
+/// A line or column number as engines print one: 1 to `u32::MAX` in
+/// decimal digits, no sign, no leading zero.
+fn coordinate(text: &str) -> Option<u32> {
+    let canonical = matches!(text.as_bytes().first(), Some(b'1'..=b'9'))
+        && text.bytes().all(|b| b.is_ascii_digit());
+    if !canonical {
+        return None;
+    }
+    // Fails past `u32::MAX`.
+    text.parse().ok()
 }
 
 /// `D3f9Kq_x.js` of a Vite chunk file name `index-D3f9Kq_x.js`: a non-empty
@@ -389,10 +518,6 @@ fn vite_chunk_hash(file: &str) -> Option<&str> {
     let base64url = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_');
     let named = !name.is_empty() && name.bytes().all(|b| base64url(b) || b == b'.');
     (named && hash.bytes().all(base64url)).then(|| &file[split..])
-}
-
-fn is_number(text: &str) -> bool {
-    (1..=10).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Logs a whitelisted UI metric as `ui.metric`; other names and values that
@@ -455,15 +580,78 @@ mod tests {
         fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
-    /// What a build embeds, as `AssetResolver::iter` lists it: the trusted
-    /// list the tests run against.
+    /// What a build embeds, keyed as `AssetResolver::iter` lists it: the
+    /// trusted list the tests run against. `index-D3f9Kq_x.js` has 50 lines
+    /// of 400 bytes (columns 1 to 401), `vendor-a1B2-c_D.mjs` one line of 17
+    /// bytes; the others are not chunks.
     fn bundled() -> BundledAssets {
         BundledAssets::new([
-            "/index.html",
-            "/assets/index-D3f9Kq_x.js",
-            "/assets/index-D3f9Kq_x.css",
-            "/assets/vendor-a1B2-c_D.mjs",
+            ("/index.html", "<!doctype html>".to_string()),
+            (
+                "/assets/index-D3f9Kq_x.js",
+                vec!["x".repeat(400); 50].join("\n"),
+            ),
+            ("/assets/index-D3f9Kq_x.css", "body{}".to_string()),
+            (
+                "/assets/vendor-a1B2-c_D.mjs",
+                "export const a=1;".to_string(),
+            ),
         ])
+    }
+
+    #[test]
+    fn script_extents_follow_javascript_line_terminators() {
+        let measured = Extent::measure("ab\ncd\r\nefg\rh\u{2028}ij\u{2029}中".as_bytes());
+        assert_eq!(measured, Extent::Lines(Box::new([2, 2, 3, 1, 2, 3])));
+        assert_eq!(Extent::measure(b""), Extent::Lines(Box::new([0])));
+        assert_eq!(Extent::measure(b"a\n"), Extent::Lines(Box::new([1, 0])));
+        for (line, column, admitted) in [
+            (1, 1, true),
+            (1, 3, true),
+            (1, 4, false),
+            (6, 4, true),
+            (6, 5, false),
+            (7, 1, false),
+            (0, 1, false),
+            (1, 0, false),
+            (u32::MAX, 1, false),
+        ] {
+            assert_eq!(measured.admits(line, column), admitted, "{line}:{column}");
+        }
+
+        let long = format!("{}abcdef", "a\n".repeat(MAX_LINE_TABLE + 10));
+        let lines = (MAX_LINE_TABLE + 11) as u32;
+        let measured = Extent::measure(long.as_bytes());
+        assert_eq!(measured, Extent::Long { lines, longest: 6 });
+        assert!(measured.admits(lines, 7) && measured.admits(1, 7));
+        assert!(!measured.admits(lines + 1, 1) && !measured.admits(1, 8));
+        assert!(!measured.admits(0, 1) && !measured.admits(1, 0));
+        let table = Extent::measure("a\n".repeat(MAX_LINE_TABLE - 1).as_bytes());
+        assert!(matches!(table, Extent::Lines(lengths) if lengths.len() == MAX_LINE_TABLE));
+
+        // Only chunks are kept, by path without the leading `/`.
+        let assets = bundled();
+        assert_eq!(assets.0.len(), 2);
+        assert!(assets.extent("assets/vendor-a1B2-c_D.mjs").is_some());
+        assert!(assets.extent("index.html").is_none());
+        assert!(assets.extent("assets/index-D3f9Kq_x.css").is_none());
+
+        for (text, parsed) in [
+            ("1", Some(1)),
+            ("401", Some(401)),
+            ("4294967295", Some(u32::MAX)),
+            ("4294967296", None),
+            ("98765432109", None),
+            ("0", None),
+            ("012", None),
+            ("00001234", None),
+            ("+1", None),
+            ("1e3", None),
+            (" 1", None),
+            ("", None),
+        ] {
+            assert_eq!(coordinate(text), parsed, "{text:?}");
+        }
     }
 
     /// Only the head of a long stack is read, cut on a line (and so on a
@@ -504,9 +692,11 @@ mod tests {
         // Each line is dropped: the dev server, no hash, `<anonymous>`,
         // relative paths, outside `/assets/`, a subdirectory, eval,
         // `Function`, `blob:`, `data:`, another host, a style sheet, a
-        // query string, a fragment, a 6-character hash, no name, and
+        // query string, a fragment, a 6-character hash, no name,
         // Vite-shaped names the build did not embed (any text, one character
-        // off, a known hash under another name).
+        // off, a known hash under another name), and positions that are not
+        // in the chunk or not written canonically (past the last line, past
+        // the end of the line plus one, zero, a leading zero).
         let dropped = [
             "at new Store (http://localhost:1420/src/store.ts?t=1729591293:7:8)",
             "at http://tauri.localhost/assets/vendor.js:1:2",
@@ -531,6 +721,12 @@ mod tests {
             "at load (http://tauri.localhost/assets/index-D3f9Kq_y.js:5:6)",
             "at load (http://tauri.localhost/assets/vendor-D3f9Kq_x.js:5:6)",
             "load@tauri://localhost/assets/index-a1B2-c_D.mjs:5:6",
+            "at load (http://tauri.localhost/assets/index-D3f9Kq_x.js:51:1)",
+            "at load (http://tauri.localhost/assets/index-D3f9Kq_x.js:50:402)",
+            "load@tauri://localhost/assets/vendor-a1B2-c_D.mjs:1:19",
+            "at load (http://tauri.localhost/assets/index-D3f9Kq_x.js:0:1)",
+            "at load (http://tauri.localhost/assets/index-D3f9Kq_x.js:1:0)",
+            "at load (http://tauri.localhost/assets/index-D3f9Kq_x.js:012:345)",
         ];
         let stack = format!("{kept}{}", dropped.join("\n"));
         let message = "Uncaught TypeError: Cannot read properties of undefined (reading 'body')";
@@ -888,6 +1084,103 @@ mod tests {
                 full.iter()
                     .filter(|(name, _)| *name != "active.json")
                     .map(|(name, text)| (format!("full:{name}"), text)),
+            );
+        for (name, text) in every_entry {
+            for sentinel in SENTINELS {
+                assert!(!text.contains(sentinel), "{name} leaks {sentinel}:\n{text}");
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// S-08 privacy test for line and column numbers, the caller text left
+    /// in a location of a bundled chunk: digits that are not a position
+    /// inside the chunk (a numeric phrase, a zero-padded one, past the last
+    /// line or the end of a line, beyond `u32`) drop the whole frame through
+    /// `source`, V8 frames and Firefox frames alike, and reach no file in the
+    /// data directory and no entry of a Summary bundle. Positions inside the
+    /// chunk are kept, printed from the parsed numbers.
+    #[test]
+    fn caller_chosen_coordinates_reach_no_log_or_bundle_entry() {
+        use crate::diagnostics::{
+            bundle::test_support::summary_entries,
+            logging::test_support::{read_logs, scoped},
+        };
+        use tracing::level_filters::LevelFilter;
+
+        // Searchable sentinels: digit runs that occur nowhere else in a log.
+        const SENTINELS: [&str; 5] = [
+            "1234567890",
+            "00001234",
+            "00000012",
+            "00000345",
+            "98765432109",
+        ];
+        // `index-D3f9Kq_x.js` has 50 lines of 400 bytes.
+        let positions = [
+            ("1234567890", "1"),
+            ("1", "1234567890"),
+            ("00001234", "1"),
+            ("1", "00001234"),
+            ("00000012", "00000345"),
+            ("98765432109", "1"),
+            ("1", "98765432109"),
+            ("51", "1"),
+            ("50", "402"),
+            ("0", "1"),
+            ("1", "0"),
+        ];
+        let dir = std::env::temp_dir().join(format!("quicker-fe-test-{}", uuid::Uuid::new_v4()));
+        let built = scoped(&log_dir(&dir), LevelFilter::TRACE);
+        let assets = bundled();
+        tracing::subscriber::with_default(built.subscriber, || {
+            for (line, column) in positions {
+                let at = format!("assets/index-D3f9Kq_x.js:{line}:{column}");
+                let stack = format!(
+                    "TypeError: x\n\
+                     \x20   at render (http://tauri.localhost/{at})\n\
+                     \x20   at https://tauri.localhost/{at}\n\
+                     render@tauri://localhost/{at}"
+                );
+                let source = format!("tauri://localhost/{at}");
+                record_frontend_error(&assets, "TypeError: x", Some(&stack), Some(&source));
+            }
+            // In range, at the edges of the chunk and of a line.
+            record_frontend_error(
+                &assets,
+                "TypeError: x",
+                Some(
+                    "    at render (http://tauri.localhost/assets/index-D3f9Kq_x.js:1:1)\n\
+                     \x20   at https://tauri.localhost/assets/vendor-a1B2-c_D.mjs:1:18\n\
+                     render@tauri://localhost/assets/index-D3f9Kq_x.js:12:345",
+                ),
+                Some("tauri://localhost/assets/index-D3f9Kq_x.js:50:401"),
+            );
+        });
+        drop(built.guard);
+
+        let log = read_logs(&log_dir(&dir));
+        let dropped = positions.len();
+        assert_eq!(log.matches("frontend.error").count(), dropped + 1, "{log}");
+        assert_eq!(log.matches("source_dropped=true").count(), dropped, "{log}");
+        assert_eq!(log.matches("stack=[]").count(), dropped, "{log}");
+        assert_eq!(log.matches("dropped_lines=4").count(), dropped, "{log}");
+        let kept = r#"source="D3f9Kq_x.js:50:401" source_dropped=false stack=["D3f9Kq_x.js:1:1", "a1B2-c_D.mjs:1:18", "D3f9Kq_x.js:12:345"] dropped_lines=0"#;
+        assert!(log.contains(kept), "{kept} missing:\n{log}");
+        // No other position of the chunk made it.
+        assert_eq!(log.matches("D3f9Kq_x.js:").count(), 3, "{log}");
+
+        let on_disk = files_under(&dir);
+        assert!(!on_disk.is_empty());
+        let bundle = summary_entries(&dir);
+        assert!(bundle.keys().any(|name| name.starts_with("logs/")));
+        let every_entry = on_disk
+            .iter()
+            .map(|(path, text)| (path.display().to_string(), text))
+            .chain(
+                bundle
+                    .iter()
+                    .map(|(name, text)| (format!("bundle:{name}"), text)),
             );
         for (name, text) in every_entry {
             for sentinel in SENTINELS {

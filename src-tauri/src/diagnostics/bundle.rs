@@ -917,7 +917,7 @@ mod tests {
         fs::write(dir.join("active.json"), config).unwrap();
         let body = format!("body-{SENTINEL}");
         let failed: Result<(), String> = std::hint::black_box(Err(format!("x\"{body}\"y")));
-        let assets = BundledAssets::new(["/index.html", "/assets/index-D3f9Kq_x.js"]);
+        let assets = BundledAssets::new([("/assets/index-D3f9Kq_x.js", "a();\n".repeat(5))]);
         let built = scoped(&log_dir(&dir), LevelFilter::TRACE);
         tracing::subscriber::with_default(built.subscriber, || {
             panic_into(&dir, || panic!("could not expand {body}"));
