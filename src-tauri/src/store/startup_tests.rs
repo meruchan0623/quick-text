@@ -9,8 +9,9 @@ use super::{
     RecoverySource, Store,
 };
 use crate::{
+    autostart::LoginItem,
     error::{CommandError, SafeModeReason},
-    startup::ProblemKind,
+    startup::{defer_autostart_repair, ProblemKind},
 };
 use quicker_domain::*;
 use quicker_platform::traits::Clock;
@@ -20,7 +21,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -868,6 +869,94 @@ fn export_refuses_other_spellings_of_the_data_dir() {
         assert!(refused_as_data_dir(result), "{}", target.display());
     }
     assert_eq!(files(&dir), before);
+}
+
+/// In-memory login item shared with the deferred repair; the real one is
+/// never touched.
+struct FakeLoginItem {
+    entry: parking_lot::Mutex<Option<String>>,
+    writes: AtomicU32,
+}
+impl FakeLoginItem {
+    fn stale() -> Arc<Self> {
+        Arc::new(Self {
+            entry: parking_lot::Mutex::new(Some("\"D:/old/quicker-text.exe\" --background".into())),
+            writes: AtomicU32::new(0),
+        })
+    }
+    fn writes(&self) -> u32 {
+        self.writes.load(Ordering::SeqCst)
+    }
+}
+impl LoginItem for Arc<FakeLoginItem> {
+    fn entry(&self) -> io::Result<Option<String>> {
+        Ok(self.entry.lock().clone())
+    }
+    fn set_entry(&self, entry: &str) -> io::Result<()> {
+        *self.entry.lock() = Some(entry.into());
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// B-04: a stale login item is not rewritten during any safe mode; it is
+/// repaired exactly once when the store becomes writable.
+#[test]
+fn autostart_repair_waits_until_the_store_is_writable() {
+    let exe = PathBuf::from("C:/Apps/quicker-text.exe");
+    let repaired = |store: &Store| {
+        store
+            .startup_problems()
+            .iter()
+            .filter(|p| p.kind == ProblemKind::AutostartRepaired {})
+            .count()
+    };
+    for mode in ALL_MODES {
+        let (dir, world, mut store) = store_in(mode);
+        let item = FakeLoginItem::stale();
+        defer_autostart_repair(&mut store, item.clone(), exe.clone());
+        // Registering again changes nothing.
+        defer_autostart_repair(&mut store, item.clone(), exe.clone());
+        match mode {
+            None => {}
+            Some(SafeModeReason::Locked) => {
+                assert_eq!(item.writes(), 0, "{mode:?}");
+                world.locked.lock().clear();
+                store.apply_retry(retry_locked(&dir, &env(&world)).unwrap());
+            }
+            Some(SafeModeReason::NewerSchema) => {
+                assert_eq!(item.writes(), 0, "{mode:?}");
+                // No way out within the session; a reload that finds a
+                // supported file stands in for becoming writable.
+                write(&dir, "active.json", &bytes(&config_at(2)));
+                store.apply_retry(load_or_fallback(&dir, &env(&world)));
+            }
+            Some(_) => {
+                assert_eq!(item.writes(), 0, "{mode:?}");
+                let imported = metadata_config(&["imported"]);
+                store.pending_import = Some((imported.clone(), vec![]));
+                store.save(imported).unwrap();
+                assert_eq!(item.writes(), 0, "{mode:?}: committed, not published");
+                store.publish(store.draft.clone()).unwrap();
+            }
+        }
+        assert_eq!(store.safe_mode(), None, "{mode:?}");
+        assert_eq!(item.writes(), 1, "{mode:?}");
+        assert!(item
+            .entry
+            .lock()
+            .as_ref()
+            .unwrap()
+            .contains("C:/Apps/quicker-text.exe"));
+        assert_eq!(repaired(&store), 1, "{mode:?}");
+
+        // Later writes and registrations do not repair again.
+        *item.entry.lock() = Some("\"D:/old/quicker-text.exe\" --background".into());
+        store.publish(metadata_config(&["later"])).unwrap();
+        defer_autostart_repair(&mut store, item.clone(), exe.clone());
+        assert_eq!(item.writes(), 1, "{mode:?}");
+        assert_eq!(repaired(&store), 1, "{mode:?}");
+    }
 }
 
 /// Fault injection (B-52): the store points behave as the real failures.

@@ -47,7 +47,15 @@ pub struct Store {
     /// In safe mode: the draft was committed from an import and may be
     /// published, which ends safe mode.
     safe_import: bool,
+    /// Work waiting for the store to become writable (see
+    /// [`Store::when_writable`]).
+    writable_hooks: Vec<(&'static str, WritableHook)>,
+    /// Keys of hooks that already ran.
+    writable_done: Vec<&'static str>,
 }
+
+/// Deferred work run with the store once it is writable.
+pub type WritableHook = Box<dyn FnOnce(&mut Store) + Send>;
 
 /// Makes the running store's run marker reachable from
 /// [`clear_run_marker_on_session_end`].
@@ -88,6 +96,27 @@ impl Store {
             None => Ok(()),
         }
     }
+    /// Runs `hook` once per session, the first time the store is writable:
+    /// right away outside safe mode, otherwise when safe mode ends (the
+    /// SafeMode(Locked) retry succeeds, or a published import leaves
+    /// CrashLoop or NoValidConfig). A `key` that is already waiting or has
+    /// run is ignored, so registering twice changes nothing.
+    pub fn when_writable(&mut self, key: &'static str, hook: WritableHook) {
+        if self.writable_done.contains(&key) || self.writable_hooks.iter().any(|(k, _)| *k == key) {
+            return;
+        }
+        if self.safe_mode.is_none() {
+            self.writable_done.push(key);
+            hook(self);
+        } else {
+            tracing::info!(
+                event = "store.writable_hook_deferred",
+                hook = key,
+                "deferred until safe mode ends"
+            );
+            self.writable_hooks.push((key, hook));
+        }
+    }
     /// The only place safe mode changes. The engine is never resumed here:
     /// it starts paused and stays paused through safe mode.
     // P1a: set/clear `PauseReasons::SAFE_MODE` here; P5: emit the change.
@@ -110,6 +139,12 @@ impl Store {
         }
         self.safe_mode = reason;
         self.safe_import = false;
+        if reason.is_none() {
+            for (key, hook) in std::mem::take(&mut self.writable_hooks) {
+                self.writable_done.push(key);
+                hook(self);
+            }
+        }
     }
     /// Records `revision` as last-known-good in `store-meta.json`; it is the
     /// first candidate after `active.json` in `load_or_fallback`.

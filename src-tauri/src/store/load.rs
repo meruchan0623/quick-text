@@ -50,6 +50,8 @@ impl Store {
             startup_problems: vec![],
             meta,
             safe_import: false,
+            writable_hooks: vec![],
+            writable_done: vec![],
         };
         store.install(report);
         store

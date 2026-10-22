@@ -3,9 +3,9 @@
 //! SafeMode(Locked) retry and the run marker lifecycle (B-04).
 use crate::{
     app_state::Managed,
-    autostart,
+    autostart::{self, LoginItem},
     error::SafeModeReason,
-    store::{self, RecoverySource, StoreEnv},
+    store::{self, RecoverySource, Store, StoreEnv},
 };
 use serde::Serialize;
 use std::{path::PathBuf, time::Duration};
@@ -65,8 +65,8 @@ impl From<ProblemKind> for StartupProblem {
     }
 }
 
-/// Runs once the store is managed: repairs a stale autostart entry, keeps
-/// the run marker reachable for session end, and starts the
+/// Runs once the store is managed: keeps the run marker reachable for
+/// session end, schedules the autostart repair, and starts the
 /// SafeMode(Locked) retry.
 pub fn after_load(app: &AppHandle) {
     let state = app.state::<Managed>();
@@ -75,20 +75,35 @@ pub fn after_load(app: &AppHandle) {
     // A development build would point the user's login item at itself.
     if !cfg!(debug_assertions) {
         if let Ok(exe) = std::env::current_exe() {
-            match autostart::repair(&autostart::SystemLoginItem, &exe) {
-                Ok(true) => store.add_problem(ProblemKind::AutostartRepaired {}),
-                Ok(false) => {}
-                Err(e) => tracing::warn!(
-                    event = "autostart.repair_failed",
-                    error = %e,
-                    "autostart entry could not be checked or repaired"
-                ),
-            }
+            defer_autostart_repair(&mut store, autostart::SystemLoginItem, exe);
         }
     }
     if store.safe_mode() == Some(SafeModeReason::Locked) {
         spawn_locked_retry(app.clone(), store.dir().to_path_buf());
     }
+}
+
+/// Repairs a stale login item (B-04) once, and only while the store is
+/// writable: never during safe mode, where it waits until safe mode ends
+/// (see [`Store::when_writable`]). The repair itself only writes when the
+/// entry points somewhere else.
+pub fn defer_autostart_repair(
+    store: &mut Store,
+    item: impl LoginItem + Send + 'static,
+    exe: PathBuf,
+) {
+    store.when_writable(
+        "autostart_repair",
+        Box::new(move |store| match autostart::repair(&item, &exe) {
+            Ok(true) => store.add_problem(ProblemKind::AutostartRepaired {}),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                event = "autostart.repair_failed",
+                error = %e,
+                "autostart entry could not be checked or repaired"
+            ),
+        }),
+    );
 }
 
 /// Clears the run marker when the event loop ends. tao turns
