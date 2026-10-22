@@ -9,10 +9,26 @@ fn version() -> u32 {
 fn yes() -> bool {
     true
 }
+/// Terminator keys that older configurations may contain but the Windows input path
+/// never delivers (B-12 / S-12). Existing values are kept as configured; readers only
+/// warn with [`diagnostic_code::TERMINATOR_UNSUPPORTED`].
+pub const UNSUPPORTED_TERMINATORS: [&str; 2] = ["tab", "enter"];
+/// Stable diagnostic codes that hosts match on instead of message text.
+pub mod diagnostic_code {
+    /// `version` is above [`crate::SUPPORTED_SCHEMA_VERSION`]: open read-only, never overwrite.
+    pub const SCHEMA_NEWER: &str = "schema_newer";
+    /// `version` is not a supported schema version (for example 0).
+    pub const SCHEMA_VERSION: &str = "schema_version";
+    /// A top-level or global field had the wrong type and fell back to its default.
+    pub const FIELD_RESET: &str = "field_reset";
+    /// A rule entry could not be read; it is kept verbatim and disabled at runtime.
+    pub const RULE_UNREADABLE: &str = "rule_unreadable";
+    /// The configuration still uses `tab` / `enter` terminators (B-12).
+    pub const TERMINATOR_UNSUPPORTED: &str = "terminator_unsupported";
+}
 fn default_terminators() -> Vec<String> {
-    ["space", "tab", "enter", "semicolon"]
-        .map(str::to_string)
-        .to_vec()
+    // New configurations only offer the keys every runtime delivers (B-12).
+    ["space", "semicolon"].map(str::to_string).to_vec()
 }
 fn default_separators() -> String {
     " \t\r\n".into()
@@ -35,6 +51,49 @@ impl Default for Config {
             globals: GlobalSettings::default(),
             rules: vec![],
         }
+    }
+}
+impl Config {
+    /// Locations that still use [`UNSUPPORTED_TERMINATORS`]: the global setting and the
+    /// overrides of terminator-mode rules (immediate rules never consult terminators).
+    fn unsupported_terminator_uses(&self) -> impl Iterator<Item = (String, &[String])> {
+        let globals = std::iter::once((
+            "globals.terminators".to_string(),
+            self.globals.terminators.as_slice(),
+        ));
+        let rules = self.rules.iter().enumerate().filter_map(|(index, rule)| {
+            let keys = &rule.terminator.as_ref()?.keys;
+            (rule.trigger_mode == TriggerMode::Terminator)
+                .then(|| (format!("rules[{index}].terminator.keys"), keys.as_slice()))
+        });
+        globals.chain(rules).filter(|(_, keys)| {
+            keys.iter()
+                .any(|k| UNSUPPORTED_TERMINATORS.contains(&k.as_str()))
+        })
+    }
+    /// Distinct legacy terminator keys still in use, in [`UNSUPPORTED_TERMINATORS`] order
+    /// (the `keys` of the `terminator_unsupported` startup problem).
+    pub fn unsupported_terminators(&self) -> Vec<String> {
+        let used: Vec<_> = self.unsupported_terminator_uses().collect();
+        UNSUPPORTED_TERMINATORS
+            .iter()
+            .filter(|key| used.iter().any(|(_, keys)| keys.iter().any(|k| k == *key)))
+            .map(|key| key.to_string())
+            .collect()
+    }
+    /// One warning per location that uses a legacy terminator. The keys stay configured
+    /// and compile unchanged; only the warning is new (B-12).
+    pub fn terminator_diagnostics(&self) -> Vec<Diagnostic> {
+        self.unsupported_terminator_uses()
+            .map(|(path, _)| {
+                Diagnostic::warning(
+                    diagnostic_code::TERMINATOR_UNSUPPORTED,
+                    "Tab and Enter terminators are not delivered on Windows; the setting is kept unchanged",
+                    SourceSpan::default(),
+                )
+                .at(path)
+            })
+            .collect()
     }
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -432,6 +491,12 @@ impl Diagnostic {
             path: String::new(),
             span,
             severity: Severity::Error,
+        }
+    }
+    pub fn warning(code: &str, message: impl Into<String>, span: SourceSpan) -> Self {
+        Self {
+            severity: Severity::Warning,
+            ..Self::error(code, message, span)
         }
     }
     pub fn at(mut self, path: impl Into<String>) -> Self {
