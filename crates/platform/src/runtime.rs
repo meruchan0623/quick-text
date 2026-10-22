@@ -21,7 +21,7 @@ use crate::Shared;
 use arc_swap::ArcSwapOption;
 use parking_lot::{Mutex, RwLock};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
 /// Receives every [`EngineEvent`]. Called on the runtime's event thread.
@@ -173,7 +173,8 @@ struct PauseState {
 /// `latest` held, and `history` alone. Listeners run on the event thread
 /// with none of these held; the process probe never runs with `health` or
 /// `pause` held. Each subscription's `delivered` is taken only by the event
-/// thread, with none of these held.
+/// thread, with none of these held. `failed_latch` is written only with
+/// `latest` held, and publishers read it under `latest`.
 pub struct Runtime {
     clock: Arc<dyn Clock>,
     history: History,
@@ -184,6 +185,8 @@ pub struct Runtime {
     /// thread exited).
     events: Mutex<Option<EventThread>>,
     health: Mutex<HealthSnapshot>,
+    /// Failed until repair (see [`Runtime::latch_failed`]).
+    failed_latch: AtomicBool,
     pause: Mutex<PauseState>,
     shared: ArcSwapOption<Shared>,
     process: RwLock<Option<ProcessProbe>>,
@@ -199,6 +202,7 @@ impl Runtime {
             outbox: Arc::default(),
             events: Mutex::new(None),
             health: Mutex::new(HealthSnapshot::default()),
+            failed_latch: AtomicBool::new(false),
             pause: Mutex::new(PauseState::default()),
             shared: ArcSwapOption::empty(),
             process: RwLock::new(None),
@@ -371,32 +375,88 @@ impl Runtime {
     /// `health` → `pause`, see [`Runtime`]), so concurrent publishers cannot
     /// leave ENGINE_DOWN disagreeing with the stored health, nor pair a
     /// Health with another publish's State.
+    ///
+    /// While Failed is latched (`latch_failed`, set by the supervisor's
+    /// watchdog until a repair) a snapshot that is not Failed is rejected:
+    /// the current one stays, ENGINE_DOWN too.
     pub fn publish_health(&self, snapshot: HealthSnapshot) {
-        let engine_down = matches!(
-            snapshot.state,
-            HealthState::Recovering | HealthState::Failed
-        );
         let changed = {
             let mut latest = self.outbox.latest.lock();
-            let (health, reasons) = {
-                let mut health = self.health.lock();
-                let mut pause = self.pause.lock();
-                self.sync_legacy(&mut pause);
-                pause.reasons = if engine_down {
-                    pause.reasons.with(PauseReasons::ENGINE_DOWN)
-                } else {
-                    pause.reasons.without(PauseReasons::ENGINE_DOWN)
-                };
-                self.sync_legacy(&mut pause);
-                health.clone_from(&snapshot);
-                (health.state, pause.reasons)
-            };
-            let state = self.state_from(health, reasons);
-            Self::store_latest(&mut latest, Some(snapshot), state)
+            if snapshot.state != HealthState::Failed && self.failed_latch.load(Ordering::SeqCst) {
+                tracing::debug!(
+                    event = "runtime.health_rejected",
+                    state = ?snapshot.state,
+                    "engine failed until repair"
+                );
+                return;
+            }
+            self.store_health(&mut latest, snapshot)
         };
         if changed {
             self.post(None);
         }
+    }
+
+    /// Reports the engine Failed until the supervisor handles a repair
+    /// request ([`Runtime::clear_latch`]): in one critical section the latch
+    /// is set and the current snapshot is published as Failed, with
+    /// ENGINE_DOWN. Until then [`Runtime::publish_health`] rejects any other
+    /// state, so a publisher that raced with this cannot clear it.
+    pub(crate) fn latch_failed(&self, reason: &'static str) {
+        let changed = {
+            let mut latest = self.outbox.latest.lock();
+            if !self.failed_latch.swap(true, Ordering::SeqCst) {
+                tracing::error!(
+                    event = "runtime.failed_latched",
+                    reason,
+                    "engine failed until repair"
+                );
+            }
+            let mut snapshot = self.health.lock().clone();
+            snapshot.state = HealthState::Failed;
+            self.store_health(&mut latest, snapshot)
+        };
+        if changed {
+            self.post(None);
+        }
+    }
+
+    /// Ends [`Runtime::latch_failed`]. Only the supervisor calls it, when it
+    /// handles a repair request (machine lock held, before recovery is
+    /// armed); the next published snapshot then replaces Failed.
+    pub(crate) fn clear_latch(&self) {
+        let _latest = self.outbox.latest.lock();
+        self.failed_latch.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether Failed is latched (see [`Runtime::latch_failed`]).
+    pub(crate) fn failed_latched(&self) -> bool {
+        self.failed_latch.load(Ordering::SeqCst)
+    }
+
+    /// Stores `snapshot` with ENGINE_DOWN following its state (set in
+    /// Recovering/Failed, cleared otherwise) and the derived State; `latest`
+    /// is held by the caller. Returns whether Health or State changed.
+    fn store_health(&self, latest: &mut Latest, snapshot: HealthSnapshot) -> bool {
+        let engine_down = matches!(
+            snapshot.state,
+            HealthState::Recovering | HealthState::Failed
+        );
+        let (health, reasons) = {
+            let mut health = self.health.lock();
+            let mut pause = self.pause.lock();
+            self.sync_legacy(&mut pause);
+            pause.reasons = if engine_down {
+                pause.reasons.with(PauseReasons::ENGINE_DOWN)
+            } else {
+                pause.reasons.without(PauseReasons::ENGINE_DOWN)
+            };
+            self.sync_legacy(&mut pause);
+            health.clone_from(&snapshot);
+            (health.state, pause.reasons)
+        };
+        let state = self.state_from(health, reasons);
+        Self::store_latest(latest, Some(snapshot), state)
     }
 
     // ---- pause --------------------------------------------------------
@@ -733,6 +793,47 @@ mod tests {
         assert_eq!(runtime.pause_reasons(), PauseReasons::MANUAL);
         // Starting carries no pause reason (mapping table row 1).
         runtime.publish_health(snapshot(HealthState::Starting));
+        assert_eq!(runtime.pause_reasons(), PauseReasons::MANUAL);
+    }
+
+    /// While Failed is latched only Failed snapshots are taken; nothing but
+    /// `clear_latch` ends it, and user reasons are kept throughout.
+    #[test]
+    fn a_latched_failed_holds_until_the_latch_is_cleared() {
+        let (runtime, _) = runtime();
+        runtime.publish_health(numbered(HealthState::Recovering, 1));
+        runtime.set_pause(PauseReasons::MANUAL, true);
+        runtime.latch_failed("test");
+        assert!(runtime.failed_latched());
+        let failed = HealthSnapshot {
+            state: HealthState::Failed,
+            ..numbered(HealthState::Recovering, 1)
+        };
+        assert_eq!(runtime.health(), failed, "current components, Failed");
+        let both = PauseReasons::MANUAL.with(PauseReasons::ENGINE_DOWN);
+        assert_eq!(runtime.pause_reasons(), both);
+
+        for state in [
+            HealthState::Healthy,
+            HealthState::Degraded,
+            HealthState::Recovering,
+            HealthState::Starting,
+        ] {
+            runtime.publish_health(numbered(state, 2));
+            assert_eq!(runtime.health(), failed, "{state:?} rejected");
+            assert_eq!(runtime.pause_reasons(), both);
+        }
+        runtime.set_pause(PauseReasons::ENGINE_DOWN, false);
+        assert_eq!(runtime.pause_reasons(), both);
+        // A Failed snapshot (e.g. the machine's own) is taken.
+        runtime.publish_health(numbered(HealthState::Failed, 3));
+        assert_eq!(runtime.health(), numbered(HealthState::Failed, 3));
+        assert_eq!(runtime.pause_reasons(), both);
+
+        runtime.clear_latch();
+        assert!(!runtime.failed_latched());
+        runtime.publish_health(numbered(HealthState::Healthy, 4));
+        assert_eq!(runtime.health(), numbered(HealthState::Healthy, 4));
         assert_eq!(runtime.pause_reasons(), PauseReasons::MANUAL);
     }
 

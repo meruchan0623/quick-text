@@ -36,7 +36,9 @@
 //!   While that thread is alive it spawns no other; if the replacement is
 //!   stuck too, it reports the engine Failed (`supervisor.driver_hung`)
 //!   instead. So at most two driver threads exist, each blocked in at most
-//!   one adapter call.
+//!   one adapter call. That Failed is latched in the runtime, so a stuck
+//!   tick that publishes later cannot clear it; the next tick moves the
+//!   machine to Failed as well, and only `repair()` ends both.
 //!
 //! `probe`, `input_health` and `enforce_budget` must not block (see the
 //! trait docs). A tick handles the repair request and the deadlines before
@@ -423,8 +425,9 @@ impl Supervisor {
         machine
     }
 
-    /// First step of a tick, before any adapter call: arms a pending
-    /// `repair()` and applies the deadlines (an attempt hung past
+    /// First step of a tick, before any adapter call: follows a Failed the
+    /// watchdog latched ([`Self::reconcile`]), arms a pending `repair()`
+    /// (which ends that latch) and applies the deadlines (an attempt hung past
     /// ATTEMPT_TIMEOUT, a verification window that ran out). A change is
     /// published at once with the latest observation. False when the
     /// machine stayed busy (the tick is skipped).
@@ -433,19 +436,35 @@ impl Supervisor {
             return false;
         };
         let now = self.clock.now();
+        let reconciled = self.reconcile(&mut machine);
         let armed = self.take_repair(&mut machine, now);
         let hung = Self::expire_attempt(&mut machine, now);
         let expired = Self::expire_verification(&mut machine, now);
-        if armed || hung || expired {
+        if reconciled || armed || hung || expired {
             self.publish(&mut machine);
             self.beat.lock().progress = now;
         }
         true
     }
 
+    /// The watchdog latched Failed in the runtime (see
+    /// [`Self::report_driver_hung`]), possibly while this machine was busy
+    /// and about to publish something else: the machine follows (lock
+    /// held) before it advances, so it does not go on recovering behind a
+    /// Failed engine. True when it opened the circuit now.
+    fn reconcile(&self, machine: &mut Machine) -> bool {
+        if machine.state == HealthState::Failed || !self.runtime.failed_latched() {
+            return false;
+        }
+        Self::open_circuit(machine, "driver_hung");
+        true
+    }
+
     /// Advances the machine on one observation (lock held, no adapter
     /// calls). Returns the attempt to run once the lock is released.
     fn advance(&self, machine: &mut Machine, observed: &Observed, now: Instant) -> Option<Ticket> {
+        // Again here: the watchdog may have latched Failed while we observed.
+        self.reconcile(machine);
         if machine.in_flight.is_some() {
             // An attempt is still running (possibly invalidated): nothing
             // starts until it returns.
@@ -543,7 +562,8 @@ impl Supervisor {
     /// Attempt `id` physically returned: it leaves flight, so the next
     /// attempt may start, and its result is applied unless it was
     /// invalidated meanwhile (superseded by `repair()` or hung: discarded,
-    /// not counted again).
+    /// not counted again) or the circuit opened while it ran (discarded:
+    /// only `repair()` leaves Failed).
     ///
     /// The attempt's duration is checked here as well, under the lock: one
     /// that took longer than ATTEMPT_TIMEOUT is a timeout even if no tick
@@ -575,6 +595,14 @@ impl Supervisor {
                 superseded = attempt.superseded,
                 hung = attempt.hung,
                 "result of an invalidated attempt"
+            );
+        } else if machine.state == HealthState::Failed {
+            // The circuit opened while it ran (driver_hung): only repair()
+            // leaves Failed.
+            tracing::warn!(
+                event = "supervisor.attempt_discarded",
+                attempt = id,
+                "circuit opened while the attempt ran"
             );
         } else if now.saturating_duration_since(attempt.started) > ATTEMPT_TIMEOUT {
             tracing::warn!(
@@ -647,19 +675,21 @@ impl Supervisor {
 
     /// Whether attempt `id` may make its next rebuild step: not superseded
     /// by `repair()` (a request still pending is applied here), not hung,
-    /// and still within ATTEMPT_TIMEOUT. An invalidated attempt stops at
+    /// still within ATTEMPT_TIMEOUT, and the circuit not opened meanwhile
+    /// (by the watchdog, `driver_hung`). An invalidated attempt stops at
     /// the next step boundary instead of running its remaining reattaches.
     fn may_continue(&self, id: u64) -> Result<(), String> {
         let mut machine = self.machine.lock();
         let now = self.clock.now();
         // Attempt `id` is in flight, so this never arms the repair.
         self.take_repair(&mut machine, now);
-        let valid = machine.in_flight.is_some_and(|attempt| {
-            attempt.id == id
-                && !attempt.superseded
-                && !attempt.hung
-                && now.saturating_duration_since(attempt.started) <= ATTEMPT_TIMEOUT
-        });
+        let valid = machine.state != HealthState::Failed
+            && machine.in_flight.is_some_and(|attempt| {
+                attempt.id == id
+                    && !attempt.superseded
+                    && !attempt.hung
+                    && now.saturating_duration_since(attempt.started) <= ATTEMPT_TIMEOUT
+            });
         if valid {
             Ok(())
         } else {
@@ -734,6 +764,10 @@ impl Supervisor {
         );
     }
 
+    /// Enters Failed. Only `repair()` leaves it ([`Self::arm_repair`]): an
+    /// attempt still in flight stops at its next step and its result is
+    /// discarded. The runtime is not latched here; the machine stays Failed
+    /// on its own (the watchdog, which may not get the machine, latches).
     fn open_circuit(machine: &mut Machine, cause: &'static str) {
         machine.state = HealthState::Failed;
         machine.next_attempt = None;
@@ -802,10 +836,11 @@ impl Supervisor {
         });
     }
 
-    /// The user's "repair engine": clears the circuit breaker, enters
-    /// Recovering and schedules a forced rebuild on the driver's next tick
-    /// (woken now). Returns at once with the current snapshot; Recovering
-    /// and the outcome are published through the runtime's `Health` events.
+    /// The user's "repair engine": clears the circuit breaker (and a Failed
+    /// the watchdog latched in the runtime), enters Recovering and
+    /// schedules a forced rebuild on the driver's next tick (woken now).
+    /// Returns at once with the current snapshot; Recovering and the
+    /// outcome are published through the runtime's `Health` events.
     ///
     /// Only records the request and wakes the driver: no adapter call, no
     /// wait for the machine, so it never blocks the caller. The driver's
@@ -841,6 +876,9 @@ impl Supervisor {
             return false;
         }
         self.repair_requested.store(false, Ordering::SeqCst);
+        // The only place a latched Failed ends: machine lock held, before
+        // recovery is armed (and published).
+        self.runtime.clear_latch();
         Self::arm_repair(machine, now);
         true
     }
@@ -960,8 +998,11 @@ impl Supervisor {
     }
 
     /// The driver and the one it replaced are both stuck: reports the
-    /// engine Failed (through the machine when it is free, otherwise
-    /// straight to the runtime) instead of spawning another thread.
+    /// engine Failed instead of spawning another thread. Failed is latched
+    /// in the runtime either way, so a stuck tick that holds the machine
+    /// and publishes later cannot clear it; when the machine is free it
+    /// opens the circuit at once, otherwise the next tick follows the latch
+    /// ([`Self::reconcile`]). Only `repair()` ends it.
     fn report_driver_hung(&self) {
         if !self.driver_hung.swap(true, Ordering::SeqCst) {
             tracing::error!(
@@ -975,14 +1016,10 @@ impl Supervisor {
                     Self::open_circuit(&mut machine, "driver_hung");
                     self.publish(&mut machine);
                 }
+                // The snapshot is Failed by now: this just sets the latch.
+                self.runtime.latch_failed("driver_hung");
             }
-            None => {
-                let mut snapshot = self.runtime.health();
-                if snapshot.state != HealthState::Failed {
-                    snapshot.state = HealthState::Failed;
-                    self.runtime.publish_health(snapshot);
-                }
-            }
+            None => self.runtime.latch_failed("driver_hung"),
         }
     }
 }
@@ -1608,6 +1645,111 @@ mod tests {
             });
             handle.join().unwrap();
         }
+    }
+
+    /// The watchdog reports the driver hung while a recovering tick holds
+    /// the machine (so it cannot open the circuit), and that tick then
+    /// publishes Recovering. Failed and ENGINE_DOWN hold anyway; the next
+    /// tick moves the machine to Failed instead of settling, and only
+    /// `repair()` recovers.
+    #[test]
+    fn a_failed_latched_by_the_watchdog_holds_until_repair() {
+        let rig = Rig::healthy();
+        rig.inputs.set(
+            Component::KeyboardHook,
+            HealthState::Failed,
+            ReasonCode::HookMissing,
+        );
+        rig.step(MS);
+        assert_eq!(rig.state(), HealthState::Recovering);
+        let engine_down = || {
+            rig.runtime
+                .pause_reasons()
+                .contains(PauseReasons::ENGINE_DOWN)
+        };
+
+        // A recovering driver holds the machine, about to publish.
+        let (holding_tx, holding) = mpsc::channel();
+        let (go_tx, go) = mpsc::channel::<()>();
+        let supervisor = Arc::clone(&rig.supervisor);
+        let driver = std::thread::spawn(move || {
+            let mut machine = supervisor.machine.lock();
+            assert_eq!(machine.state, HealthState::Recovering);
+            holding_tx.send(()).unwrap();
+            go.recv().unwrap();
+            supervisor.publish(&mut machine);
+        });
+        holding
+            .recv_timeout(Duration::from_secs(5))
+            .expect("driver holds the machine");
+        rig.supervisor.report_driver_hung();
+        assert_eq!(rig.state(), HealthState::Failed);
+        go_tx.send(()).unwrap();
+        driver.join().unwrap();
+        assert_eq!(rig.state(), HealthState::Failed, "late Recovering rejected");
+        assert!(engine_down());
+        assert_eq!(rig.supervisor.machine.lock().state, HealthState::Recovering);
+
+        // The fault clears and the attempt is due: the tick follows the
+        // latch first instead of settling to Healthy.
+        rig.inputs.set(
+            Component::KeyboardHook,
+            HealthState::Healthy,
+            ReasonCode::Ok,
+        );
+        rig.step(BACKOFF[0]);
+        assert_eq!(rig.supervisor.machine.lock().state, HealthState::Failed);
+        assert_eq!(rig.state(), HealthState::Failed);
+        assert!(engine_down());
+        rig.step(BACKOFF[4]);
+        assert_eq!(rig.state(), HealthState::Failed);
+        assert!(engine_down());
+        assert_eq!(rig.executor.rebuild_count(), 0, "no attempt while Failed");
+        assert!(rig.inputs.reattached.lock().is_empty());
+
+        rig.supervisor.repair();
+        rig.step(MS);
+        assert_eq!(rig.executor.rebuild_count(), 1, "forced rebuild");
+        assert_eq!(rig.state(), HealthState::Healthy);
+        assert!(!engine_down());
+        assert!(!rig.runtime.failed_latched());
+    }
+
+    /// The watchdog opens the circuit while an attempt is blocked in its
+    /// rebuild. When the rebuild returns the attempt skips its remaining
+    /// reattach and its result is discarded (not counted): the engine stays
+    /// Failed until `repair()`.
+    #[test]
+    fn an_attempt_returning_into_an_open_circuit_is_discarded() {
+        let rig = Rig::healthy();
+        let gate = block_first_rebuild(&rig);
+        *rig.executor.status.lock() = Status::Down(ReasonCode::ExecutorTimeout);
+        rig.inputs.set(
+            Component::KeyboardHook,
+            HealthState::Failed,
+            ReasonCode::HookMissing,
+        );
+        rig.step(MS);
+        rig.clock.advance(BACKOFF[0]);
+        let (stuck, _) = tick_into_blocked_rebuild(&rig, &gate);
+        rig.supervisor.report_driver_hung();
+        assert_eq!(rig.supervisor.machine.lock().state, HealthState::Failed);
+        assert!(rig.runtime.failed_latched());
+        drop(gate.release);
+        stuck.join().unwrap();
+        assert!(rig.inputs.reattached.lock().is_empty(), "reattach skipped");
+        assert_eq!(rig.failures(), 0, "discarded, not counted");
+        assert_eq!(rig.supervisor.machine.lock().state, HealthState::Failed);
+        assert_eq!(rig.state(), HealthState::Failed);
+        rig.step(BACKOFF[4]);
+        assert_eq!(rig.state(), HealthState::Failed);
+        assert_eq!(rig.executor.rebuild_count(), 1);
+
+        rig.supervisor.repair();
+        rig.step(MS);
+        assert_eq!(rig.executor.rebuild_count(), 2);
+        assert_eq!(*rig.inputs.reattached.lock(), [Component::KeyboardHook]);
+        assert_eq!(rig.state(), HealthState::Healthy);
     }
 
     #[test]
