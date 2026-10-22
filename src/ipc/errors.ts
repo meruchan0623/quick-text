@@ -60,6 +60,8 @@ const strOrNull = (v: unknown): string | null => (typeof v === 'string' ? v : nu
 const numOrNull = (v: unknown): number | null =>
   typeof v === 'number' && Number.isFinite(v) ? v : null;
 
+const MISSING_COMMAND_TEXT = '当前版本的桌面引擎不支持此功能，请更新到新版本后再试。';
+
 const internal = (message?: string): CommandError =>
   message === undefined
     ? { code: 'internal', detail: { trace_id: null } }
@@ -134,6 +136,7 @@ function fromObject(value: Obj): CommandError | null {
  * the offending field.
  */
 export function parseCommandError(value: unknown): CommandError {
+  if (isMissingCommand(value)) return internal(MISSING_COMMAND_TEXT);
   if (isObj(value) && !(value instanceof Error)) return fromObject(value) ?? internal();
   if (value instanceof Error) return internal(value.message);
   if (typeof value === 'string') {

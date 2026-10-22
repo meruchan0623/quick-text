@@ -151,4 +151,10 @@ describe('isMissingCommand', () => {
     expect(isMissingCommand('Store lock')).toBe(false);
     expect(isMissingCommand({ code: 'not_found', detail: { kind: 'rule', id: 'x' } })).toBe(false);
   });
+
+  it('explains a missing command in Chinese instead of showing the English rejection', () => {
+    expect(errorText('Command export_diagnostics not found')).toBe(
+      '当前版本的桌面引擎不支持此功能，请更新到新版本后再试。',
+    );
+  });
 });

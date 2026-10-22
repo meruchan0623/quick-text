@@ -18,7 +18,9 @@ import CaptureTemplate from './CaptureTemplate';
 import RuntimeStatus from './RuntimeStatus';
 import { useAsk } from './Ask';
 import { Modal } from './Modal';
-import { every } from './lib/timers';
+import { runtimeSync, useRuntime } from './ipc/events';
+import { liveStatus } from './status';
+import { BannerStack, HealthCard, HistoryList } from './StatusArea';
 
 // `null` from describe() means the user cancelled: show nothing.
 const errorText = (e: unknown) => describe(e) ?? '';
@@ -84,6 +86,10 @@ export default function App() {
     setEditingErrors([]);
   }
   const { askDialog, confirmAction, askValue } = useAsk();
+  // Health, engine state and history arrive as events (S-19); no polling.
+  const sync = runtimeSync();
+  const runtime = useRuntime(sync);
+  const live = liveStatus(runtime);
   const edited = useRef(false);
   const modeCache = useRef(
     new Map<
@@ -142,16 +148,64 @@ export default function App() {
       })
       .catch((e: unknown) => setError(errorText(e)));
   }, []);
+  // The legacy load_state fields (target observation, capabilities, draft flags) have no event:
+  // reload them when the window regains focus and on 「刷新状态」. Unsaved local edits are kept.
+  const reload = async () => {
+    const s = await call<State>('load_state');
+    if (edited.current) setState(s);
+    else receive(s);
+  };
+  const reloadRef = useRef(reload);
   useEffect(() => {
-    if (!('__TAURI_INTERNALS__' in window)) return;
-    return every(2000, () => {
-      call<State>('load_state')
-        .then(setState)
-        .catch(() => {
-          // Keep showing the last known state; the next poll retries.
-        });
-    });
+    reloadRef.current = reload;
+  });
+  useEffect(() => {
+    const onFocus = () => {
+      reloadRef.current().catch(() => {
+        // Keep showing the last known state; 「刷新状态」 reports errors.
+      });
+    };
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
   }, []);
+  const refresh = () =>
+    run(async () => {
+      await reload();
+      if (runtime.status !== 'unsupported') await sync.resync();
+    }, '状态已刷新');
+  const repair = () =>
+    run(async () => {
+      await call('repair_engine');
+      await sync.resync();
+    }, '已开始修复引擎，结果会自动更新');
+  const togglePause = () =>
+    run(async () => {
+      const manual = live ? live.manualPause : !!state?.paused;
+      // set_paused only toggles the manual reason; the unsaved draft in the editor stays untouched.
+      setState(await call<State>('set_paused', { paused: !manual }));
+    });
+  const exportDiagnostics = () =>
+    run(async () => {
+      const redaction = await askValue({
+        title: '导出诊断包？',
+        detail:
+          '诊断包包含最近 7 天的日志、崩溃记录、健康与能力快照和配置摘要，不含剪贴板与输入内容。只有选择「包含短语内容」时才附带完整配置。',
+        confirm: '导出',
+        input: {
+          label: '短语内容',
+          value: 'summary',
+          options: [
+            { value: 'summary', label: '不包含短语内容（推荐）' },
+            { value: 'full', label: '包含短语内容' },
+          ],
+        },
+      });
+      if (!redaction) return;
+      const path = await call<string | null>('export_diagnostics', { redaction });
+      // null: the save dialog was cancelled; nothing to report.
+      if (path) setMessage(`诊断包已导出：${path}`);
+    });
+  const openDir = (command: 'open_log_dir' | 'open_data_dir') => run(() => call(command));
   const change = (c: Config) => {
     setConfig(c);
     setLocalDirty(true);
@@ -163,6 +217,8 @@ export default function App() {
     return s;
   };
   const selectedSet = new Set(selected);
+  const ruleNames = new Map<string, string>(config.rules.map((r) => [r.id, r.match.value || r.id]));
+  const ruleName = (id: string) => ruleNames.get(id) ?? id;
   const groupCounts = new Map<string, number>();
   for (const r of config.rules) groupCounts.set(r.group, (groupCounts.get(r.group) || 0) + 1);
   const groups = ['全部', ...new Set(config.rules.map((r) => r.group || '默认'))];
@@ -236,15 +292,20 @@ export default function App() {
           </div>
         </div>
         <div className="header-status">
-          <span className={`dot ${state?.paused ? 'paused' : ''}`} />
-          {state ? (state.paused ? '引擎已暂停' : '引擎运行中') : '未连接'}
-          <button
-            onClick={() =>
-              run(async () => receive(await call<State>('set_paused', { paused: !state?.paused })))
-            }
-            disabled={!state || busy}
-          >
-            {state?.paused ? '恢复监听' : '暂停监听'}
+          <span role="status">
+            <span
+              aria-hidden="true"
+              className={`dot ${live ? live.kind : state?.paused ? 'paused' : ''}`}
+            />
+            {live ? live.text : state ? (state.paused ? '引擎已暂停' : '引擎运行中') : '未连接'}
+          </span>
+          {live?.kind === 'failed' && (
+            <button className="primary" onClick={repair} disabled={busy}>
+              修复引擎
+            </button>
+          )}
+          <button onClick={togglePause} disabled={!state || busy}>
+            {(live ? live.manualPause : state?.paused) ? '恢复监听' : '暂停监听'}
           </button>
         </div>
       </header>
@@ -263,6 +324,7 @@ export default function App() {
           <em>{state?.dirty || localDirty ? '草稿待应用' : '配置已同步'}</em>
         </span>
       </nav>
+      <BannerStack view={runtime} onOpenDataDir={() => openDir('open_data_dir')} />
       {error && (
         <div className="alert error" role="alert">
           {error}
@@ -597,14 +659,16 @@ export default function App() {
       {tab === 'status' && (
         <section className="settings">
           <h2>运行状态与恢复</h2>
+          <HealthCard view={runtime} busy={busy} onRepair={repair} />
           <dl>
             <dt>引擎状态</dt>
             <dd>
-              {({ running: '正在执行动作', paused: '已暂停监听', listening: '正在监听' } as Data)[
-                state?.engine_status || ''
-              ] ||
-                state?.engine_status ||
-                '尚未连接'}
+              {live?.text ??
+                (({ running: '正在执行动作', paused: '已暂停监听', listening: '正在监听' } as Data)[
+                  state?.engine_status || ''
+                ] ||
+                  state?.engine_status ||
+                  '尚未连接')}
             </dd>
             <dt>当前生效版本</dt>
             <dd>{state?.revision ?? 0}</dd>
@@ -612,13 +676,7 @@ export default function App() {
             <dd>{state?.dirty || localDirty ? '存在未应用的设置' : '与生效版本一致'}</dd>
           </dl>
           <div className="inline">
-            <button
-              onClick={() =>
-                run(async () => receive(await call<State>('load_state')), '状态已刷新')
-              }
-            >
-              刷新状态
-            </button>
+            <button onClick={refresh}>刷新状态</button>
             <button
               onClick={async () => {
                 if (await confirmAction({ title: '放弃全部未应用草稿？', confirm: '放弃草稿' }))
@@ -640,7 +698,24 @@ export default function App() {
             </button>
             <button onClick={() => run(() => call('exit_app'))}>退出全部</button>
           </div>
-          <RuntimeStatus state={state} />
+          {runtime.status === 'ready' && (
+            <div className="inline diagnostics">
+              <button onClick={exportDiagnostics}>导出诊断包</button>
+              <button onClick={() => openDir('open_log_dir')}>打开日志目录</button>
+            </div>
+          )}
+          <RuntimeStatus
+            state={state}
+            history={
+              runtime.status === 'ready' ? (
+                <HistoryList
+                  rows={runtime.history}
+                  available={runtime.historyAvailable}
+                  ruleName={ruleName}
+                />
+              ) : undefined
+            }
+          />
         </section>
       )}
       <footer>

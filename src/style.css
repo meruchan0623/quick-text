@@ -835,3 +835,100 @@ dialog.overlay::backdrop {
   margin-top: 24px;
   color: #8090a3;
 }
+/* Runtime status (S-03, S-19): text always accompanies the colour. */
+.dot.degraded {
+  background: #e3a245;
+}
+.dot.failed {
+  background: #c4314b;
+}
+.dot.starting,
+.dot.recovering,
+.dot.unknown {
+  background: #8a8a8a;
+}
+.dot.executing {
+  background: var(--blue);
+}
+.header-status > span[role='status'] {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 20px;
+  font-size: 12px;
+  border-bottom: 1px solid;
+}
+.banner > span {
+  flex: 1;
+}
+.banner.error {
+  background: #fff0ec;
+  color: #8f3a26;
+  border-color: #f3c8bd;
+}
+.banner.warning {
+  background: #fff8e6;
+  color: #6b4a00;
+  border-color: #f0d9a0;
+}
+.banner.info {
+  background: #eef6fc;
+  color: #1f4e70;
+  border-color: #c5ddef;
+}
+.banner small {
+  color: inherit;
+}
+.health-card {
+  max-width: 850px;
+  padding: 16px;
+  border: 1px solid #dce5ed;
+  background: #f5f9fc;
+}
+.health-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.health-head strong {
+  font-size: 15px;
+  font-weight: 500;
+}
+.health-tag {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  border: 1px solid currentColor;
+  color: #22664f;
+}
+.health-tag.degraded {
+  color: #8a5a00;
+}
+.health-tag.failed {
+  color: #a3263b;
+}
+.health-tag.starting,
+.health-tag.recovering {
+  color: #4f5b6a;
+}
+.component-table,
+.history-table {
+  min-width: 0;
+  max-width: 850px;
+  margin-top: 12px;
+}
+.history-table td {
+  max-width: none;
+}
+.history-table tr:not(.outcome-succeeded) td:nth-child(5) {
+  color: #8a5a00;
+}
+.diagnostics {
+  margin-top: 12px;
+}

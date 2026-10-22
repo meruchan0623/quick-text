@@ -1,4 +1,4 @@
-import { Fragment } from 'react';
+import { Fragment, type ReactNode } from 'react';
 import { Data, State } from './model';
 const names: Record<string, string> = {
   keyboard_hook: '键盘监听',
@@ -197,13 +197,20 @@ function ExecutionStatus({ result }: { result: Data | null }) {
     </>
   );
 }
-export default function RuntimeStatus({ state }: { state: State | null }) {
+export default function RuntimeStatus({
+  state,
+  history,
+}: {
+  state: State | null;
+  /** Live execution history (0.4 backends); without it the legacy `last_result` is shown. */
+  history?: ReactNode;
+}) {
   const result: Data | null = state?.last_result ?? null;
   return (
     <>
       <TargetStatus state={state} />
       <CapabilityTable capabilities={state?.capabilities ?? []} />
-      <ExecutionStatus result={result} />
+      {history ?? <ExecutionStatus result={result} />}
       <details className="expert-details">
         <summary>详细运行信息（高级）</summary>
         <pre>
