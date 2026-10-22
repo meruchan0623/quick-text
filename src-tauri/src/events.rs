@@ -16,10 +16,14 @@
 //! (nothing at or below the snapshot's `seq` is missing from it, nothing
 //! above it is older than what it already shows).
 //!
-//! The store reports its revision and safe mode through a [`StoreSink`]
-//! after every change (and once when the sink is set, the initial
-//! `store-state`); the bus sends `store-state` unthrottled, only when the
-//! value differs from the last one sent.
+//! The store's revision and safe mode reach the bus through a [`StoreSink`]
+//! (review A9). Setting the sink writes the current value straight into the
+//! view as the baseline, on the calling thread, under the store lock, with
+//! no `seq` and nothing sent (like the starting Health and State: the
+//! frontend reads initial values from `load_state` /
+//! `get_runtime_snapshot`). After that every change is queued and sent as
+//! `store-state`, unthrottled, with the next `seq`, only when it differs
+//! from the value in the view (the baseline or the last one sent).
 //!
 //! Idle cost: the bus thread sleeps in `recv` and only sets a timeout while
 //! something is held back (a trailing Health/State, held executions, a busy
@@ -101,21 +105,46 @@ pub struct StoreState {
     pub safe_mode: Option<SafeModeReason>,
 }
 
-/// Receives the store's [`StoreState`] after each change, called with the
-/// store lock held (so reports arrive in the order the changes were made).
-/// Never blocks.
-pub type StoreSink = Arc<dyn Fn(StoreState) + Send + Sync>;
+/// Where the store gives its [`StoreState`] ([`EventBus::store_sink`],
+/// [`crate::store::Store::set_store_sink`]). Both calls are made with the
+/// store lock held, so they follow the order of the changes, and neither
+/// blocks: [`StoreSink::baseline`] takes the bus's view lock (a leaf: held
+/// by the bus only to number and record one event, never while sending or
+/// taking another lock), [`StoreSink::report`] only queues.
+#[derive(Clone)]
+pub struct StoreSink {
+    view: Arc<Mutex<BusView>>,
+    tx: mpsc::Sender<Input>,
+}
+
+impl StoreSink {
+    /// The value when the sink is set: written into the view as the
+    /// baseline at once, on the calling thread. No `seq`, nothing sent; a
+    /// snapshot taken from now on has it, and a later report equal to it is
+    /// not sent.
+    pub fn baseline(&self, store: StoreState) {
+        self.view.lock().store = store;
+    }
+
+    /// The value after a change: queued, and sent as `store-state` with the
+    /// next `seq` if it differs from the view's (the baseline or the last
+    /// one sent) when the bus gets to it.
+    pub fn report(&self, store: StoreState) {
+        let _ = self.tx.send(Input::Store(store));
+    }
+}
 
 /// The emitted stream at one point: the last `seq` and the Health, State
-/// and store state sent up to it (before the first event, the Health and
-/// State the bus started with, at `seq` 0; `store` is `None` until the
-/// first `store-state`).
+/// and store state sent up to it. Before the first event: `seq` 0 and the
+/// Health and State the bus started with; `store` is the value the bus
+/// started with until the store sink's baseline replaces it (setup does
+/// both under one store lock).
 #[derive(Clone, Debug, PartialEq)]
 pub struct BusView {
     pub seq: u64,
     pub health: HealthSnapshot,
     pub state: EngineState,
-    pub store: Option<StoreState>,
+    pub store: StoreState,
 }
 
 /// The legacy `engine-status` value (and `load_state.engine_status`).
@@ -151,22 +180,31 @@ enum Out {
 pub struct EventBus {
     view: Arc<Mutex<BusView>>,
     tx: mpsc::Sender<Input>,
+    /// Whether the bus thread runs. If it did not start, nothing is ever
+    /// sent and the view never moves past the starting point.
+    started: bool,
 }
 
 impl EventBus {
     /// Starts the bus thread and subscribes it to `runtime`. The current
-    /// Health and State are the starting point (not sent: the frontend reads
-    /// them from `load_state` / `get_runtime_snapshot`). If the thread
-    /// cannot start, nothing is ever sent; the frontend still works from
-    /// commands (logged).
-    pub fn start(runtime: &Arc<Runtime>, sink: impl Sink, observer: Box<dyn Observer>) -> Self {
+    /// Health and State and `store` (the store's current value) are the
+    /// starting point (not sent: the frontend reads them from `load_state` /
+    /// `get_runtime_snapshot`). If the thread cannot start, nothing is ever
+    /// sent; the frontend still works from commands (logged, and
+    /// [`EventBus::started`] is false).
+    pub fn start(
+        runtime: &Arc<Runtime>,
+        store: StoreState,
+        sink: impl Sink,
+        observer: Box<dyn Observer>,
+    ) -> Self {
         let health = runtime.health();
         let state = runtime.engine_state();
         let view = Arc::new(Mutex::new(BusView {
             seq: 0,
             health: health.clone(),
             state: state.clone(),
-            store: None,
+            store,
         }));
         let (tx, rx) = mpsc::channel();
         let worker = Worker {
@@ -178,31 +216,57 @@ impl EventBus {
             throttle: Throttle::new(health.clone(), state.clone()),
             health,
             state,
-            store: None,
             busy_check: None,
         };
         let spawned = std::thread::Builder::new()
             .name("qt-event-bus".into())
             .spawn(move || worker.run());
-        match spawned {
+        let started = match spawned {
             Ok(_) => {
                 let forward = tx.clone();
                 runtime.subscribe(Box::new(move |event| {
                     let _ = forward.send(Input::Engine(event));
                 }));
+                true
             }
-            Err(e) => tracing::error!(
-                event = "events.start_failed",
-                error = %e,
-                "event bus thread did not start; no events will be sent"
-            ),
+            Err(e) => {
+                tracing::error!(
+                    event = "events.start_failed",
+                    error = %e,
+                    "event bus thread did not start; no events will be sent"
+                );
+                false
+            }
+        };
+        Self { view, tx, started }
+    }
+
+    /// A bus whose thread did not start (tests of what the commands do
+    /// then): nothing is ever sent.
+    #[cfg(test)]
+    pub(crate) fn not_started(runtime: &Runtime, store: StoreState) -> Self {
+        let (tx, _) = mpsc::channel();
+        Self {
+            view: Arc::new(Mutex::new(BusView {
+                seq: 0,
+                health: runtime.health(),
+                state: runtime.engine_state(),
+                store,
+            })),
+            tx,
+            started: false,
         }
-        Self { view, tx }
     }
 
     /// The emitted stream so far (`get_runtime_snapshot`).
     pub fn view(&self) -> BusView {
         self.view.lock().clone()
+    }
+
+    /// False if the bus thread did not start: no event will ever be sent,
+    /// so `get_runtime_snapshot` reads the live values instead of the view.
+    pub fn started(&self) -> bool {
+        self.started
     }
 
     /// Where the store reports problems found from now on: each becomes one
@@ -214,14 +278,15 @@ impl EventBus {
         })
     }
 
-    /// Where the store reports its revision and safe mode
-    /// ([`crate::store::Store::set_store_sink`]): each report that differs
-    /// from the last one sent becomes one `store-state` event.
+    /// Where the store gives its revision and safe mode
+    /// ([`crate::store::Store::set_store_sink`]): the baseline when the sink
+    /// is set (not sent), then each change that differs from the view
+    /// becomes one `store-state` event.
     pub fn store_sink(&self) -> StoreSink {
-        let tx = self.tx.clone();
-        Arc::new(move |store| {
-            let _ = tx.send(Input::Store(store));
-        })
+        StoreSink {
+            view: Arc::clone(&self.view),
+            tx: self.tx.clone(),
+        }
     }
 }
 
@@ -238,8 +303,6 @@ struct Worker {
     /// The latest Health and State received (for the observer).
     health: HealthSnapshot,
     state: EngineState,
-    /// The last store state let through (`None` before the first).
-    store: Option<StoreState>,
     /// Next `busy` re-check and how many are left.
     busy_check: Option<(Instant, u32)>,
 }
@@ -298,13 +361,9 @@ impl Worker {
                 self.after_execution(now);
             }
             Input::Problem(problem) => out.push(Out::Problem(problem)),
-            // Unthrottled; a report equal to the last one sent is dropped.
-            Input::Store(store) => {
-                if self.store != Some(store) {
-                    self.store = Some(store);
-                    out.push(Out::Store(store));
-                }
-            }
+            // Unthrottled; `deliver` drops a report equal to the view's
+            // (the baseline or the last one sent).
+            Input::Store(store) => out.push(Out::Store(store)),
         }
     }
 
@@ -364,10 +423,15 @@ fn guarded(what: &'static str, f: impl FnOnce()) {
 /// Assigns the next `seq`, records Health/State/store state in the view
 /// (one critical section, so a snapshot sees the `seq` and the values
 /// together) and emits with the lock released. A State that changes the
-/// legacy status string is followed by `engine-status`.
+/// legacy status string is followed by `engine-status`. A store state
+/// equal to the view's (the baseline the store sink wrote, or the last one
+/// sent) is dropped there, before it takes a `seq`.
 fn deliver(view: &Mutex<BusView>, sink: &dyn Sink, item: Out) {
     let (seq, legacy) = {
         let mut view = view.lock();
+        if matches!(&item, Out::Store(store) if *store == view.store) {
+            return;
+        }
         view.seq += 1;
         let legacy = match &item {
             Out::Health(health) => {
@@ -381,7 +445,7 @@ fn deliver(view: &Mutex<BusView>, sink: &dyn Sink, item: Out) {
                 (before != after).then_some(after)
             }
             Out::Store(store) => {
-                view.store = Some(*store);
+                view.store = *store;
                 None
             }
             Out::Execution { .. } | Out::Problem(_) => None,
@@ -639,6 +703,13 @@ mod tests {
         Duration::from_millis(n)
     }
 
+    fn store(revision: u64, safe_mode: Option<SafeModeReason>) -> StoreState {
+        StoreState {
+            revision,
+            safe_mode,
+        }
+    }
+
     #[test]
     fn health_state_changes_go_out_at_once_and_same_state_changes_at_most_every_5s() {
         let t0 = Instant::now();
@@ -798,7 +869,7 @@ mod tests {
             seq: 0,
             health: HealthSnapshot::default(),
             state: state(false, false),
-            store: None,
+            store: store(1, None),
         });
         let (tx, rx) = mpsc::channel();
         let sink = Channel(tx);
@@ -850,7 +921,7 @@ mod tests {
         assert_eq!(view.seq, 5);
         assert_eq!(view.health, health(HealthState::Healthy, None));
         assert_eq!(view.state, state(true, false));
-        assert_eq!(view.store, None);
+        assert_eq!(view.store, store(1, None));
     }
 
     #[test]
@@ -858,7 +929,13 @@ mod tests {
         let runtime = Arc::new(Runtime::new(Arc::new(SystemClock)));
         let (tx, rx) = mpsc::channel();
         let seen = Arc::new(Mutex::new(Seen::default()));
-        let bus = EventBus::start(&runtime, Channel(tx), Box::new(Recorder(seen.clone())));
+        let bus = EventBus::start(
+            &runtime,
+            store(1, None),
+            Channel(tx),
+            Box::new(Recorder(seen.clone())),
+        );
+        assert!(bus.started());
         // The starting point is not sent.
         assert_eq!(bus.view().seq, 0);
         assert_eq!(bus.view().health.state, HealthState::Starting);
@@ -911,69 +988,87 @@ mod tests {
         assert_eq!(seen.executed, [1]);
     }
 
-    /// Review A4: `store-state` goes out at once (no merging, even for
+    /// Everything sent before the next `startup-problem`, a marker queued
+    /// behind the step under test.
+    fn until_marker(rx: &Receiver<(&'static str, Value)>) -> Vec<(&'static str, Value)> {
+        let mut sent = vec![];
+        loop {
+            let (name, payload) = next(rx);
+            if name == STARTUP_PROBLEM {
+                return sent;
+            }
+            sent.push((name, payload));
+        }
+    }
+
+    /// Review A4/A9: `store-state` goes out at once (no merging, even for
     /// reports back to back), numbered from the same `seq` as the rest, and
-    /// only when the reported value differs from the last one sent; the
-    /// view keeps the last one sent.
+    /// only when the reported value differs from the view's: the baseline
+    /// first, then the last one sent. The view keeps the last one sent.
     #[test]
     fn store_state_goes_out_unthrottled_once_per_change() {
         let runtime = Arc::new(Runtime::new(Arc::new(SystemClock)));
         let (tx, rx) = mpsc::channel();
-        let bus = EventBus::start(&runtime, Channel(tx), Box::new(Recorder(Arc::default())));
-        assert_eq!(bus.view().store, None);
-        let report = bus.store_sink();
-        let locked = StoreState {
-            revision: 0,
-            safe_mode: Some(SafeModeReason::Locked),
-        };
-        let recovered = StoreState {
-            revision: 2,
-            safe_mode: None,
-        };
-        report(locked);
-        report(locked);
-        report(recovered);
-        report(recovered);
-        report(StoreState {
-            revision: 3,
-            safe_mode: None,
-        });
-        // A marker behind the reports: everything they caused is before it.
+        let bus = EventBus::start(
+            &runtime,
+            store(1, None),
+            Channel(tx),
+            Box::new(Recorder(Arc::default())),
+        );
+        let sink = bus.store_sink();
+        let locked = store(0, Some(SafeModeReason::Locked));
+        let recovered = store(2, None);
+        sink.baseline(locked);
+        sink.report(locked);
+        sink.report(locked);
+        sink.report(recovered);
+        sink.report(recovered);
+        sink.report(store(3, None));
         (bus.problem_sink())(ProblemKind::AutostartRepaired {}.into());
-        let mut sent = vec![];
-        loop {
-            let (name, payload) = next(&rx);
-            if name == STARTUP_PROBLEM {
-                break;
-            }
-            sent.push((name, payload));
-        }
         assert_eq!(
-            sent,
+            until_marker(&rx),
             [
                 (
                     STORE_STATE,
-                    json!({"seq": 1, "revision": 0, "safe_mode": "locked"})
+                    json!({"seq": 1, "revision": 2, "safe_mode": null})
                 ),
                 (
                     STORE_STATE,
-                    json!({"seq": 2, "revision": 2, "safe_mode": null})
-                ),
-                (
-                    STORE_STATE,
-                    json!({"seq": 3, "revision": 3, "safe_mode": null})
+                    json!({"seq": 2, "revision": 3, "safe_mode": null})
                 ),
             ]
         );
         let view = bus.view();
-        assert_eq!(view.seq, 4);
-        assert_eq!(
-            view.store,
-            Some(StoreState {
-                revision: 3,
-                safe_mode: None
-            })
+        assert_eq!(view.seq, 3);
+        assert_eq!(view.store, store(3, None));
+    }
+
+    /// Review A9: the baseline is in the view as soon as `baseline` returns
+    /// (on the caller's thread, no `seq`), it is not sent, and with no
+    /// change after it no `store-state` is ever sent.
+    #[test]
+    fn the_baseline_is_in_the_view_at_once_and_never_sent() {
+        let runtime = Arc::new(Runtime::new(Arc::new(SystemClock)));
+        let (tx, rx) = mpsc::channel();
+        let bus = EventBus::start(
+            &runtime,
+            store(1, None),
+            Channel(tx),
+            Box::new(Recorder(Arc::default())),
         );
+        let sink = bus.store_sink();
+        let locked = store(4, Some(SafeModeReason::Locked));
+        sink.baseline(locked);
+        let view = bus.view();
+        assert_eq!((view.seq, view.store), (0, locked));
+        // Reports of the same value (an unchanged reload) send nothing.
+        sink.report(locked);
+        sink.report(locked);
+        (bus.problem_sink())(ProblemKind::AutostartRepaired {}.into());
+        let sent = until_marker(&rx);
+        assert!(sent.is_empty(), "nothing before the marker: {sent:?}");
+        let view = bus.view();
+        assert_eq!((view.seq, view.store), (1, locked), "only the marker");
     }
 
     /// Review A3: the observer (tray run notifications) gets every history
@@ -983,7 +1078,12 @@ mod tests {
         let runtime = Arc::new(Runtime::new(Arc::new(SystemClock)));
         let (tx, rx) = mpsc::channel();
         let seen = Arc::new(Mutex::new(Seen::default()));
-        let _bus = EventBus::start(&runtime, Channel(tx), Box::new(Recorder(seen.clone())));
+        let _bus = EventBus::start(
+            &runtime,
+            store(1, None),
+            Channel(tx),
+            Box::new(Recorder(seen.clone())),
+        );
         for _ in 0..15 {
             runtime.record(Record {
                 rule_id: "r".into(),

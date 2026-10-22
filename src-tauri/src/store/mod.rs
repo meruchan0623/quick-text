@@ -129,13 +129,14 @@ impl Store {
             safe_mode: self.safe_mode,
         }
     }
-    /// From now on the revision and safe mode are given to `sink` after
-    /// every change; the current value is given at once (the initial
-    /// `store-state`, so the EventBus's view has it before the frontend can
-    /// ask for a snapshot).
+    /// Review A9: the current revision and safe mode become the EventBus's
+    /// baseline at once, on this thread, under this store lock (no `seq`,
+    /// no event: the frontend reads initial values from `load_state` /
+    /// `get_runtime_snapshot`); from now on every change is reported to
+    /// `sink`. Called once, in setup, before the bus is managed.
     pub fn set_store_sink(&mut self, sink: StoreSink) {
+        sink.baseline(self.store_state());
         self.store_sink = Some(sink);
-        self.report_store_state();
     }
     /// Reports the current revision and safe mode, still under the store
     /// lock, so reports follow the order of the changes. The two places
@@ -143,10 +144,10 @@ impl Store {
     /// (startup and the SafeMode(Locked) retry: new revision and safe mode
     /// left, one report) and `publish_with_metadata` (save/apply, rollback,
     /// published import, which may also end safe mode). The EventBus drops
-    /// a report equal to the last one it sent.
+    /// a report equal to its baseline or the last one it sent.
     fn report_store_state(&self) {
         if let Some(sink) = &self.store_sink {
-            sink(self.store_state());
+            sink.report(self.store_state());
         }
     }
     /// The safe-mode gate for write commands (plan §7.2): everything that

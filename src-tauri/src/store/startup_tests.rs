@@ -1234,110 +1234,242 @@ fn problems_found_outside_the_load_survive_a_reload() {
     assert_eq!(kinds, outside);
 }
 
-/// Review A4 (contract §3 `store-state`): the frontend takes a snapshot in
-/// SafeMode(Locked), then the retry succeeds. The new revision and the end
-/// of safe mode arrive together as one `store-state` above the snapshot's
-/// `seq`, and the next snapshot (the bus's view) has them. A reload that
-/// changes neither sends nothing; publishing and rolling back send one each.
+/// Records what the EventBus emits.
+struct EventChannel(std::sync::mpsc::Sender<(&'static str, Value)>);
+impl crate::events::Sink for EventChannel {
+    fn emit(&self, name: &'static str, payload: Value) {
+        let _ = self.0.send((name, payload));
+    }
+}
+
+/// An observer that ignores everything, or (`held`) holds the bus thread
+/// in its first callback, which `Worker::run` makes before it takes
+/// anything from its queue, until the test releases it.
+struct HeldObserver {
+    held: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+}
+impl crate::events::Observer for HeldObserver {
+    fn status(
+        &mut self,
+        _: &quicker_platform::health::HealthSnapshot,
+        _: &quicker_platform::health::EngineState,
+    ) {
+        if let Some((entered, release)) = self.held.take() {
+            let _ = entered.send(());
+            let _ = release.recv_timeout(Duration::from_secs(10));
+        }
+    }
+    fn executed(&mut self, _: &quicker_platform::health::HistoryEntry) {}
+}
+
+/// The `store-state` events before the next `startup-problem`, a marker
+/// sent after the step under test (engine events are skipped).
+fn store_states(rx: &std::sync::mpsc::Receiver<(&'static str, Value)>) -> Vec<Value> {
+    use crate::events::{STARTUP_PROBLEM, STORE_STATE};
+    let mut sent = vec![];
+    loop {
+        let (name, payload) = rx.recv_timeout(Duration::from_secs(10)).expect("event");
+        match name {
+            STARTUP_PROBLEM => return sent,
+            STORE_STATE => sent.push(payload),
+            _ => {}
+        }
+    }
+}
+
+/// A store in SafeMode(Locked) (active.json locked), managed, with an
+/// EventBus started and the store sink set under one store lock, as in
+/// setup (the problem sink is left out: `startup-problem` is the marker).
+struct LockedBus {
+    dir: TempDir,
+    world: Arc<World>,
+    managed: crate::app_state::Managed,
+    bus: crate::events::EventBus,
+    rx: std::sync::mpsc::Receiver<(&'static str, Value)>,
+}
+impl LockedBus {
+    fn start(observer: HeldObserver) -> Self {
+        let dir = TempDir::new();
+        let world = world();
+        write(&dir, "active.json", &bytes(&config_at(2)));
+        write(&dir, "draft.json", &bytes(&config_at(2)));
+        world.locked.lock().push("active.json");
+        let store = Store::load_with(dir.path(), &env(&world));
+        assert_eq!(store.safe_mode(), Some(SafeModeReason::Locked));
+        let runtime = store.runtime.clone();
+        let managed = crate::app_state::Managed::new(store);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let bus = {
+            let mut store = managed.lock();
+            let bus = crate::events::EventBus::start(
+                &runtime,
+                store.store_state(),
+                EventChannel(tx),
+                Box::new(observer),
+            );
+            store.set_store_sink(bus.store_sink());
+            bus
+        };
+        Self {
+            dir,
+            world,
+            managed,
+            bus,
+            rx,
+        }
+    }
+    fn marker(&self) {
+        (self.bus.problem_sink())(ProblemKind::AutostartRepaired {}.into());
+    }
+    fn retry_succeeds(&self) {
+        self.world.locked.lock().clear();
+        let report = retry_locked(&self.dir, &env(&self.world)).unwrap();
+        self.managed.lock().apply_retry(report);
+    }
+    fn snapshot(&self) -> crate::commands::engine::RuntimeSnapshot {
+        crate::commands::engine::runtime_snapshot(&self.bus, &self.managed)
+    }
+}
+
+/// Review A4/A9 (contract §3 `store-state`): setting the sink makes the
+/// store's value the bus's baseline (in the snapshot, never sent). The
+/// frontend takes a snapshot in SafeMode(Locked), then the retry succeeds:
+/// the new revision and the end of safe mode arrive together as one
+/// `store-state` above the snapshot's `seq`, and the next snapshot has
+/// them. A reload that changes neither sends nothing; publishing and
+/// rolling back send one each.
 #[test]
 fn a_locked_retry_after_a_snapshot_arrives_as_store_state() {
-    use crate::{
-        app_state::Managed,
-        commands::engine::runtime_snapshot,
-        events::{EventBus, Observer, Sink, STARTUP_PROBLEM, STORE_STATE},
-    };
-    use quicker_platform::health::{EngineState, HealthSnapshot, HistoryEntry};
-    use std::sync::mpsc;
-
-    struct Channel(mpsc::Sender<(&'static str, Value)>);
-    impl Sink for Channel {
-        fn emit(&self, name: &'static str, payload: Value) {
-            let _ = self.0.send((name, payload));
-        }
-    }
-    struct Quiet;
-    impl Observer for Quiet {
-        fn status(&mut self, _: &HealthSnapshot, _: &EngineState) {}
-        fn executed(&mut self, _: &HistoryEntry) {}
-    }
-    /// The `store-state` events before the next `startup-problem`, a marker
-    /// sent after the step under test (engine events are skipped).
-    fn store_states(rx: &mpsc::Receiver<(&'static str, Value)>) -> Vec<Value> {
-        let mut sent = vec![];
-        loop {
-            let (name, payload) = rx.recv_timeout(Duration::from_secs(10)).expect("event");
-            match name {
-                STARTUP_PROBLEM => return sent,
-                STORE_STATE => sent.push(payload),
-                _ => {}
-            }
-        }
-    }
-
-    let dir = TempDir::new();
-    let world = world();
-    write(&dir, "active.json", &bytes(&config_at(2)));
-    write(&dir, "draft.json", &bytes(&config_at(2)));
-    world.locked.lock().push("active.json");
-    let store = Store::load_with(dir.path(), &env(&world));
-    assert_eq!(store.safe_mode(), Some(SafeModeReason::Locked));
-    let runtime = store.runtime.clone();
-    let managed = Managed::new(store);
-    let (tx, rx) = mpsc::channel();
-    let bus = EventBus::start(&runtime, Channel(tx), Box::new(Quiet));
-    let problems = bus.problem_sink();
-    let marker = || problems(ProblemKind::AutostartRepaired {}.into());
-    // As in setup: setting the sink sends the initial value.
-    managed.lock().set_store_sink(bus.store_sink());
-    marker();
-    let initial = store_states(&rx);
+    let t = LockedBus::start(HeldObserver { held: None });
     let locked_revision = Config::default().revision;
-    assert_eq!(initial.len(), 1);
-    assert_eq!(initial[0]["revision"], locked_revision);
-    assert_eq!(initial[0]["safe_mode"], "locked");
-
-    let snapshot = runtime_snapshot(bus.view(), &managed);
+    // The baseline: in the snapshot at once, with no event.
+    let snapshot = t.snapshot();
+    assert_eq!(snapshot.seq, 0);
     assert_eq!(snapshot.revision, locked_revision);
     assert_eq!(snapshot.safe_mode, Some(SafeModeReason::Locked));
-    assert!(snapshot.seq > initial[0]["seq"].as_u64().unwrap());
+    t.marker();
+    assert_eq!(
+        store_states(&t.rx),
+        Vec::<Value>::new(),
+        "baseline not sent"
+    );
 
-    world.locked.lock().clear();
-    let report = retry_locked(&dir, &env(&world)).unwrap();
-    managed.lock().apply_retry(report);
-    marker();
-    let recovered = store_states(&rx);
+    t.retry_succeeds();
+    t.marker();
+    let recovered = store_states(&t.rx);
     assert_eq!(recovered.len(), 1, "revision and safe mode in one event");
     let seq = recovered[0]["seq"].as_u64().unwrap();
     assert!(seq > snapshot.seq);
     assert_eq!(recovered[0]["revision"], 2);
     assert_eq!(recovered[0]["safe_mode"], Value::Null);
-    let after = runtime_snapshot(bus.view(), &managed);
+    let after = t.snapshot();
     assert!(after.seq > seq);
     assert_eq!((after.revision, after.safe_mode), (2, None));
 
     // Unchanged: reloading the same files sends nothing.
-    managed
+    t.managed
         .lock()
-        .apply_retry(load_or_fallback(&dir, &env(&world)));
-    marker();
-    assert_eq!(store_states(&rx), Vec::<Value>::new());
+        .apply_retry(load_or_fallback(&t.dir, &env(&t.world)));
+    t.marker();
+    assert_eq!(store_states(&t.rx), Vec::<Value>::new());
 
     // Any other cause: a publish, then a rollback (a new revision too).
     {
-        let mut store = managed.lock();
+        let mut store = t.managed.lock();
         let draft = store.draft.clone();
         store.publish(draft).unwrap();
     }
-    marker();
-    let published = store_states(&rx);
+    t.marker();
+    let published = store_states(&t.rx);
     assert_eq!(published.len(), 1);
     assert_eq!(published[0]["revision"], 3);
-    managed.lock().rollback_previous().unwrap();
-    marker();
-    let rolled_back = store_states(&rx);
+    t.managed.lock().rollback_previous().unwrap();
+    t.marker();
+    let rolled_back = store_states(&t.rx);
     assert_eq!(rolled_back.len(), 1);
     assert_eq!(rolled_back[0]["revision"], 4);
     assert_eq!(rolled_back[0]["safe_mode"], Value::Null);
+}
+
+/// Review A9, the order that used to regress: the bus thread is held
+/// before it takes anything from its queue; setting the sink does not wait
+/// for it; the Locked retry succeeds and its report is queued; the
+/// frontend takes a snapshot; then the bus runs. The snapshot shows the
+/// baseline (Locked) at `seq` 0, and no event after it moves the revision
+/// back or brings safe mode back: the one `store-state` is the recovery.
+/// (Before A9 the initial value was queued too and the snapshot read the
+/// store live, so a `store-state` with `safe_mode: "locked"` came after a
+/// snapshot that already showed the recovery.)
+#[test]
+fn a_store_change_queued_before_the_bus_runs_never_regresses_the_snapshot() {
+    let (entered_tx, entered) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let t = LockedBus::start(HeldObserver {
+        held: Some((entered_tx, release_rx)),
+    });
+    entered
+        .recv_timeout(Duration::from_secs(10))
+        .expect("bus thread held before its first take");
+
+    t.retry_succeeds();
+    let snapshot = t.snapshot();
+    assert_eq!(snapshot.seq, 0);
+    assert_eq!(
+        (snapshot.revision, snapshot.safe_mode),
+        (Config::default().revision, Some(SafeModeReason::Locked))
+    );
+
+    release.send(()).unwrap();
+    t.marker();
+    let sent = store_states(&t.rx);
+    let (mut revision, mut safe_mode) = (snapshot.revision, snapshot.safe_mode);
+    for event in &sent {
+        assert!(event["seq"].as_u64().unwrap() > snapshot.seq);
+        let next = event["revision"].as_u64().unwrap();
+        assert!(next >= revision, "revision went back: {sent:?}");
+        if safe_mode.is_none() {
+            assert_eq!(event["safe_mode"], Value::Null, "safe mode came back");
+        }
+        revision = next;
+        safe_mode = (!event["safe_mode"].is_null()).then_some(SafeModeReason::Locked);
+    }
+    assert_eq!(sent.len(), 1, "only the recovery: {sent:?}");
+    assert_eq!((revision, safe_mode), (2, None));
+    let after = t.snapshot();
+    assert_eq!((after.revision, after.safe_mode), (2, None));
+}
+
+/// Review A9: `set_store_sink` itself writes the store's value into the
+/// bus's view (replacing whatever the bus started with), on the calling
+/// thread, with no `seq`; and with no change after it no `store-state` is
+/// sent.
+#[test]
+fn setting_the_store_sink_makes_the_store_value_the_baseline() {
+    let dir = TempDir::new();
+    let world = world();
+    world.locked.lock().push("active.json");
+    write(&dir, "active.json", &bytes(&config_at(2)));
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    let current = store.store_state();
+    assert_eq!(current.safe_mode, Some(SafeModeReason::Locked));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stale = crate::events::StoreState {
+        revision: current.revision + 40,
+        safe_mode: None,
+    };
+    let bus = crate::events::EventBus::start(
+        &store.runtime,
+        stale,
+        EventChannel(tx),
+        Box::new(HeldObserver { held: None }),
+    );
+    store.set_store_sink(bus.store_sink());
+    let view = bus.view();
+    assert_eq!((view.seq, view.store), (0, current));
+    // An unchanged reload reports the same value: nothing is sent.
+    store.apply_retry(load_or_fallback(&dir, &env(&world)));
+    (bus.problem_sink())(ProblemKind::AutostartRepaired {}.into());
+    assert_eq!(store_states(&rx), Vec::<Value>::new());
 }
 
 /// Fault injection (B-52): the store points behave as the real failures.

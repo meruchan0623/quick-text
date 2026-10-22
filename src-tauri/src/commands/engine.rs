@@ -22,8 +22,8 @@ use tauri::{Manager, State};
 /// `get_runtime_snapshot`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RuntimeSnapshot {
-    /// The global event `seq` that `health` and `state` were last sent with
-    /// (0 before the first event).
+    /// The last event `seq` sent (any event; 0 before the first): `health`,
+    /// `state`, `revision` and `safe_mode` are as of it.
     pub seq: u64,
     pub health: HealthSnapshot,
     pub state: EngineState,
@@ -41,24 +41,45 @@ pub struct RuntimeSnapshot {
 /// taken and its `execution-result` (or the `suppressed` count of one) has a
 /// `seq` above the snapshot's.
 ///
-/// Before the bus has sent the first `store-state` (the store reports it
-/// when the sink is set during setup, before the webview loads, so this only
-/// covers a bus thread that never started) the revision and safe mode are
-/// read live from the store, after the view: still at least as new as it,
-/// and any later change still arrives as a `store-state` above `seq`.
-pub(crate) fn runtime_snapshot(view: BusView, store: &Managed) -> RuntimeSnapshot {
+/// `revision` and `safe_mode` always come from the view (review A9): setup
+/// writes the store's value into it as the baseline before any command can
+/// reach the bus, and every change after that is a `store-state` the view
+/// records with its `seq`. They are the same quantity as `load_state`'s
+/// `revision` / `safe_mode` and the `revision` in the `AppState` that write
+/// commands return (all the store's `active.revision`, see
+/// [`crate::store::Store::store_state`]), only as of `seq`.
+///
+/// Only if the bus thread never started ([`EventBus::started`]: no event
+/// will ever be sent, so there is no stream to line up with) is everything
+/// read live, with `seq` 0.
+pub(crate) fn runtime_snapshot(bus: &EventBus, store: &Managed) -> RuntimeSnapshot {
+    let view = bus.view();
     let (runtime, live) = {
         let store = store.lock();
         (store.runtime.clone(), store.store_state())
     };
-    let StoreState {
-        revision,
-        safe_mode,
-    } = view.store.unwrap_or(live);
+    let BusView {
+        seq,
+        health,
+        state,
+        store: StoreState {
+            revision,
+            safe_mode,
+        },
+    } = if bus.started() {
+        view
+    } else {
+        BusView {
+            seq: 0,
+            health: runtime.health(),
+            state: runtime.engine_state(),
+            store: live,
+        }
+    };
     RuntimeSnapshot {
-        seq: view.seq,
-        health: view.health,
-        state: view.state,
+        seq,
+        health,
+        state,
         revision,
         history_seq: runtime.history_seq(),
         safe_mode,
@@ -77,7 +98,7 @@ pub fn get_runtime_snapshot(
     store: State<Managed>,
     bus: State<EventBus>,
 ) -> Result<RuntimeSnapshot, CommandError> {
-    Ok(runtime_snapshot(bus.view(), &store))
+    Ok(runtime_snapshot(&bus, &store))
 }
 
 /// The runtime's live Health.
@@ -212,9 +233,14 @@ mod tests {
         let runtime = store.runtime.clone();
         let managed = Managed::new(store);
         let (tx, events) = mpsc::channel();
-        let bus = EventBus::start(&runtime, Channel(tx), Box::new(Quiet));
+        let bus = {
+            let mut store = managed.lock();
+            let bus = EventBus::start(&runtime, store.store_state(), Channel(tx), Box::new(Quiet));
+            store.set_store_sink(bus.store_sink());
+            bus
+        };
 
-        let before = runtime_snapshot(bus.view(), &managed);
+        let before = runtime_snapshot(&bus, &managed);
         assert_eq!(before.seq, 0);
         assert_eq!(before.health, runtime.health());
         assert_eq!(before.history_seq, 0);
@@ -240,7 +266,7 @@ mod tests {
         let (name, execution) = next_seq(&events);
         assert_eq!(name, "execution-result");
 
-        let after = runtime_snapshot(bus.view(), &managed);
+        let after = runtime_snapshot(&bus, &managed);
         assert_eq!(after.seq, execution["seq"].as_u64().unwrap());
         assert_eq!(after.health, healthy);
         let mut sent = state;
@@ -248,6 +274,44 @@ mod tests {
         assert_eq!(serde_json::to_value(&after.state).unwrap(), sent);
         assert!(after.state.listening);
         assert!(after.history_seq >= entry.seq);
+        drop(bus);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Review A9: if the bus thread never started, no event will ever be
+    /// sent, so the snapshot is the live values at `seq` 0 (the explicit
+    /// `started` flag, not a missing store value, decides).
+    #[test]
+    fn a_bus_that_never_started_gives_the_live_values() {
+        let dir = temp_dir();
+        let store = Store::load(dir.clone());
+        let runtime = store.runtime.clone();
+        let managed = Managed::new(store);
+        let bus = {
+            let mut store = managed.lock();
+            let bus = EventBus::not_started(&runtime, store.store_state());
+            store.set_store_sink(bus.store_sink());
+            bus
+        };
+        assert!(!bus.started());
+        let healthy = HealthSnapshot {
+            state: HealthState::Healthy,
+            components: vec![],
+        };
+        runtime.publish_health(healthy.clone());
+        let revision = {
+            let mut store = managed.lock();
+            let draft = store.draft.clone();
+            store.publish(draft).unwrap();
+            store.active.revision
+        };
+        let snapshot = runtime_snapshot(&bus, &managed);
+        assert_eq!(snapshot.seq, 0);
+        assert_eq!(snapshot.health, healthy);
+        assert_eq!(snapshot.state, runtime.engine_state());
+        assert_eq!((snapshot.revision, snapshot.safe_mode), (revision, None));
+        // The view itself never moved.
+        assert_ne!(bus.view().store.revision, revision);
         drop(bus);
         std::fs::remove_dir_all(dir).unwrap();
     }

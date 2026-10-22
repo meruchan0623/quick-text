@@ -66,16 +66,24 @@ fn main() {
             // tray miss nothing after the state `load_state` reads.
             let pause_item = tray::build(app)?;
             let status = tray::TrayStatus::new(app.handle().clone(), pause_item, engine.clone());
-            let bus = events::EventBus::start(&runtime, app.handle().clone(), Box::new(status));
-            {
+            let bus = {
                 let managed = app.state::<Managed>();
                 let mut store = managed.lock();
+                let bus = events::EventBus::start(
+                    &runtime,
+                    store.store_state(),
+                    app.handle().clone(),
+                    Box::new(status),
+                );
                 store.set_problem_sink(bus.problem_sink());
-                // Sends the initial `store-state` (revision, safe mode), so
-                // the bus's view has them before the frontend can ask for
-                // `get_runtime_snapshot` (the webview loads after setup).
+                // Review A9: writes the revision and safe mode into the
+                // bus's view as the baseline, here, under this store lock
+                // (nothing sent, nothing waited for); every later change
+                // is a `store-state` above it. Commands reach the bus only
+                // after `manage` below.
                 store.set_store_sink(bus.store_sink());
-            }
+                bus
+            };
             app.manage(bus);
             startup::after_load(app.handle());
             startup::start_engine(engine, runtime);
