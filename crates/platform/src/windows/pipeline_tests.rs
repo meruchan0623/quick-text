@@ -116,8 +116,8 @@ impl Rig {
     /// Runs a candidate the way the executor thread does, on the mock ports,
     /// through the production entry that installs and uninstalls the proof.
     fn execute(&self, candidate: &Candidate) -> Result<ExecutionResult, String> {
-        // `physical()` reports "held" when its mirror is contended, so runs
-        // from parallel tests must not overlap (production has one executor).
+        // `physical()` reads the process-wide key mirror, which other tests
+        // write: runs must not overlap them (see [`SERIAL`]).
         let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         let config = self.shared.config.lock().unwrap().clone();
         let plan = expand_reusable(&candidate.rule.action, &config, &VariableContext::default())
@@ -669,7 +669,10 @@ fn pasted(clipboard: &MockClipboard, text: &str) -> Vec<(u32, Vec<u8>)> {
 #[path = "pipeline_tests_clipboard.rs"]
 mod clipboard_cases;
 
-/// Serializes action runs across the pipeline test modules: `physical()`
-/// reports "held" when its mirror is contended, so runs must not overlap
-/// (production has one executor). Shared with `pipeline_tests_executor`.
+/// Serializes the pipeline tests that share process-wide input state, so
+/// their runs never overlap (production has one executor): the physical key
+/// mirror `keystate::PHYSICAL`, which every run reads through `physical()`,
+/// the executor tests hold keys in and some input tests resync, and the
+/// global fault points. Shared by `pipeline_tests_executor` and
+/// `pipeline_tests_input`.
 pub(super) static SERIAL: Mutex<()> = Mutex::new(());

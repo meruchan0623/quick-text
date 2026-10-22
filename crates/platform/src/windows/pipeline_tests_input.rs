@@ -116,10 +116,13 @@ fn context() -> InputContext {
 }
 
 /// Hook tests consume the global HookPanic fault point, and some tests
-/// write the global key mirror; they must not overlap.
-static SERIAL: Mutex<()> = Mutex::new(());
+/// write (or resync) the global key mirror; they must not overlap, neither
+/// with each other nor with the executor tests, which hold keys in that
+/// mirror. One lock for all of them: [`super::pipeline_tests::SERIAL`].
 fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+    super::pipeline_tests::SERIAL
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
 }
 fn nothing() {}
 
