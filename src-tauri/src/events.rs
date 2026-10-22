@@ -175,7 +175,6 @@ impl EventBus {
     }
 
     /// The emitted stream so far (`get_runtime_snapshot`).
-    #[cfg_attr(not(test), allow(dead_code))] // get_runtime_snapshot (P5 item 4).
     pub fn view(&self) -> BusView {
         self.view.lock().clone()
     }

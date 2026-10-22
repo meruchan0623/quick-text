@@ -8,8 +8,7 @@ use crate::{
     commands::import_export::{dialog, Filter},
     diagnostics::{
         bundle::{
-            default_file_name, write_bundle_file, HealthReport, LastResult, Redaction, Snapshot,
-            SystemInfo,
+            default_file_name, write_bundle_file, HealthReport, Redaction, Snapshot, SystemInfo,
         },
         level::{LevelState, LogLevel, LogLevelControl},
         logging::log_dir,
@@ -21,7 +20,6 @@ use std::{
     collections::HashMap,
     fs, io,
     path::{Path, PathBuf},
-    sync::atomic::Ordering,
     time::{Instant, SystemTime},
 };
 use tauri::State;
@@ -80,36 +78,17 @@ pub fn export_diagnostics(
 }
 
 /// The runtime half of the bundle. The store lock is held only to clone
-/// the engine handle.
+/// the engine and runtime handles.
 fn health_report(store: &Managed, control: &LogLevelControl) -> HealthReport {
-    let capabilities = quicker_platform::capabilities();
-    let (engine, revision) = {
+    let (engine, runtime, revision) = {
         let store = store.lock();
-        (store.engine.clone(), store.active.revision)
+        (
+            store.engine.clone(),
+            store.runtime.clone(),
+            store.active.revision,
+        )
     };
-    let paused = engine.paused.load(Ordering::SeqCst);
-    let busy = engine.busy.load(Ordering::SeqCst);
-    let last_result = engine
-        .last
-        .lock()
-        .ok()
-        .and_then(|last| last.as_ref().map(LastResult::from));
-    HealthReport {
-        health: None,
-        engine_status: if busy {
-            "running"
-        } else if paused {
-            "paused"
-        } else {
-            "listening"
-        },
-        paused,
-        busy,
-        revision,
-        last_result,
-        capabilities,
-        log_level: control.current(),
-    }
+    HealthReport::current(&runtime, &engine, revision, control.current())
 }
 
 #[tauri::command(rename_all = "snake_case")]

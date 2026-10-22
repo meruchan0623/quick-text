@@ -114,7 +114,8 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 | 命令 | 变化 |
 |---|---|
 | 全部 | 错误类型改为 `CommandError` |
-| `load_state` | 返回值在原字段之外新增 `health: HealthSnapshot`、`engine_state: EngineState`（不含 `seq`）、`startup_problems: StartupProblem[]`、`safe_mode: SafeModeReason \| null`；`engine_status` 字符串保留 |
+| `load_state` | 返回值在原字段之外新增 `health: HealthSnapshot`、`engine_state: EngineState`（不含 `seq`）、`startup_problems: StartupProblem[]`、`safe_mode: SafeModeReason \| null`；`engine_status` 字符串保留。`health`、`engine_state` 是调用时运行时的实时值（不是 EventBus 最后发出的值，需要 `seq` 基准时用 `get_runtime_snapshot`）；`capabilities` 与 `get_capabilities` 同源，按这份 `health` 的组件降级 |
+| `load_state.platform` | 取 `std::env::consts::OS`：`"windows"`、`"macos"`，或没有输入适配器的平台名（如 `"linux"`）。0.3 在 macOS 以外一律返回 `"windows"`；Windows 与 macOS 上的值不变 |
 | `set_paused(paused)` | 只置位或清除 `manual`；其他暂停原因仍在时，返回的状态仍是暂停。恢复（`paused: false`）在安全模式下返回 `safe_mode`；Health 不是 `healthy` / `degraded` 时返回 `engine_unavailable { health }`；录制中恢复不再返回 `busy`，而是清除 `manual` 后仍因 `recording` 保持暂停。托盘菜单项走同一逻辑：监听中显示「暂停监听」，否则显示「恢复监听」；托盘恢复被拒绝时发系统通知说明原因（安全模式、引擎启动中、恢复中、已停止） |
 | `start_recording`、`stop_recording` | 录制期间置位 `recording` 暂停原因，录制结束即清除；结束后引擎回到其他原因决定的状态（录制前已手动暂停的仍暂停，原来在监听的恢复监听） |
 | `load_state.paused`、`engine_status` | 由运行时推导：`paused` = 不在监听（任何暂停原因，或 Health 不接受恢复）；`engine_status` 为 `running`（执行中）、`paused` 或 `listening` |
@@ -127,23 +128,56 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 
 | 命令 | 参数 | 返回 |
 |---|---|---|
-| `get_runtime_snapshot` | — | `{ seq, health: HealthSnapshot, state: EngineState, revision: number, history_seq: number, safe_mode: SafeModeReason \| null }`；`seq` 是生成快照时的全局事件序号，前端以它为新的基准 |
-| `get_health` | — | `HealthSnapshot` = `{ state, components }` |
-| `repair_engine` | — | `HealthSnapshot`：立即返回当前快照；`recovering` 和结果通过 `engine-health` 推送。Failed 已锁存（supervisor 的 watchdog 判定卡死）时返回 `failed`，锁存要等 supervisor 受理这次修复才解除 |
+| `get_runtime_snapshot` | — | `{ seq, health: HealthSnapshot, state: EngineState, revision: number, history_seq: number, safe_mode: SafeModeReason \| null }`；`seq` 是生成快照时的全局事件序号，前端以它为新的基准。细则见下方「快照与事件」 |
+| `get_health` | — | `HealthSnapshot` = `{ state, components }`：运行时的实时值，可能比最后一条 `engine-health` 新（合并中的值） |
+| `repair_engine` | — | `HealthSnapshot`：立即返回当前快照；`recovering` 和结果通过 `engine-health` 推送。Failed 已锁存（supervisor 的 watchdog 判定卡死）时返回 `failed`，锁存要等 supervisor 受理这次修复才解除。安全模式下也可调用：重建不会恢复监听（`safe_mode`、`manual` 仍在） |
 | `startup_problems` | — | `StartupProblem[]`（不含 `seq`） |
-| `get_capabilities` | — | `Capability[]`，`Capability = { id: string, status: "available" \| "unavailable" \| "experimental" \| "degraded", reason: string \| null, available: boolean }`；`reason` 是原因码，`available` 保留给旧界面（`status` 不是 `unavailable` 即为真） |
+| `get_capabilities` | — | `Capability[]`，`Capability = { id: string, status: "available" \| "unavailable" \| "experimental" \| "degraded", reason: string \| null, available: boolean }`；`reason` 是原因码，`status` 为 `available` 时恰好为 `null`；`available` 保留给旧界面（`status` 不是 `unavailable` 即为真）。id 与 reason 的取值见下方「能力表」 |
 | `export_diagnostics` | `{ redaction: "summary" \| "full" }` | `string \| null`：弹出保存对话框，返回写入的 zip 路径；取消返回 `null` |
 | `set_log_level` | `{ level: "error" \| "warn" \| "info" \| "debug" \| "trace", ttl_hours: number \| null }` | `{ level, until_ms: number \| null }`；`ttl_hours` 为空表示恢复默认级别 |
 | `open_log_dir`、`open_data_dir` | — | `null` |
 | `self_test` | — | `{ passed: boolean, checks: { name: "raw_input" \| "hook_heartbeat" \| "foreground" \| "clipboard", passed: boolean, reason: ReasonCode \| null, elapsed_ms: number }[] }` |
 | `log_frontend_error` | `{ message: string, stack: string \| null, source: string \| null }` | `null`；后端截断到 8 KiB 后写日志 |
 | `report_metric` | `{ name: string, value: number }` | `null`；只接受白名单内的名称（0.4：`ui_first_paint_ms`、`ui_event_lag_ms`），其他名称忽略 |
-| `list_history` | `{ since_seq: number \| null }` | `HistoryEntry[]`，按 `seq` 升序，只含 `seq > since_seq` 的条目 |
-| `clear_history` | — | `null` |
+| `list_history` | `{ since_seq: number \| null }` | `HistoryEntry[]`，按 `seq` 升序，只含 `seq > since_seq` 的条目；`null` 返回全部（内存中最多 200 条、30 分钟内） |
+| `clear_history` | — | `null`；清空内存中的执行历史，不发事件。历史 `seq` 不归零，之后的条目接着编号。安全模式下也可调用（不写数据或设置） |
 | `explain_last_miss` | — | `{ seq, at_ms, rule_id: string, outcome: Outcome, reason: ReasonCode } \| null`：0.4 只基于执行历史，取最近一条不是 `succeeded` 的记录（F-52 的完整版在 0.5） |
-| `debug_inject_fault` | `{ point: FaultPoint, param: number }` | `null`；只在 `fault-injection` feature 下注册，release 构建不存在 |
+| `debug_inject_fault` | `{ point: FaultPoint, param: number }` | `null`；只在 `fault-injection` feature 下注册，release 构建不存在（命令和符号都没有）。`param` 对 `executor_hang`、`clipboard_busy` 是毫秒数，其他点忽略；每次调用写一条 `fault.injected` 日志 |
 
-`FaultPoint` 的取值见 `crates/platform/src/fault.rs`。
+`FaultPoint` 的取值见 `crates/platform/src/fault.rs`：`executor_panic`、`executor_hang`、`hook_panic`、`hook_unhook`、`rawinput_close`、`rawinput_unregister`、`clipboard_busy`、`store_write_fail`、`config_corrupt`、`store_locked`、`autostart_stale`、`session_end`。
+
+### 快照与事件（`get_runtime_snapshot`）
+
+- `seq`、`health`、`state` 是 EventBus 同一时刻的一份拷贝：`seq` 是最后发出的事件序号，`health`、`state` 是截至这个 `seq` 发出的值（还没有任何事件时 `seq` 为 0，`health`、`state` 是 EventBus 启动时的值）。合并中尚未发出的值不在快照里，它们之后以更大的 `seq` 发出。
+- 其余字段（`revision`、`safe_mode`、`history_seq`）在这份拷贝之后读取，所以至少和它一样新。快照没有包含的变化，一定以大于快照 `seq` 的事件到达；`seq` 不大于快照的事件可以直接丢弃，不会漏掉变化。
+- `history_seq` 是读取时已分配的最大历史序号。`seq` 不大于快照的 `execution-result` 所带的条目都满足 `entry.seq ≤ history_seq`；`entry.seq > history_seq` 的条目都是快照之后记录的，会以更大的 `seq` 推送（或计入某条推送的 `suppressed`）。快照之前的明细用 `list_history(null)` 取，之后的条目跟随事件；被合并的条目用 `list_history(history_seq)` 补齐。
+- 与 `load_state` 的区别：`load_state` 给实时值、不带 `seq`，适合首屏；对齐事件流用 `get_runtime_snapshot`。
+
+### 能力表（`get_capabilities`）
+
+`load_state.capabilities`、`get_capabilities` 和诊断包 `health.json` 的 `capabilities` 是同一张表（`src-tauri/src/app_state.rs` 的 `capabilities`，即 `capabilities_for(当前 Health 的组件)`）。先看平台适配器能否提供，再按依赖组件的实时健康降级：依赖组件 `degraded` 时能力为 `degraded`；`starting`、`recovering`、`failed` 时为 `unavailable`；取最差的一个，同等严重时保留先出现的原因；健康的组件不会抬高适配器给出的状态。
+
+| id | 依赖组件 | 平台 |
+|---|---|---|
+| `keyboard_hook` | `keyboard_hook`、`raw_input`（macOS 只有 `keyboard_hook`） | 全部；Windows 还需要 RawInput |
+| `keys` | `executor` | 全部 |
+| `paste`、`html`、`file_clipboard`、`image_clipboard` | `executor`、`clipboard` | 全部 |
+| `mouse` | `executor` | 全部 |
+| `recording` | `keyboard_hook`、`mouse_hook` | 全部 |
+| `foreground` | `focus_events` | 全部 |
+| `open` | `executor` | 全部 |
+| `ime_committed_text` | `keyboard_hook`、`raw_input` | Windows；macOS 恒为 `unavailable` / `not_implemented` |
+| `quicker_private_action` | — | 恒为 `unavailable` / `not_implemented` |
+| `wheel_delta` | — | **仅 macOS 列出**，恒为 `unavailable` / `not_implemented` |
+| `media_system_actions` | `executor` | **仅 macOS 列出** |
+| `window_ime_actions` | — | **仅 macOS 列出**，恒为 `unavailable` / `not_implemented` |
+
+Windows 与不受支持的平台列出前 12 个 id（同样的顺序），macOS 列出全部 15 个。前端按 id 查找，不依赖顺序和个数；对未知 id 显示 id 原文。
+
+`reason` 是下面两类之一（裸字符串）：
+
+- 平台原因：`experimental_platform`（macOS 适配器就绪但未经实机验收，ADR-f；`status` 为 `experimental`）、`permission_missing`（macOS 辅助功能、输入监控或合成输入权限未授予）、`not_implemented`（这个平台没有适配器提供该能力）。
+- `ReasonCode`（§3 的完整列表）：适配器本身给出的 `unsupported`（不受支持的平台，全部能力）、`hook_missing`（Windows 钩子未安装）、`raw_input_missing`（Windows RawInput 未注册）、`engine_down`（macOS 权限已授予但事件 tap 未运行）；或依赖组件报告的原因（组件未给原因时按组件取默认值：`executor` → `engine_down`，`keyboard_hook`、`mouse_hook`、`focus_events` → `hook_missing`，`raw_input` → `raw_input_missing`，`clipboard` → `clipboard_busy`），例如 `executor_panic`、`executor_timeout`、`clipboard_changed`、`hook_install_failed`。
 
 ## 6. 跨 IPC 的整数范围
 

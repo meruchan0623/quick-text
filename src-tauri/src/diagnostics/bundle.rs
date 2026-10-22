@@ -18,12 +18,20 @@ use super::{
     logging::{log_dir, FILE_PREFIX, FILE_SUFFIX, MAX_LOG_FILES},
     redact::redact_user_paths,
 };
-use crate::store::{
-    prefs::{civil_from_days, utc_stamp},
-    replace_file,
+use crate::{
+    app_state::capabilities,
+    events::legacy_status,
+    store::{
+        prefs::{civil_from_days, utc_stamp},
+        replace_file,
+    },
 };
 use quicker_domain::{compile_config, Config, Severity};
-use quicker_platform::{health::HealthSnapshot, Capability, ExecutionResult};
+use quicker_platform::{
+    health::{HealthSnapshot, PauseReasons},
+    runtime::Runtime,
+    Capability, ExecutionResult, Shared,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -76,15 +84,48 @@ pub struct Snapshot {
 /// `health.json`.
 #[derive(Serialize)]
 pub struct HealthReport {
-    /// TODO(B-03): the supervisor's snapshot once `get_health` exists (P1a).
-    pub health: Option<HealthSnapshot>,
+    /// The runtime's current snapshot (what `get_health` returns).
+    pub health: HealthSnapshot,
     pub engine_status: &'static str,
     pub paused: bool,
+    pub paused_reasons: PauseReasons,
     pub busy: bool,
     pub revision: u64,
     pub last_result: Option<LastResult>,
+    /// Lowered by `health`, as `get_capabilities` reports them.
     pub capabilities: Vec<Capability>,
     pub log_level: LevelState,
+}
+impl HealthReport {
+    /// The report for the engine as it is now: Health, State and the
+    /// capability table from the runtime (the same sources as `load_state`
+    /// and `get_capabilities`), the last result from `engine`. Takes no
+    /// store lock.
+    pub fn current(
+        runtime: &Runtime,
+        engine: &Shared,
+        revision: u64,
+        log_level: LevelState,
+    ) -> Self {
+        let health = runtime.health();
+        let state = runtime.engine_state();
+        let last_result = engine
+            .last
+            .lock()
+            .ok()
+            .and_then(|last| last.as_ref().map(LastResult::from));
+        Self {
+            capabilities: capabilities(&health),
+            health,
+            engine_status: legacy_status(&state),
+            paused: !state.listening,
+            paused_reasons: state.paused_reasons,
+            busy: state.busy,
+            revision,
+            last_result,
+            log_level,
+        }
+    }
 }
 
 /// The last execution without its rule id and message.
@@ -681,9 +722,10 @@ pub mod test_support {
         let snapshot = Snapshot {
             now: SystemTime::now(),
             health: HealthReport {
-                health: None,
+                health: HealthSnapshot::default(),
                 engine_status: "listening",
                 paused: false,
+                paused_reasons: PauseReasons::default(),
                 busy: false,
                 revision: 0,
                 last_result: None,
@@ -726,9 +768,10 @@ mod tests {
         Snapshot {
             now: UNIX_EPOCH + Duration::from_secs(NOW_SECS),
             health: HealthReport {
-                health: None,
+                health: HealthSnapshot::default(),
                 engine_status: "listening",
                 paused: false,
+                paused_reasons: PauseReasons::default(),
                 busy: false,
                 revision: 3,
                 last_result: Some(LastResult::from(&ExecutionResult {
@@ -886,7 +929,66 @@ mod tests {
         let health: serde_json::Value = serde_json::from_str(&files["health.json"]).unwrap();
         assert_eq!(health["last_result"]["status"], "failed");
         assert_eq!(health["log_level"]["level"], "debug");
-        assert!(health["health"].is_null());
+        assert_eq!(
+            health["health"],
+            serde_json::json!({ "state": "starting", "components": [] })
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Codex I2: `health.json` carries the runtime's live Health (no longer
+    /// null), so a busy clipboard shows up in the bundle, and its capability
+    /// table is the one `get_capabilities` reports for that Health.
+    #[test]
+    fn health_json_shows_a_degraded_clipboard() {
+        use quicker_platform::{
+            health::{Component, ComponentHealth, HealthState, ReasonCode},
+            traits::SystemClock,
+        };
+        use std::sync::Arc;
+
+        let runtime = Runtime::new(Arc::new(SystemClock));
+        let engine = Shared::new();
+        runtime.attach(&engine);
+        let busy = HealthSnapshot {
+            state: HealthState::Degraded,
+            components: vec![
+                ComponentHealth {
+                    component: Component::Executor,
+                    state: HealthState::Healthy,
+                    reason: None,
+                    since_ms: 1,
+                },
+                ComponentHealth {
+                    component: Component::Clipboard,
+                    state: HealthState::Degraded,
+                    reason: Some(ReasonCode::ClipboardBusy),
+                    since_ms: 2,
+                },
+            ],
+        };
+        runtime.publish_health(busy.clone());
+        let mut snapshot = snapshot(&[]);
+        snapshot.health = HealthReport::current(&runtime, &engine, 4, LevelState::default());
+        let dir = temp_dir();
+        let (cursor, _) =
+            build_bundle(&dir, Redaction::Summary, Cursor::new(Vec::new()), &snapshot).unwrap();
+        let files = unzip(cursor.into_inner());
+        let health: serde_json::Value = serde_json::from_str(&files["health.json"]).unwrap();
+        assert_eq!(health["health"]["state"], "degraded");
+        let clipboard = &health["health"]["components"][1];
+        assert_eq!(clipboard["component"], "clipboard");
+        assert_eq!(clipboard["state"], "degraded");
+        assert_eq!(clipboard["reason"], "clipboard_busy");
+        assert_eq!(
+            health["capabilities"],
+            serde_json::to_value(quicker_platform::capabilities_for(&busy.components)).unwrap()
+        );
+        // Degraded accepts a resume; the runtime starts manually paused.
+        assert_eq!(health["paused"], true);
+        assert_eq!(health["paused_reasons"], serde_json::json!(["manual"]));
+        assert_eq!(health["engine_status"], "paused");
+        assert_eq!(health["revision"], 4);
         fs::remove_dir_all(dir).unwrap();
     }
 

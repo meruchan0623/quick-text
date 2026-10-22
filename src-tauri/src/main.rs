@@ -116,7 +116,16 @@ fn main() {
             commands::diagnostics::open_data_dir,
             commands::diagnostics::log_frontend_error,
             commands::diagnostics::report_metric,
-            commands::runtime::startup_problems
+            commands::runtime::startup_problems,
+            commands::engine::get_runtime_snapshot,
+            commands::engine::get_health,
+            commands::engine::repair_engine,
+            commands::engine::get_capabilities,
+            commands::engine::list_history,
+            commands::engine::clear_history,
+            commands::engine::explain_last_miss,
+            #[cfg(feature = "fault-injection")]
+            commands::engine::debug_inject_fault
         ])
         .build(tauri::generate_context!())
         .expect("Quicker Text startup failed")
