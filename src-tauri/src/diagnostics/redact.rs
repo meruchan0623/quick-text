@@ -1,9 +1,9 @@
 //! Text redaction for crash records and the diagnostics bundle (§7.1).
 //!
 //! - [`redact_user_paths`]: user profile directories become `%USERNAME%`.
-//! - [`sanitize_quoted`]: quoted spans in panic messages (std quotes the
-//!   offending string, e.g. a phrase body sliced at a bad index) are replaced
-//!   by their length.
+//! - [`PanicPayload`]: what is kept of a panic message (std quotes the
+//!   offending string, e.g. a phrase body sliced at a bad index): a class
+//!   from std's fixed wording, the length and a fingerprint, never the text.
 //! - [`truncate_utf8`]: byte budget on a char boundary.
 //! - [`fingerprint`]: an irreversible short hash that groups equal texts
 //!   without recording them.
@@ -185,64 +185,104 @@ fn redact_users_segments(text: &str) -> String {
     out
 }
 
-/// Code tokens std puts in backticks that never carry user data.
-const SAFE_CODE: [&str; 9] = [
-    "Option::unwrap()",
-    "Option::expect()",
-    "Result::unwrap()",
-    "Result::expect()",
-    "Result::unwrap_err()",
-    "None",
-    "Some",
-    "Ok",
-    "Err",
+/// What std's own panics are about, read from their fixed wording.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanicClass {
+    /// `index out of bounds: the len is 3 but the index is 5`.
+    IndexOutOfBounds,
+    /// A `str` sliced off a char boundary or past its end (`byte index 2 is
+    /// not a char boundary ...`, `begin <= end (4 <= 2) when slicing ...`).
+    ByteIndex,
+    /// A slice range out of order or past the end (`range end index 5 out
+    /// of range ...`, `slice index starts at 4 but ends at 2`).
+    SliceRange,
+    /// ``called `Option::unwrap()` on a `None` value``.
+    OptionUnwrap,
+    /// ``called `Result::unwrap()` on an `Err` value: ...`` (and
+    /// `unwrap_err` on `Ok`).
+    ResultUnwrap,
+    /// `attempt to add with overflow`, `attempt to divide by zero`, ...
+    Arithmetic,
+    /// A `RefCell` borrowed twice (`already borrowed`, `already mutably
+    /// borrowed`).
+    AlreadyBorrowed,
+    /// The payload is not text (`std::panic::panic_any`).
+    NonString,
+    /// Any other text, including every `expect` and `panic!` message.
+    Other,
+}
+
+/// Payload prefixes of std's panics (current and older wording); first
+/// match wins.
+const PANIC_PREFIXES: [(&str, PanicClass); 16] = [
+    ("index out of bounds", PanicClass::IndexOutOfBounds),
+    ("start byte index ", PanicClass::ByteIndex),
+    ("end byte index ", PanicClass::ByteIndex),
+    ("byte index ", PanicClass::ByteIndex),
+    ("begin <= end ", PanicClass::ByteIndex),
+    ("range start index ", PanicClass::SliceRange),
+    ("range end index ", PanicClass::SliceRange),
+    ("slice index starts at ", PanicClass::SliceRange),
+    ("called `Option::unwrap()`", PanicClass::OptionUnwrap),
+    ("called `Result::unwrap()`", PanicClass::ResultUnwrap),
+    ("called `Result::unwrap_err()`", PanicClass::ResultUnwrap),
+    ("attempt to ", PanicClass::Arithmetic),
+    ("already borrowed", PanicClass::AlreadyBorrowed),
+    ("already mutably borrowed", PanicClass::AlreadyBorrowed),
+    ("RefCell already borrowed", PanicClass::AlreadyBorrowed),
+    (
+        "RefCell already mutably borrowed",
+        PanicClass::AlreadyBorrowed,
+    ),
 ];
 
-/// Replaces quoted spans with `<redacted len=N>`: `` `...` `` (std quotes
-/// sliced strings this way) unless it is a known code token, `"..."` (Debug
-/// of strings), and single-char `'x'`. An unclosed quote redacts to the end.
-pub fn sanitize_quoted(message: &str) -> String {
-    let mut out = String::with_capacity(message.len());
-    let mut rest = message;
-    while let Some(open) = rest.find(['`', '"', '\'']) {
-        let quote = rest[open..].chars().next().unwrap_or('"');
-        let after = &rest[open + 1..];
-        out.push_str(&rest[..open]);
-        if quote == '\'' {
-            // Only `'x'`: apostrophes in English text stay.
-            let mut chars = after.chars();
-            match (chars.next(), chars.next()) {
-                (Some(c), Some('\'')) => {
-                    out.push_str(&format!("'<redacted len={}>'", c.len_utf8()));
-                    rest = &after[c.len_utf8() + 1..];
-                }
-                _ => {
-                    out.push('\'');
-                    rest = after;
-                }
-            }
-            continue;
+impl PanicClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IndexOutOfBounds => "index_out_of_bounds",
+            Self::ByteIndex => "byte_index",
+            Self::SliceRange => "slice_range",
+            Self::OptionUnwrap => "option_unwrap",
+            Self::ResultUnwrap => "result_unwrap",
+            Self::Arithmetic => "arithmetic",
+            Self::AlreadyBorrowed => "already_borrowed",
+            Self::NonString => "non_string",
+            Self::Other => "other",
         }
-        let close = after.find(quote);
-        let inner = &after[..close.unwrap_or(after.len())];
-        if quote == '`' && SAFE_CODE.contains(&inner) {
-            out.push('`');
-            out.push_str(inner);
-            out.push('`');
-        } else {
-            out.push(quote);
-            out.push_str(&format!("<redacted len={}>", inner.len()));
-            if close.is_some() {
-                out.push(quote);
-            }
-        }
-        rest = match close {
-            Some(close) => &after[close + 1..],
-            None => "",
-        };
     }
-    out.push_str(rest);
-    out
+}
+
+/// What is recorded of a panic payload: its class, byte length and
+/// [`fingerprint`], never its text. A payload can quote anything (std quotes
+/// the string it was slicing, `Result::unwrap` appends the error's `Debug`),
+/// and the quoted text may itself contain quotes, so no rule can tell where
+/// a quoted phrase ends; the whole payload is treated as sensitive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PanicPayload {
+    pub class: PanicClass,
+    pub len: usize,
+    pub hash: String,
+}
+impl PanicPayload {
+    /// `text` is `None` when the payload is not a string.
+    pub fn summarize(text: Option<&str>) -> Self {
+        let Some(text) = text else {
+            return Self {
+                class: PanicClass::NonString,
+                len: 0,
+                hash: fingerprint(""),
+            };
+        };
+        let class = PANIC_PREFIXES
+            .into_iter()
+            .find(|(prefix, _)| text.starts_with(prefix))
+            .map_or(PanicClass::Other, |(_, class)| class);
+        Self {
+            class,
+            len: text.len(),
+            hash: fingerprint(text),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -357,29 +397,67 @@ mod tests {
         );
     }
 
+    /// Quoted spans are not found and cut out any more: the whole payload is
+    /// reduced to its class, length and fingerprint.
     #[test]
     fn quoted_spans_in_panic_messages_are_redacted() {
-        assert_eq!(
-            sanitize_quoted("byte index 3 is not a char boundary; it is inside 'é' (bytes 2..4) of `SENTINEL phrase`"),
-            "byte index 3 is not a char boundary; it is inside '<redacted len=2>' (bytes 2..4) of `<redacted len=15>`"
-        );
-        assert_eq!(
-            sanitize_quoted("called `Option::unwrap()` on a `None` value"),
-            "called `Option::unwrap()` on a `None` value"
-        );
-        assert_eq!(
-            sanitize_quoted(
-                r#"called `Result::unwrap()` on an `Err` value: Custom { error: "C:\x secret" }"#
+        let cases = [
+            (
+                "byte index 3 is not a char boundary; it is inside 'é' (bytes 2..4) of `SENTINEL phrase`",
+                PanicClass::ByteIndex,
             ),
-            r#"called `Result::unwrap()` on an `Err` value: Custom { error: "<redacted len=11>" }"#
-        );
-        assert_eq!(
-            sanitize_quoted("can't open `unclosed secret"),
-            "can't open `<redacted len=15>"
-        );
-        assert_eq!(
-            sanitize_quoted("index out of bounds: the len is 3 but the index is 5"),
-            "index out of bounds: the len is 3 but the index is 5"
-        );
+            (
+                "end byte index 1 is not a char boundary; it is inside 'é' (bytes 0..2) of `é`SENTINEL`é`",
+                PanicClass::ByteIndex,
+            ),
+            (
+                "start byte index 9 is out of bounds of `SENTINEL`",
+                PanicClass::ByteIndex,
+            ),
+            ("begin <= end (4 <= 2) when slicing `SENTINEL`", PanicClass::ByteIndex),
+            (
+                "range end index 9 out of range for slice of length 3",
+                PanicClass::SliceRange,
+            ),
+            (
+                "slice index starts at 4 but ends at 2",
+                PanicClass::SliceRange,
+            ),
+            (
+                "called `Option::unwrap()` on a `None` value",
+                PanicClass::OptionUnwrap,
+            ),
+            (
+                r#"called `Result::unwrap()` on an `Err` value: Custom { error: "C:\x \"SENTINEL\"" }"#,
+                PanicClass::ResultUnwrap,
+            ),
+            (
+                "index out of bounds: the len is 3 but the index is 5",
+                PanicClass::IndexOutOfBounds,
+            ),
+            ("attempt to add with overflow", PanicClass::Arithmetic),
+            ("already mutably borrowed: BorrowError", PanicClass::AlreadyBorrowed),
+            ("RefCell already borrowed", PanicClass::AlreadyBorrowed),
+            ("can't open `unclosed SENTINEL", PanicClass::Other),
+            (r#""a\"SENTINEL\"b""#, PanicClass::Other),
+            ("SENTINEL index out of bounds", PanicClass::Other),
+            ("", PanicClass::Other),
+        ];
+        for (text, class) in cases {
+            let payload = PanicPayload::summarize(Some(text));
+            assert_eq!(
+                payload,
+                PanicPayload {
+                    class,
+                    len: text.len(),
+                    hash: fingerprint(text),
+                },
+                "{text}"
+            );
+        }
+        let other = PanicPayload::summarize(None);
+        assert_eq!((other.class, other.len), (PanicClass::NonString, 0));
+        assert_eq!(PanicClass::ByteIndex.as_str(), "byte_index");
+        assert_eq!(PanicClass::NonString.as_str(), "non_string");
     }
 }

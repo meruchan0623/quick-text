@@ -34,7 +34,7 @@
 //! |---|---|---|
 //! | `app.start` | info | process started; version and build profile |
 //! | `app.exit` | info | event loop finished; the log is flushed next |
-//! | `app.panic` | error | a panic; thread, location, redacted message, crash file name |
+//! | `app.panic` | error | a panic; thread, crate-relative location, payload class, length and fingerprint (never the payload), crash file name |
 //! | `command.internal` | error | `CommandError::Internal`; `trace_id` and the original error |
 //! | `command.io` | warn | `CommandError::Io`; operation, file name, OS error |
 //! | `diagnostics.export` | info | a bundle was written; redaction, entry count, `elapsed_ms` |

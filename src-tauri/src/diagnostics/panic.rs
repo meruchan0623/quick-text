@@ -2,13 +2,12 @@
 //! `crash-<UTC yyyymmdd-hhmmss>.txt` in the data directory and an `app.panic`
 //! log event, then the previous hook runs as before.
 //!
-//! The record has the version, thread, location, the panic message with
-//! quoted spans redacted (std quotes the string it was slicing, which may be
-//! a phrase body), user names in paths replaced and the result truncated,
-//! the executable's load address and a
-//! backtrace. Release builds keep line tables and PDBs are archived, so
-//! frames can be symbolized offline. Writing the record never panics.
-use super::redact::{redact_user_paths, sanitize_quoted, truncate_utf8, user_homes};
+//! The record has the version, thread, location (relative to its crate),
+//! the panic payload's class, length and fingerprint ([`PanicPayload`]; never
+//! its text, which may quote a phrase body), the executable's load address
+//! and a backtrace. Release builds keep line tables and PDBs are archived,
+//! so frames can be symbolized offline. Writing the record never panics.
+use super::redact::{redact_user_paths, user_homes, PanicPayload};
 use crate::store::prefs::utc_stamp;
 use std::{
     backtrace::Backtrace,
@@ -22,15 +21,28 @@ use std::{
     time::SystemTime,
 };
 
-/// Panic messages longer than this are cut (after redaction).
-pub const MAX_MESSAGE_BYTES: usize = 2048;
-
 static CRASH_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 thread_local! {
     /// Set while this thread is inside the hook, so a panic while recording
     /// does not record again.
     static IN_HOOK: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests share one process and so one hook: a test sends the panics of
+    /// its own thread to its own directory instead of [`CRASH_DIR`].
+    static TEST_CRASH_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn crash_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    let test_dir = TEST_CRASH_DIR.with(|dir| dir.borrow().clone());
+    #[cfg(not(test))]
+    let test_dir = None;
+    test_dir.or_else(|| CRASH_DIR.get().cloned())
 }
 
 /// Chains the crash recorder in front of the current panic hook. Call first
@@ -61,9 +73,9 @@ pub struct CrashReport<'a> {
     pub debug_build: bool,
     pub time_utc: String,
     pub thread: &'a str,
+    /// See [`crate_location`].
     pub location: Option<String>,
-    /// Already redacted and truncated.
-    pub message: String,
+    pub payload: PanicPayload,
     pub exe_base: Option<usize>,
     pub backtrace: String,
 }
@@ -73,11 +85,10 @@ fn record(info: &PanicHookInfo<'_>) {
     let thread = std::thread::current();
     let thread = thread.name().unwrap_or("<unnamed>");
     let payload = info.payload();
-    let raw = payload
+    let text = payload
         .downcast_ref::<&str>()
         .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("<non-string panic payload>");
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
     let report = CrashReport {
         version: env!("CARGO_PKG_VERSION"),
         debug_build: cfg!(debug_assertions),
@@ -85,14 +96,12 @@ fn record(info: &PanicHookInfo<'_>) {
         thread,
         location: info
             .location()
-            .map(|at| format!("{}:{}:{}", at.file(), at.line(), at.column())),
-        message: clean_message(raw, &user_homes()),
+            .map(|at| crate_location(at.file(), at.line(), at.column(), &user_homes())),
+        payload: PanicPayload::summarize(text),
         exe_base: exe_base(),
         backtrace: format!("{:#}", Backtrace::force_capture()),
     };
-    let written = CRASH_DIR
-        .get()
-        .map(|dir| write_report(dir, now, &render_report(&report)));
+    let written = crash_dir().map(|dir| write_report(&dir, now, &render_report(&report)));
     let crash_file = match &written {
         Some(Ok(path)) => crate::error::file_label(path),
         _ => None,
@@ -105,23 +114,29 @@ fn record(info: &PanicHookInfo<'_>) {
         event = "app.panic",
         thread = report.thread,
         location = report.location.as_deref(),
-        message = %report.message,
+        panic_class = report.payload.class.as_str(),
+        payload_len = report.payload.len,
+        payload_hash = %report.payload.hash,
         crash_file = crash_file.as_deref(),
         write_error = write_error.as_deref(),
         "panic"
     );
 }
 
-/// The panic message as recorded: quoted spans redacted, user names in
-/// paths replaced, then truncated.
-pub fn clean_message(raw: &str, homes: &[String]) -> String {
-    let clean = redact_user_paths(&sanitize_quoted(raw), homes);
-    let cut = truncate_utf8(&clean, MAX_MESSAGE_BYTES);
-    if cut.len() < clean.len() {
-        format!("{cut}… <truncated, {} bytes total>", clean.len())
-    } else {
-        clean
-    }
+/// `file:line:col` with the file cut to its crate: from the directory above
+/// the last `src` segment (`tokio-1.40.0/src/runtime/mod.rs` rather than the
+/// registry path in the user's profile, `core/src/str/mod.rs` for std), or
+/// the bare file name without a `src` segment; `/` separated, user names in
+/// what is left replaced.
+pub fn crate_location(file: &str, line: u32, column: u32, homes: &[String]) -> String {
+    let file = file.replace('\\', "/");
+    let segments: Vec<&str> = file.split('/').filter(|s| !s.is_empty()).collect();
+    let start = match segments.iter().rposition(|s| *s == "src") {
+        Some(src) => src.saturating_sub(1),
+        None => segments.len().saturating_sub(1),
+    };
+    let file = redact_user_paths(&segments[start..].join("/"), homes);
+    format!("{file}:{line}:{column}")
 }
 
 pub fn render_report(report: &CrashReport<'_>) -> String {
@@ -144,7 +159,9 @@ pub fn render_report(report: &CrashReport<'_>) -> String {
         "location: {}",
         report.location.as_deref().unwrap_or("<unknown>")
     );
-    let _ = writeln!(out, "message: {}", report.message);
+    let _ = writeln!(out, "panic_class: {}", report.payload.class.as_str());
+    let _ = writeln!(out, "payload_len: {}", report.payload.len);
+    let _ = writeln!(out, "payload_hash: {}", report.payload.hash);
     match report.exe_base {
         Some(base) => {
             let _ = writeln!(out, "exe_base: {base:#x}");
@@ -211,6 +228,7 @@ fn exe_base() -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostics::redact::{fingerprint, PanicClass};
     use std::time::{Duration, UNIX_EPOCH};
 
     fn temp_dir() -> PathBuf {
@@ -232,16 +250,19 @@ mod tests {
 
     #[test]
     fn report_has_every_field_and_no_quoted_content() {
+        let payload = r"byte index 2 is not a char boundary of `SENTINEL-7f3a` in D:\Home\bob\x";
         let text = render_report(&CrashReport {
             version: "0.4.0",
             debug_build: false,
             time_utc: "20261022-102133".into(),
             thread: "quicker-executor",
-            location: Some("src\\engine.rs:10:5".into()),
-            message: clean_message(
-                r"byte index 2 is not a char boundary of `SENTINEL-7f3a` in D:\Home\bob\x",
+            location: Some(crate_location(
+                r"D:\Home\bob\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tokio-1.40.0\src\runtime\mod.rs",
+                10,
+                5,
                 &[r"D:\Home\bob".to_string()],
-            ),
+            )),
+            payload: PanicPayload::summarize(Some(payload)),
             exe_base: Some(0x7ff6_1234_0000),
             backtrace: "   0: std::backtrace".into(),
         });
@@ -250,22 +271,57 @@ mod tests {
             "build: release",
             "time_utc: 20261022-102133",
             "thread: quicker-executor",
-            "location: src\\engine.rs:10:5",
-            r"message: byte index 2 is not a char boundary of `<redacted len=13>` in D:\Home\%USERNAME%\x",
+            "location: tokio-1.40.0/src/runtime/mod.rs:10:5",
+            "panic_class: byte_index",
+            &format!("payload_len: {}", payload.len()),
+            &format!("payload_hash: {}", fingerprint(payload)),
             "exe_base: 0x7ff612340000",
             "backtrace:\n   0: std::backtrace",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in\n{text}");
         }
-        assert!(!text.contains("SENTINEL"));
+        assert!(!text.contains("SENTINEL"), "{text}");
+        assert!(!text.contains("bob"), "{text}");
+
+        for (file, expected) in [
+            (
+                r"src-tauri\src\diagnostics\panic.rs",
+                "src-tauri/src/diagnostics/panic.rs",
+            ),
+            (
+                "crates/platform/src/windows/hook.rs",
+                "platform/src/windows/hook.rs",
+            ),
+            (
+                "/rustc/90b35a6/library/core/src/str/mod.rs",
+                "core/src/str/mod.rs",
+            ),
+            ("src/main.rs", "src/main.rs"),
+            (r"C:\Users\alice\build\gen.rs", "gen.rs"),
+        ] {
+            assert_eq!(crate_location(file, 1, 2, &[]), format!("{expected}:1:2"));
+        }
     }
 
+    /// Long payloads cost nothing: only their length is recorded.
     #[test]
     fn long_messages_are_truncated_on_a_char_boundary() {
-        let message = clean_message(&"中".repeat(1000), &[]);
-        assert!(message.len() < MAX_MESSAGE_BYTES + 64);
-        assert!(message.ends_with("<truncated, 3000 bytes total>"));
-        assert_eq!(clean_message("short", &[]), "short");
+        let long = "中".repeat(1000);
+        let payload = PanicPayload::summarize(Some(&long));
+        assert_eq!((payload.class, payload.len), (PanicClass::Other, 3000));
+        let text = render_report(&CrashReport {
+            version: "0.4.0",
+            debug_build: true,
+            time_utc: "20261022-102133".into(),
+            thread: "main",
+            location: None,
+            payload,
+            exe_base: None,
+            backtrace: String::new(),
+        });
+        assert!(text.len() < 300, "{text}");
+        assert!(!text.contains('中'), "{text}");
+        assert!(text.contains("location: <unknown>"), "{text}");
     }
 
     #[test]
@@ -308,15 +364,97 @@ mod tests {
             .map(|path| fs::read_to_string(path).unwrap())
             .find(|text| text.contains("thread: crash-record-test"))
             .expect("crash record written");
+        // "cannot slice `SENTINEL-crash-phrase`": not std's wording.
+        assert!(record.contains("panic_class: other"), "{record}");
+        assert!(record.contains("payload_len: 36"), "{record}");
         assert!(
-            record.contains("message: cannot slice `<redacted len=21>`"),
+            record.contains("location: src-tauri/src/diagnostics/panic.rs:"),
             "{record}"
         );
-        assert!(record.contains("panic.rs"), "{record}");
         assert!(record.contains("backtrace:"), "{record}");
         assert!(!record.contains("SENTINEL"), "{record}");
         if crash_dir == dir {
             fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    /// S-08 privacy test, panic half: real panics whose payloads quote a
+    /// phrase in ways a quote-matching redactor gets wrong (a slice of text
+    /// with backticks in it, `Debug` escapes, no quotes at all) leave the
+    /// phrase in neither the crash records, the `app.panic` log nor a
+    /// Summary bundle.
+    #[test]
+    fn panic_payload_text_never_reaches_the_crash_record_the_log_or_the_bundle() {
+        use crate::diagnostics::{
+            bundle::test_support::summary_entries,
+            logging::{
+                log_dir,
+                test_support::{read_logs, scoped},
+            },
+        };
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use tracing::level_filters::LevelFilter;
+
+        const S: &str = "SENTINEL-payload-5b0e";
+        let dir = temp_dir();
+        install();
+        TEST_CRASH_DIR.with(|crash_dir| *crash_dir.borrow_mut() = Some(dir.clone()));
+        let backticks = std::hint::black_box(format!("é`{S}`é"));
+        let quoted = format!("a\"{S}\"b");
+        let failed: Result<(), String> = std::hint::black_box(Err(format!("x\"{S}\"y")));
+        let panics: [Box<dyn Fn()>; 4] = [
+            // end byte index 1 is not a char boundary; ... of `é`SENTINEL`é`
+            Box::new(|| {
+                std::hint::black_box(&backticks[..1]);
+            }),
+            // called `Result::unwrap()` on an `Err` value: "x\"SENTINEL\"y"
+            Box::new(|| failed.clone().unwrap()),
+            Box::new(|| panic!("could not expand {S} at all")),
+            // "a\"SENTINEL\"b"
+            Box::new(|| panic!("{quoted:?}")),
+        ];
+        let built = scoped(&log_dir(&dir), LevelFilter::TRACE);
+        tracing::subscriber::with_default(built.subscriber, || {
+            for panic in &panics {
+                assert!(catch_unwind(AssertUnwindSafe(panic)).is_err());
+            }
+        });
+        drop(built.guard);
+        TEST_CRASH_DIR.with(|crash_dir| crash_dir.borrow_mut().take());
+
+        let records: Vec<String> = crash_files(&dir)
+            .into_iter()
+            .map(|path| fs::read_to_string(path).unwrap())
+            .collect();
+        assert_eq!(records.len(), 4);
+        let classes: Vec<_> = records
+            .iter()
+            .filter_map(|record| record.lines().find(|l| l.starts_with("panic_class: ")))
+            .collect();
+        for class in ["byte_index", "result_unwrap", "other"] {
+            assert!(
+                classes.contains(&format!("panic_class: {class}").as_str()),
+                "{class} missing from {classes:?}"
+            );
+        }
+        for record in &records {
+            assert!(!record.contains(S), "the crash record leaks:\n{record}");
+        }
+
+        let log = read_logs(&log_dir(&dir));
+        assert_eq!(log.matches("app.panic").count(), 4, "{log}");
+        assert!(log.contains("panic_class=\"byte_index\""), "{log}");
+        assert!(!log.contains(S), "the log leaks:\n{log}");
+
+        let files = summary_entries(&dir);
+        assert_eq!(
+            files.keys().filter(|n| n.starts_with("crashes/")).count(),
+            4
+        );
+        assert!(files.keys().any(|name| name.starts_with("logs/")));
+        for (name, text) in &files {
+            assert!(!text.contains(S), "{name} leaks:\n{text}");
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 }
