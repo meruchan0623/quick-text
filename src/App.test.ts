@@ -551,7 +551,7 @@ describe('tolerant reading (B-43)', () => {
     expect(saved.future_setting).toEqual({ sample: true });
     expect(saved.globals.future_global).toBe('kept');
 
-    // Deleting a rule keeps every raw entry, in order and where it was.
+    // Deleting a rule removes it in place: every other entry keeps its position relative to the rest.
     const remove = [...container.querySelectorAll('tbody tr')]
       .find((r) => r.querySelector('strong')?.textContent === ';s1')
       ?.querySelector<HTMLButtonElement>('.row-tools button:last-child');
@@ -569,7 +569,32 @@ describe('tolerant reading (B-43)', () => {
     const ids = lastSaved(backend).rules.map((r) =>
       typeof r === 'object' && r !== null ? (r as { id?: unknown }).id : r,
     );
-    expect(ids).toEqual(['mock-rule-2', 'mock-unreadable-1', 'mock-rule-3', 'not a rule', null]);
+    expect(ids).toEqual(['mock-unreadable-1', 'mock-rule-2', 'mock-rule-3', 'not a rule', null]);
+    expect(lastSaved(backend).rules[0]).toEqual(before.rules[1]);
+  });
+
+  it('deletes selected rules in place around unreadable entries', async () => {
+    const mounted = await mountSample();
+    const { backend, container } = mounted;
+    for (const label of ['选择 ;s1', '选择 ;s3']) {
+      const box = container.querySelector<HTMLInputElement>(`input[aria-label="${label}"]`);
+      await mounted.act(() => {
+        box?.click();
+      });
+    }
+    await clickIn(mounted, container.querySelector('.batch'), '删除');
+    const question = '删除所选 2 条指令？';
+    await waitFor(mounted, () => {
+      expect(dialog(container, question)).not.toBeNull();
+    });
+    await clickIn(mounted, dialog(container, question), '删除');
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+    });
+    const ids = lastSaved(backend).rules.map((r) =>
+      typeof r === 'object' && r !== null ? (r as { id?: unknown }).id : r,
+    );
+    expect(ids).toEqual(['mock-unreadable-1', 'mock-rule-2', 'not a rule', null]);
   });
 
   it('lists entries with a malformed nested field read-only and writes them back unchanged', async () => {

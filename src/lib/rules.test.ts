@@ -12,6 +12,7 @@ import {
   unknownRuleKeys,
   unreadableEntries,
   unreadableId,
+  type ReadableRule,
 } from './rules';
 
 /** A readable rule as the backend sends it. */
@@ -178,27 +179,101 @@ describe('tolerant reading (B-43)', () => {
     expect(unreadableId({ id: 3 })).toBeNull();
   });
 
-  it('writes edits back without moving or dropping raw entries', () => {
-    const edited = { ...rule('b'), enabled: false };
-    expect(replaceReadable(rules, [rule('a'), edited, rule('c')])).toEqual([
-      rule('a'),
-      raw1,
-      edited,
-      'not a rule',
-      rule('c'),
-      null,
-    ]);
-    // Deleting: readable slots close up, raw entries keep their order.
-    expect(replaceReadable(rules, [rule('a'), rule('c')])).toEqual([
-      rule('a'),
-      raw1,
-      rule('c'),
-      'not a rule',
-      null,
-    ]);
-    // Adding: new rules go to the end.
-    expect(replaceReadable([raw1], [rule('n')])).toEqual([raw1, rule('n')]);
-    expect(replaceReadable(rules, [])).toEqual([raw1, 'not a rule', null]);
+  describe('position-stable write-back', () => {
+    const bad = (id: string) => ({ id, match: 42 });
+    // Unreadable entries at the start, two in a row between rules, and two at the end.
+    const first = bad('first');
+    const mid = bad('mid');
+    const last = bad('last');
+    const mixed: unknown[] = [first, rule('a'), mid, 'mid-2', rule('b'), rule('c'), last, null];
+    /** Edit the readable rules the way the list does (on a copy) and write them back. */
+    const edit = (fn: (rs: ReadableRule[]) => readonly { id: string }[]) => {
+      const result = replaceReadable(mixed, fn(structuredClone(mixed.filter(isReadableRule))));
+      // Every unreadable entry is written back as the same value.
+      for (const entry of mixed.filter((e) => !isReadableRule(e))) expect(result).toContain(entry);
+      return result;
+    };
+
+    it('changes nothing when no rule changed', () => {
+      expect(edit((rs) => rs)).toEqual(mixed);
+    });
+
+    it.each([
+      ['a', [first, mid, 'mid-2', rule('b'), rule('c'), last, null]],
+      ['b', [first, rule('a'), mid, 'mid-2', rule('c'), last, null]],
+      ['c', [first, rule('a'), mid, 'mid-2', rule('b'), last, null]],
+    ])('deletes rule %s in place', (id, expected) => {
+      expect(edit((rs) => rs.filter((r) => r.id !== id))).toEqual(expected);
+    });
+
+    it('deletes several rules in place', () => {
+      const ac = new Set(['a', 'c']);
+      expect(edit((rs) => rs.filter((r) => !ac.has(r.id)))).toEqual([
+        first,
+        mid,
+        'mid-2',
+        rule('b'),
+        last,
+        null,
+      ]);
+      expect(edit(() => [])).toEqual([first, mid, 'mid-2', last, null]);
+    });
+
+    it('keeps an edited rule where it was', () => {
+      const changed = { ...rule('b'), description: '改过', group: '新分组' };
+      expect(edit((rs) => rs.map((r) => (r.id === 'b' ? changed : r)))).toEqual([
+        first,
+        rule('a'),
+        mid,
+        'mid-2',
+        changed,
+        rule('c'),
+        last,
+        null,
+      ]);
+    });
+
+    it('enables and disables rules in place', () => {
+      const off = (id: string) => ({ ...rule(id), enabled: false });
+      const disabled = edit((rs) => rs.map((r) => (r.id === 'b' ? r : { ...r, enabled: false })));
+      expect(disabled).toEqual([first, off('a'), mid, 'mid-2', rule('b'), off('c'), last, null]);
+      const again = replaceReadable(
+        disabled,
+        disabled.filter(isReadableRule).map((r) => ({ ...r, enabled: true })),
+      );
+      expect(again).toEqual(mixed);
+    });
+
+    it('appends only new rules, after the trailing unreadable entries', () => {
+      expect(edit((rs) => [...rs, rule('n')])).toEqual([...mixed, rule('n')]);
+      // A new rule listed first is still appended; a deletion in the same edit stays in place.
+      expect(edit((rs) => [rule('n'), ...rs.filter((r) => r.id !== 'a')])).toEqual([
+        first,
+        mid,
+        'mid-2',
+        rule('b'),
+        rule('c'),
+        last,
+        null,
+        rule('n'),
+      ]);
+      expect(replaceReadable([first], [rule('n')])).toEqual([first, rule('n')]);
+    });
+
+    it('keeps entries at their positions even if the edited list comes back reordered', () => {
+      expect(edit((rs) => [...rs].reverse())).toEqual(mixed);
+    });
+
+    it('pairs rules with a duplicate id with their entries in order', () => {
+      const one = { ...rule('d'), description: '1' };
+      const two = { ...rule('d'), description: '2' };
+      const dup: unknown[] = [one, mid, two];
+      expect(replaceReadable(dup, [one, { ...two, enabled: false }])).toEqual([
+        one,
+        mid,
+        { ...two, enabled: false },
+      ]);
+    });
   });
 
   describe('structural check of every nested field', () => {

@@ -82,17 +82,36 @@ export const unreadableEntries = (rules: readonly unknown[]): UnreadableEntry[] 
   );
 
 /**
- * Put an edited list of readable rules back into `rules`: unreadable entries stay where they were,
- * the readable slots take `next` in order, extra rules go to the end and missing ones are dropped.
+ * Put an edited list of readable rules back into `rules`, position by position. A rule of `next`
+ * takes the place of the readable entry it came from (the first one not yet taken with its id), so
+ * an edit stays where it was; a readable entry with no rule left in `next` is deleted in place.
+ * Unreadable entries stay where they were, every surviving entry keeps its relative order, and only
+ * rules that came from no entry (new ones) are appended, in `next` order.
  */
-export function replaceReadable(rules: readonly unknown[], next: readonly unknown[]): unknown[] {
+export function replaceReadable(
+  rules: readonly unknown[],
+  next: readonly { id: string }[],
+): unknown[] {
+  // Positions in `next` per id, in order; duplicate ids pair up with their entries in order.
+  const pending = new Map<string, number[]>();
+  next.forEach((rule, position) => {
+    const queue = pending.get(rule.id);
+    if (queue) queue.push(position);
+    else pending.set(rule.id, [position]);
+  });
+  const placed = new Set<number>();
   const result: unknown[] = [];
-  let taken = 0;
   for (const entry of rules) {
-    if (!isReadableRule(entry)) result.push(entry);
-    else if (taken < next.length) result.push(next[taken++]);
+    if (!isReadableRule(entry)) {
+      result.push(entry);
+      continue;
+    }
+    const position = pending.get(entry.id)?.shift();
+    if (position === undefined) continue; // deleted
+    placed.add(position);
+    result.push(next[position]);
   }
-  return [...result, ...next.slice(taken)];
+  return [...result, ...next.filter((_, position) => !placed.has(position))];
 }
 
 const RULE_KEYS = new Set([
