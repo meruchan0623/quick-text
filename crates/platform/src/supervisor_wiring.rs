@@ -12,10 +12,11 @@
 //! `Shared::shutdown`, which `Runtime::shutting_down` reads. The driver and
 //! the watchdog stop at their next turn, and until then the adapters are
 //! frozen (the guards below): probes repeat the last value read before the
-//! shutdown, and rebuilds and reattaches do nothing. The engine's own
-//! teardown (the Windows input consumer closes the RawInput window once it
-//! sees `shutdown`) is therefore never read as a failure: no incident, no
-//! rebuild, no Failed during exit.
+//! shutdown, rebuilds and reattaches do nothing, and one that was already
+//! running when the shutdown began reports success whatever it returned.
+//! The engine's own teardown (the Windows input consumer closes the RawInput
+//! window once it sees `shutdown`) is therefore never read as a failure: no
+//! incident, no failed attempt, no Failed during exit.
 use crate::health::{Component, ComponentHealth, HealthSnapshot, HealthState, ReasonCode};
 use crate::runtime::Runtime;
 use crate::supervisor::{self, ExecutorControl, InputSources, Status, Supervisor};
@@ -174,8 +175,9 @@ pub fn begin_shutdown(runtime: &Runtime) -> bool {
 }
 
 /// The executor as the supervisor sees it while the engine shuts down:
-/// probes repeat the last value read before, rebuilds do nothing. The
-/// budget fence keeps running.
+/// probes repeat the last value read before, rebuilds do nothing, and a
+/// rebuild that returns after the shutdown began is discarded (`Ok`), so no
+/// failure is committed after it. The budget fence keeps running.
 struct GuardedExecutor {
     runtime: Arc<Runtime>,
     inner: Arc<dyn ExecutorControl>,
@@ -201,12 +203,24 @@ impl ExecutorControl for GuardedExecutor {
             tracing::info!(event = "supervisor.rebuild_skipped", "engine shutting down");
             return Ok(());
         }
-        self.inner.rebuild()
+        let result = self.inner.rebuild();
+        if self.runtime.shutting_down() {
+            // Started before the shutdown, returned after it: the teardown
+            // may be what made it fail, so its result is not counted.
+            tracing::info!(
+                event = "supervisor.rebuild_discarded",
+                failed = result.is_err(),
+                "engine shut down while the rebuild ran"
+            );
+            return Ok(());
+        }
+        result
     }
 }
 
 /// The input sources as the supervisor sees them while the engine shuts
-/// down: health repeats the last value read before, reattaches do nothing.
+/// down: health repeats the last value read before, reattaches do nothing,
+/// and a reattach that returns after the shutdown began is discarded (`Ok`).
 struct GuardedInputs {
     runtime: Arc<Runtime>,
     inner: Arc<dyn InputSources>,
@@ -233,7 +247,17 @@ impl InputSources for GuardedInputs {
             );
             return Ok(());
         }
-        self.inner.reattach(component)
+        let result = self.inner.reattach(component);
+        if self.runtime.shutting_down() {
+            tracing::info!(
+                event = "supervisor.reattach_discarded",
+                component = ?component,
+                failed = result.is_err(),
+                "engine shut down while the reattach ran"
+            );
+            return Ok(());
+        }
+        result
     }
 }
 
@@ -435,10 +459,11 @@ mod tests {
     use super::*;
     use crate::health::PauseReasons;
     use crate::mock::FakeClock;
-    use crate::supervisor::{BACKOFF, STARTUP_GRACE, TICK};
+    use crate::supervisor::{BACKOFF, CIRCUIT_FAILURES, STARTUP_GRACE, TICK};
     use crate::Shared;
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::mpsc;
 
     struct Executor {
         status: Mutex<Status>,
@@ -721,6 +746,143 @@ mod tests {
         assert_eq!(rig.state(), HealthState::Healthy);
         assert_eq!(executor.rebuilds.load(Ordering::SeqCst), 0);
         assert_eq!(inputs.reattaches.load(Ordering::SeqCst), 0);
+    }
+
+    /// Holds the `at`-th call until the test releases it (bounded waits on
+    /// both sides, so a failing test cannot hang).
+    struct Gate {
+        calls: AtomicUsize,
+        at: usize,
+        entered: (Mutex<mpsc::Sender<()>>, Mutex<mpsc::Receiver<()>>),
+        release: (Mutex<mpsc::Sender<()>>, Mutex<mpsc::Receiver<()>>),
+    }
+
+    impl Gate {
+        fn new(at: usize) -> Self {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            Self {
+                calls: AtomicUsize::new(0),
+                at,
+                entered: (Mutex::new(entered_tx), Mutex::new(entered_rx)),
+                release: (Mutex::new(release_tx), Mutex::new(release_rx)),
+            }
+        }
+        fn pass(&self) {
+            if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.at {
+                let _ = self.entered.0.lock().send(());
+                let _ = self.release.1.lock().recv_timeout(Duration::from_secs(10));
+            }
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+        fn wait_entered(&self) -> bool {
+            self.entered
+                .1
+                .lock()
+                .recv_timeout(Duration::from_secs(5))
+                .is_ok()
+        }
+        fn open(&self) {
+            let _ = self.release.0.lock().send(());
+        }
+    }
+
+    /// Every rebuild fails, the gated one once it is released.
+    struct GatedExecutor {
+        status: Mutex<Status>,
+        gate: Gate,
+    }
+
+    impl ExecutorControl for GatedExecutor {
+        fn enforce_budget(&self, _now: Instant) {}
+        fn probe(&self, _now: Instant) -> Vec<(Component, Status)> {
+            vec![(Component::Executor, *self.status.lock())]
+        }
+        fn rebuild(&self) -> Result<(), String> {
+            self.gate.pass();
+            Err("rebuild refused".into())
+        }
+    }
+
+    /// Every reattach fails, the gated one once it is released.
+    struct GatedInputs {
+        inputs: Arc<Inputs>,
+        gate: Gate,
+    }
+
+    impl InputSources for GatedInputs {
+        fn input_health(&self) -> Vec<ComponentHealth> {
+            self.inputs.input_health()
+        }
+        fn reattach(&self, _component: Component) -> Result<(), String> {
+            self.gate.pass();
+            Err("reattach refused".into())
+        }
+    }
+
+    /// A rebuild or reattach that was running when the shutdown began and
+    /// fails after it is discarded: the failure that would open the circuit
+    /// (the CIRCUIT_FAILURES-th) is not committed, so Health is not Failed
+    /// during exit. Without the shutdown the same sequence ends in Failed.
+    /// Only `repair()` leaves Failed, so not Failed at the end means it never
+    /// was.
+    #[test]
+    fn an_attempt_that_fails_after_the_shutdown_never_commits_failed() {
+        for adapter in ["executor", "inputs"] {
+            for shutdown in [false, true] {
+                let case = format!("{adapter}, shutdown {shutdown}");
+                let rig = Rig::new();
+                let executor = Arc::new(GatedExecutor {
+                    status: Mutex::new(Status::Ok),
+                    gate: Gate::new(CIRCUIT_FAILURES),
+                });
+                let inputs = Arc::new(GatedInputs {
+                    inputs: Inputs::new(),
+                    gate: Gate::new(CIRCUIT_FAILURES),
+                });
+                let supervisor = rig.build(executor.clone(), inputs.clone());
+                supervisor.tick();
+                assert_eq!(rig.state(), HealthState::Healthy, "{case}");
+                let gate = if adapter == "executor" {
+                    *executor.status.lock() = Status::Down(ReasonCode::ExecutorPanic);
+                    &executor.gate
+                } else {
+                    *inputs.inputs.down.lock() = Some(ReasonCode::HookMissing);
+                    &inputs.gate
+                };
+
+                let during = std::thread::scope(|scope| {
+                    // Attempts 1..4 fail at once; the 5th blocks in the gate.
+                    let ticker = scope.spawn(|| {
+                        for _ in 0..1200 {
+                            if gate.calls() >= CIRCUIT_FAILURES {
+                                break;
+                            }
+                            rig.clock.advance(Duration::from_millis(100));
+                            supervisor.tick();
+                        }
+                    });
+                    let entered = gate.wait_entered();
+                    let during = rig.state();
+                    if shutdown {
+                        begin_shutdown(&rig.runtime);
+                    }
+                    gate.open();
+                    ticker.join().unwrap();
+                    assert!(entered, "{case}: the gated attempt ran");
+                    during
+                });
+                assert_eq!(during, HealthState::Recovering, "{case}");
+                assert_eq!(gate.calls(), CIRCUIT_FAILURES, "{case}");
+                if shutdown {
+                    assert_ne!(rig.state(), HealthState::Failed, "{case}");
+                } else {
+                    assert_eq!(rig.state(), HealthState::Failed, "{case}");
+                }
+            }
+        }
     }
 
     /// The Windows read: a busy table repeats the last value, and before
