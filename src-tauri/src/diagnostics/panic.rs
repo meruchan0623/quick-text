@@ -45,6 +45,25 @@ fn crash_dir() -> Option<PathBuf> {
     test_dir.or_else(|| CRASH_DIR.get().cloned())
 }
 
+#[cfg(test)]
+pub mod test_support {
+    use super::{install, TEST_CRASH_DIR};
+    use std::{
+        panic::{catch_unwind, AssertUnwindSafe},
+        path::Path,
+    };
+
+    /// Runs `panic`, which must panic, through the installed hook with this
+    /// thread's crash records written to `dir`.
+    pub fn panic_into(dir: &Path, panic: impl FnOnce()) {
+        install();
+        TEST_CRASH_DIR.with(|crash_dir| *crash_dir.borrow_mut() = Some(dir.to_path_buf()));
+        let result = catch_unwind(AssertUnwindSafe(panic));
+        TEST_CRASH_DIR.with(|crash_dir| crash_dir.borrow_mut().take());
+        assert!(result.is_err(), "the closure returned instead of panicking");
+    }
+}
+
 /// Chains the crash recorder in front of the current panic hook. Call first
 /// thing in `main`; later calls do nothing.
 pub fn install() {

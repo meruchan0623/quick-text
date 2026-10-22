@@ -199,6 +199,10 @@ pub fn build_bundle<W: Write + Seek>(
         });
     }
     if redaction == Redaction::Full {
+        // Phrase content on purpose: the plan (§7.1 「可观测性」) has Full add the
+        // complete configuration, only when the user ticks 「包含短语内容」 in
+        // the export dialog. Logs and crash records above stay as redacted
+        // as in Summary.
         match fs::read(data_dir.join("active.json")) {
             Ok(bytes) => bundle.add_text("active.json", &String::from_utf8_lossy(&bytes))?,
             Err(e) => bundle.skip("active.json".into(), &e),
@@ -669,6 +673,11 @@ pub mod test_support {
     /// The entries of a Summary bundle of `data_dir` built now (log files are
     /// dated by the real clock), for privacy tests outside this module.
     pub fn summary_entries(data_dir: &Path) -> BTreeMap<String, String> {
+        entries(data_dir, Redaction::Summary)
+    }
+
+    /// The entries of a bundle of `data_dir` built now.
+    pub fn entries(data_dir: &Path, redaction: Redaction) -> BTreeMap<String, String> {
         let snapshot = Snapshot {
             now: SystemTime::now(),
             health: HealthReport {
@@ -684,13 +693,8 @@ pub mod test_support {
             system: SystemInfo::current(),
             homes: Vec::new(),
         };
-        let (cursor, _) = build_bundle(
-            data_dir,
-            Redaction::Summary,
-            Cursor::new(Vec::new()),
-            &snapshot,
-        )
-        .unwrap();
+        let (cursor, _) =
+            build_bundle(data_dir, redaction, Cursor::new(Vec::new()), &snapshot).unwrap();
         unzip(cursor.into_inner())
     }
 }
@@ -893,6 +897,57 @@ mod tests {
         assert!(active.contains(&format!("body-{SENTINEL}")));
         let manifest: serde_json::Value = serde_json::from_str(&files["manifest.json"]).unwrap();
         assert_eq!(manifest["redaction"], "full");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Full carries phrase content in `active.json` only: the logs and crash
+    /// records the real sinks wrote while phrases went through panics and
+    /// frontend errors are as redacted as in Summary.
+    #[test]
+    fn full_bundles_carry_phrases_in_the_active_configuration_only() {
+        use super::test_support::entries;
+        use crate::{
+            commands::diagnostics::log_frontend_error,
+            diagnostics::{logging::test_support::scoped, panic::test_support::panic_into},
+        };
+        use tracing::level_filters::LevelFilter;
+
+        let dir = temp_dir();
+        let config = serde_json::to_string_pretty(&sentinel_config()).unwrap();
+        fs::write(dir.join("active.json"), config).unwrap();
+        let body = format!("body-{SENTINEL}");
+        let failed: Result<(), String> = std::hint::black_box(Err(format!("x\"{body}\"y")));
+        let built = scoped(&log_dir(&dir), LevelFilter::TRACE);
+        tracing::subscriber::with_default(built.subscriber, || {
+            panic_into(&dir, || panic!("could not expand {body}"));
+            panic_into(&dir, || failed.clone().unwrap());
+            log_frontend_error(
+                format!("TypeError: could not expand {body}"),
+                Some(format!(
+                    "    at {SENTINEL} (http://tauri.localhost/assets/{SENTINEL}-D3f9Kq_x.js:1:2)"
+                )),
+                Some(body.clone()),
+            );
+        });
+        drop(built.guard);
+
+        let files = entries(&dir, Redaction::Full);
+        assert!(files["active.json"].contains(&body));
+        let logs: String = files
+            .iter()
+            .filter(|(name, _)| name.starts_with("logs/"))
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(logs.matches("app.panic").count(), 2, "{logs}");
+        assert_eq!(logs.matches("frontend.error").count(), 1, "{logs}");
+        let crashes = files.keys().filter(|name| name.starts_with("crashes/"));
+        assert_eq!(crashes.count(), 2);
+        for (name, text) in files.iter().filter(|(name, _)| *name != "active.json") {
+            assert!(
+                !text.contains(SENTINEL),
+                "{name} leaks the sentinel:\n{text}"
+            );
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
