@@ -40,7 +40,7 @@ pub(super) fn test_input_enabled() -> bool {
 }
 
 /// The fields the keyboard hook reads from `KBDLLHOOKSTRUCT`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub(super) struct KeyInfo {
     pub(super) vk: u16,
     pub(super) scan: u32,
@@ -49,6 +49,18 @@ pub(super) struct KeyInfo {
     /// When the event happened: the struct's `time`, a millisecond tick
     /// count that wraps every 49.7 days.
     pub(super) time: u32,
+}
+/// Which key is redacted (B-09): the hook's keys are what the user types.
+impl std::fmt::Debug for KeyInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyInfo")
+            .field("vk", &quicker_domain::RedactedKey)
+            .field("scan", &quicker_domain::RedactedKey)
+            .field("flags", &self.flags)
+            .field("extra", &self.extra)
+            .field("time", &self.time)
+            .finish()
+    }
 }
 /// The fields the mouse hook reads from `MSLLHOOKSTRUCT`.
 #[derive(Clone, Copy, Debug)]
@@ -101,7 +113,7 @@ pub(super) struct Acceptance {
     pub(super) modified: bool,
     pub(super) allowed: bool,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub(super) struct KeyRecord {
     pub(super) vk: u16,
     pub(super) scan: u32,
@@ -117,6 +129,21 @@ pub(super) struct KeyRecord {
     /// The recording session current when the key happened
     /// ([`recording_session`]): only that recording takes it (M2).
     pub(super) session: u64,
+}
+/// Which key is redacted (B-09), as in [`KeyInfo`]; the rest is shown.
+impl std::fmt::Debug for KeyRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyRecord")
+            .field("vk", &quicker_domain::RedactedKey)
+            .field("scan", &quicker_domain::RedactedKey)
+            .field("down", &self.down)
+            .field("hardware", &self.hardware)
+            .field("generation", &self.generation)
+            .field("acceptance", &self.acceptance)
+            .field("time", &self.time)
+            .field("session", &self.session)
+            .finish()
+    }
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) enum HookRecord {
@@ -787,5 +814,64 @@ mod tests {
             mouse_operation(WM_MOUSEWHEEL, (-120i16 as u16 as u32) << 16),
             Some(Operation::Wheel { amount: -120, .. })
         ));
+    }
+
+    /// B-09: which key the hook saw (vk 0x53 = 83, 'S'; scan 0x1F = 31) and
+    /// the foreground window's title never reach `Debug`; timing, origin,
+    /// session and the process do.
+    #[test]
+    fn debug_never_shows_keys_or_window_titles() {
+        let info = KeyInfo {
+            vk: 0x53,
+            scan: 0x1F,
+            flags: 0,
+            extra: 0,
+            time: 7,
+        };
+        let record = KeyRecord {
+            vk: 0x53,
+            scan: 0x1F,
+            down: true,
+            hardware: true,
+            generation: 2,
+            acceptance: None,
+            time: 7,
+            session: 4,
+        };
+        let foreground = Foreground {
+            platform: "windows".into(),
+            bundle_id: String::new(),
+            id: 5,
+            process: "outlook.exe".into(),
+            title: "Invoice for ACME Corp".into(),
+        };
+        let shown = [
+            format!("{info:?}"),
+            format!("{info:#?}"),
+            format!("{record:?}"),
+            format!("{record:#?}"),
+            format!("{:?}", HookRecord::Key(record)),
+            format!("{foreground:?}"),
+            format!("{foreground:#?}"),
+        ];
+        for shown in &shown {
+            for hidden in ["83", "31", "0x53", "ACME", "Invoice"] {
+                assert!(!shown.contains(hidden), "{hidden} in {shown}");
+            }
+            assert!(shown.contains("<redacted"), "{shown}");
+        }
+        assert!(shown[0].contains("vk: <redacted>, scan: <redacted>"));
+        assert!(shown[2].contains("time: 7"), "{}", shown[2]);
+        assert!(shown[2].contains("session: 4"), "{}", shown[2]);
+        assert!(
+            shown[5].contains(r#"process: "outlook.exe""#),
+            "{}",
+            shown[5]
+        );
+        assert!(
+            shown[5].contains("title: <redacted len=21>"),
+            "{}",
+            shown[5]
+        );
     }
 }

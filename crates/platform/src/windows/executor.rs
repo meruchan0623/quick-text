@@ -145,16 +145,15 @@
 //!   `worker` → leaves (`fault`, `shared.last`, the history). Nothing waits
 //!   for `send_lock` while holding `life`.
 use super::actions::{
-    begin_trace, current_stage, execute_with_proof, set_stage, stage_marks, Ports, Stage,
-    StageMarks,
+    begin_trace, current_stage, run_plan, set_stage, stage_marks, Ports, Stage, StageMarks,
 };
-use super::clipboard::WinClipboard;
+use super::clipboard::{try_clipboard_health, WinClipboard};
 use super::foreground::WinForeground;
 use super::inject::{WinInjector, SENT_EFFECT};
 use super::keystate::{own_input, physical, OwnInput};
 use super::*;
 use crate::fault::{self, FaultPoint};
-use crate::health::{Component, Outcome, ReasonCode, StageTimings, TriggerKind};
+use crate::health::{Component, ComponentHealth, Outcome, ReasonCode, StageTimings, TriggerKind};
 use crate::history::Record;
 use crate::runtime::Runtime;
 use crate::supervisor::{ExecutorControl, Status};
@@ -197,6 +196,23 @@ const RELEASE_OWED: &str = "Key-ups of a stopped action are still owed; refused 
 /// What one task produced.
 pub(super) struct RunReport {
     pub(super) result: Result<ExecutionResult, String>,
+    /// The clipboard lease's reason when the lease stopped the run (B-08),
+    /// as it was raised: it wins over the message text ([`classify`]).
+    pub(super) reason: Option<ReasonCode>,
+    /// The formats the lease's backup skipped, or the ones behind its
+    /// refusal, for `HistoryEntry::skipped_formats`.
+    pub(super) skipped_formats: Vec<u32>,
+}
+
+impl RunReport {
+    /// A report without a structured reason or skipped formats.
+    pub(super) fn text(result: Result<ExecutionResult, String>) -> Self {
+        Self {
+            result,
+            reason: None,
+            skipped_formats: vec![],
+        }
+    }
 }
 
 /// Runs one candidate on the worker thread. Production wires the Windows
@@ -234,11 +250,12 @@ impl Task {
         }
     }
 
-    fn record(&self, verdict: Verdict, timings: StageTimings) -> Record {
+    fn record(&self, verdict: Verdict, skipped_formats: Vec<u32>, timings: StageTimings) -> Record {
         Record {
             process: self.process.clone(),
             completed_steps: verdict.completed_steps,
             side_effects: verdict.side_effects,
+            skipped_formats,
             timings,
             ..Record::new(
                 self.rule_id.clone(),
@@ -271,11 +288,14 @@ impl Verdict {
 }
 
 /// Reason codes recognised in run messages; the first matching fragment
-/// wins. The action pipeline reports failures as text: the executor's own
+/// wins. Clipboard stops never come through here: the lease raises its
+/// reason with the stop and the executor's clipboard claim flags its
+/// refusal, both passed on as they are ([`RunReport::reason`]). The rest of
+/// the action pipeline still reports failures as text: the executor's own
 /// texts are matched whole (their constants), the others by a stable
-/// fragment of the text produced by inject.rs, clipboard.rs, protection.rs,
-/// rawinput.rs or the guards in actions.rs. Every text this table maps is
-/// quoted verbatim, with its source file, in the `ORIGINALS` table of
+/// fragment of the text produced by inject.rs, protection.rs, rawinput.rs
+/// or the guards in actions.rs. Every text this table maps is quoted
+/// verbatim, with its source file, in the `ORIGINALS` table of
 /// `pipeline_tests_executor`: a reworded text fails that test instead of
 /// silently falling back to `Internal`.
 const REASONS: &[(&str, ReasonCode)] = &[
@@ -284,26 +304,6 @@ const REASONS: &[(&str, ReasonCode)] = &[
     (RELEASE_OWED, ReasonCode::ExecutorTimeout),
     (PANICKED, ReasonCode::ExecutorPanic),
     ("Execution timeout", ReasonCode::ExecutorTimeout),
-    (CLIPBOARD_HELD, ReasonCode::ClipboardBusy),
-    ("Clipboard is busy", ReasonCode::ClipboardBusy),
-    ("changed externally", ReasonCode::ClipboardChanged),
-    ("cannot be safely", ReasonCode::ClipboardFormatSkipped),
-    (
-        "unsupported handle format",
-        ReasonCode::ClipboardFormatSkipped,
-    ),
-    // P2's lease refusals (B-08), mapped to the reason its `LeaseError`
-    // carries; the run only sees the text. Its `Internal` refusals (backup
-    // worker failed, unreadable format, unverifiable payload) fall through.
-    ("too large to back up", ReasonCode::ClipboardTooLarge),
-    ("took too long to read", ReasonCode::ClipboardBusy),
-    ("did not arrive in time", ReasonCode::ClipboardBusy),
-    ("owner is not responding", ReasonCode::ClipboardBusy),
-    ("kept changing during backup", ReasonCode::ClipboardChanged),
-    (
-        "never verified after the paste write",
-        ReasonCode::ClipboardChanged,
-    ),
     ("Cancelled", ReasonCode::Cancelled),
     ("Engine paused", ReasonCode::Paused),
     (
@@ -364,19 +364,24 @@ fn outcome_for(reason: ReasonCode, side_effects: bool) -> Outcome {
 /// unknown"). A completed plan is `Succeeded`: every event was accepted by
 /// the system. The UI-facing `ExecutionResult.status` keeps saying
 /// `unknown`, because consumption by the target is still not verified.
-/// `stage` is where the run stopped; `sent` whether any input or clipboard
-/// effect happened (used when the run returned an error; a result carries
-/// its own `side_effects`, which the verdict keeps).
+/// `reported` is the reason the run raised with its stop (the clipboard
+/// lease's, [`RunReport::reason`]); it wins over the message text, which is
+/// only mapped ([`reason_for`]) when the run reported none. `stage` is where
+/// the run stopped; `sent` whether any input or clipboard effect happened
+/// (used when the run returned an error; a result carries its own
+/// `side_effects`, which the verdict keeps).
 pub(super) fn classify(
     result: &Result<ExecutionResult, String>,
+    reported: Option<ReasonCode>,
     stage: Stage,
     sent: bool,
 ) -> Verdict {
+    let reason_for = |message: &str| reported.unwrap_or_else(|| reason_for(message, stage));
     match result {
         Ok(run) => {
             let stopped = match run.status.as_str() {
                 "cancelled" => Some(ReasonCode::Cancelled),
-                "failed" => Some(reason_for(&run.message, stage)),
+                "failed" => Some(reason_for(&run.message)),
                 _ => None,
             };
             let (outcome, reason) = stopped
@@ -391,7 +396,7 @@ pub(super) fn classify(
             }
         }
         Err(message) => {
-            let reason = reason_for(message, stage);
+            let reason = reason_for(message);
             Verdict::new(outcome_for(reason, sent), reason, sent)
         }
     }
@@ -432,11 +437,7 @@ pub(super) fn stage_timings(
 }
 
 /// Records one manual run (`execute`, no rule) in the process history.
-pub(super) fn record_manual(
-    process: &str,
-    result: &Result<ExecutionResult, String>,
-    started: Instant,
-) {
+pub(super) fn record_manual(process: &str, report: &RunReport, started: Instant) {
     let end = SystemClock.now();
     let sent = SENT_EFFECT.with(Cell::get);
     let verdict = if MANUAL_REFUSED.with(|refused| refused.replace(false)) {
@@ -444,7 +445,7 @@ pub(super) fn record_manual(
         // same verdict, not the "accepted 0/N" text it surfaces as.
         Verdict::new(Outcome::Failed, ReasonCode::ExecutorTimeout, sent)
     } else {
-        classify(result, current_stage(), sent)
+        classify(&report.result, report.reason, current_stage(), sent)
     };
     let task = Task {
         rule_id: String::new(),
@@ -452,8 +453,11 @@ pub(super) fn record_manual(
         process: Some(process.to_owned()).filter(|name| !name.is_empty()),
         queued_at: started,
     };
-    crate::runtime::current()
-        .record(task.record(verdict, stage_timings(None, started, end, &stage_marks())));
+    crate::runtime::current().record(task.record(
+        verdict,
+        report.skipped_formats.clone(),
+        stage_timings(None, started, end, &stage_marks()),
+    ));
 }
 
 #[derive(Default)]
@@ -528,6 +532,49 @@ fn status_index(status: Status) -> u8 {
         .position(|known| *known == status)
         .unwrap_or(EXECUTOR_STATUSES.len() - 1) as u8
 }
+
+/// Every clipboard status [`ExecutorCore::status`] caches, as for
+/// [`EXECUTOR_STATUSES`]. A lease only ever reports Healthy or
+/// Degraded(ClipboardBusy); any other status is cached as Degraded or Down
+/// with `Internal`. Clipboard is optional: the supervisor publishes it as
+/// Degraded at worst and never rebuilds for it.
+const CLIPBOARD_STATUSES: [Status; 4] = [
+    Status::Ok,
+    Status::Degraded(ReasonCode::ClipboardBusy),
+    Status::Degraded(ReasonCode::Internal),
+    Status::Down(ReasonCode::Internal),
+];
+
+/// The index of `status` in [`CLIPBOARD_STATUSES`].
+fn clipboard_index(status: Status) -> u8 {
+    CLIPBOARD_STATUSES
+        .iter()
+        .position(|known| *known == status)
+        .unwrap_or(match status {
+            Status::Ok => 0,
+            Status::Degraded(_) => 2,
+            Status::Down(_) => 3,
+        }) as u8
+}
+
+/// The worse of two statuses of one component; `a` on a tie.
+fn worse(a: Status, b: Status) -> Status {
+    let rank = |status: Status| match status {
+        Status::Ok => 0,
+        Status::Degraded(_) => 1,
+        Status::Down(_) => 2,
+    };
+    if rank(b) > rank(a) {
+        b
+    } else {
+        a
+    }
+}
+
+/// Reads the clipboard component's own health without waiting; `None`
+/// while it cannot be read now. Production reads the process-wide
+/// `clipboard_health` ([`try_clipboard_health`]); a test rig its mock's.
+struct ClipboardProbe(Box<dyn Fn() -> Option<ComponentHealth> + Send + Sync>);
 
 #[cfg(test)]
 type PauseHook = Arc<dyn Fn(Pause) + Send + Sync>;
@@ -661,6 +708,13 @@ pub(super) struct ExecutorCore {
     /// [`EXECUTOR_STATUSES`]: what `probe` returns while a lock it needs is
     /// held elsewhere (A2).
     last_status: AtomicU8,
+    /// Where `probe` reads the clipboard's own health; empty: the
+    /// process-wide one ([`try_clipboard_health`]).
+    clipboard_probe: ArcSwapOption<ClipboardProbe>,
+    /// The clipboard status last read, as an index into
+    /// [`CLIPBOARD_STATUSES`]: what `probe` returns while a lease is
+    /// updating it (A2).
+    last_clipboard: AtomicU8,
     /// Execution history (B-35); production uses `runtime::current()`.
     runtime: Arc<Runtime>,
     #[cfg(test)]
@@ -697,9 +751,22 @@ impl ExecutorCore {
             clipboard_holder: AtomicU64::new(0),
             fault: PlMutex::new(None),
             last_status: AtomicU8::new(0),
+            clipboard_probe: ArcSwapOption::empty(),
+            last_clipboard: AtomicU8::new(0),
             #[cfg(test)]
             pause_hook: PlMutex::new(None),
         })
+    }
+
+    /// Makes `probe` read the clipboard's own health from `probe` (tests:
+    /// the rig's mock clipboard instead of the process-wide health).
+    #[cfg(test)]
+    pub(super) fn set_clipboard_probe(
+        &self,
+        probe: impl Fn() -> Option<ComponentHealth> + Send + Sync + 'static,
+    ) {
+        self.clipboard_probe
+            .store(Some(Arc::new(ClipboardProbe(Box::new(probe)))));
     }
 
     pub(super) fn epoch(&self) -> u64 {
@@ -916,7 +983,7 @@ impl ExecutorCore {
             }
         };
         self.runtime
-            .record(task.record(verdict, StageTimings::default()));
+            .record(task.record(verdict, vec![], StageTimings::default()));
         false
     }
 
@@ -960,7 +1027,7 @@ impl ExecutorCore {
         };
         let verdict = Verdict::new(Outcome::DroppedBusy, ReasonCode::DroppedBusy, false);
         self.runtime
-            .record(task.record(verdict, StageTimings::default()));
+            .record(task.record(verdict, vec![], StageTimings::default()));
     }
 
     /// A manual run claims `busy` ([`ManualBusy`]): compare-and-set in one
@@ -1140,6 +1207,7 @@ impl ExecutorCore {
             let sent = running.sent.load(Ordering::SeqCst) || in_flight;
             self.runtime.record(running.task.record(
                 Verdict::new(Outcome::Failed, ReasonCode::ExecutorTimeout, sent),
+                vec![],
                 StageTimings {
                     queue_us: micros(running.task.queued_at, running.started_at),
                     total_us: micros(running.task.queued_at, now),
@@ -1254,7 +1322,9 @@ impl ExecutorCore {
 
     /// The components' status (`probe`). Never waits for a lock (A2): the
     /// fault and the worker are only try_locked, and while either is held
-    /// elsewhere the executor status last observed is returned.
+    /// elsewhere the executor status last observed is returned. The
+    /// clipboard is the worse of a lease held by a fenced task and the
+    /// clipboard's own health ([`Self::clipboard_reported`]).
     fn status(&self) -> Vec<(Component, Status)> {
         let fault = self.fault.try_lock().map(|fault| *fault);
         let alive = self.worker.try_lock().map(|worker| worker.alive());
@@ -1281,15 +1351,40 @@ impl ExecutorCore {
             }
         };
         let holder = self.clipboard_holder.load(Ordering::SeqCst);
-        let clipboard = if holder != 0 && holder - 1 < self.epoch() {
+        let held = if holder != 0 && holder - 1 < self.epoch() {
             Status::Degraded(ReasonCode::ClipboardBusy)
         } else {
             Status::Ok
         };
         vec![
             (Component::Executor, executor),
-            (Component::Clipboard, clipboard),
+            (Component::Clipboard, worse(held, self.clipboard_reported())),
         ]
+    }
+
+    /// The clipboard's own health (`clipboard_health`, B-08: Degraded after
+    /// a lease found it busy, held it too long or met a hung owner; Healthy
+    /// again after the next lease that kept every section in time) as a
+    /// status. Never waits (A2): while a lease is updating it, the status
+    /// last read is returned.
+    fn clipboard_reported(&self) -> Status {
+        let probe = self.clipboard_probe.load();
+        let health = match probe.as_deref() {
+            Some(probe) => (probe.0)(),
+            None => try_clipboard_health(),
+        };
+        match health {
+            Some(health) => {
+                let status = Status::from_health(&health);
+                self.last_clipboard
+                    .store(clipboard_index(status), Ordering::SeqCst);
+                status
+            }
+            None => {
+                tracing::debug!(event = "executor.clipboard_probe_cached");
+                CLIPBOARD_STATUSES[usize::from(self.last_clipboard.load(Ordering::SeqCst))]
+            }
+        }
     }
 
     /// Closes the queue so the worker exits (tests; production never stops).
@@ -1355,6 +1450,7 @@ impl ExecutorCore {
                 let reason = self.fault.lock().unwrap_or(ReasonCode::ExecutorTimeout);
                 self.runtime.record(task.record(
                     Verdict::new(Outcome::Skipped, reason, false),
+                    vec![],
                     StageTimings::default(),
                 ));
                 return;
@@ -1381,6 +1477,7 @@ impl ExecutorCore {
             epoch,
             sent,
             refused: AtomicBool::new(false),
+            clipboard_refused: AtomicBool::new(false),
         });
         // S3 (b): owed key-ups are paid before the task may do anything.
         // While they stay owed the task sends nothing, touches nothing and
@@ -1394,9 +1491,7 @@ impl ExecutorCore {
         begin_trace();
         set_stage(Stage::Resolve, started);
         let outcome = if owed {
-            Ok(RunReport {
-                result: Err(RELEASE_OWED.into()),
-            })
+            Ok(RunReport::text(Err(RELEASE_OWED.into())))
         } else {
             catch_unwind(AssertUnwindSafe(|| (self.runner)(&candidate, &scope)))
         };
@@ -1404,8 +1499,8 @@ impl ExecutorCore {
         let end = self.clock.now();
         let stage = current_stage();
         let mut panicked = false;
-        let result = match outcome {
-            Ok(report) => report.result,
+        let (result, reported, skipped_formats) = match outcome {
+            Ok(report) => (report.result, report.reason, report.skipped_formats),
             Err(payload) => {
                 panicked = true;
                 let kind = if payload.is::<&'static str>() {
@@ -1425,9 +1520,17 @@ impl ExecutorCore {
                 if self.epoch() == epoch {
                     *self.fault.lock() = Some(ReasonCode::ExecutorPanic);
                 }
-                Err(PANICKED.into())
+                (Err(PANICKED.into()), None, vec![])
             }
         };
+        // The clipboard port's refusal is text to the run (the port is
+        // `Fn() -> Result<C, String>`); the scope remembers it as a reason.
+        let reported = reported.or_else(|| {
+            scope
+                .clipboard_refused
+                .load(Ordering::SeqCst)
+                .then_some(ReasonCode::ClipboardBusy)
+        });
         // Read before the guard sends its key-ups (`released` counts those).
         let effect = SENT_EFFECT.with(Cell::get);
         let released = guard.release();
@@ -1441,7 +1544,7 @@ impl ExecutorCore {
             // run was refused for owed key-ups (S3).
             Verdict::new(Outcome::Failed, ReasonCode::ExecutorTimeout, sent)
         } else {
-            classify(&result, stage, sent)
+            classify(&result, reported, stage, sent)
         };
         let id = format!("{}:{}", candidate.rule.id, candidate.generation);
         let last = match result {
@@ -1459,7 +1562,7 @@ impl ExecutorCore {
                 side_effects: sent,
             },
         };
-        guard.settle(verdict, Some(last), end);
+        guard.settle(verdict, skipped_formats, Some(last), end);
     }
 }
 
@@ -1509,7 +1612,13 @@ impl BusyGuard<'_> {
         released
     }
 
-    fn settle(&mut self, verdict: Verdict, last: Option<ExecutionResult>, end: Instant) {
+    fn settle(
+        &mut self,
+        verdict: Verdict,
+        skipped_formats: Vec<u32>,
+        last: Option<ExecutionResult>,
+        end: Instant,
+    ) {
         self.done = true;
         let core = self.core;
         core.pause(Pause::GuardBeforeClear);
@@ -1533,7 +1642,8 @@ impl BusyGuard<'_> {
             end,
             &stage_marks(),
         );
-        core.runtime.record(running.task.record(verdict, timings));
+        core.runtime
+            .record(running.task.record(verdict, skipped_formats, timings));
         core.shared.busy.store(false, Ordering::SeqCst);
     }
 }
@@ -1548,6 +1658,7 @@ impl Drop for BusyGuard<'_> {
         let end = self.core.clock.now();
         self.settle(
             Verdict::new(Outcome::Failed, ReasonCode::Internal, true),
+            vec![],
             None,
             end,
         );
@@ -1563,6 +1674,9 @@ pub(super) struct TaskScope {
     /// A send found the send lock held past [`SEND_LOCK_WAIT`]; every later
     /// send of the task is refused at once (fail-stop).
     refused: AtomicBool,
+    /// [`claim_clipboard`](Self::claim_clipboard) refused the clipboard: the
+    /// run's reason is `ClipboardBusy`, whatever text the refusal became.
+    clipboard_refused: AtomicBool,
 }
 
 impl TaskScope {
@@ -1600,6 +1714,7 @@ impl TaskScope {
                 event = "executor.clipboard_busy",
                 "clipboard held by a stalled task; paste refused"
             );
+            self.clipboard_refused.store(true, Ordering::SeqCst);
             return Err(CLIPBOARD_HELD.into());
         }
         match open() {
@@ -1981,32 +2096,28 @@ where
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
     match expand_reusable(&candidate.rule.action, &config, &context) {
-        Ok(plan) => RunReport {
-            result: execute_with_proof(
-                ports,
-                shared,
-                plan,
-                candidate.focus.clone(),
-                candidate.generation,
-                Some(candidate.proof.clone()),
-                if candidate.matched.consume_terminator {
-                    None
-                } else {
-                    candidate.terminator.clone()
-                },
-                match candidate.rule.action {
-                    Action::Replay { speed, .. } => speed,
-                    _ => 1.0,
-                },
-            ),
-        },
-        Err(errors) => RunReport {
-            result: Err(errors
-                .iter()
-                .map(|e| e.message.clone())
-                .collect::<Vec<_>>()
-                .join("; ")),
-        },
+        Ok(plan) => run_plan(
+            ports,
+            shared,
+            plan,
+            candidate.focus.clone(),
+            candidate.generation,
+            Some(candidate.proof.clone()),
+            if candidate.matched.consume_terminator {
+                None
+            } else {
+                candidate.terminator.clone()
+            },
+            match candidate.rule.action {
+                Action::Replay { speed, .. } => speed,
+                _ => 1.0,
+            },
+        ),
+        Err(errors) => RunReport::text(Err(errors
+            .iter()
+            .map(|e| e.message.clone())
+            .collect::<Vec<_>>()
+            .join("; "))),
     }
 }
 

@@ -3,12 +3,27 @@ use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
-#[derive(Debug, Clone)]
+use std::fmt;
+#[derive(Clone)]
 pub struct CompiledRule {
     pub rule: Rule,
     regex: Option<Regex>,
     literal: Option<Regex>,
     order: usize,
+}
+/// The compiled patterns are built from the abbreviation, so they are redacted too (B-09).
+impl fmt::Debug for CompiledRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn pattern(regex: &Option<Regex>) -> Option<Redacted<'_>> {
+            regex.as_ref().map(|regex| Redacted(regex.as_str()))
+        }
+        f.debug_struct("CompiledRule")
+            .field("rule", &self.rule)
+            .field("regex", &pattern(&self.regex))
+            .field("literal", &pattern(&self.literal))
+            .field("order", &self.order)
+            .finish()
+    }
 }
 impl CompiledRule {
     /// Position of the rule in the configured list.
@@ -62,7 +77,7 @@ pub struct CompiledConfig {
     pub config: Config,
     pub rules: Vec<CompiledRule>,
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct MatchResult {
     pub rule_id: String,
     pub matched: String,
@@ -75,6 +90,26 @@ pub struct MatchResult {
     /// (S-17), in list order. The runtime records these as a conflict for the health page.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tied_rule_ids: Vec<String>,
+}
+/// The matched input, captures and parameter are typed text and are redacted (B-09).
+impl fmt::Debug for MatchResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let captures: Vec<_> = self
+            .captures
+            .iter()
+            .map(|capture| capture.as_deref().map(Redacted))
+            .collect();
+        f.debug_struct("MatchResult")
+            .field("rule_id", &self.rule_id)
+            .field("matched", &Redacted(&self.matched))
+            .field("captures", &captures)
+            .field("erase_chars", &self.erase_chars)
+            .field("parameter", &self.parameter.as_deref().map(Redacted))
+            .field("consume_terminator", &self.consume_terminator)
+            .field("revision", &self.revision)
+            .field("tied_rule_ids", &self.tied_rule_ids)
+            .finish()
+    }
 }
 fn diag(code: &str, message: impl Into<String>, path: &str) -> Diagnostic {
     Diagnostic::error(code, message, SourceSpan::default()).at(path)

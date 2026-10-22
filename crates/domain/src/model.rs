@@ -2,6 +2,9 @@ use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
+// B-09: types holding abbreviations or phrase bodies print `<redacted len=N>` in Debug.
+use crate::{Redacted, RedactedKey, RedactedLen, RedactedList, RedactedValue, RedactedValues};
+use std::fmt;
 /// Schema version this build writes.
 pub const SCHEMA_VERSION: u32 = 1;
 /// Highest schema version this build reads; `version` must be in `1..=SUPPORTED_SCHEMA_VERSION`
@@ -46,7 +49,7 @@ fn default_separators() -> String {
 /// `extra`; `unreadable_rules` go back into `rules` and never add a key (B-43). Deserializing
 /// keeps unknown fields and unreadable rule entries but rejects wrongly typed known fields;
 /// stored files go through [`crate::read_stored_config`], which also resets those.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Config {
     pub version: u32,
     pub revision: u64,
@@ -72,17 +75,38 @@ impl Default for Config {
         }
     }
 }
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("version", &self.version)
+            .field("revision", &self.revision)
+            .field("enabled", &self.enabled)
+            .field("globals", &self.globals)
+            .field("rules", &self.rules)
+            .field("unreadable_rules", &self.unreadable_rules)
+            .field("extra", &RedactedValues(&self.extra))
+            .finish()
+    }
+}
 /// Keys of the serialized [`Config`] object; `extra` never shadows them.
 pub(crate) const CONFIG_FIELDS: [&str; 5] = ["version", "revision", "enabled", "globals", "rules"];
 /// A `rules` entry this build could not read (an unknown action type, a wrongly typed field).
 /// It never compiles, so it stays off at runtime, and it is written back verbatim (B-43).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct UnreadableRule {
     /// Position in the serialized `rules` array. When the list has since become shorter the
     /// entry is written after the last rule.
     pub index: usize,
     /// The entry exactly as read.
     pub raw: Value,
+}
+impl fmt::Debug for UnreadableRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnreadableRule")
+            .field("index", &self.index)
+            .field("raw", &RedactedValue(&self.raw))
+            .finish()
+    }
 }
 impl UnreadableRule {
     /// The entry's `id`, when it has a string one.
@@ -229,7 +253,7 @@ impl Config {
             .collect()
     }
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GlobalSettings {
     pub terminators: Vec<String>,
@@ -251,9 +275,20 @@ impl Default for GlobalSettings {
         }
     }
 }
+impl fmt::Debug for GlobalSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GlobalSettings")
+            .field("terminators", &self.terminators)
+            .field("word_separators", &self.word_separators)
+            .field("blacklist", &self.blacklist)
+            .field("ime_erasure", &self.ime_erasure)
+            .field("extra", &RedactedValues(&self.extra))
+            .finish()
+    }
+}
 /// Unknown fields of a rule are kept in `extra` (B-43); nested values stay strict, so an
 /// entry with an unknown action type or nested field is kept whole as an [`UnreadableRule`].
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 pub struct Rule {
     pub id: String,
     pub enabled: bool,
@@ -348,11 +383,39 @@ impl Rule {
         self.ime_erasure.unwrap_or(globals.ime_erasure)
     }
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+impl fmt::Debug for Rule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Rule")
+            .field("id", &self.id)
+            .field("enabled", &self.enabled)
+            .field("group", &self.group)
+            .field("description", &self.description)
+            .field("ignore_case", &self.ignore_case)
+            .field("match_spec", &self.match_spec)
+            .field("trigger_mode", &self.trigger_mode)
+            .field("terminator", &self.terminator)
+            .field("ime_erasure", &self.ime_erasure)
+            .field("action", &self.action)
+            .field("parameter", &self.parameter)
+            .field("notification", &self.notification)
+            .field("extra", &RedactedValues(&self.extra))
+            .finish()
+    }
+}
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MatchSpec {
     pub kind: MatchKind,
     pub value: String,
+}
+/// The abbreviation (literal or regex source) is redacted.
+impl fmt::Debug for MatchSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MatchSpec")
+            .field("kind", &self.kind)
+            .field("value", &Redacted(&self.value))
+            .finish()
+    }
 }
 impl Default for MatchSpec {
     fn default() -> Self {
@@ -412,7 +475,7 @@ pub struct Notification {
     pub enabled: bool,
     pub message: String,
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ParameterSource {
     DefaultMatch,
@@ -421,7 +484,24 @@ pub enum ParameterSource {
     CaptureTemplate { template: String },
     Null,
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+impl fmt::Debug for ParameterSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DefaultMatch => f.write_str("DefaultMatch"),
+            Self::Fixed { value } => f
+                .debug_struct("Fixed")
+                .field("value", &Redacted(value))
+                .finish(),
+            Self::FirstCapture => f.write_str("FirstCapture"),
+            Self::CaptureTemplate { template } => f
+                .debug_struct("CaptureTemplate")
+                .field("template", &Redacted(template))
+                .finish(),
+            Self::Null => f.write_str("Null"),
+        }
+    }
+}
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContentSource {
     Inline {
@@ -440,7 +520,23 @@ impl ContentSource {
         }
     }
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// The phrase body of `Inline` is redacted; a file source shows its path.
+impl fmt::Debug for ContentSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inline { value } => f
+                .debug_struct("Inline")
+                .field("value", &Redacted(value))
+                .finish(),
+            Self::File { path, encoding } => f
+                .debug_struct("File")
+                .field("path", path)
+                .field("encoding", encoding)
+                .finish(),
+        }
+    }
+}
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
     None,
@@ -488,6 +584,71 @@ pub enum Action {
         parameter: String,
     },
 }
+/// HTML and plain-text bodies, parameter values, plans and what an `Open` opens (target and
+/// arguments: paths, URLs and parameters can carry user data) are redacted; kinds, methods,
+/// hotkeys, working directories and ids are shown.
+impl fmt::Debug for Action {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::Text { method, source } => f
+                .debug_struct("Text")
+                .field("method", method)
+                .field("source", source)
+                .finish(),
+            Self::Html { html, plain_text } => f
+                .debug_struct("Html")
+                .field("html", &Redacted(html))
+                .field("plain_text", &Redacted(plain_text))
+                .finish(),
+            Self::Hotkey { keys } => f.debug_struct("Hotkey").field("keys", keys).finish(),
+            Self::SendKeys {
+                source,
+                syntax_variables,
+            } => f
+                .debug_struct("SendKeys")
+                .field("source", source)
+                .field("syntax_variables", syntax_variables)
+                .finish(),
+            Self::Steps { plan } => f.debug_struct("Steps").field("plan", plan).finish(),
+            Self::Replay { plan, speed } => f
+                .debug_struct("Replay")
+                .field("plan", plan)
+                .field("speed", speed)
+                .finish(),
+            Self::Open {
+                target,
+                args,
+                working_directory,
+            } => f
+                .debug_struct("Open")
+                .field("target", &Redacted(target))
+                .field("args", &RedactedList(args))
+                .field("working_directory", working_directory)
+                .finish(),
+            Self::Reusable {
+                action_id,
+                parameters,
+            } => f
+                .debug_struct("Reusable")
+                .field("action_id", action_id)
+                .field("parameters", &RedactedValues(parameters))
+                .finish(),
+            Self::Common { function } => f
+                .debug_struct("Common")
+                .field("function", function)
+                .finish(),
+            Self::Quicker {
+                action_id,
+                parameter,
+            } => f
+                .debug_struct("Quicker")
+                .field("action_id", action_id)
+                .field("parameter", &Redacted(parameter))
+                .finish(),
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Key {
@@ -500,7 +661,7 @@ impl Key {
         Self::Named { name: name.into() }
     }
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ActionPlan {
     pub version: u32,
@@ -516,6 +677,18 @@ impl Default for ActionPlan {
             source: None,
             steps: vec![],
         }
+    }
+}
+/// The script source is redacted, and so are the steps (shown as their count): a recorded
+/// plan is the key sequence that was typed, which spells the text out key by key.
+impl fmt::Debug for ActionPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ActionPlan")
+            .field("version", &self.version)
+            .field("dialect", &self.dialect)
+            .field("source", &self.source.as_deref().map(Redacted))
+            .field("steps", &RedactedLen(self.steps.len()))
+            .finish()
     }
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -552,7 +725,7 @@ pub enum TargetPolicy {
         process: String,
     },
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Text {
@@ -613,6 +786,86 @@ pub enum Operation {
         action_id: String,
         parameters: BTreeMap<String, serde_json::Value>,
     },
+}
+/// Text and HTML bodies, parameter values, what an `Open` opens and the key of a key
+/// operation are redacted: a recorded macro (`Vec<Step>`) is the typed key sequence, one key
+/// operation per key, so each one hides its key, not only the enclosing [`ActionPlan`].
+/// Hotkeys, delays, pointer moves, paths, working directories and ids are shown.
+impl fmt::Debug for Operation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text { text, method } => f
+                .debug_struct("Text")
+                .field("text", &Redacted(text))
+                .field("method", method)
+                .finish(),
+            Self::KeyDown { .. } => f
+                .debug_struct("KeyDown")
+                .field("key", &RedactedKey)
+                .finish(),
+            Self::KeyUp { .. } => f.debug_struct("KeyUp").field("key", &RedactedKey).finish(),
+            Self::KeyPress { .. } => f
+                .debug_struct("KeyPress")
+                .field("key", &RedactedKey)
+                .finish(),
+            Self::Hotkey { keys } => f.debug_struct("Hotkey").field("keys", keys).finish(),
+            Self::Delay { ms } => f.debug_struct("Delay").field("ms", ms).finish(),
+            Self::MouseMove {
+                x,
+                y,
+                relative,
+                percent,
+            } => f
+                .debug_struct("MouseMove")
+                .field("x", x)
+                .field("y", y)
+                .field("relative", relative)
+                .field("percent", percent)
+                .finish(),
+            Self::MouseButton { button, state } => f
+                .debug_struct("MouseButton")
+                .field("button", button)
+                .field("state", state)
+                .finish(),
+            Self::Wheel { axis, amount, unit } => f
+                .debug_struct("Wheel")
+                .field("axis", axis)
+                .field("amount", amount)
+                .field("unit", unit)
+                .finish(),
+            Self::PasteFiles { paths } => {
+                f.debug_struct("PasteFiles").field("paths", paths).finish()
+            }
+            Self::PasteImage { path } => f.debug_struct("PasteImage").field("path", path).finish(),
+            Self::Html { html, plain_text } => f
+                .debug_struct("Html")
+                .field("html", &Redacted(html))
+                .field("plain_text", &Redacted(plain_text))
+                .finish(),
+            Self::Open {
+                target,
+                args,
+                working_directory,
+            } => f
+                .debug_struct("Open")
+                .field("target", &Redacted(target))
+                .field("args", &RedactedList(args))
+                .field("working_directory", working_directory)
+                .finish(),
+            Self::Common { function } => f
+                .debug_struct("Common")
+                .field("function", function)
+                .finish(),
+            Self::Reusable {
+                action_id,
+                parameters,
+            } => f
+                .debug_struct("Reusable")
+                .field("action_id", action_id)
+                .field("parameters", &RedactedValues(parameters))
+                .finish(),
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

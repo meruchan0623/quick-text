@@ -11,12 +11,23 @@ pub struct Package {
     #[serde(default)]
     pub unresolved: Vec<MigrationItem>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MigrationItem {
     pub rule_id: String,
     pub status: MigrationStatus,
     pub diagnostics: Vec<Diagnostic>,
     pub original: serde_json::Value,
+}
+/// The original imported entry carries the abbreviation and phrase, so it is redacted (B-09).
+impl std::fmt::Debug for MigrationItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MigrationItem")
+            .field("rule_id", &self.rule_id)
+            .field("status", &self.status)
+            .field("diagnostics", &self.diagnostics)
+            .field("original", &RedactedValue(&self.original))
+            .finish()
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -546,11 +557,21 @@ pub fn validate_asset_path(value: &str) -> Result<(), String> {
     }
     Ok(())
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct EspansoExport {
     pub yaml: String,
     pub unsupported_rule_ids: Vec<String>,
     pub global_conflicts: Vec<String>,
+}
+/// The exported YAML holds the triggers and replacements, so it is redacted (B-09).
+impl std::fmt::Debug for EspansoExport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EspansoExport")
+            .field("yaml", &Redacted(&self.yaml))
+            .field("unsupported_rule_ids", &self.unsupported_rule_ids)
+            .field("global_conflicts", &self.global_conflicts)
+            .finish()
+    }
 }
 /// Interoperable literal/text subset only; never writes or modifies Espanso's unmanaged files.
 pub fn export_espanso_subset(config: &Config) -> EspansoExport {

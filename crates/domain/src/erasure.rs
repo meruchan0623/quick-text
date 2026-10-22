@@ -1,4 +1,5 @@
-use crate::{CompositionEvidence, ImeErasure, TextObservation};
+use crate::{CompositionEvidence, ImeErasure, Redacted, TextObservation};
+use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErasureKind {
@@ -9,13 +10,25 @@ pub enum ErasureKind {
     CancelComposition,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ErasureProof {
     observation: TextObservation,
     generation: u64,
     kind: ErasureKind,
     expected_suffix: String,
     timeout_ms: u64,
+}
+/// The expected suffix is the typed abbreviation and is redacted (B-09).
+impl fmt::Debug for ErasureProof {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ErasureProof")
+            .field("observation", &self.observation)
+            .field("generation", &self.generation)
+            .field("kind", &self.kind)
+            .field("expected_suffix", &Redacted(&self.expected_suffix))
+            .field("timeout_ms", &self.timeout_ms)
+            .finish()
+    }
 }
 
 impl ErasureProof {

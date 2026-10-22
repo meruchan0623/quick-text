@@ -17,3 +17,7 @@ pub use package::*;
 pub use parser::*;
 pub use stored::*;
 pub use transaction::*;
+
+/// `Debug` that never prints sensitive text (B-09).
+mod redact;
+pub use redact::*;

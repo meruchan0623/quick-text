@@ -47,13 +47,26 @@ mod acceptance_mode_tests {
     }
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Serialize, PartialEq)]
 pub struct Foreground {
     pub platform: String,
     pub bundle_id: String,
     pub id: u64,
     pub process: String,
     pub title: String,
+}
+/// The window title is redacted (B-09): it can carry a document name, a mail
+/// subject or a customer's name. The process stays visible for diagnostics.
+impl std::fmt::Debug for Foreground {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Foreground")
+            .field("platform", &self.platform)
+            .field("bundle_id", &self.bundle_id)
+            .field("id", &self.id)
+            .field("process", &self.process)
+            .field("title", &Redacted(&self.title))
+            .finish()
+    }
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct ExecutionResult {
@@ -205,3 +218,6 @@ pub fn stop_recording(shared: &Arc<Shared>) -> Result<ActionPlan, String> {
 pub mod history;
 pub mod runtime;
 pub mod supervisor;
+
+/// The app's clipboard lease options, set at startup from prefs (B-08).
+pub mod clipboard_options;
