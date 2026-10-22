@@ -118,7 +118,6 @@ impl Rig {
     fn execute(&self, candidate: &Candidate) -> Result<ExecutionResult, String> {
         // `physical()` reports "held" when its mirror is contended, so runs
         // from parallel tests must not overlap (production has one executor).
-        static SERIAL: Mutex<()> = Mutex::new(());
         let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         let config = self.shared.config.lock().unwrap().clone();
         let plan = expand_reusable(&candidate.rule.action, &config, &VariableContext::default())
@@ -648,3 +647,8 @@ fn proof_is_uninstalled_when_the_run_unwinds() {
     rig.foreground.update_input_context(|c| c.caret_epoch += 1);
     assert_eq!(rawinput::guard(&rig.shared, &rig.foreground), Ok(()));
 }
+
+/// Serializes action runs across the pipeline test modules: `physical()`
+/// reports "held" when its mirror is contended, so runs must not overlap
+/// (production has one executor). Shared with `pipeline_tests_executor`.
+pub(super) static SERIAL: Mutex<()> = Mutex::new(());

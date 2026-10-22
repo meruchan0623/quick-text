@@ -60,3 +60,6 @@ pub fn start_engine(shared: Arc<Shared>) -> Result<(), String> {
     executor::start_executor(shared.clone());
     input::start_input_sources(shared)
 }
+pub use executor::executor_control;
+#[cfg(test)]
+mod pipeline_tests_executor;

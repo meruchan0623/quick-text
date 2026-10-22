@@ -14,6 +14,44 @@ use super::{
 use crate::traits::{ClipboardBackend, Clock, ForegroundProbe, Injector, SystemClock};
 thread_local! {
     static AUTOMATIC_EXECUTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STAGE: std::cell::Cell<Stage> = const { std::cell::Cell::new(Stage::Idle) };
+}
+/// Where the run on this thread currently is. Logged (location only, never
+/// content) when an executor task panics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Stage {
+    Idle,
+    Resolve,
+    Preflight,
+    Guard,
+    Clipboard,
+    Erase,
+    Output,
+    Cleanup,
+    Restore,
+    Done,
+}
+impl Stage {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Stage::Idle => "idle",
+            Stage::Resolve => "resolve",
+            Stage::Preflight => "preflight",
+            Stage::Guard => "guard",
+            Stage::Clipboard => "clipboard",
+            Stage::Erase => "erase",
+            Stage::Output => "output",
+            Stage::Cleanup => "cleanup",
+            Stage::Restore => "restore",
+            Stage::Done => "done",
+        }
+    }
+}
+pub(super) fn set_stage(stage: Stage) {
+    STAGE.with(|current| current.set(stage));
+}
+pub(super) fn current_stage() -> Stage {
+    STAGE.with(std::cell::Cell::get)
 }
 fn open(target: &str, args: &[String], cwd: &Option<String>) -> Result<(), String> {
     if args.is_empty() {
@@ -161,6 +199,9 @@ fn guarded_context(
     target: &Foreground,
     generation: u64,
 ) -> Result<(), String> {
+    // B-01: a task fenced by the supervisor stops here, before any further
+    // input, clipboard write or launch (also records task progress).
+    super::executor::checkpoint()?;
     if pause_blocks_execution(
         s.paused.load(Ordering::SeqCst),
         AUTOMATIC_EXECUTION.with(|automatic| automatic.get()),
@@ -283,10 +324,12 @@ where
     let erasure = proof.as_ref().map(rawinput::Proof::erasure);
     SENT_EFFECT.with(|flag| flag.set(false));
     let _fence_lease = FenceLease::install(proof);
+    set_stage(Stage::Preflight);
     if !speed.is_finite() || speed <= 0.0 {
         return Err("Replay speed must be positive and finite".into());
     }
     preflight(&plan)?;
+    set_stage(Stage::Guard);
     // A shifted or AltGr trigger can match before the modifier is released.
     // Wait for release while keeping every cancellation and focus check active.
     if erasure.is_some() {
@@ -300,6 +343,7 @@ where
     }
     guarded(probe, s, &target, generation)?;
     // All potentially failing source/format checks happen before trigger deletion.
+    set_stage(Stage::Clipboard);
     let mut clipboard = acquire_clipboard(&plan, || ClipboardLease::new((ports.clipboard)()?))?;
     let mut payloads = std::collections::BTreeMap::new();
     if let Some(lease) = clipboard.as_ref() {
@@ -313,6 +357,7 @@ where
     if let Some(lease) = clipboard.as_ref() {
         lease.verify_current()?;
     }
+    set_stage(Stage::Erase);
     if let Some(erasure) = &erasure {
         let erased = erase(injector, clock, erasure, || {
             guarded(probe, s, &target, generation)
@@ -327,6 +372,7 @@ where
             });
         }
     }
+    set_stage(Stage::Output);
     let mut owned = BTreeSet::new();
     let mut owned_mouse = vec![];
     let mut completed = 0;
@@ -501,6 +547,7 @@ where
             }
         }
     }
+    set_stage(Stage::Cleanup);
     for v in owned {
         if !physical(v) {
             if let Err(error) = key(injector, v, true) {
@@ -532,11 +579,13 @@ where
             }
         }
     }
+    set_stage(Stage::Restore);
     if let Some(mut lease) = clipboard {
         if let Err(e) = lease.restore() {
             failure = Some(format!("Clipboard restore failed after input: {e}"));
         }
     }
+    set_stage(Stage::Done);
     let result = ExecutionResult {
         id: format!("run-{}", s.generation.load(Ordering::SeqCst)),
         status: if failure.as_deref() == Some("Cancelled") {
@@ -552,7 +601,12 @@ where
         completed_steps: completed,
         side_effects: SENT_EFFECT.with(|flag| flag.get()) || completed > 0,
     };
-    *s.last.lock().unwrap() = Some(result.clone());
+    // A task fenced by the supervisor no longer owns the "last result".
+    if super::executor::checkpoint().is_ok() {
+        *s.last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.clone());
+    }
     Ok(result)
 }
 
