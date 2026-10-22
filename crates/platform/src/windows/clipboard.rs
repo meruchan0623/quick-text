@@ -877,33 +877,36 @@ pub(super) struct ClipboardLease<C: ClipboardBackend> {
     baseline: Capture,
 }
 /// Trust in the clipboard the lease's last write left (B-08). It is
-/// established once, by the capture right after a paste write; a restore
-/// only compares against what that capture recorded and never establishes
-/// trust itself.
+/// established once per write, by the first check of the clipboard that
+/// gets it open: normally the capture right after a paste write, or the
+/// restore's check when that capture never got it open. Every later check
+/// only compares against what was recorded. [`ClipboardLease::verify_owned`]
+/// makes every transition.
 #[derive(Debug, PartialEq)]
 enum Capture {
-    /// No capture since the lease last cleared the clipboard: nothing
-    /// written yet, a write (paste or restore) whose `set` failed after the
-    /// clear, or a capture that never got the clipboard open (busy on every
-    /// attempt, e.g. a clipboard manager reading the paste) and so read
-    /// nothing. A failed clear leaves the clipboard, and this state, as
-    /// they were. Its restore checks the clipboard the way a capture would.
-    /// Accepted residual risk, like the window between a write's
-    /// CloseClipboard and its capture, which a busy capture extends to the
-    /// first successful open: another process rewriting a derived format in
-    /// place in between is outside the threat model (see
-    /// [`HANDLE_FORMATS`]); normal programs never do it without emptying
-    /// the clipboard.
+    /// No check has opened the clipboard since the lease last cleared it:
+    /// nothing written yet, a write (paste or restore) whose `set` failed
+    /// after the clear, or checks that never got the clipboard open (busy
+    /// on every attempt, e.g. a clipboard manager reading the paste) and so
+    /// read nothing. A failed clear leaves the clipboard, and this state,
+    /// as they were. The next check that opens it (the restore's, Drop's)
+    /// captures the way the paste write's capture would. Accepted residual
+    /// risk, like the window between a write's CloseClipboard and its
+    /// capture, which busy checks extend to the first successful open:
+    /// another process rewriting a derived format in place in between is
+    /// outside the threat model (see [`HANDLE_FORMATS`]); normal programs
+    /// never do it without emptying the clipboard.
     Untried,
-    /// Recorded by the capture: what every restore holds the clipboard to.
+    /// Recorded by the first check that opened the clipboard: what every
+    /// later check holds it to.
     Captured(Baseline),
-    /// The capture opened the clipboard and then refused (owner, format
-    /// set, bytes, a derived format it could not read) or could not finish
-    /// (the sequence never settled, a later attempt stayed busy). Nothing
-    /// establishes trust later: what the capture could not vouch for may
-    /// have been rewritten since, and checking it now would adopt that.
-    /// Every restore, explicit or on drop, refuses and the clipboard keeps
-    /// the paste.
+    /// A check opened the clipboard and then refused (owner, format set,
+    /// bytes, a derived format it could not read) or could not finish (the
+    /// sequence never settled, a later attempt stayed busy), whether it was
+    /// capturing or comparing. Nothing establishes trust later: what the
+    /// check could not vouch for may have been rewritten since, and
+    /// checking it again would adopt that. Every restore, explicit or on
+    /// drop, refuses and the clipboard keeps what it holds.
     Failed,
 }
 /// What a restore holds the clipboard to (B-08), captured in the section
@@ -1174,17 +1177,23 @@ fn retry_clipboard_verification<T>(
 }
 impl<C: ClipboardBackend> ClipboardLease<C> {
     /// Re-establishes the lease's own ownership after a write
-    /// ([`check_owned`] against `baseline`), retried until the sequence it
+    /// ([`check_owned`] against the baseline), retried until the sequence it
     /// verified at is still current once the clipboard is closed. A sequence
     /// that moved since the write is not a refusal by itself: the format set
-    /// and every byte decide. Returns that sequence, and the baseline
-    /// captured when there was none. Refuses without opening the clipboard
-    /// after a failed capture ([`Capture::Failed`]). Sets `opened` once one
-    /// of its sections opens the clipboard, telling a clipboard busy
-    /// throughout (nothing read) from a check that saw it. Runs on the
-    /// lease thread; the data is the lease's own, so no read waits on
-    /// another owner.
-    fn verify_owned(&self, opened: &Cell<bool>) -> Result<(u32, Option<Baseline>), LeaseError> {
+    /// and every byte decide. Returns that sequence. Runs on the lease
+    /// thread; the data is the lease's own, so no read waits on another
+    /// owner.
+    ///
+    /// The only path to the clipboard after a write, for the paste write's
+    /// capture and every restore alike, so each makes the same [`Capture`]
+    /// transition. [`Capture::Failed`] refuses without opening the
+    /// clipboard. Otherwise, verified: a baseline captured from
+    /// [`Capture::Untried`] is kept ([`Capture::Captured`]), and every later
+    /// check compares against it, never captures again. Failed after one of
+    /// its sections opened the clipboard: [`Capture::Failed`], from either
+    /// state. Never got it open (busy on every attempt, nothing read): the
+    /// state stays as it was.
+    fn verify_owned(&mut self) -> Result<u32, LeaseError> {
         let backend = &self.backend;
         let owner = backend.identity();
         let baseline = match &self.baseline {
@@ -1192,7 +1201,8 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
             Capture::Captured(baseline) => Some(baseline),
             Capture::Failed => return Err(uncaptured()),
         };
-        retry_clipboard_verification(
+        let opened = Cell::new(false);
+        let verified = retry_clipboard_verification(
             || {
                 let (sequence, captured) = critical(backend, &self.degraded, || {
                     opened.set(true);
@@ -1202,7 +1212,22 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
                     .then_some((sequence, captured)))
             },
             || backend.pause(VERIFY_RETRY_INTERVAL),
-        )
+        );
+        match verified {
+            Ok((sequence, captured)) => {
+                // `None` only when it compared against a baseline it keeps.
+                if let Some(captured) = captured {
+                    self.baseline = Capture::Captured(captured);
+                }
+                Ok(sequence)
+            }
+            Err(error) => {
+                if opened.get() {
+                    self.baseline = Capture::Failed;
+                }
+                Err(error)
+            }
+        }
     }
     pub(super) fn verify_current(&self) -> Result<(), String> {
         if self
@@ -1300,19 +1325,12 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
         // and refused or could not finish is final: every restore refuses
         // ([`Capture::Failed`]). One that never got it open (a clipboard
         // manager reading the paste can hold it through every attempt) read
-        // nothing and stays [`Capture::Untried`], so its restore can still
-        // bring the original back.
+        // nothing and stays [`Capture::Untried`]: the restore's check
+        // captures in its place, so it can still bring the original back.
         // 待实测: whether CF_LOCALE is listed after CF_UNICODETEXT alone, and
         // whether rendering a synthesized format advances the sequence (a
         // move after the capture fails `verify_current` before the paste).
-        let opened = Cell::new(false);
-        let (sequence, captured) = self.verify_owned(&opened).inspect_err(|_| {
-            if opened.get() {
-                self.baseline = Capture::Failed;
-            }
-        })?;
-        self.written = Some(sequence);
-        self.baseline = captured.map_or(Capture::Failed, Capture::Captured);
+        self.written = Some(self.verify_owned()?);
         Ok(())
     }
     /// [`ClipboardLease::open`] with the default options.
@@ -1448,10 +1466,12 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
         // previous one is no longer current. Another application adding or
         // rewriting a format without emptying the clipboard keeps the owner
         // and the payload but not the baseline: that refuses, and the
-        // clipboard stays as it is. So does a failed capture: the restore
-        // compares, it never captures in its place. Drop runs this same
-        // check.
-        self.written = Some(self.verify_owned(&Cell::new(false))?.0);
+        // clipboard stays as it is. So does a failed capture. From
+        // [`Capture::Untried`] the check captures, exactly as the paste
+        // write's would; what it records, or its failure, holds for every
+        // later attempt, so a write that fails here (busy) leaves Drop
+        // comparing against it. Drop runs this same check.
+        self.written = Some(self.verify_owned()?);
         let result = self.write(self.backup.clone());
         finish_clipboard_restore(&mut self.backup, result)?;
         self.written = None;
@@ -2275,11 +2295,10 @@ mod tests {
             expected.push((theirs, vec![1, 2, 3]));
             assert_eq!(clipboard.owner_now(), MockClipboard::LEASE);
             if explicit {
-                assert_eq!(
-                    lease.verify_owned(&Cell::new(false)).err(),
-                    Some(formats_changed())
-                );
                 assert_eq!(lease.restore(), Err(formats_changed().message));
+                // A comparison that opened the clipboard and refused is as
+                // final as a failed capture.
+                assert_eq!(lease.baseline, Capture::Failed);
                 assert_eq!(clipboard.content(), expected);
             }
             drop(lease);
@@ -2547,5 +2566,86 @@ mod tests {
         drop(lease);
         assert_eq!(clipboard.content(), pasted(&clipboard, "expansion"));
         assert_eq!(clipboard.clears(), 1);
+    }
+    #[test]
+    fn restore_check_that_fails_after_a_busy_capture_is_final() {
+        let clipboard = MockClipboard::new(7, text("original"));
+        let script = clipboard.clone();
+        // Lock 2 writes the paste and every attempt at capturing it is busy;
+        // lock 3 is the explicit restore's check: CF_TEXT is listed but its
+        // data cannot be read.
+        clipboard.on_lock(move |index| match index {
+            2 => script.set_busy(OPEN_ATTEMPTS),
+            3 => {
+                script.add_format(CF_TEXT, b"expansion\0".to_vec());
+                script.fail_read(CF_TEXT);
+            }
+            _ => {}
+        });
+        let mut lease = ClipboardLease::new(clipboard.clone()).unwrap();
+        let mut prepared = lease.prepare(text("expansion")).unwrap();
+        assert_eq!(
+            lease.write_prepared(&mut prepared),
+            Err("Clipboard is busy".into())
+        );
+        assert_eq!(lease.baseline, Capture::Untried);
+        assert_eq!(
+            lease.restore(),
+            Err("Clipboard payload cannot be verified".into())
+        );
+        assert_eq!(lease.baseline, Capture::Failed);
+        // Another application then replaces CF_TEXT in place with data that
+        // reads, would pass the whitelist and is not the paste's.
+        clipboard.add_format(CF_TEXT, b"unrelated\0".to_vec());
+        let replaced = clipboard.content();
+        drop(lease);
+        assert_eq!(clipboard.content(), replaced);
+        assert_eq!(clipboard.clears(), 1);
+    }
+    #[test]
+    fn restore_keeps_what_its_check_captured_when_its_write_is_busy() {
+        // The paste write's capture never gets the clipboard open; the
+        // explicit restore's check does and captures, then its write is
+        // busy. Drop compares against that capture and never captures again.
+        for rewritten in [true, false] {
+            let clipboard = MockClipboard::new(7, text("original"));
+            let script = clipboard.clone();
+            // Lock 2 writes the paste and every attempt at capturing it is
+            // busy; lock 3 is the restore's check, by which time the system
+            // lists CF_TEXT, and every attempt at the restore write is busy.
+            clipboard.on_lock(move |index| match index {
+                2 => script.set_busy(OPEN_ATTEMPTS),
+                3 => {
+                    script.add_format(CF_TEXT, b"expansion\0".to_vec());
+                    script.set_busy(OPEN_ATTEMPTS);
+                }
+                _ => {}
+            });
+            let mut lease = ClipboardLease::new(clipboard.clone()).unwrap();
+            let mut prepared = lease.prepare(text("expansion")).unwrap();
+            assert_eq!(
+                lease.write_prepared(&mut prepared),
+                Err("Clipboard is busy".into())
+            );
+            assert_eq!(lease.baseline, Capture::Untried);
+            assert_eq!(lease.restore(), Err("Clipboard is busy".into()));
+            let Capture::Captured(baseline) = &lease.baseline else {
+                panic!("captured by the restore's check");
+            };
+            assert_eq!(baseline.derived, vec![(CF_TEXT, b"expansion\0".to_vec())]);
+            if rewritten {
+                // Rewritten in place: a fresh capture would adopt it.
+                clipboard.add_format(CF_TEXT, b"unrelated\0".to_vec());
+            }
+            let expected = if rewritten {
+                clipboard.content()
+            } else {
+                text("original")
+            };
+            drop(lease);
+            assert_eq!(clipboard.content(), expected, "rewritten: {rewritten}");
+            let clears = if rewritten { 1 } else { 2 };
+            assert_eq!(clipboard.clears(), clears, "rewritten: {rewritten}");
+        }
     }
 }
