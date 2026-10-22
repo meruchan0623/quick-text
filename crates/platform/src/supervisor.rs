@@ -1752,6 +1752,80 @@ mod tests {
         assert_eq!(rig.state(), HealthState::Healthy);
     }
 
+    /// As above, but the blocked rebuild then fails. Its error is discarded
+    /// too: the published Failed stays, the one earlier failure is not
+    /// joined by a second and no retry is scheduled. `repair()` then enters
+    /// Recovering and starts the next attempt, with nothing running next to
+    /// it.
+    #[test]
+    fn a_failing_attempt_returning_into_an_open_circuit_is_discarded() {
+        let rig = Rig::healthy();
+        let engine_down = || {
+            rig.runtime
+                .pause_reasons()
+                .contains(PauseReasons::ENGINE_DOWN)
+        };
+        *rig.executor.status.lock() = Status::Down(ReasonCode::ExecutorTimeout);
+        *rig.executor.refuse.lock() = 2;
+        rig.step(MS);
+        rig.step(BACKOFF[0]);
+        assert_eq!(rig.failures(), 1, "attempt 1 failed normally");
+        assert_eq!(rig.state(), HealthState::Recovering);
+
+        let gate = block_first_rebuild(&rig);
+        rig.clock.advance(BACKOFF[1]);
+        let (stuck, _) = tick_into_blocked_rebuild(&rig, &gate);
+        rig.supervisor.report_driver_hung();
+        let latched = rig.runtime.health();
+        assert_eq!(latched.state, HealthState::Failed);
+        assert!(rig.runtime.failed_latched());
+        drop(gate.release);
+        stuck.join().unwrap();
+        assert_eq!(rig.executor.rebuild_count(), 2);
+        assert_eq!(*rig.executor.refuse.lock(), 0, "the blocked rebuild failed");
+
+        assert_eq!(rig.runtime.health(), latched, "Failed as published");
+        assert!(engine_down());
+        assert_eq!(rig.failures(), 1, "the discarded error is not counted");
+        {
+            let machine = rig.supervisor.machine.lock();
+            assert_eq!(machine.state, HealthState::Failed);
+            assert!(machine.in_flight.is_none());
+            assert_eq!(machine.next_attempt, None, "no retry");
+            assert_eq!(machine.verify_until, None);
+        }
+        rig.step(BACKOFF[4]);
+        assert_eq!(rig.state(), HealthState::Failed);
+        assert!(engine_down());
+        assert_eq!(rig.failures(), 1);
+        assert_eq!(rig.executor.rebuild_count(), 2, "no attempt while Failed");
+
+        // repair(): Recovering, then attempt 3, alone.
+        let gate = block_first_rebuild(&rig);
+        rig.supervisor.repair();
+        let (repairing, _) = tick_into_blocked_rebuild(&rig, &gate);
+        assert_eq!(rig.state(), HealthState::Recovering);
+        assert!(engine_down());
+        assert!(!rig.runtime.failed_latched());
+        assert_eq!(rig.failures(), 0, "repair resets the count");
+        assert_eq!(
+            rig.supervisor
+                .machine
+                .lock()
+                .in_flight
+                .map(|attempt| attempt.id),
+            Some(3)
+        );
+        assert_eq!(rig.executor.rebuild_count(), 3);
+        rig.step(MS);
+        assert_eq!(rig.executor.rebuild_count(), 3, "no overlapping attempt");
+        drop(gate.release);
+        repairing.join().unwrap();
+        assert_eq!(rig.executor.rebuild_count(), 3);
+        assert_eq!(rig.state(), HealthState::Healthy);
+        assert!(!engine_down());
+    }
+
     #[test]
     fn engine_down_clears_on_recovery_and_manual_stays() {
         let rig = Rig::healthy();
