@@ -114,6 +114,9 @@ pub(super) struct KeyRecord {
     /// Capture time ([`KeyInfo::time`]); macro delays are measured between
     /// capture times, not when the consumer gets to a record (M1).
     pub(super) time: u32,
+    /// The recording session current when the key happened
+    /// ([`recording_session`]): only that recording takes it (M2).
+    pub(super) session: u64,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) enum HookRecord {
@@ -128,19 +131,23 @@ pub(super) enum HookRecord {
     Cancel {
         session: u64,
     },
-    /// A click or wheel message, with its capture time.
+    /// A click or wheel message, with its capture time and recording
+    /// session (as for [`KeyRecord`]).
     Mouse {
         msg: u32,
         data: u32,
         x: i32,
         y: i32,
         time: u32,
+        session: u64,
     },
-    /// A pointer move (macro recording only), with its capture time.
+    /// A pointer move (macro recording only), with its capture time and
+    /// recording session.
     Move {
         x: i32,
         y: i32,
         time: u32,
+        session: u64,
     },
 }
 
@@ -262,6 +269,7 @@ pub(super) fn on_key(
         generation,
         acceptance,
         time: key.time,
+        session: recording_session(),
     }));
     HookAction::Pass
 }
@@ -330,11 +338,14 @@ pub(super) fn on_mouse(pipe: &HookPipe, shared: &Shared, mouse: MouseInfo) {
         }
         pipe.keys.set(button, down);
     }
+    // M2: stamped like keys, so only the recording current now takes it.
+    let session = recording_session();
     if mouse.msg == WM_MOUSEMOVE {
         pipe.lane.push(HookRecord::Move {
             x: mouse.x,
             y: mouse.y,
             time: mouse.time,
+            session,
         });
         return;
     }
@@ -348,6 +359,7 @@ pub(super) fn on_mouse(pipe: &HookPipe, shared: &Shared, mouse: MouseInfo) {
         x: mouse.x,
         y: mouse.y,
         time: mouse.time,
+        session,
     });
 }
 /// What the mouse hook runs: [`on_mouse`] with panics contained.

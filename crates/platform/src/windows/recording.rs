@@ -55,16 +55,25 @@ pub(super) fn capture_gap(from: u32, to: u32) -> u64 {
         u64::from(gap).min(MAX_DELAY_MS)
     }
 }
-/// Records `operation`, captured by a hook at tick `time`. The caller has
-/// already dropped input aimed at our own windows. Delays come from capture
-/// times, so a consumer that drains late keeps the user's timing (M1).
-pub(super) fn record_event(shared: &Shared, operation: Operation, time: u32) {
+/// Records `operation`, captured by a hook at tick `time` during recording
+/// session `session`. The caller has already dropped input aimed at our own
+/// windows. Delays come from capture times, so a consumer that drains late
+/// keeps the user's timing (M1). Input from another session (captured
+/// during an earlier recording, or between two, and drained only now) is
+/// dropped before it touches anything, so it can neither enter this
+/// recording nor leave a held key or button for the stop to release (M2).
+pub(super) fn record_event(shared: &Shared, operation: Operation, time: u32, session: u64) {
     let Ok(mut recorded) = shared.recording.try_lock() else {
         return;
     };
     let Some(rows) = recorded.as_mut() else {
         return;
     };
+    let current = SESSION.load(Ordering::SeqCst);
+    if session != current {
+        tracing::debug!(event = "recording.event_stale", session, current);
+        return;
+    }
     let mut meta = RECORD_META.lock().unwrap();
     if meta.stopped || rows.len() + 2 >= MAX_STEPS {
         return;

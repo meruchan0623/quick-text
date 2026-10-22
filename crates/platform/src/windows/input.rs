@@ -272,6 +272,7 @@ impl Consumer {
                         Operation::KeyUp { key: code }
                     },
                     key.time,
+                    key.session,
                 );
                 if !key.down {
                     return;
@@ -291,29 +292,41 @@ impl Consumer {
                 x,
                 y,
                 time,
+                session,
             } => {
                 if let Some(operation) = mouse_operation(msg, data) {
-                    self.record_pointer(shared, operation, x, y, time);
+                    self.record_pointer(shared, operation, (x, y), time, session);
                 }
             }
-            HookRecord::Move { x, y, time } => {
-                self.record_pointer(shared, pointer_move(x, y), x, y, time)
-            }
+            HookRecord::Move {
+                x,
+                y,
+                time,
+                session,
+            } => self.record_pointer(shared, pointer_move(x, y), (x, y), time, session),
         }
     }
-    /// Records a key operation captured at `time` unless one of our own
-    /// windows has the focus.
-    fn record_key(&self, shared: &Shared, operation: Operation, time: u32) {
+    /// Records a key operation captured at `time` during recording session
+    /// `session` unless one of our own windows has the focus.
+    fn record_key(&self, shared: &Shared, operation: Operation, time: u32, session: u64) {
         if recording(shared) && !(self.own.foreground)() {
-            record_event(shared, operation, time);
+            record_event(shared, operation, time, session);
         }
     }
-    /// Records a pointer operation captured at `time` unless the pointer is
-    /// over, or the focus is in, one of our own windows. Hit-testing runs
-    /// only while a recording is active, never on the hook.
-    fn record_pointer(&self, shared: &Shared, operation: Operation, x: i32, y: i32, time: u32) {
+    /// Records a pointer operation captured at `time` during recording
+    /// session `session` unless the pointer (at `x`, `y`) is over, or the
+    /// focus is in, one of our own windows. Hit-testing runs only while a
+    /// recording is active, never on the hook.
+    fn record_pointer(
+        &self,
+        shared: &Shared,
+        operation: Operation,
+        (x, y): (i32, i32),
+        time: u32,
+        session: u64,
+    ) {
         if recording(shared) && !(self.own.at)(x, y) && !(self.own.foreground)() {
-            record_event(shared, operation, time);
+            record_event(shared, operation, time, session);
         }
     }
     fn detect(

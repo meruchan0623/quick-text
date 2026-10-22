@@ -896,16 +896,19 @@ fn a_stop_before_the_first_recorded_event_still_holds() {
     assert_eq!(recorded(&shared), [key_down(0x44), key_up(0x44)]);
 }
 
-/// M2: a stop gesture stops only the recording it was pressed in. The
-/// consumer stalls while the user presses the gesture during recording A,
-/// once with room in the hook queue (a queued stop record) and once with
-/// the queue full (the overflow stop); the app finishes and takes A and
-/// starts B before the consumer catches up. That stop is stale: B keeps
-/// recording what follows.
+/// M2: a recording takes only what was captured during it. The consumer
+/// stalls while the user types, clicks, moves the pointer and presses the
+/// stop gesture during recording A, once with room in the hook queue (the
+/// stop travels as a queued record) and once with the queue full (the
+/// overflow stop); the app finishes and takes A and starts B before the
+/// consumer catches up. Everything from A is stale: its stop does not stop
+/// B, none of its input enters B, and ending B releases nothing A pressed.
 #[test]
-fn a_stop_from_a_finished_recording_never_stops_the_next_one() {
+fn nothing_from_a_finished_recording_reaches_the_next_one() {
     let _serial = serial();
-    for capacity in [32, 3] {
+    // A's key, click, move and the gesture's Ctrl and Shift fill a queue of
+    // 5, so the stop overflows it; 32 queues the stop as well.
+    for capacity in [32, 5] {
         let shared = engine("btw");
         let hooks = HookPipe::new(leaked_keys(), capacity, false, nothing);
         let raw = Lane::new(4, nothing);
@@ -913,8 +916,10 @@ fn a_stop_from_a_finished_recording_never_stops_the_next_one() {
         let mut consumer = Consumer::with_windows(NOT_OURS);
         begin_recording(&shared);
         handle_key(&hooks, &shared, &probe, WM_KEYDOWN, key_at(0x41, 0));
+        handle_mouse(&hooks, &shared, mouse_at(WM_LBUTTONDOWN, 1, 1, 4));
+        handle_mouse(&hooks, &shared, mouse_at(WM_MOUSEMOVE, 2, 2, 8));
         stop_gesture(&hooks, &shared, &probe, 10);
-        let overflowed = u64::from(capacity == 3);
+        let overflowed = u64::from(capacity == 5);
         assert_eq!(hooks.lane().dropped(), overflowed, "capacity {capacity}");
         // The app ends A and starts B; the consumer has drained nothing.
         assert!(recorded(&shared).is_empty(), "capacity {capacity}");
@@ -923,10 +928,20 @@ fn a_stop_from_a_finished_recording_never_stops_the_next_one() {
         after_stop(&hooks, &shared, &probe, 0x43, &mut || {
             drain(&mut consumer, &shared, &hooks, &raw, &probe);
         });
-        let b = recorded(&shared);
-        for step in [key_down(0x43), key_up(0x43), left(ButtonState::Down)] {
-            assert!(b.contains(&step), "capacity {capacity}: {b:?}");
-        }
+        // Exactly B's own input: no key, click, move or gesture press of
+        // A, and no release of A's key or button when B ends.
+        assert_eq!(
+            recorded(&shared),
+            [
+                key_down(0x43),
+                key_up(0x43),
+                delay(100),
+                left(ButtonState::Down),
+                delay(100),
+                left(ButtonState::Up),
+            ],
+            "capacity {capacity}"
+        );
     }
 }
 
