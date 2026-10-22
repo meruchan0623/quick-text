@@ -3,6 +3,7 @@
 mod atomic;
 mod load;
 mod metadata;
+mod prefs;
 mod revisions;
 
 pub use metadata::merge_import_metadata;
