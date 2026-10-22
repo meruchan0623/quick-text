@@ -3,8 +3,9 @@
 # Jobs and triggers (names match the plan; branch protection should require
 # rust-windows, rust-portable, deps and frontend):
 #
-#   rust-windows   every PR and push   fmt -> hook-module lints (S-02) -> clippy -> tests
-#                                      (plain, then with mock + fault-injection)
+#   rust-windows   every PR and push   fmt -> hook-module lints (S-02) -> source allowlist
+#                                      (B-51) -> clippy -> tests (plain, then with mock +
+#                                      fault-injection)
 #   rust-portable  every PR            quicker-domain tests on Linux (platform independence)
 #   macos-check    every PR            cargo check --workspace (ADR-f: compile check only)
 #   deps           every PR; weekly    dependency direction + cargo deny (B-51); the
@@ -67,6 +68,12 @@ jobs:
       # Fails when crates/platform/src/windows/{hook,rawinput}.rs are missing.
       - name: Hook-module lints (S-02)
         run: pwsh -NoProfile -File scripts/check-hook-lints.ps1
+
+      # B-51: every workspace crate (and every tracked file inside one) must be covered by
+      # the source allowlist that feeds Source.zip. The release workflow repeats the check
+      # on the finished ZIP with -Strict.
+      - name: Source allowlist covers all crates (B-51)
+        run: pwsh -NoProfile -File scripts/check-source-allowlist.ps1
 
       # 0.5 removes the two -A flags (plan section 7.5).
       - name: Clippy

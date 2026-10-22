@@ -10,9 +10,10 @@
 #   * advisories: RustSec database; see the `deps` job in .github/workflows/ci.yml for how
 #     the (network dependent) advisories check is scheduled.
 #
-# When a new crate is added: run `cargo deny check`, read its license, and update
-# the source allowlist used by scripts/package-artifacts.ps1 if the crate is a new
-# workspace member (B-51).
+# When a new dependency is added: run `cargo deny check` and read its license.
+# When a new workspace crate (or a root-level build file) is added: update the source
+# allowlist in scripts/source-allowlist.ps1, which package-artifacts.ps1 and
+# package-portable.ps1 share; scripts/check-source-allowlist.ps1 fails CI otherwise (B-51).
 # Run locally: `cargo install cargo-deny --locked` then `cargo deny check`.
 
 [graph]

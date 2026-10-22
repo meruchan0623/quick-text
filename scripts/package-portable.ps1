@@ -2,6 +2,7 @@
 param([Parameter(Mandatory=$true)][string]$OutputDirectory)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'source-allowlist.ps1')
 $version = (Get-Content -LiteralPath (Join-Path $root 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json).version
 $output = [IO.Path]::GetFullPath($OutputDirectory)
 $name = "Quicker-Text-$version-Windows-x64-Portable"
@@ -16,21 +17,12 @@ Copy-Item -LiteralPath $exe -Destination (Join-Path $folder 'quicker-text.exe')
 Copy-Item -LiteralPath (Join-Path $root 'README.md'), (Join-Path $root 'LICENSE'), (Join-Path $root 'THIRD_PARTY_NOTICES.md'), (Join-Path $root 'docs\windows-0.3.0-refactor.md'), (Join-Path $root 'docs\windows-0.3.1-notes.md') -Destination $folder
 Copy-Item -LiteralPath (Join-Path $root 'vendor\espanso-win32\LICENSE') -Destination (Join-Path $folder 'LICENSE-ESPANSO-GPL-3.0.txt')
 # Carry the actual corresponding source, including patched upstream code and build scripts.
-# Explicit allowlist excludes user configuration, imports, logs and workspace snapshots.
+# The explicit allowlist excludes user configuration, imports, logs and workspace snapshots.
 $source = Join-Path $folder 'source'
 New-Item -ItemType Directory -Path $source | Out-Null
-$files = @('Cargo.toml','Cargo.lock','package.json','package-lock.json','index.html','tsconfig.json','vite.config.ts','.gitignore','LICENSE','README.md','THIRD_PARTY_NOTICES.md','src-tauri\Cargo.toml','src-tauri\build.rs','src-tauri\tauri.conf.json')
-$dirs = @('crates','vendor','src','scripts','docs','src-tauri\src','src-tauri\icons','src-tauri\capabilities')
-foreach ($dir in $dirs) {
-    $path = Join-Path $root $dir
-    if (Test-Path -LiteralPath $path) {
-        foreach ($file in Get-ChildItem -LiteralPath $path -File -Recurse) {
-            $relative = [IO.Path]::GetRelativePath($root, $file.FullName)
-            if ($relative -match '(^|[\\/])(target|node_modules|\.git)([\\/]|$)') { continue }
-            $files += $relative
-        }
-    }
-}
+# The allowlist is shared with package-artifacts.ps1 and check-source-allowlist.ps1:
+# scripts/source-allowlist.ps1 (update it when a crate or a root-level build file is added, B-51).
+$files = @(Get-SourceAllowlist -ProjectRoot $root)
 foreach ($relative in ($files | Sort-Object -Unique)) {
     $destination = Join-Path $source $relative
     New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
