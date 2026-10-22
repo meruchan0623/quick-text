@@ -169,3 +169,4 @@ pub fn stop_recording(shared: &Arc<Shared>) -> Result<ActionPlan, String> {
         ..Default::default()
     })
 }
+pub mod history;
