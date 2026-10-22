@@ -747,6 +747,7 @@ fn run_consumer(
     let mut liveness = Liveness::new(&SOURCES);
     while !shared.shutdown.load(Ordering::SeqCst) {
         let drained = catch_unwind(AssertUnwindSafe(|| {
+            session::inject_fault(&session::SESSION_END);
             let handled = consumer.drain(&shared, hooks, raw, &WinForeground, &mut |candidate| {
                 // A lost hook leaves the key mirror and focus epochs stale:
                 // nothing is injected until it is back (B-06).

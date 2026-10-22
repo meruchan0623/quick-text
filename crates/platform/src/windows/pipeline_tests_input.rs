@@ -19,7 +19,7 @@ use super::input::{
 use super::keystate::{AsyncKeyProbe, KeyBits, MODIFIER_VERIFY_AFTER};
 use super::liveness::{MATCH_WINDOW, MISS_LIMIT};
 use super::rawinput::{raw_record, InputEvent, RawRecord, KEYBOARD_LAYOUT_CACHE_INTERVAL};
-use super::session::{SessionSignals, Signal};
+use super::session::{end_message, SessionEnd, SessionSignals, Signal};
 use super::*;
 use crate::health::{Component, ComponentHealth, HealthState, ReasonCode};
 use crate::mock::{FakeClock, MockForeground};
@@ -1610,4 +1610,121 @@ fn keys_before_start_are_not_held_against_the_hooks() {
     sources.start();
     assert_eq!(pipe.settle(&clock, &mut liveness), None);
     assert!(sources.hooks_ready());
+}
+
+/// A session-end callback that records `name` when it runs.
+fn recorder(
+    ran: &Arc<Mutex<Vec<&'static str>>>,
+    name: &'static str,
+) -> Box<dyn Fn() + Send + Sync> {
+    let ran = ran.clone();
+    Box::new(move || ran.lock().unwrap().push(name))
+}
+
+/// B-04: WM_QUERYENDSESSION is answered TRUE at once and runs nothing, a
+/// cancelled shutdown (WM_ENDSESSION with wParam FALSE) runs nothing, and
+/// the real end runs every callback once, in registration order.
+#[test]
+fn the_session_end_runs_callbacks_once_and_never_vetoes_a_shutdown() {
+    let end = SessionEnd::new();
+    let ran = Arc::new(Mutex::new(Vec::new()));
+    end.register(recorder(&ran, "first"));
+    end.register(recorder(&ran, "second"));
+    let (answers, lines) = capture::logs(|| {
+        [
+            end_message(&end, WM_QUERYENDSESSION, 0, "system"),
+            end_message(&end, WM_ENDSESSION, 0, "system"),
+        ]
+    });
+    assert_eq!(answers, [Some(1), Some(0)]);
+    assert!(lines.is_empty(), "{lines:?}");
+    assert!(ran.lock().unwrap().is_empty());
+    let (answers, lines) = capture::logs(|| {
+        [
+            end_message(&end, WM_QUERYENDSESSION, 0, "system"),
+            end_message(&end, WM_ENDSESSION, 1, "system"),
+            end_message(&end, WM_ENDSESSION, 1, "system"),
+        ]
+    });
+    assert_eq!(answers, [Some(1), Some(0), Some(0)]);
+    assert_eq!(
+        lines,
+        [line(
+            r#"INFO event="session.end" source="system" callbacks=2"#
+        )]
+    );
+    assert_eq!(*ran.lock().unwrap(), ["first", "second"]);
+    // A callback registered after the end never runs.
+    end.register(recorder(&ran, "late"));
+    assert!(!end.fire("system"));
+    assert_eq!(*ran.lock().unwrap(), ["first", "second"]);
+}
+
+/// Every other message goes on to the resync signals and the default
+/// window procedure.
+#[test]
+fn other_messages_are_not_session_end_messages() {
+    let end = SessionEnd::new();
+    let ran = Arc::new(Mutex::new(Vec::new()));
+    end.register(recorder(&ran, "only"));
+    for (msg, wparam) in [
+        (WM_POWERBROADCAST, PBT_APMSUSPEND as usize),
+        (WM_POWERBROADCAST, PBT_APMRESUMESUSPEND as usize),
+        (WM_WTSSESSION_CHANGE, WTS_SESSION_LOGOFF as usize),
+        (WM_CLOSE, 1),
+        (WM_DESTROY, 1),
+    ] {
+        assert_eq!(end_message(&end, msg, wparam, "system"), None);
+    }
+    assert!(ran.lock().unwrap().is_empty());
+}
+
+/// A panicking callback is logged and the rest still run; a callback that
+/// registers another one does not deadlock.
+#[test]
+fn a_panicking_or_registering_callback_does_not_stop_the_others() {
+    static END: SessionEnd = SessionEnd::new();
+    let ran = Arc::new(Mutex::new(Vec::new()));
+    END.register(Box::new(|| panic!("session-end callback failed")));
+    END.register(Box::new(|| END.register(Box::new(nothing))));
+    END.register(recorder(&ran, "last"));
+    let (fired, lines) = capture::logs(|| END.fire("system"));
+    assert!(fired);
+    assert_eq!(
+        lines,
+        [
+            line(r#"INFO event="session.end" source="system" callbacks=3"#),
+            line(r#"ERROR event="session.end_callback_panic" index=0"#),
+        ]
+    );
+    assert_eq!(*ran.lock().unwrap(), ["last"]);
+}
+
+/// The session_end fault replays both shutdown messages once.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn the_session_end_fault_replays_the_shutdown_messages() {
+    use super::session::inject_fault;
+    use crate::fault::{self, FaultPoint};
+    let _serial = serial();
+    let end = SessionEnd::new();
+    let ran = Arc::new(Mutex::new(Vec::new()));
+    end.register(recorder(&ran, "marker"));
+    let (_, lines) = capture::logs(|| inject_fault(&end));
+    assert!(lines.is_empty(), "{lines:?}");
+    assert!(ran.lock().unwrap().is_empty());
+    fault::debug_inject_fault(FaultPoint::SessionEnd, 0);
+    let (_, lines) = capture::logs(|| {
+        inject_fault(&end);
+        inject_fault(&end);
+    });
+    fault::disarm(FaultPoint::SessionEnd);
+    assert_eq!(
+        lines,
+        [
+            line(r#"WARN event="fault.injected" point="session_end""#),
+            line(r#"INFO event="session.end" source="fault" callbacks=1"#),
+        ]
+    );
+    assert_eq!(*ran.lock().unwrap(), ["marker"]);
 }

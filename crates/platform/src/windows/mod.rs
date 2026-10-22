@@ -43,6 +43,7 @@ pub use input::{engine_ready, input_status, native_ready};
 pub use input::{input_health, reattach};
 pub use recording::finish_recording;
 pub use selection::capture_selection;
+pub use session::on_session_end;
 const MARK: usize = 0x51545854;
 static LAST_GATE: OnceLock<Mutex<String>> = OnceLock::new();
 fn gate(reason: &str) {

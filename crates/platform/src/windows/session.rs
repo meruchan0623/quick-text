@@ -10,6 +10,11 @@
 //! consumer; the resync itself (which reads the asynchronous key state)
 //! runs on the consumer. Tests use [`signal_for`] and local
 //! [`SessionSignals`]; nothing in this module runs a window in tests.
+//!
+//! The same window answers the shutdown messages: `WM_QUERYENDSESSION` is
+//! answered TRUE at once (never vetoes or delays a shutdown), and
+//! `WM_ENDSESSION` for a session that really ends runs the callbacks
+//! registered with [`on_session_end`] once ([`SessionEnd`]).
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -17,7 +22,10 @@
     clippy::indexing_slicing
 )]
 use super::*;
+use crate::fault::{self, FaultPoint};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::AtomicU32;
+use std::sync::PoisonError;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
@@ -115,6 +123,100 @@ fn raise(signal: Signal) {
     super::input::wake();
 }
 
+/// A callback run when the Windows session ends (shutdown, restart or
+/// logoff).
+pub(super) type SessionEndCallback = Box<dyn Fn() + Send + Sync>;
+
+/// Callbacks for the end of the session (B-04), run at most once per
+/// process: Windows may end the process at any time after `WM_ENDSESSION`
+/// returns, so nothing after the first end is ever needed.
+pub(super) struct SessionEnd {
+    callbacks: Mutex<Vec<SessionEndCallback>>,
+    fired: AtomicBool,
+}
+impl SessionEnd {
+    pub(super) const fn new() -> Self {
+        Self {
+            callbacks: Mutex::new(Vec::new()),
+            fired: AtomicBool::new(false),
+        }
+    }
+    pub(super) fn register(&self, callback: SessionEndCallback) {
+        self.callbacks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(callback);
+    }
+    /// Runs every registered callback once, in registration order, on the
+    /// calling thread. A panicking callback is logged and does not stop
+    /// the others. Returns false when the session already ended.
+    pub(super) fn fire(&self, source: &'static str) -> bool {
+        if self.fired.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        // Taken out of the lock so a callback that registers another one
+        // cannot deadlock.
+        let callbacks = std::mem::take(
+            &mut *self
+                .callbacks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        tracing::info!(event = "session.end", source, callbacks = callbacks.len());
+        for (index, callback) in callbacks.iter().enumerate() {
+            if catch_unwind(AssertUnwindSafe(callback)).is_err() {
+                tracing::error!(event = "session.end_callback_panic", index);
+            }
+        }
+        true
+    }
+}
+pub(super) static SESSION_END: SessionEnd = SessionEnd::new();
+
+/// Registers a callback for the end of the Windows session (shutdown,
+/// restart or logoff). Callbacks run once, in registration order, on the
+/// session window thread while it handles `WM_ENDSESSION`, and Windows may
+/// end the process as soon as they return: keep them short and limited to
+/// the I/O that must happen before the process dies (no waiting on other
+/// threads, no UI). A callback registered after the session ended never
+/// runs.
+pub fn on_session_end(callback: Box<dyn Fn() + Send + Sync>) {
+    SESSION_END.register(callback);
+}
+
+/// The answer to a shutdown message, or `None` for any other message.
+/// `WM_QUERYENDSESSION` is answered TRUE at once: the shutdown is never
+/// vetoed or delayed. `WM_ENDSESSION` runs the callbacks when the session
+/// really ends (wParam TRUE), not when another application cancelled it.
+pub(super) fn end_message(
+    end: &SessionEnd,
+    msg: u32,
+    wparam: WPARAM,
+    source: &'static str,
+) -> Option<LRESULT> {
+    match msg {
+        WM_QUERYENDSESSION => Some(1),
+        WM_ENDSESSION => {
+            if wparam != 0 {
+                end.fire(source);
+            }
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
+/// The `session_end` fault (B-04): replays the shutdown messages through
+/// [`end_message`] as if Windows had sent them. Like a real shutdown it
+/// latches [`SessionEnd`]; the scenario ends the process right after.
+pub(super) fn inject_fault(end: &SessionEnd) {
+    if fault::take(FaultPoint::SessionEnd).is_some() {
+        tracing::warn!(event = "fault.injected", point = "session_end");
+        end_message(end, WM_QUERYENDSESSION, 0, "fault");
+        end_message(end, WM_ENDSESSION, 1, "fault");
+    }
+}
+
 /// How often a failed session-notification registration is retried: early
 /// at boot the session service may not accept it yet (待实测).
 const REGISTER_RETRY: Duration = Duration::from_secs(5);
@@ -122,6 +224,11 @@ const REGISTER_RETRY: Duration = Duration::from_secs(5);
 const REGISTER_ATTEMPTS: u32 = 12;
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    // 待实测: that the hidden window receives both messages, and how much of
+    // the shutdown time budget the callbacks may use.
+    if let Some(answer) = end_message(&SESSION_END, msg, w, "system") {
+        return answer;
+    }
     if let Some(signal) = signal_for(msg, w) {
         raise(signal);
     }
