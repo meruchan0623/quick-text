@@ -15,40 +15,12 @@ import {
 import ActionEditor from './ActionEditor';
 import CaptureTemplate from './CaptureTemplate';
 import RuntimeStatus from './RuntimeStatus';
+import { useAsk } from './Ask';
+import { Modal } from './Modal';
+import { every } from './lib/timers';
 
 const errorText = (e: unknown) =>
   typeof e === 'string' ? e : e instanceof Error ? e.message : JSON.stringify(e, null, 2);
-function Modal({
-  children,
-  className,
-  onClose,
-  title,
-}: {
-  children: React.ReactNode;
-  className: string;
-  onClose: () => void;
-  title: string;
-}) {
-  const ref = useRef<HTMLDialogElement>(null);
-  useEffect(() => {
-    const modal = ref.current;
-    modal?.showModal();
-    return () => modal?.close();
-  }, []);
-  return (
-    <dialog
-      aria-label={title}
-      ref={ref}
-      className={className}
-      onCancel={(e) => {
-        e.preventDefault();
-        onClose();
-      }}
-    >
-      {children}
-    </dialog>
-  );
-}
 function Field({
   label,
   children,
@@ -56,7 +28,7 @@ function Field({
 }: {
   label: string;
   children: React.ReactNode;
-  hint?: string;
+  hint?: string | undefined;
 }) {
   return (
     <label className="field">
@@ -104,7 +76,13 @@ export default function App() {
     [sort, setSort] = useState<'match' | 'group'>('match'),
     [localDirty, setLocalDirty] = useState(false);
   const [editingErrors, setEditingErrors] = useState<Data[]>([]);
-  useEffect(() => setEditingErrors([]), [editing?.id]);
+  // Clear the editor's validation errors when another rule is opened.
+  const [errorsFor, setErrorsFor] = useState(editing?.id);
+  if (errorsFor !== editing?.id) {
+    setErrorsFor(editing?.id);
+    setEditingErrors([]);
+  }
+  const { askDialog, confirmAction, askValue } = useAsk();
   const edited = useRef(false);
   const modeCache = useRef(
     new Map<
@@ -161,16 +139,17 @@ export default function App() {
         receive(s);
         setMessage('已连接 · 保存写入草稿，应用设置后生效');
       })
-      .catch((e) => setError(errorText(e)));
+      .catch((e: unknown) => setError(errorText(e)));
   }, []);
   useEffect(() => {
     if (!('__TAURI_INTERNALS__' in window)) return;
-    const timer = setInterval(() => {
+    return every(2000, () => {
       call<State>('load_state')
         .then(setState)
-        .catch(() => {});
-    }, 2000);
-    return () => clearInterval(timer);
+        .catch(() => {
+          // Keep showing the last known state; the next poll retries.
+        });
+    });
   }, []);
   const change = (c: Config) => {
     setConfig(c);
@@ -210,10 +189,19 @@ export default function App() {
     run(async () => {
       const p = await choose('import');
       if (!p?.length) return;
-      const strategy = window.prompt(
-        '冲突策略：merge（保留现有）、keep_both（保留两份）、replace（替换全部）',
-        'merge',
-      );
+      const strategy = await askValue({
+        title: '遇到重复的指令时怎么处理？',
+        confirm: '导入',
+        input: {
+          label: '冲突策略',
+          value: 'merge',
+          options: [
+            { value: 'merge', label: '保留现有（merge）' },
+            { value: 'keep_both', label: '保留两份（keep_both）' },
+            { value: 'replace', label: '替换全部（replace）' },
+          ],
+        },
+      });
       if (!strategy) return;
       const r = await call('import_config', { path: p[0], strategy });
       setDialog({ title: '导入预览 · 确认后写入草稿', data: r.report, importConfig: r.config });
@@ -341,19 +329,31 @@ export default function App() {
             </button>
             <button
               disabled={!selected.length}
-              onClick={() => {
-                const g = prompt('移至分组', '默认');
+              onClick={async () => {
+                const g = await askValue({
+                  title: `把所选 ${selected.length} 条指令移到哪个分组？`,
+                  confirm: '移动',
+                  input: { label: '分组名称', value: '默认' },
+                });
                 if (g)
-                  mutate((rs) => rs.map((r) => (selectedSet.has(r.id) ? { ...r, group: g } : r)));
+                  void mutate((rs) =>
+                    rs.map((r) => (selectedSet.has(r.id) ? { ...r, group: g } : r)),
+                  );
               }}
             >
               移至分组
             </button>
             <button
               disabled={!selected.length}
-              onClick={() => {
-                if (confirm(`删除所选 ${selected.length} 条指令？此操作保存至草稿。`))
-                  mutate((rs) => rs.filter((r) => !selectedSet.has(r.id)));
+              onClick={async () => {
+                if (
+                  await confirmAction({
+                    title: `删除所选 ${selected.length} 条指令？`,
+                    detail: '此操作保存至草稿。',
+                    confirm: '删除',
+                  })
+                )
+                  void mutate((rs) => rs.filter((r) => !selectedSet.has(r.id)));
               }}
             >
               删除
@@ -454,9 +454,14 @@ export default function App() {
                     <td className="row-tools">
                       <button onClick={() => setEditing(clone(r))}>编辑</button>
                       <button
-                        onClick={() => {
-                          if (confirm(`删除指令“${r.match.value}”？`))
-                            mutate((rs) => rs.filter((x) => x.id !== r.id));
+                        onClick={async () => {
+                          if (
+                            await confirmAction({
+                              title: `删除指令“${r.match.value}”？`,
+                              confirm: '删除',
+                            })
+                          )
+                            void mutate((rs) => rs.filter((x) => x.id !== r.id));
                         }}
                       >
                         删除
@@ -614,20 +619,18 @@ export default function App() {
               刷新状态
             </button>
             <button
-              onClick={() =>
-                run(async () => {
-                  if (confirm('放弃全部未应用草稿？')) receive(await call<State>('discard_draft'));
-                })
-              }
+              onClick={async () => {
+                if (await confirmAction({ title: '放弃全部未应用草稿？', confirm: '放弃草稿' }))
+                  void run(async () => receive(await call<State>('discard_draft')));
+              }}
             >
               放弃未应用草稿
             </button>
             <button
-              onClick={() =>
-                run(async () => {
-                  if (confirm('回滚到上一个生效版本？')) receive(await call<State>('rollback'));
-                })
-              }
+              onClick={async () => {
+                if (await confirmAction({ title: '回滚到上一个生效版本？', confirm: '回滚' }))
+                  void run(async () => receive(await call<State>('rollback')));
+              }}
             >
               恢复上一个版本
             </button>
@@ -862,10 +865,17 @@ export default function App() {
                   />
                 )}
                 <button
-                  onClick={() => {
-                    const input = prompt('输入一段文字，检查是否会触发指令', editing.match.value);
+                  onClick={async () => {
+                    const input = await askValue({
+                      title: '用哪段文字检查？',
+                      confirm: '检查',
+                      input: {
+                        label: '输入一段文字，检查是否会触发指令',
+                        value: editing.match.value,
+                      },
+                    });
                     if (input !== null)
-                      run(async () =>
+                      void run(async () =>
                         setDialog({
                           title: '查看是否匹配及附带内容',
                           data: await call('test_rule', { rule: editing, input }),
@@ -961,6 +971,7 @@ export default function App() {
           </div>
         </Modal>
       )}
+      {askDialog}
     </div>
   );
 }

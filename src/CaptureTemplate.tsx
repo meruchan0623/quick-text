@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 type Row = { id: string; name: string; group: number };
 const serialize = (xs: Row[]) => xs.map((r) => `${r.name}={$${r.group}}`).join('&');
 const parseRows = (value: string): Row[] =>
@@ -21,9 +21,12 @@ export default function CaptureTemplate({
   onChange: (s: string) => void;
 }) {
   const [rows, setRows] = useState<Row[]>(() => parseRows(value));
-  useEffect(() => {
+  // Re-parse when the template changes from outside (not from our own edits).
+  const [seen, setSeen] = useState(value);
+  if (seen !== value) {
+    setSeen(value);
     setRows((current) => (value === serialize(current) ? current : parseRows(value)));
-  }, [value]);
+  }
   const compatible = rows.every((r) => r.group > 0);
   const save = (xs: Row[]) => {
     setRows(xs);

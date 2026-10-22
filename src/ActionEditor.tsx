@@ -1,8 +1,9 @@
 import { useRef, useState } from 'react';
 import { call } from './bridge';
 import { actionChoice, actionLabel, actionOptions, clone, Data, Rule } from './model';
+import { moveItem, withoutKey } from './lib/list';
 type Props = {
-  platform?: string;
+  platform?: string | undefined;
   rules: Rule[];
   action: Data;
   diagnostics?: Data[];
@@ -218,7 +219,7 @@ function Shortcut({
   onChange,
   platform,
 }: {
-  platform?: string;
+  platform?: string | undefined;
   value: Data[];
   onChange: (ks: Data[]) => void;
 }) {
@@ -308,7 +309,9 @@ export default function ActionEditor({
       try {
         const ds = JSON.parse(typeof e === 'string' ? e : String(e));
         if (Array.isArray(ds)) setDiagnostics(ds);
-      } catch {}
+      } catch {
+        // Not a diagnostics payload; the caller reports the original error.
+      }
       throw e;
     }
   };
@@ -361,7 +364,8 @@ export default function ActionEditor({
         i === stepIndex ? { ...s, operation: { ...s.operation, ...patch } } : s,
       ),
     );
-  const o: Data = steps[stepIndex]?.operation ?? {};
+  const current: Data | undefined = steps[stepIndex];
+  const o: Data = current?.operation ?? {};
   const parse = async (dialect: string, s: string) => {
     const r = await call('parse_source', { dialect, source: s });
     if (r.plan) {
@@ -377,7 +381,7 @@ export default function ActionEditor({
   };
   const addStep = () => {
     if (command === 'sendkeys') {
-      run(async () => {
+      void run(async () => {
         const sequence =
           mods.map((m) => (m === 'Ctrl' ? '^' : m === 'Shift' ? '+' : '%')).join('') +
           `{${bKey} ${repeat}}`;
@@ -388,7 +392,7 @@ export default function ActionEditor({
       return;
     }
     if (command === 'input2') {
-      run(async () => {
+      void run(async () => {
         const p = await parse('inputscript', 'input2:' + bText);
         updateSteps([...steps, ...p.steps]);
         setStepIndex(steps.length);
@@ -432,15 +436,17 @@ export default function ActionEditor({
       {[...inheritedDiagnostics, ...diagnostics].length > 0 && (
         <div className="action-diagnostics" role="alert">
           <strong>需要修改的设置 · 点击查看位置</strong>
-          {[...inheritedDiagnostics, ...diagnostics].map((d, i) => (
-            <button key={i} onClick={() => focusDiagnostic(d)}>
-              {String(d.path || '').match(/steps\[(\d+)\]/)
-                ? `步骤 ${Number(String(d.path).match(/steps\[(\d+)\]/)![1]) + 1}`
-                : '操作设置'}
-              {d.span?.line > 0 ? ` · 第 ${d.span.line} 行 / ${d.span.column || 1} 列` : ''} ·{' '}
-              {d.message}
-            </button>
-          ))}
+          {[...inheritedDiagnostics, ...diagnostics].map((d, i) => {
+            const step = /steps\[(\d+)\]/.exec(String(d.path || ''));
+            return (
+              <button key={i} onClick={() => focusDiagnostic(d)}>
+                {step ? `步骤 ${Number(step[1]) + 1}` : '操作设置'}
+                {d.span?.line > 0
+                  ? ` · 第 ${d.span.line} 行 / ${d.span.column || 1} 列`
+                  : ''} · {d.message}
+              </button>
+            );
+          })}
         </div>
       )}
       {capabilities
@@ -570,7 +576,9 @@ export default function ActionEditor({
                 {['{cliptext}', '{selection}', '{0:yyyy-MM-dd}', '{0:HH:mm:ss}'].map((v) => (
                   <button
                     key={v}
-                    onClick={() => edit({ source: { ...a.source, value: a.source.value + v } })}
+                    onClick={() =>
+                      edit({ source: { ...a.source, value: String(a.source.value) + v } })
+                    }
                   >
                     {
                       (
@@ -646,7 +654,7 @@ export default function ActionEditor({
                       .split('')
                       .map((c) => ('+^%~()[]{}'.includes(c) ? `{${c}}` : c))
                       .join('');
-                    edit({ source: { type: 'inline', value: a.source.value + literal } });
+                    edit({ source: { type: 'inline', value: String(a.source.value) + literal } });
                     setBText('');
                   }}
                 >
@@ -687,7 +695,7 @@ export default function ActionEditor({
                       source: {
                         type: 'inline',
                         value:
-                          a.source.value +
+                          String(a.source.value) +
                           mods
                             .map((m) => (m === 'Ctrl' ? '^' : m === 'Shift' ? '+' : '%'))
                             .join('') +
@@ -709,8 +717,10 @@ export default function ActionEditor({
                       .map((m) => (m === 'Ctrl' ? '^' : m === 'Shift' ? '+' : '%'))
                       .join('');
                     const groupSource =
-                      prefix + '(' + bGroup.map((k) => '{' + keyValue(k) + '}').join('') + ')';
-                    edit({ source: { type: 'inline', value: a.source.value + groupSource } });
+                      prefix + '(' + bGroup.map((k) => `{${String(keyValue(k))}}`).join('') + ')';
+                    edit({
+                      source: { type: 'inline', value: String(a.source.value) + groupSource },
+                    });
                     setBGroup([]);
                   }}
                 >
@@ -875,81 +885,80 @@ export default function ActionEditor({
               <small>
                 名称要与另一条指令需要的名称一致；内容可以是文字、数字、“是或否”，也可以留空。
               </small>
-              {Object.entries(a.parameters ?? {}).map(([name, value], i) => (
-                <div className="inline" key={i}>
-                  <input
-                    aria-label="参数名称"
-                    value={name}
-                    onChange={(e) => {
-                      const p = { ...a.parameters };
-                      delete p[name];
-                      p[e.target.value] = value;
-                      edit({ parameters: p });
-                    }}
-                  />
-                  <select
-                    aria-label="参数类型"
-                    value={value === null ? 'null' : typeof value}
-                    onChange={(e) =>
-                      edit({
-                        parameters: {
-                          ...a.parameters,
-                          [name]:
-                            e.target.value === 'boolean'
-                              ? true
-                              : e.target.value === 'number'
-                                ? 0
-                                : e.target.value === 'null'
-                                  ? null
-                                  : '',
-                        },
-                      })
-                    }
-                  >
-                    <option value="string">文字</option>
-                    <option value="number">数字</option>
-                    <option value="boolean">是或否</option>
-                    <option value="null">空值</option>
-                  </select>
-                  {typeof value === 'boolean' ? (
-                    <select
-                      aria-label="选择是或否"
-                      value={String(value)}
-                      onChange={(e) =>
-                        edit({ parameters: { ...a.parameters, [name]: e.target.value === 'true' } })
-                      }
-                    >
-                      <option value="true">是</option>
-                      <option value="false">否</option>
-                    </select>
-                  ) : (
+              {Object.entries<string | number | boolean | null>(a.parameters ?? {}).map(
+                ([name, value], i) => (
+                  <div className="inline" key={i}>
                     <input
-                      aria-label="参数值"
-                      disabled={value === null}
-                      type={typeof value === 'number' ? 'number' : 'text'}
-                      value={value === null ? '' : String(value)}
+                      aria-label="参数名称"
+                      value={name}
+                      onChange={(e) => {
+                        const p = withoutKey(a.parameters ?? {}, name);
+                        p[e.target.value] = value;
+                        edit({ parameters: p });
+                      }}
+                    />
+                    <select
+                      aria-label="参数类型"
+                      value={value === null ? 'null' : typeof value}
                       onChange={(e) =>
                         edit({
                           parameters: {
                             ...a.parameters,
                             [name]:
-                              typeof value === 'number' ? Number(e.target.value) : e.target.value,
+                              e.target.value === 'boolean'
+                                ? true
+                                : e.target.value === 'number'
+                                  ? 0
+                                  : e.target.value === 'null'
+                                    ? null
+                                    : '',
                           },
                         })
                       }
-                    />
-                  )}
-                  <button
-                    onClick={() => {
-                      const p = { ...a.parameters };
-                      delete p[name];
-                      edit({ parameters: p });
-                    }}
-                  >
-                    删除
-                  </button>
-                </div>
-              ))}
+                    >
+                      <option value="string">文字</option>
+                      <option value="number">数字</option>
+                      <option value="boolean">是或否</option>
+                      <option value="null">空值</option>
+                    </select>
+                    {typeof value === 'boolean' ? (
+                      <select
+                        aria-label="选择是或否"
+                        value={String(value)}
+                        onChange={(e) =>
+                          edit({
+                            parameters: { ...a.parameters, [name]: e.target.value === 'true' },
+                          })
+                        }
+                      >
+                        <option value="true">是</option>
+                        <option value="false">否</option>
+                      </select>
+                    ) : (
+                      <input
+                        aria-label="参数值"
+                        disabled={value === null}
+                        type={typeof value === 'number' ? 'number' : 'text'}
+                        value={value === null ? '' : String(value)}
+                        onChange={(e) =>
+                          edit({
+                            parameters: {
+                              ...a.parameters,
+                              [name]:
+                                typeof value === 'number' ? Number(e.target.value) : e.target.value,
+                            },
+                          })
+                        }
+                      />
+                    )}
+                    <button
+                      onClick={() => edit({ parameters: withoutKey(a.parameters ?? {}, name) })}
+                    >
+                      删除
+                    </button>
+                  </div>
+                ),
+              )}
               <button
                 onClick={() =>
                   edit({
@@ -996,7 +1005,8 @@ export default function ActionEditor({
             <button
               disabled={!history.length}
               onClick={() => {
-                const prev = history.at(-1)!;
+                const prev = history.at(-1);
+                if (!prev) return;
                 onChange(prev);
                 setHistory(history.slice(0, -1));
                 setStepIndex(0);
@@ -1132,10 +1142,7 @@ export default function ActionEditor({
                       onDragOver={(e) => e.preventDefault()}
                       onDrop={() => {
                         if (dragged.current !== null) {
-                          const xs = [...steps];
-                          const [v] = xs.splice(dragged.current, 1);
-                          xs.splice(i, 0, v);
-                          updateSteps(xs);
+                          updateSteps(moveItem(steps, dragged.current, i));
                           setStepIndex(i);
                           dragged.current = null;
                         }
@@ -1165,7 +1172,7 @@ export default function ActionEditor({
                   ))}
                 </ol>
                 <div ref={stepForm} className="step-form">
-                  {!steps.length ? (
+                  {!current ? (
                     <p className="muted">
                       先选择操作并点击“添加步骤”，再在这里填写文字、按键或鼠标位置。按从上到下的顺序执行，可拖动步骤调整顺序。
                     </p>
@@ -1378,7 +1385,7 @@ export default function ActionEditor({
                       <label className="field">
                         <span>这一步要在什么窗口执行</span>
                         <select
-                          value={steps[stepIndex].target.type}
+                          value={current.target.type}
                           onChange={(e) =>
                             updateSteps(
                               steps.map((s, i) =>
@@ -1399,11 +1406,11 @@ export default function ActionEditor({
                           <option value="declared">允许切换到指定程序</option>
                         </select>
                       </label>
-                      {steps[stepIndex].target.type === 'declared' && (
+                      {current.target.type === 'declared' && (
                         <input
                           aria-label="允许切换的程序名称（例如 notepad.exe）"
                           placeholder="允许切换的程序名称（例如 notepad.exe）"
-                          value={steps[stepIndex].target.process}
+                          value={current.target.process}
                           onChange={(e) =>
                             updateSteps(
                               steps.map((s, i) =>
@@ -1419,9 +1426,7 @@ export default function ActionEditor({
                         <button
                           disabled={stepIndex === 0}
                           onClick={() => {
-                            const x = [...steps];
-                            [x[stepIndex - 1], x[stepIndex]] = [x[stepIndex], x[stepIndex - 1]];
-                            updateSteps(x);
+                            updateSteps(moveItem(steps, stepIndex, stepIndex - 1));
                             setStepIndex(stepIndex - 1);
                           }}
                         >
@@ -1430,15 +1435,13 @@ export default function ActionEditor({
                         <button
                           disabled={stepIndex === steps.length - 1}
                           onClick={() => {
-                            const x = [...steps];
-                            [x[stepIndex + 1], x[stepIndex]] = [x[stepIndex], x[stepIndex + 1]];
-                            updateSteps(x);
+                            updateSteps(moveItem(steps, stepIndex, stepIndex + 1));
                             setStepIndex(stepIndex + 1);
                           }}
                         >
                           下移
                         </button>
-                        <button onClick={() => updateSteps([...steps, clone(steps[stepIndex])])}>
+                        <button onClick={() => updateSteps([...steps, clone(current)])}>
                           复制
                         </button>
                         <button
@@ -1462,7 +1465,7 @@ export default function ActionEditor({
                                     version: 1,
                                     dialect: 'structured',
                                     source: null,
-                                    steps: [steps[stepIndex]],
+                                    steps: [current],
                                   },
                                 },
                               }),
