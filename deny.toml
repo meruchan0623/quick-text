@@ -1,0 +1,95 @@
+# cargo-deny configuration (B-51, S-28, R-09).
+#
+# Policy
+#   * licenses: the whole project is distributed as GPL-3.0-or-later, so only licenses that
+#     can be combined into a GPL-3.0-or-later work are allowed (list below).
+#   * bans:     `openssl-sys` is forbidden (TLS must go through the platform stack, never a
+#     system OpenSSL); several versions of `windows-sys` only warn for now.
+#   * sources:  unknown registries and any git source are rejected. Everything comes from
+#     crates.io or from this workspace.
+#   * advisories: RustSec database; see the `deps` job in .github/workflows/ci.yml for how
+#     the (network dependent) advisories check is scheduled.
+#
+# When a new crate is added: run `cargo deny check`, read its license, and update
+# the source allowlist used by scripts/package-artifacts.ps1 if the crate is a new
+# workspace member (B-51).
+# Run locally: `cargo install cargo-deny --locked` then `cargo deny check`.
+
+[graph]
+# Only the platforms this project ships or compiles in CI (ADR-f): Windows x64 (primary)
+# and macOS (experimental, `macos-check`). Linux-only crates (gtk, webkit2gtk, ...) are
+# pulled in by Tauri on other targets, are never built or distributed here, and are not
+# judged. Add a triple here before adding support for it.
+targets = [
+  "x86_64-pc-windows-msvc",
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+]
+all-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+# Database is fetched from the default RustSec URL; a fresh clone needs network access.
+yanked = "warn"
+ignore = [
+  # Add entries as { id = "RUSTSEC-YYYY-NNNN", reason = "..." } together with a review note.
+]
+
+[licenses]
+# Every entry must be compatible with distributing the combined program under
+# GPL-3.0-or-later. Only licenses that actually occur in the graph above are listed, so a
+# new license fails CI and gets a conscious decision. ISC and "Apache-2.0 WITH
+# LLVM-exception" are equally compatible but occur only in Linux-only crates today; add
+# them here when a Windows/macOS dependency needs them.
+allow = [
+  # Our own license (workspace crates) and GPL-compatible copyleft of the same family.
+  "GPL-3.0-or-later",
+  # Permissive licenses (all compatible with GPL-3.0; Apache-2.0 only with GPLv3, which is
+  # why the project is GPL-3.0-or-later and not GPL-2.0-only).
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "0BSD",
+  "Zlib",
+  "BSL-1.0",
+  "Unicode-3.0",
+  # Public-domain dedications.
+  "CC0-1.0",
+  "Unlicense",
+  # File-level weak copyleft. MPL-2.0 section 3.3 lets MPL code be combined with GPL-3.0
+  # code unless a file is marked "Incompatible With Secondary Licenses"; the current users
+  # are cssparser, selectors, dtoa-short and option-ext (unmodified, via tauri / wry).
+  # Modified MPL files would still have to be offered under MPL-2.0.
+  "MPL-2.0",
+]
+confidence-threshold = 0.8
+# Per-crate exceptions: none needed at the moment. Format when one is needed (always with
+# the reason):
+#   { allow = ["OpenSSL"], crate = "some-crate" },  # reason: ...
+exceptions = []
+
+[bans]
+# Different versions of the same crate are tolerated as warnings (tauri, windows, zbus and
+# friends each pin their own `windows-sys`); revisit once the duplicates are triaged.
+multiple-versions = "warn"
+# `*` requirements are not rejected: cargo-deny would also flag the workspace path
+# dependencies unless every crate is marked `publish = false`.
+wildcards = "allow"
+highlight = "all"
+deny = [
+  # TLS must not link a system OpenSSL (R-09, B-51). `ureq` must use native-tls/SChannel or
+  # rustls; the Windows build must never need an OpenSSL installation.
+  { crate = "openssl-sys", reason = "no system OpenSSL; use SChannel (native-tls on Windows) or rustls" },
+]
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
