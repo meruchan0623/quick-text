@@ -31,11 +31,21 @@
 //!   its next step and its result is discarded, but it stays "in flight"
 //!   until its adapter call returns. So at most one `rebuild`/`reattach`
 //!   call is outstanding, however often recovery is requested.
+//! - At most one replacement driver: the watchdog ([`Supervisor::check`])
+//!   replaces a stuck driver once and keeps the replaced thread's handle.
+//!   While that thread is alive it spawns no other; if the replacement is
+//!   stuck too, it reports the engine Failed (`supervisor.driver_hung`)
+//!   instead. So at most two driver threads exist, each blocked in at most
+//!   one adapter call.
+//!
+//! `probe`, `input_health` and `enforce_budget` must not block (see the
+//! trait docs). A tick handles the repair request and the deadlines before
+//! calling them, and `repair()` calls no adapter at all.
 use crate::health::{Component, ComponentHealth, HealthSnapshot, HealthState, ReasonCode};
 use crate::runtime::Runtime;
 use crate::traits::Clock;
 use arc_swap::ArcSwapOption;
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -125,6 +135,13 @@ impl Status {
 /// Input sources (keyboard/mouse hooks, RawInput, focus events). Windows
 /// wires `input::input_health` / `input::reattach` (P1b).
 pub trait InputSources: Send + Sync {
+    /// Current health of every input component, read every tick.
+    ///
+    /// Must not block: read atomics or use `try_lock` only, and when a lock
+    /// is unavailable return the last known value (or an unknown status if
+    /// there is none) instead of waiting. A blocking call stalls the
+    /// supervisor driver; the watchdog replaces it once and then reports
+    /// the engine Failed.
     fn input_health(&self) -> Vec<ComponentHealth>;
     /// Re-registers one component; should return within a few hundred ms.
     fn reattach(&self, component: Component) -> Result<(), String>;
@@ -132,9 +149,17 @@ pub trait InputSources: Send + Sync {
 
 /// The executor as the supervisor sees it.
 pub trait ExecutorControl: Send + Sync {
-    /// Fences a task that has run past its budget (called first each tick).
+    /// Fences a task that has run past its budget (called every tick, right
+    /// after the deadlines). Must not block, as for [`Self::probe`].
     fn enforce_budget(&self, now: Instant);
-    /// Executor (and related components such as the clipboard) status.
+    /// Executor (and related components such as the clipboard) status,
+    /// read every tick.
+    ///
+    /// Must not block: read atomics or use `try_lock` only, and when a lock
+    /// is unavailable return the last known status (or an unknown one if
+    /// there is none) instead of waiting. A blocking call stalls the
+    /// supervisor driver; the watchdog replaces it once and then reports
+    /// the engine Failed.
     fn probe(&self, now: Instant) -> Vec<(Component, Status)>;
     /// Replaces the executor worker with a fresh one.
     fn rebuild(&self) -> Result<(), String>;
@@ -255,9 +280,9 @@ pub struct Supervisor {
     executor: Arc<dyn ExecutorControl>,
     inputs: Arc<dyn InputSources>,
     machine: Mutex<Machine>,
-    /// A `repair()` not armed yet: the machine was busy or an attempt was
-    /// still physically running. Armed by the next tick or attempt return
-    /// that finds no attempt in flight (see `take_repair`).
+    /// A `repair()` not armed yet. Armed by the next tick, or the return of
+    /// the attempt in flight, once no attempt is in flight (see
+    /// `take_repair`).
     repair_requested: AtomicBool,
     /// Ticks are being skipped (logged once per stretch).
     skipping: AtomicBool,
@@ -267,6 +292,12 @@ pub struct Supervisor {
     wake_signal: Condvar,
     driver: Mutex<Option<JoinHandle<()>>>,
     driver_generation: AtomicU64,
+    /// The driver `check()` last replaced while it was stuck, kept while
+    /// its thread is alive: no further replacement until it ends. Taken
+    /// before `driver` when both are held.
+    replaced_driver: Mutex<Option<JoinHandle<()>>>,
+    /// `supervisor.driver_hung` was logged (once per stretch).
+    driver_hung: AtomicBool,
 }
 
 impl Supervisor {
@@ -306,6 +337,8 @@ impl Supervisor {
             wake_signal: Condvar::new(),
             driver: Mutex::new(None),
             driver_generation: AtomicU64::new(0),
+            replaced_driver: Mutex::new(None),
+            driver_hung: AtomicBool::new(false),
         })
     }
 
@@ -321,31 +354,33 @@ impl Supervisor {
         }
     }
 
-    /// One supervision step: enforce the executor budget, read every
-    /// component, advance the machine, publish the snapshot and, when an
-    /// attempt is due, run it and commit its result.
+    /// One supervision step: apply a pending repair and the deadlines
+    /// (attempt hang, verification window), enforce the executor budget,
+    /// read every component, advance the machine, publish the snapshot and,
+    /// when an attempt is due, run it and commit its result.
     ///
-    /// No adapter call (`enforce_budget`, `probe`, `input_health`,
-    /// `rebuild`, `reattach`) runs under the machine lock, so an adapter that
-    /// blocks never stalls `repair()` or a replacement driver; the lock is
-    /// held only to decide and to commit. While an attempt is in flight no
-    /// other attempt starts (from this or any other ticking thread); a
-    /// timeout or `repair()` only invalidates it, so its result is discarded
-    /// when it returns. A driver blocked in an attempt is busy, not stale,
-    /// until ATTEMPT_TIMEOUT (see [`Self::check`]).
+    /// The repair request and the deadlines come first, before any adapter
+    /// call, so a probe that blocks cannot hold them back. No adapter call
+    /// (`enforce_budget`, `probe`, `input_health`, `rebuild`, `reattach`)
+    /// runs under the machine lock, so an adapter that blocks never stalls
+    /// `repair()` or a replacement driver; the lock is held only to decide
+    /// and to commit. While an attempt is in flight no other attempt starts
+    /// (from this or any other ticking thread); a timeout or `repair()`
+    /// only invalidates it, so its result is discarded when it returns. A
+    /// driver blocked in an attempt is busy, not stale, until
+    /// ATTEMPT_TIMEOUT (see [`Self::check`]).
     pub fn tick(&self) {
+        let ready = self.handle_deadlines();
+        // The fence does not wait for the machine.
         self.executor.enforce_budget(self.clock.now());
+        if !ready {
+            return;
+        }
         let observed = catch_unwind(AssertUnwindSafe(|| self.observe(self.clock.now())));
-        let Some(mut machine) = self.machine.try_lock_for(TICK) else {
-            if !self.skipping.swap(true, Ordering::SeqCst) {
-                tracing::warn!(event = "supervisor.tick_skipped", "state machine busy");
-            }
-            return; // not progress: the heartbeat is left alone
+        let Some(mut machine) = self.lock_for_tick() else {
+            return;
         };
-        self.skipping.store(false, Ordering::SeqCst);
         let now = self.clock.now();
-        self.take_repair(&mut machine, now);
-        Self::expire_attempt(&mut machine, now);
         let observed = match observed {
             Ok(observed) => observed,
             Err(panic) => {
@@ -373,6 +408,39 @@ impl Supervisor {
             let outcome = self.attempt(&ticket);
             self.commit(ticket.id, outcome);
         }
+    }
+
+    /// The machine for one tick step, waiting at most one TICK. A tick that
+    /// cannot get it is skipped (logged once per stretch); that is not
+    /// progress, so the heartbeat is left alone.
+    fn lock_for_tick(&self) -> Option<MutexGuard<'_, Machine>> {
+        let machine = self.machine.try_lock_for(TICK);
+        if machine.is_some() {
+            self.skipping.store(false, Ordering::SeqCst);
+        } else if !self.skipping.swap(true, Ordering::SeqCst) {
+            tracing::warn!(event = "supervisor.tick_skipped", "state machine busy");
+        }
+        machine
+    }
+
+    /// First step of a tick, before any adapter call: arms a pending
+    /// `repair()` and applies the deadlines (an attempt hung past
+    /// ATTEMPT_TIMEOUT, a verification window that ran out). A change is
+    /// published at once with the latest observation. False when the
+    /// machine stayed busy (the tick is skipped).
+    fn handle_deadlines(&self) -> bool {
+        let Some(mut machine) = self.lock_for_tick() else {
+            return false;
+        };
+        let now = self.clock.now();
+        let armed = self.take_repair(&mut machine, now);
+        let hung = Self::expire_attempt(&mut machine, now);
+        let expired = Self::expire_verification(&mut machine, now);
+        if armed || hung || expired {
+            self.publish(&mut machine);
+            self.beat.lock().progress = now;
+        }
+        true
     }
 
     /// Advances the machine on one observation (lock held, no adapter
@@ -441,16 +509,10 @@ impl Supervisor {
 
     fn recover(&self, machine: &mut Machine, observed: &Observed, now: Instant) -> Option<Ticket> {
         let healthy = observed.required_down().is_empty();
-        if let Some(deadline) = machine.verify_until {
+        if machine.verify_until.is_some() {
+            // Its deadline is applied first in the tick (expire_verification).
             if healthy {
                 self.settle(machine, observed);
-            } else if now >= deadline {
-                machine.verify_until = None;
-                Self::failure(
-                    machine,
-                    now,
-                    "components did not report healthy after rebuild",
-                );
             }
             return None;
         }
@@ -544,13 +606,13 @@ impl Supervisor {
     /// is hung: it counts as one failure (once) and the circuit opens at
     /// once (Failed, cause "attempt_hung"), because no new attempt may start
     /// while it runs. It stays in flight until it returns; its result is
-    /// then discarded.
-    fn expire_attempt(machine: &mut Machine, now: Instant) {
+    /// then discarded. True when it was judged hung now.
+    fn expire_attempt(machine: &mut Machine, now: Instant) -> bool {
         let Some(attempt) = machine.in_flight.as_mut() else {
-            return;
+            return false;
         };
         if attempt.hung || now.saturating_duration_since(attempt.started) <= ATTEMPT_TIMEOUT {
-            return;
+            return false;
         }
         attempt.hung = true;
         let id = attempt.id;
@@ -564,6 +626,23 @@ impl Supervisor {
             "recovery attempt still running after ATTEMPT_TIMEOUT"
         );
         Self::open_circuit(machine, "attempt_hung");
+        true
+    }
+
+    /// After a rebuild the components have VERIFY_TIMEOUT to report
+    /// healthy; once it has run out the attempt counts as failed. True when
+    /// it ran out now.
+    fn expire_verification(machine: &mut Machine, now: Instant) -> bool {
+        if machine.verify_until.is_none_or(|deadline| now < deadline) {
+            return false;
+        }
+        machine.verify_until = None;
+        Self::failure(
+            machine,
+            now,
+            "components did not report healthy after rebuild",
+        );
+        true
     }
 
     /// Whether attempt `id` may make its next rebuild step: not superseded
@@ -725,41 +804,18 @@ impl Supervisor {
 
     /// The user's "repair engine": clears the circuit breaker, enters
     /// Recovering and schedules a forced rebuild on the driver's next tick
-    /// (woken immediately). Returns the current snapshot (Recovering once
-    /// armed); the outcome is published through the runtime's `Health`
-    /// events.
+    /// (woken now). Returns at once with the current snapshot; Recovering
+    /// and the outcome are published through the runtime's `Health` events.
     ///
-    /// A forced rebuild never overlaps an attempt that is still running:
-    /// that attempt is invalidated instead (it stops at its next step and
-    /// its result is discarded) and the repair is armed the moment it
-    /// returns. Never blocks the caller for longer than one TICK: if the
-    /// machine stays locked, the request is left for the next tick.
+    /// Only records the request and wakes the driver: no adapter call, no
+    /// wait for the machine, so it never blocks the caller. The driver's
+    /// next tick arms it before any adapter call. A forced rebuild never
+    /// overlaps an attempt that is still running: that attempt is
+    /// invalidated instead (it stops at its next step and its result is
+    /// discarded) and the repair is armed the moment it returns.
     pub fn repair(&self) -> HealthSnapshot {
         tracing::info!(event = "supervisor.repair");
         self.repair_requested.store(true, Ordering::SeqCst);
-        // Probed before locking: the probe is an adapter call.
-        let observed = catch_unwind(AssertUnwindSafe(|| self.observe(self.clock.now())));
-        match self.machine.try_lock_for(TICK) {
-            Some(mut machine) => {
-                if let Ok(observed) = observed {
-                    machine.last = observed;
-                }
-                if self.take_repair(&mut machine, self.clock.now()) {
-                    self.publish(&mut machine);
-                } else if self.repair_requested.load(Ordering::SeqCst) {
-                    tracing::warn!(
-                        event = "supervisor.repair_deferred",
-                        "attempt still running; repair applies when it returns"
-                    );
-                }
-            }
-            None => {
-                tracing::warn!(
-                    event = "supervisor.repair_deferred",
-                    "state machine busy; repair applies on the next tick"
-                );
-            }
-        }
         self.wake();
         self.runtime.health()
     }
@@ -852,7 +908,15 @@ impl Supervisor {
     /// SUPERVISOR_STALE and no attempt that is still within ATTEMPT_TIMEOUT
     /// (a driver blocked in a slow reattach is busy, not dead; one blocked
     /// past the limit is replaced, and the new driver's tick judges the
-    /// attempt hung). Returns false when it had to respawn.
+    /// attempt hung). Returns false when it had to respawn or the driver is
+    /// hung.
+    ///
+    /// At most one replacement while the replaced driver is stuck: its
+    /// handle is kept, and if the replacement goes stale while that thread
+    /// is still alive, no further thread is spawned (it would block the
+    /// same way). The engine is reported Failed instead, logged once per
+    /// stretch as `supervisor.driver_hung`. A driver whose thread ended is
+    /// always replaced.
     pub fn check(self: &Arc<Self>) -> bool {
         if self.runtime.shutting_down() {
             return true;
@@ -871,13 +935,55 @@ impl Supervisor {
             !busy && now.saturating_duration_since(beat.progress) > SUPERVISOR_STALE
         };
         if !finished && !stale {
+            self.driver_hung.store(false, Ordering::SeqCst);
             return true;
         }
+        let mut replaced = self.replaced_driver.lock();
+        if replaced.as_ref().is_some_and(JoinHandle::is_finished) {
+            *replaced = None;
+        }
+        if !finished && replaced.is_some() {
+            drop(replaced);
+            self.report_driver_hung();
+            return false;
+        }
         tracing::warn!(event = "supervisor.respawn", finished, stale);
+        let old = self.driver.lock().take();
+        if !finished {
+            *replaced = old; // still stuck: kept so it is replaced only once
+        }
+        drop(replaced);
         if let Err(error) = self.spawn_driver() {
             tracing::error!(event = "supervisor.respawn_failed", %error);
         }
         false
+    }
+
+    /// The driver and the one it replaced are both stuck: reports the
+    /// engine Failed (through the machine when it is free, otherwise
+    /// straight to the runtime) instead of spawning another thread.
+    fn report_driver_hung(&self) {
+        if !self.driver_hung.swap(true, Ordering::SeqCst) {
+            tracing::error!(
+                event = "supervisor.driver_hung",
+                "supervisor driver and its replacement are both stuck; engine failed"
+            );
+        }
+        match self.machine.try_lock() {
+            Some(mut machine) => {
+                if machine.state != HealthState::Failed {
+                    Self::open_circuit(&mut machine, "driver_hung");
+                    self.publish(&mut machine);
+                }
+            }
+            None => {
+                let mut snapshot = self.runtime.health();
+                if snapshot.state != HealthState::Failed {
+                    snapshot.state = HealthState::Failed;
+                    self.runtime.publish_health(snapshot);
+                }
+            }
+        }
     }
 }
 
@@ -889,8 +995,9 @@ pub fn install(supervisor: Arc<Supervisor>) {
     SUPERVISOR.store(Some(supervisor));
 }
 
-/// `repair_engine`: forced rebuild; returns the (usually Recovering)
-/// snapshot immediately. Without a supervisor, the current snapshot.
+/// `repair_engine`: requests a forced rebuild and returns the current
+/// snapshot immediately (Recovering follows as a Health event). Without a
+/// supervisor, the current snapshot.
 pub fn repair() -> HealthSnapshot {
     match SUPERVISOR.load_full() {
         Some(supervisor) => supervisor.repair(),
@@ -938,6 +1045,8 @@ mod tests {
         budget_checks: AtomicUsize,
         /// Runs at the start of every rebuild, after it is recorded.
         on_rebuild: Mutex<Option<Hook>>,
+        /// Runs at the start of every probe.
+        on_probe: Mutex<Option<Hook>>,
     }
 
     impl FakeExecutor {
@@ -950,6 +1059,7 @@ mod tests {
                 rebuilds: Mutex::new(vec![]),
                 budget_checks: AtomicUsize::new(0),
                 on_rebuild: Mutex::new(None),
+                on_probe: Mutex::new(None),
             })
         }
         fn rebuild_count(&self) -> usize {
@@ -962,6 +1072,7 @@ mod tests {
             self.budget_checks.fetch_add(1, Ordering::SeqCst);
         }
         fn probe(&self, _now: Instant) -> Vec<(Component, Status)> {
+            run_hook(&self.on_probe);
             vec![(Component::Executor, *self.status.lock())]
         }
         fn rebuild(&self) -> Result<(), String> {
@@ -1289,15 +1400,24 @@ mod tests {
         );
         *rig.inputs.heal_on_reattach.lock() = true;
         let reattached_before = rig.inputs.reattached.lock().len();
+        // What is published while the forced rebuild runs.
+        let during = Arc::new(Mutex::new(None));
+        let (seen, runtime) = (Arc::clone(&during), Arc::clone(&rig.runtime));
+        *rig.executor.on_rebuild.lock() = Some(Arc::new(move || {
+            *seen.lock() = Some(runtime.health());
+        }));
 
         let snapshot = rig.supervisor.repair();
-        assert_eq!(snapshot.state, HealthState::Recovering);
-        assert_eq!(rig.state(), HealthState::Recovering);
-        assert_eq!(
-            rig.component(Component::Executor).state,
-            HealthState::Recovering
-        );
+        assert_eq!(snapshot.state, HealthState::Failed, "returns at once");
         rig.supervisor.tick();
+        let during = during.lock().take().unwrap();
+        assert_eq!(during.state, HealthState::Recovering);
+        let executor = during
+            .components
+            .iter()
+            .find(|c| c.component == Component::Executor)
+            .unwrap();
+        assert_eq!(executor.state, HealthState::Recovering);
         assert_eq!(rig.executor.rebuild_count(), 6, "one forced rebuild");
         assert_eq!(rig.inputs.reattached.lock().len(), reattached_before + 1);
         assert_eq!(rig.state(), HealthState::Healthy);
@@ -1356,6 +1476,138 @@ mod tests {
         rig.supervisor.tick();
         assert_eq!(rig.executor.rebuild_count(), 1, "deferred forced rebuild");
         assert_eq!(rig.state(), HealthState::Healthy);
+    }
+
+    /// From now on every probe blocks until the returned sender is dropped
+    /// (the counter counts the probes that started).
+    fn block_probes(rig: &Rig) -> (Arc<AtomicUsize>, mpsc::Sender<()>) {
+        let probes = Arc::new(AtomicUsize::new(0));
+        let (release, blocked) = mpsc::channel::<()>();
+        let (calls, blocked) = (Arc::clone(&probes), Mutex::new(blocked));
+        *rig.executor.on_probe.lock() = Some(Arc::new(move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let _ = blocked.lock().recv();
+        }));
+        (probes, release)
+    }
+
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out: {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A tick applies the deadlines before it observes: an attempt hung
+    /// past ATTEMPT_TIMEOUT is reported Failed even when the probe of that
+    /// same tick then blocks.
+    #[test]
+    fn deadlines_are_handled_before_a_blocking_probe() {
+        let rig = Rig::healthy();
+        let gate = block_first_rebuild(&rig);
+        *rig.executor.status.lock() = Status::Down(ReasonCode::ExecutorTimeout);
+        rig.step(MS);
+        rig.clock.advance(BACKOFF[0]);
+        let (stuck, _) = tick_into_blocked_rebuild(&rig, &gate);
+        rig.clock.advance(ATTEMPT_TIMEOUT + MS);
+        let (probes, release) = block_probes(&rig);
+        let supervisor = Arc::clone(&rig.supervisor);
+        let ticker = std::thread::spawn(move || supervisor.tick());
+        wait_until("Failed published before the probe", || {
+            rig.state() == HealthState::Failed
+        });
+        wait_until("the same tick then probes", || {
+            probes.load(Ordering::SeqCst) == 1
+        });
+        assert_eq!(rig.failures(), 1);
+
+        *rig.executor.on_probe.lock() = None;
+        drop(release);
+        ticker.join().unwrap();
+        drop(gate.release);
+        stuck.join().unwrap();
+        assert_eq!(rig.state(), HealthState::Failed);
+        assert_eq!(rig.failures(), 1);
+    }
+
+    #[test]
+    fn repair_returns_at_once_without_probing_or_locking() {
+        let rig = Rig::healthy();
+        let (probes, release) = block_probes(&rig);
+        let held = rig.supervisor.machine.lock();
+        let (done_tx, done) = mpsc::channel();
+        let supervisor = Arc::clone(&rig.supervisor);
+        std::thread::spawn(move || done_tx.send(supervisor.repair()).unwrap());
+        let snapshot = done
+            .recv_timeout(Duration::from_secs(5))
+            .expect("repair() returned with the probe blocked and the machine held");
+        assert_eq!(snapshot.state, HealthState::Healthy, "current snapshot");
+        assert_eq!(probes.load(Ordering::SeqCst), 0, "no adapter call");
+        assert!(rig.supervisor.repair_requested.load(Ordering::SeqCst));
+        assert!(*rig.supervisor.wake.lock(), "driver woken");
+        drop(held);
+        *rig.executor.on_probe.lock() = None;
+        drop(release);
+        rig.supervisor.tick();
+        assert_eq!(rig.executor.rebuild_count(), 1, "the tick applied it");
+        assert_eq!(rig.state(), HealthState::Healthy);
+    }
+
+    /// Every probe blocks for good. The watchdog replaces the stuck driver
+    /// once; when the replacement is stuck too while the first one is still
+    /// alive, it spawns no further thread and reports the engine Failed.
+    #[test]
+    fn a_blocked_probe_gets_one_replacement_driver_then_the_engine_fails() {
+        let rig = Rig::healthy();
+        let (probes, release) = block_probes(&rig);
+        rig.supervisor.spawn_driver().unwrap();
+        wait_until("driver blocked in its probe", || {
+            probes.load(Ordering::SeqCst) == 1
+        });
+        rig.clock.advance(SUPERVISOR_STALE + MS);
+        assert!(!rig.supervisor.check(), "replaced once");
+        wait_until("replacement blocked too", || {
+            probes.load(Ordering::SeqCst) == 2
+        });
+        let generation = rig.supervisor.driver_generation.load(Ordering::SeqCst);
+        assert!(rig.supervisor.replaced_driver.lock().is_some());
+        assert_eq!(rig.state(), HealthState::Healthy);
+
+        rig.clock.advance(SUPERVISOR_STALE + MS);
+        assert!(!rig.supervisor.check(), "the driver is hung");
+        assert_eq!(rig.state(), HealthState::Failed);
+        assert!(rig
+            .runtime
+            .pause_reasons()
+            .contains(PauseReasons::ENGINE_DOWN));
+        for _ in 0..3 {
+            rig.clock.advance(SUPERVISOR_STALE + MS);
+            assert!(!rig.supervisor.check());
+        }
+        assert_eq!(
+            rig.supervisor.driver_generation.load(Ordering::SeqCst),
+            generation,
+            "no further driver"
+        );
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+        assert_eq!(rig.state(), HealthState::Failed);
+
+        // Retire both drivers and let their probes return.
+        rig.supervisor
+            .driver_generation
+            .fetch_add(1, Ordering::SeqCst);
+        *rig.executor.on_probe.lock() = None;
+        drop(release);
+        let current = rig.supervisor.driver.lock().take();
+        let replaced = rig.supervisor.replaced_driver.lock().take();
+        for handle in [current, replaced].into_iter().flatten() {
+            wait_until("driver ended", || {
+                rig.supervisor.wake();
+                handle.is_finished()
+            });
+            handle.join().unwrap();
+        }
     }
 
     #[test]
