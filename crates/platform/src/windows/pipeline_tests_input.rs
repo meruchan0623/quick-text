@@ -10,7 +10,8 @@
 )]
 use super::executor::Candidate;
 use super::hook::{
-    handle_key, handle_mouse, HookAction, HookPipe, HookRecord, KeyInfo, KeyRecord, MouseInfo,
+    classify, handle_key, handle_mouse, HookAction, HookPipe, HookRecord, KeyInfo, KeyRecord,
+    MouseInfo, Origin,
 };
 use super::input::{Consumer, Lane};
 use super::keystate::KeyBits;
@@ -190,6 +191,7 @@ fn mouse(msg: u32, x: i32, y: i32) -> MouseInfo {
         data: 0,
         x,
         y,
+        flags: 0,
         extra: 0,
     }
 }
@@ -500,4 +502,138 @@ fn every_raw_key_reads_the_layout_and_a_switch_breaks_the_match() {
     assert!(raw_key(&shared, keys, &raw, &probe, 'w'));
     assert_eq!(probe.input_context_reads(), 3, "one read per key");
     assert!(drain(&mut consumer, &shared, &hooks, &raw, &probe).is_empty());
+}
+
+/// no-regression #4: one pure function decides own / external / hardware
+/// from the injected flag and our `dwExtraInfo` tag.
+#[test]
+fn input_origin_depends_only_on_the_injected_flag_and_our_tag() {
+    let cases = [
+        (false, 0, Origin::Hardware),
+        (false, 0xdead, Origin::Hardware),
+        (true, 0, Origin::External),
+        (true, MARK + 1, Origin::External),
+        (true, MARK - 1, Origin::External),
+        (true, MARK, Origin::Own),
+        (false, MARK, Origin::Own),
+    ];
+    for (injected, extra, origin) in cases {
+        assert_eq!(
+            classify(injected, extra),
+            origin,
+            "injected={injected} extra={extra:#x}"
+        );
+    }
+    assert_eq!(MARK, 0x5154_5854, "the tag our executor writes");
+}
+
+/// no-regression #4: a key injected by another program between hardware
+/// keys prevents the expansion, and its RawInput echo never becomes text.
+#[test]
+fn an_external_injected_key_inside_a_word_prevents_the_expansion() {
+    let _serial = serial();
+    let probe = MockForeground::new(window());
+    let keys = leaked_keys();
+    let hooks = HookPipe::new(keys, 8, false, nothing);
+    let raw = Lane::new(8, nothing);
+    // Control: hardware "btw" expands.
+    let shared = engine("btw");
+    let mut consumer = Consumer::default();
+    for ch in "btw".chars() {
+        assert!(raw_key(&shared, keys, &raw, &probe, ch));
+    }
+    assert_eq!(drain(&mut consumer, &shared, &hooks, &raw, &probe).len(), 1);
+    // "bt", then an external injected X (hook event plus its RawInput
+    // echo without a hardware source), then "w".
+    let shared = engine("btw");
+    let mut consumer = Consumer::default();
+    assert!(raw_key(&shared, keys, &raw, &probe, 'b'));
+    assert!(raw_key(&shared, keys, &raw, &probe, 't'));
+    let before = shared.generation.load(Ordering::SeqCst);
+    let x = injected(0x58);
+    assert_eq!(
+        handle_key(&hooks, &shared, &probe, WM_KEYDOWN, x),
+        HookAction::Pass
+    );
+    assert!(
+        !keys.held(0x58),
+        "injected keys stay out of the physical mirror"
+    );
+    let echo = InputEvent::key_down(0x58, "x", false);
+    assert!(raw_record(&shared, keys, &echo, &probe).is_none());
+    assert_eq!(
+        handle_key(&hooks, &shared, &probe, WM_KEYUP, x),
+        HookAction::Pass
+    );
+    assert!(shared.generation.load(Ordering::SeqCst) > before);
+    assert!(raw_key(&shared, keys, &raw, &probe, 'w'));
+    assert!(drain(&mut consumer, &shared, &hooks, &raw, &probe).is_empty());
+}
+
+/// no-regression #4: our own tagged input is invisible to detection in both
+/// normal and acceptance mode (no record, no mirror change, no generation
+/// bump; its RawInput echo is not text), so it neither enters nor breaks
+/// the word typed around it. External injected keys are still seen.
+#[test]
+fn our_own_tagged_input_never_enters_the_detection_buffer() {
+    let _serial = serial();
+    let probe = MockForeground::new(window());
+    let keys = leaked_keys();
+    let raw = Lane::new(8, nothing);
+    let own = KeyInfo {
+        extra: MARK,
+        ..injected(0x58)
+    };
+    let click = MouseInfo {
+        flags: LLMHF_INJECTED,
+        extra: MARK,
+        ..mouse(WM_LBUTTONDOWN, 1, 2)
+    };
+    let echo = InputEvent::key_down(0x58, "x", false);
+    for test_mode in [false, true] {
+        let shared = engine("btw");
+        let hooks = HookPipe::new(keys, 8, test_mode, nothing);
+        let mut consumer = Consumer::default();
+        assert!(raw_key(&shared, keys, &raw, &probe, 'b'));
+        assert!(raw_key(&shared, keys, &raw, &probe, 't'));
+        let before = shared.generation.load(Ordering::SeqCst);
+        assert_eq!(
+            handle_key(&hooks, &shared, &probe, WM_KEYDOWN, own),
+            HookAction::Pass
+        );
+        handle_mouse(&hooks, &shared, click);
+        assert!(
+            !keys.held(0x58) && !keys.held(VK_LBUTTON),
+            "mode {test_mode}"
+        );
+        assert!(raw_record(&shared, keys, &echo, &probe).is_none());
+        assert_eq!(
+            handle_key(&hooks, &shared, &probe, WM_KEYUP, own),
+            HookAction::Pass
+        );
+        assert_eq!(shared.generation.load(Ordering::SeqCst), before);
+        assert!(hooks.lane().pop().is_none(), "nothing recorded");
+        assert!(raw_key(&shared, keys, &raw, &probe, 'w'));
+        assert_eq!(
+            drain(&mut consumer, &shared, &hooks, &raw, &probe),
+            [("btw".to_string(), before + 1)],
+            "mode {test_mode}"
+        );
+        // The same key without our tag is recorded.
+        handle_key(&hooks, &shared, &probe, WM_KEYDOWN, injected(0x58));
+        let recorded = records(&hooks);
+        if test_mode {
+            assert!(matches!(
+                recorded.as_slice(),
+                [HookRecord::Key(KeyRecord {
+                    vk: 0x58,
+                    acceptance: Some(_),
+                    ..
+                })]
+            ));
+        } else {
+            assert!(matches!(recorded.as_slice(), [HookRecord::External]));
+        }
+        assert!(shared.generation.load(Ordering::SeqCst) > before + 1);
+    }
 }

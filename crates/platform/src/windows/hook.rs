@@ -48,7 +48,31 @@ pub(super) struct MouseInfo {
     pub(super) data: u32,
     pub(super) x: i32,
     pub(super) y: i32,
+    pub(super) flags: u32,
     pub(super) extra: usize,
+}
+/// Where a low-level input event came from (no-regression #4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Origin {
+    /// Our own injection, tagged with [`MARK`] in `dwExtraInfo`. Never
+    /// observed: no mirror update, no generation bump, no record.
+    Own,
+    /// Injected by someone else (the injected flag without our tag).
+    External,
+    /// Physical input.
+    Hardware,
+}
+/// Classifies an event from its injected flag (`LLKHF_INJECTED` /
+/// `LLMHF_INJECTED`) and `dwExtraInfo`. The tag alone identifies our own
+/// input, as it always has.
+pub(super) const fn classify(injected: bool, extra: usize) -> Origin {
+    if extra == MARK {
+        Origin::Own
+    } else if injected {
+        Origin::External
+    } else {
+        Origin::Hardware
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HookAction {
@@ -136,13 +160,14 @@ pub(super) fn on_key(
     msg: u32,
     key: KeyInfo,
 ) -> HookAction {
-    if key.extra == MARK {
+    let origin = classify(key.flags & LLKHF_INJECTED != 0, key.extra);
+    if origin == Origin::Own {
         return HookAction::Pass;
     }
     if fault::take(FaultPoint::HookPanic).is_some() {
         injected_panic();
     }
-    let injected = key.flags & LLKHF_INJECTED != 0;
+    let injected = origin == Origin::External;
     // no-regression #4: external injected input (LLKHF_INJECTED without MARK) invalidates the buffer.
     if injected && !pipe.test_mode {
         shared.generation.fetch_add(1, Ordering::SeqCst);
@@ -240,7 +265,9 @@ fn mouse_button(msg: u32, data: u32) -> Option<(u16, bool)> {
 }
 /// Mouse hook body: atomics and one lock-free push.
 pub(super) fn on_mouse(pipe: &HookPipe, shared: &Shared, mouse: MouseInfo) {
-    if mouse.extra == MARK {
+    // External injected clicks still move the caret, so only our own input
+    // is skipped.
+    if classify(mouse.flags & LLMHF_INJECTED != 0, mouse.extra) == Origin::Own {
         return;
     }
     if let Some((button, down)) = mouse_button(mouse.msg, mouse.data) {
@@ -278,6 +305,7 @@ unsafe extern "system" fn mouse(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                 data: event.mouseData,
                 x: event.pt.x,
                 y: event.pt.y,
+                flags: event.flags,
                 extra: event.dwExtraInfo,
             };
             handle_mouse(pipe, shared, mouse);
