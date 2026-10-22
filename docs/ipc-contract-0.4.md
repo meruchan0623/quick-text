@@ -105,7 +105,7 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 | `rules_skipped` | warning | `{ count, ids: string[] }`（宽容读取或逐条编译失败的规则） |
 | `terminator_unsupported` | warning | `{ keys: string[] }`（旧配置中的 tab、enter） |
 | `autostart_repaired` | info | `{}`（自启项路径与当前程序不符，已修正） |
-| `self_test_failed` | warning | `{ checks: ("raw_input" \| "hook_heartbeat" \| "foreground" \| "clipboard")[] }`：启动自检未通过的项（原因为 `unsupported` 的项不计入），引擎保持暂停，界面提供「恢复监听」。见 §5「自检」 |
+| `self_test_failed` | warning | `{ checks: ("raw_input" \| "hook_heartbeat" \| "foreground" \| "clipboard")[] }`：启动自检未通过的项（原因为 `unsupported` 的项不计入），引擎保持暂停（启动期间用户已手动恢复的除外），界面提供「恢复监听」。见 §5「自检」 |
 | `log_level_elevated` | info | `{ level: "error" \| "warn" \| "debug" \| "trace", until_ms: number }`：启动时从 prefs 恢复了仍在有效期内的临时日志级别，`until_ms` 为到期时间（Unix 毫秒） |
 | `store_meta_reset` | warning | `{}`（`store-meta.json` 无法解析，已重建） |
 
@@ -171,9 +171,9 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 - 运行期间置位 `self_test` 暂停原因，结束即清除（它由 Health 行表达，不是用户可见的暂停）。同一时间只运行一次，后来的调用等前一次结束。不持有 store 锁，安全模式下也可调用，不恢复监听、不写任何数据。
 - Windows 以外的平台四项都以 `unsupported` 失败。
 - 启动流程：引擎启动后最多等 30 秒让 Health 进入 `healthy`（超时也照常自检），然后运行同样的四项检查：
-  - 有未通过的项（不计原因为 `unsupported` 的项，所以 macOS 不受影响）：推送 `startup-problem` `self_test_failed { checks }` 并发系统通知，引擎保持暂停，用户可从托盘或界面「恢复监听」。安全模式、关闭自动监听时同样报告。
+  - 有未通过的项（不计原因为 `unsupported` 的项，所以 macOS 不受影响）：推送 `startup-problem` `self_test_failed { checks }` 并发系统通知，不改变暂停状态：引擎保持暂停，用户可从托盘或界面「恢复监听」。启动期间用户已手动恢复的，保持用户的选择，只报告问题，通知改为说明监听已由用户手动开启、可能无法正常工作。安全模式、关闭自动监听时同样报告。
   - 全部通过：仅当 `prefs.json` 的 `app.auto_listen_on_start` 为真、不在安全模式、且用户在启动等待期间没有手动暂停或恢复过时，清除 `manual` 开始监听；恢复被拒绝（Health 已不接受恢复）时发系统通知说明原因。其余情况保持暂停。
-  - SafeMode(Locked) 重试成功离开安全模式后不会补做自动监听，需用户手动恢复。
+  - 上面的决定在 store 锁内一次读完所需状态后做出，用户的暂停 / 恢复和 SafeMode(Locked) 重试要么整个在它之前，要么整个在它之后。SafeMode(Locked) 重试在决定之前成功的，按上面的规则照常决定（条件满足就自动开始监听）；在决定之后才成功的，不补做自动监听，`manual` 仍在，需用户手动恢复。
 
 ### 能力表（`get_capabilities`）
 

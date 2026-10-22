@@ -12,10 +12,14 @@ use super::{
 use crate::{
     autostart::LoginItem,
     error::{CommandError, SafeModeReason},
-    startup::{defer_autostart_repair, ProblemKind},
+    startup::{defer_autostart_repair, finish_self_test, ProblemKind, StartupListen},
 };
 use quicker_domain::*;
-use quicker_platform::{health::PauseReasons, traits::Clock};
+use quicker_platform::{
+    health::PauseReasons,
+    self_test::{CheckName, SelfTestCheck, SelfTestReport},
+    traits::Clock,
+};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -1470,6 +1474,65 @@ fn setting_the_store_sink_makes_the_store_value_the_baseline() {
     store.apply_retry(load_or_fallback(&dir, &env(&world)));
     (bus.problem_sink())(ProblemKind::AutostartRepaired {}.into());
     assert_eq!(store_states(&rx), Vec::<Value>::new());
+}
+
+/// Every startup check passed.
+fn passing_self_test() -> SelfTestReport {
+    let checks: Vec<_> = CheckName::ALL
+        .into_iter()
+        .map(|name| SelfTestCheck {
+            name,
+            passed: true,
+            reason: None,
+            elapsed_ms: 1,
+        })
+        .collect();
+    SelfTestReport {
+        passed: true,
+        checks,
+    }
+}
+
+/// Review A6-1: a store that started in SafeMode(Locked) whose retry
+/// succeeds before the startup self-test decides is just a store out of
+/// safe mode: the checks pass, auto-listen is on, so it listens.
+#[test]
+fn a_locked_retry_before_the_self_test_decision_listens_as_usual() {
+    let (dir, world, mut store) = store_in(Some(SafeModeReason::Locked));
+    store.runtime.publish_health(healthy());
+    // Read when startup begins its wait, as `startup_self_test` does.
+    let seen = store.manual_changes();
+    world.locked.lock().clear();
+    store.apply_retry(retry_locked(&dir, &env(&world)).unwrap());
+    assert_eq!(store.safe_mode(), None);
+    assert_eq!(store.runtime.pause_reasons(), PauseReasons::MANUAL);
+
+    let outcome = finish_self_test(&mut store, &passing_self_test(), true, seen, || true);
+    assert!(matches!(outcome, StartupListen::Listening), "{outcome:?}");
+    assert!(store.runtime.pause_reasons().is_empty());
+    assert!(store.runtime.engine_state().listening);
+}
+
+/// Review A6-1: the decision came first (safe mode: no auto-listen), the
+/// retry succeeds after it. Leaving safe mode does not make up for the
+/// missed auto-listen: still paused, MANUAL set, until the user resumes.
+#[test]
+fn a_locked_retry_after_the_self_test_decision_stays_paused() {
+    let (dir, world, mut store) = store_in(Some(SafeModeReason::Locked));
+    store.runtime.publish_health(healthy());
+    let seen = store.manual_changes();
+    let outcome = finish_self_test(&mut store, &passing_self_test(), true, seen, || true);
+    assert!(matches!(outcome, StartupListen::SafeMode), "{outcome:?}");
+
+    world.locked.lock().clear();
+    store.apply_retry(retry_locked(&dir, &env(&world)).unwrap());
+    assert_eq!(store.safe_mode(), None);
+    assert_eq!(store.runtime.pause_reasons(), PauseReasons::MANUAL);
+    assert!(!store.runtime.engine_state().listening);
+    assert!(store.engine.paused.load(Ordering::SeqCst));
+    // The user's own resume is what starts listening.
+    store.set_manual_pause(false, || true).unwrap();
+    assert!(store.runtime.engine_state().listening);
 }
 
 /// Fault injection (B-52): the store points behave as the real failures.
