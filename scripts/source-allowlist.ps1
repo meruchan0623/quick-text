@@ -30,17 +30,21 @@
 $SourceFiles = @(
     '.gitattributes',
     '.gitignore',
+    '.prettierignore',
+    '.prettierrc',
     'Cargo.lock',
     'Cargo.toml',
     'LICENSE',
     'README.md',
     'THIRD_PARTY_NOTICES.md',
     'deny.toml',
+    'eslint.config.js',
     'index.html',
     'package-lock.json',
     'package.json',
     'tsconfig.json',
     'vite.config.ts',
+    'vitest.config.ts',
     'vendor/espanso-win32/LICENSE',
     'crates/domain/Cargo.toml',
     'crates/domain/README.md',
@@ -74,8 +78,8 @@ $SourceDirectories = @(
 )
 
 $SourceExtensions = @(
-    '.cpp', '.css', '.h', '.html', '.ico', '.json', '.md', '.png', '.ps1', '.rs', '.sh',
-    '.ts', '.tsx', '.txt', '.yml'
+    '.cpp', '.css', '.h', '.html', '.ico', '.json', '.md', '.mjs', '.png', '.ps1', '.rs',
+    '.sh', '.ts', '.tsx', '.txt', '.yml'
 )
 
 # Tracked files that are deliberately not shipped (path prefix or exact path, with reason).
