@@ -618,11 +618,14 @@ fn begin_recording(shared: &Shared) {
     recording_started();
     *rows = Some(vec![]);
 }
-/// Ends the recording on `shared` the way the app does (finish, then take)
-/// and returns what it recorded.
+/// Ends the recording on `shared` the way the app should (finish and take
+/// in one critical section) and returns what it recorded.
 fn recorded(shared: &Arc<Shared>) -> Vec<Operation> {
-    finish_recording(shared);
-    let steps = shared.recording.lock().unwrap().take().unwrap();
+    let plan = finish_and_take(shared).unwrap();
+    assert_eq!(plan.dialect, Dialect::Replay);
+    operations(plan.steps)
+}
+fn operations(steps: Vec<Step>) -> Vec<Operation> {
     steps.into_iter().map(|step| step.operation).collect()
 }
 fn key_down(code: u16) -> Operation {
@@ -924,6 +927,69 @@ fn a_stop_from_a_finished_recording_never_stops_the_next_one() {
         for step in [key_down(0x43), key_up(0x43), left(ButtonState::Down)] {
             assert!(b.contains(&step), "capacity {capacity}: {b:?}");
         }
+    }
+}
+
+/// What the active recording holds so far, without ending it.
+fn pending(shared: &Shared) -> Vec<Operation> {
+    let recording = shared.recording.lock().unwrap();
+    let steps = recording.as_ref().unwrap();
+    steps.iter().map(|step| step.operation.clone()).collect()
+}
+
+/// M2: an ended recording takes nothing more, even an empty one that the
+/// app takes under a separate lock (src-tauri today: `finish_recording`,
+/// then `stop_recording`): a key-down drained in between is not appended.
+/// Empty either because nothing was recorded or because the stop gesture's
+/// Ctrl and Shift were the only presses and the stop dropped them. Only
+/// the next start resets the recorder; `finish_and_take` leaves no gap.
+#[test]
+fn an_ended_empty_recording_takes_nothing_before_it_is_taken() {
+    let _serial = serial();
+    for gesture_only in [false, true] {
+        let shared = engine("btw");
+        let hooks = HookPipe::new(leaked_keys(), 32, false, nothing);
+        let raw = Lane::new(4, nothing);
+        let probe = FixedProbe(context());
+        let mut consumer = Consumer::with_windows(NOT_OURS);
+        begin_recording(&shared);
+        if gesture_only {
+            for vk in [VK_LCONTROL, VK_LSHIFT] {
+                handle_key(&hooks, &shared, &probe, WM_KEYDOWN, key_at(vk, 0));
+            }
+            drain(&mut consumer, &shared, &hooks, &raw, &probe);
+            assert_eq!(
+                pending(&shared),
+                [key_down(VK_LCONTROL), key_down(VK_LSHIFT)]
+            );
+            handle_key(&hooks, &shared, &probe, WM_KEYDOWN, key_at(VK_ESCAPE, 0));
+            drain(&mut consumer, &shared, &hooks, &raw, &probe);
+            assert!(pending(&shared).is_empty(), "the stop dropped them");
+        }
+        finish_recording(&shared);
+        // Before the app takes the finished recording, the consumer drains
+        // a key-down.
+        handle_key(&hooks, &shared, &probe, WM_KEYDOWN, key_at(0x41, 1_000));
+        drain(&mut consumer, &shared, &hooks, &raw, &probe);
+        let taken = operations(shared.recording.lock().unwrap().take().unwrap());
+        assert!(
+            taken.is_empty(),
+            "gesture only: {gesture_only}: nothing appended, got {taken:?}"
+        );
+        // The next recording starts from scratch, and finish_and_take ends
+        // and takes it at once.
+        begin_recording(&shared);
+        handle_key(&hooks, &shared, &probe, WM_KEYDOWN, key_at(0x42, 2_000));
+        drain(&mut consumer, &shared, &hooks, &raw, &probe);
+        assert_eq!(
+            recorded(&shared),
+            [key_down(0x42), key_up(0x42)],
+            "gesture only: {gesture_only}"
+        );
+        assert_eq!(
+            finish_and_take(&shared).unwrap_err(),
+            "Recording is not active"
+        );
     }
 }
 

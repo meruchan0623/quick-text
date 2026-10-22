@@ -5,35 +5,26 @@ struct RecordMeta {
     at: u32,
     held: BTreeSet<Key>,
     buttons: Vec<MouseButton>,
-    /// Nothing more goes into the current recording.
+    /// Nothing more goes into the current recording. Set by the first stop
+    /// and cleared only when the next recording starts
+    /// ([`recording_started`]): a stopped recording stays stopped until it
+    /// is taken, even when it has no rows (M2).
     stopped: bool,
-    /// [`finish_recording`] closed the last recording: the next event or
-    /// stop belongs to a new one.
-    ended: bool,
 }
 impl RecordMeta {
-    const fn new(ended: bool) -> Self {
+    const fn new() -> Self {
         Self {
             at: 0,
             held: BTreeSet::new(),
             buttons: Vec::new(),
             stopped: false,
-            ended,
-        }
-    }
-    /// Drops what an earlier recording left behind when `rows` (the active
-    /// recording) has nothing yet and either the last one was closed by
-    /// [`finish_recording`] or nothing stopped. A stop before the first
-    /// recorded event (M2) is kept, so it still holds; a closed recording
-    /// that has not been taken yet stays stopped.
-    fn begin(&mut self, rows: &[Step]) {
-        if rows.is_empty() && (self.ended || !self.stopped) {
-            *self = Self::new(false);
         }
     }
 }
-/// No recording has run yet.
-static RECORD_META: Mutex<RecordMeta> = Mutex::new(RecordMeta::new(true));
+/// The bookkeeping of the current recording, reset only by
+/// [`recording_started`] (never inferred from what the recording holds).
+/// Lock order: the recording lock, then this one.
+static RECORD_META: Mutex<RecordMeta> = Mutex::new(RecordMeta::new());
 /// The recording session: advanced each time a recording starts
 /// ([`recording_started`]), so a stop requested during one recording never
 /// ends a later one (M2). 0 before the first recording.
@@ -43,11 +34,14 @@ static SESSION: AtomicU64 = AtomicU64::new(0);
 pub(super) fn recording_session() -> u64 {
     SESSION.load(Ordering::SeqCst)
 }
-/// A new recording session starts. `start_recording` calls this while it
-/// holds the recording lock, just before it opens the recording, so a stop
-/// checked under that lock always sees which session is current.
+/// A new recording session starts: the session advances and the recorder's
+/// bookkeeping starts from scratch. The only place either is reset (M2).
+/// `start_recording` calls this while it holds the recording lock, just
+/// before it opens the recording, so a stop or an event handled under that
+/// lock always sees which session is current.
 pub(crate) fn recording_started() {
     SESSION.fetch_add(1, Ordering::SeqCst);
+    *RECORD_META.lock().unwrap() = RecordMeta::new();
 }
 /// The delay to record between two events captured at hook ticks `from`
 /// and `to` (ms). The tick count wraps, so the gap is taken modulo 2^32; a
@@ -72,7 +66,6 @@ pub(super) fn record_event(shared: &Shared, operation: Operation, time: u32) {
         return;
     };
     let mut meta = RECORD_META.lock().unwrap();
-    meta.begin(rows);
     if meta.stopped || rows.len() + 2 >= MAX_STEPS {
         return;
     }
@@ -138,7 +131,6 @@ fn stop_rows(recorded: &mut Option<Vec<Step>>) {
         return;
     };
     let mut meta = RECORD_META.lock().unwrap();
-    meta.begin(rows);
     if meta.stopped {
         return;
     }
@@ -170,10 +162,26 @@ fn stop_rows(recorded: &mut Option<Vec<Step>>) {
         ));
     }
 }
-/// Stops the recording before the caller takes it, and marks it closed so
-/// the next recording starts from scratch (src-tauri's `stop_recording`
-/// always calls this first).
+/// Stops the recording before the caller takes it. It stays stopped until
+/// the next recording starts, so nothing reaches it before the take.
+/// Prefer [`finish_and_take`], which stops and takes in one critical
+/// section.
 pub fn finish_recording(shared: &Arc<Shared>) {
     stop_record_events(shared);
-    RECORD_META.lock().unwrap().ended = true;
+}
+/// Ends the active recording and takes it, in one critical section under
+/// the recording lock: stops it like [`finish_recording`] (drops the stop
+/// gesture's Ctrl/Shift, releases what is still held), then takes the rows
+/// as a replay plan, so no event can land between the two (M2). The
+/// Windows replacement for `finish_recording` followed by
+/// `stop_recording`; same errors as `stop_recording`.
+pub fn finish_and_take(shared: &Arc<Shared>) -> Result<ActionPlan, String> {
+    let mut recorded = shared.recording.lock().map_err(|_| "recording lock")?;
+    stop_rows(&mut recorded);
+    let steps = recorded.take().ok_or("Recording is not active")?;
+    Ok(ActionPlan {
+        steps,
+        dialect: Dialect::Replay,
+        ..Default::default()
+    })
 }

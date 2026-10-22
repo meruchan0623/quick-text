@@ -41,6 +41,7 @@ pub use actions::{execute, preflight};
 pub use foreground::{cursor, foreground};
 pub use input::{engine_ready, input_status, native_ready};
 pub use input::{input_health, reattach};
+pub use recording::finish_and_take;
 pub use recording::finish_recording;
 pub(crate) use recording::recording_started;
 pub use selection::capture_selection;
