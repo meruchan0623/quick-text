@@ -1,4 +1,4 @@
-import { isReadableRule } from './lib/rules';
+import { completeRules, isReadableRule } from './lib/rules';
 import { DEFAULT_TERMINATORS } from './lib/terminators';
 export type Data = Record<string, any>;
 export interface Config extends Data {
@@ -25,6 +25,14 @@ export interface Rule extends Data {
 }
 /** A `rules` entry the UI can show and edit (B-43). */
 export const isRule = (entry: unknown): entry is Rule => isReadableRule(entry);
+/**
+ * `config` with the serde defaults of absent rule fields filled in (see completeRules), as the UI
+ * reads it; the same object when nothing was absent.
+ */
+export function completeConfig<T extends Config>(config: T): T {
+  const rules = completeRules(config.rules);
+  return rules === config.rules ? config : { ...config, rules };
+}
 export interface State extends Data {
   draft: Config;
   active: Config;

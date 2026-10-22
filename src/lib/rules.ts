@@ -1,6 +1,6 @@
 // Pure helpers for the rule list and editor (FE-12). They fix F-04 list items in the 0.4 shell and
 // are meant to be reused by the 0.5 components.
-import { isRecord, isRuleShape } from './ruleShape';
+import { isRecord, isRuleShape, withRuleDefaults } from './ruleShape';
 
 /** Name shown for a rule without a group. */
 export const DEFAULT_GROUP = '默认';
@@ -39,7 +39,8 @@ const text = (value: unknown): string => (typeof value === 'string' ? value : ''
 
 /**
  * The top-level fields of a readable rule. `isReadableRule` checks every nested field too (see
- * ./ruleShape.ts); the backend sends all of them for a rule it could read.
+ * ./ruleShape.ts). The backend sends every field of a rule it could read; a field with a serde
+ * default may still be absent from an entry until `completeRules` fills it in, as Rust would.
  */
 export interface ReadableRule {
   id: string;
@@ -58,10 +59,20 @@ export interface ReadableRule {
 
 /**
  * Whether a `rules` entry is a rule the UI can show and edit, or a raw unreadable entry. Every
- * nested field the list and the editor read is checked, per action, step and key type; an unknown
- * type makes the entry unreadable.
+ * nested field is checked against the Rust type, per action, step and key type; an unknown type,
+ * or an unknown key below the rule itself, makes the entry unreadable.
  */
 export const isReadableRule = (entry: unknown): entry is ReadableRule => isRuleShape(entry);
+
+/**
+ * `rules` with the serde default of every absent field of every readable rule filled in, at every
+ * level (the editor reads `step.target.type`, say). Unreadable entries are left as they are; the
+ * same array is returned when nothing was absent, and a complete rule stays the same object.
+ */
+export function completeRules(rules: unknown[]): unknown[] {
+  const completed = rules.map((entry) => (isReadableRule(entry) ? withRuleDefaults(entry) : entry));
+  return completed.every((entry, i) => entry === rules[i]) ? rules : completed;
+}
 
 /** The id of an unreadable entry, when it has a usable one. */
 export function unreadableId(entry: unknown): string | null {

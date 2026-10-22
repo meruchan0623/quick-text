@@ -4,6 +4,7 @@ import { errorText as describe, diagnosticText, parseCommandError } from './ipc/
 import {
   actionLabel,
   clone,
+  completeConfig,
   Config,
   Data,
   emptyConfig,
@@ -188,9 +189,11 @@ export default function App() {
   };
   const receive = (s: State) => {
     setState(s);
-    setConfig(s.draft);
+    // A rule field with a serde default may be absent; the editor reads it filled in, as Rust does.
+    const draft = completeConfig(s.draft);
+    setConfig(draft);
     // Rules removed by a delete, rollback or import must not stay selected (F-04).
-    setSelected((current) => pruneSelection(current, s.draft.rules));
+    setSelected((current) => pruneSelection(current, draft.rules));
     setLocalDirty(false);
     edited.current = false;
   };

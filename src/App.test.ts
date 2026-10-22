@@ -629,7 +629,18 @@ describe('tolerant reading (B-43)', () => {
       { ...rule('bad-hotkey'), action: { type: 'hotkey', keys: 'ctrl+s' } },
       {
         ...rule('bad-steps'),
-        action: { type: 'steps', plan: { steps: [{ operation: { type: 'delay', ms: 1 } }] } },
+        action: { type: 'steps', plan: { steps: [{ operation: { type: 'delay', ms: -1.5 } }] } },
+      },
+      {
+        ...rule('bad-plan'),
+        action: { type: 'steps', plan: { version: 'future', dialect: { bad: true }, source: 42 } },
+      },
+      {
+        ...rule('nested-unknown-key'),
+        action: {
+          type: 'send_keys',
+          source: { type: 'inline', value: 'hello', future_option: { keep: true } },
+        },
       },
       { ...rule('bad-open'), action: { type: 'open', target: 'x', args: 'a b' } },
       { ...rule('bad-future'), action: { type: 'from_the_future', payload: 1 } },
@@ -691,6 +702,151 @@ describe('tolerant reading (B-43)', () => {
     });
     expect(lastSaved(backend).globals.future_global).toBe('kept');
     expect(lastSaved(backend).future_setting).toEqual({ sample: true });
+  });
+
+  it('keeps a nested unknown key byte for byte and rule-level keys in place through the editor', async () => {
+    // Codex's case: 「添加普通文字」 rebuilds `source`, so a rule with an unknown key in it must not
+    // reach the editor. Rule-level keys of a newer version are edited around, in place.
+    const nested = {
+      id: 'nested-unknown',
+      enabled: true,
+      group: '默认',
+      description: '',
+      ignore_case: false,
+      match: { kind: 'literal', value: ';nested' },
+      trigger_mode: 'immediate',
+      terminator: null,
+      ime_erasure: null,
+      action: {
+        type: 'send_keys',
+        source: { type: 'inline', value: 'hello', future_option: { keep: true } },
+      },
+      parameter: { type: 'default_match' },
+      notification: { enabled: false, message: '' },
+    };
+    const mounted = await mount({ unreadable: true }, (backend) => {
+      const [first] = backend.draft.rules as Record<string, unknown>[];
+      // A rule-level key of a newer version in the middle of the known ones.
+      backend.draft.rules[0] = Object.fromEntries(
+        Object.entries({
+          ...first,
+          action: { type: 'send_keys', source: { type: 'inline', value: 'hi' } },
+        }).flatMap(([k, v]) =>
+          k === 'group'
+            ? [
+                ['future_middle', { deep: [1, 'x'] }],
+                [k, v],
+              ]
+            : [[k, v]],
+        ),
+      );
+      backend.draft.rules.splice(2, 0, structuredClone(nested));
+    });
+    const { backend, container } = mounted;
+    await waitFor(mounted, () => {
+      expect(container.querySelectorAll('tbody tr')).toHaveLength(7);
+    });
+    const before = structuredClone(backend.draft);
+    const raw = [...container.querySelectorAll('tbody tr.unreadable-row')].find(
+      (r) => r.querySelector('.unreadable-id')?.textContent === 'nested-unknown',
+    );
+    // Listed read-only: nothing to open it in the editor with.
+    expect(raw).toBeDefined();
+    expect(raw?.querySelector('input, button')).toBeNull();
+
+    // Edit ;s1 through the send_keys builder that dropped the key, then save from the editor.
+    await click(mounted, '编辑');
+    const editor = dialog(container, '编辑文本指令');
+    const literal = editor?.querySelector<HTMLInputElement>('input[aria-label="要输入的普通文字"]');
+    if (!literal) throw new Error('no send_keys builder');
+    await type(mounted, literal, '!');
+    await clickIn(mounted, editor, '添加普通文字');
+    await clickIn(mounted, editor, '保存');
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+    });
+    const saved = lastSaved(backend);
+    const edited = saved.rules[0] as Record<string, unknown>;
+    expect(edited.action).toStrictEqual({
+      type: 'send_keys',
+      source: { type: 'inline', value: 'hi!' },
+      // Absent in the draft; filled in with its serde default.
+      syntax_variables: [],
+    });
+    expect(Object.keys(edited)).toEqual(Object.keys(before.rules[0] as object));
+    expect(edited.future_middle).toEqual({ deep: [1, 'x'] });
+    // Every other entry, the nested-unknown one included, is written back byte for byte.
+    expect(saved.rules[2]).toEqual(nested);
+    expect(JSON.stringify(saved.rules.slice(1))).toBe(JSON.stringify(before.rules.slice(1)));
+
+    // The globals and the config keep their unknown keys, in place, through a settings edit.
+    await click(mounted, '文本指令参数设置');
+    await type(mounted, field(container, '词分隔符'), ' ;');
+    await click(mounted, '保存参数草稿');
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'save_draft')).toHaveLength(2);
+    });
+    const settings = lastSaved(backend);
+    expect(settings.globals.word_separators).toBe(' ;');
+    expect(Object.keys(settings.globals)).toEqual(Object.keys(before.globals));
+    expect(settings.globals.future_global).toBe('kept');
+    expect(Object.keys(settings)).toEqual(Object.keys(before));
+    expect(settings.future_setting).toEqual({ sample: true });
+    expect(JSON.stringify(settings.rules[2])).toBe(JSON.stringify(nested));
+  });
+
+  it('reads absent fields as their serde defaults and edits such a rule', async () => {
+    // Rust reads this as a complete rule; the step editor reads `target.type` right away.
+    const sparse = {
+      id: 'sparse',
+      match: { kind: 'literal', value: ';a-sparse' },
+      action: { type: 'steps', plan: { steps: [{ operation: { type: 'delay', ms: 5 } }] } },
+    };
+    const mounted = await mount({}, (backend) => {
+      backend.draft.rules.push(structuredClone(sparse));
+    });
+    const { backend, container } = mounted;
+    await waitFor(mounted, () => {
+      expect(container.querySelectorAll('tbody tr')).toHaveLength(4);
+    });
+    expect(container.querySelectorAll('tbody tr.unreadable-row')).toHaveLength(0);
+    // ;a-sparse sorts first.
+    await click(mounted, '编辑');
+    const editor = dialog(container, '编辑文本指令');
+    expect(field(editor ?? container, '说明').value).toBe('');
+    await type(mounted, field(editor ?? container, '说明'), '补全');
+    await clickIn(mounted, editor, '保存');
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+    });
+    expect(lastSaved(backend).rules.at(-1)).toStrictEqual({
+      id: 'sparse',
+      match: { kind: 'literal', value: ';a-sparse' },
+      action: {
+        type: 'steps',
+        plan: {
+          steps: [
+            {
+              operation: { type: 'delay', ms: 5 },
+              span: { line: 0, column: 0, length: 0 },
+              target: { type: 'locked' },
+            },
+          ],
+          version: 1,
+          dialect: 'structured',
+          source: null,
+        },
+      },
+      enabled: true,
+      group: '',
+      description: '补全',
+      ignore_case: false,
+      trigger_mode: 'terminator',
+      terminator: null,
+      ime_erasure: null,
+      parameter: { type: 'default_match' },
+      notification: { enabled: false, message: '' },
+    });
   });
 });
 
