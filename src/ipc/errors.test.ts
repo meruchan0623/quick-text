@@ -116,6 +116,11 @@ describe('parseCommandError', () => {
     expect(describeError(error)).toBe('Store lock');
   });
 
+  it('treats a legacy cancelled export as cancelled, shown as nothing', () => {
+    expect(parseCommandError('Export cancelled')).toEqual({ code: 'cancelled' });
+    expect(errorText('Export cancelled')).toBeNull();
+  });
+
   it('recognises a legacy JSON diagnostics string as validation', () => {
     const error = parseCommandError(
       JSON.stringify([diagnostic, { ...diagnostic, message: '第二处' }]),

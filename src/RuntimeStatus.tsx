@@ -128,7 +128,7 @@ function TargetStatus({ state }: { state: State | null }) {
       </div>
       {state?.platform === 'windows' && (
         <p className="muted">
-          Windows 0.3.0 使用 espanso
+          Windows 版使用 espanso
           输入组件识别缩写，匹配后退格并输出。支持立即执行、空格和分号触发；Tab、回车触发仍不可用。逐字键入与整段粘贴分别执行，输入框不提供正文也能发送。中文选字时，数字和空格可能用于选择候选词，建议切到英文输入后使用；发送结果仍需查看目标输入框。
         </p>
       )}

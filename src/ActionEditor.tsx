@@ -3,6 +3,7 @@ import { call } from './ipc/transport';
 import { parseCommandError } from './ipc/errors';
 import { actionChoice, actionLabel, actionOptions, clone, Data, Rule } from './model';
 import { moveItem, withoutKey } from './lib/list';
+import { LinesInput } from './LinesInput';
 type Props = {
   platform?: string | undefined;
   rules: Rule[];
@@ -1334,12 +1335,10 @@ export default function ActionEditor({
                       )}
                       {o.type === 'paste_files' && (
                         <>
-                          <textarea
+                          <LinesInput
                             aria-label="文件路径列表"
-                            value={o.paths.join('\n')}
-                            onChange={(e) =>
-                              setOp({ paths: e.target.value.split('\n').filter(Boolean) })
-                            }
+                            value={o.paths}
+                            onChange={(paths) => setOp({ paths })}
                           />
                           <button onClick={() => choosePath('files', (p) => setOp({ paths: p }))}>
                             选择多个文件

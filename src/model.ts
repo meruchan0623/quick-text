@@ -1,3 +1,4 @@
+import { DEFAULT_TERMINATORS } from './lib/terminators';
 export type Data = Record<string, any>;
 export interface Config extends Data {
   version: number;
@@ -35,7 +36,7 @@ export const emptyConfig = (): Config => ({
   revision: 0,
   enabled: true,
   globals: {
-    terminators: ['space', 'tab', 'enter', 'semicolon'],
+    terminators: [...DEFAULT_TERMINATORS],
     word_separators: ' \t\n',
     blacklist: [],
     ime_erasure: 'escape',

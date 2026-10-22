@@ -60,6 +60,9 @@ const strOrNull = (v: unknown): string | null => (typeof v === 'string' ? v : nu
 const numOrNull = (v: unknown): number | null =>
   typeof v === 'number' && Number.isFinite(v) ? v : null;
 
+/** A 0.3 backend rejected a cancelled save dialog with this plain string (now `null`, §4). */
+const LEGACY_CANCELLED = 'Export cancelled';
+
 const MISSING_COMMAND_TEXT = '当前版本的桌面引擎不支持此功能，请更新到新版本后再试。';
 
 const internal = (message?: string): CommandError =>
@@ -133,7 +136,7 @@ function fromObject(value: Obj): CommandError | null {
  * Normalise anything an `invoke` can reject with. Values that are not a CommandError become
  * `internal` with an empty trace id (contract §2). A 0.3 backend's validation failure is a JSON
  * string of a Diagnostic array; it is recognised as `validation` so the editor can still point at
- * the offending field.
+ * the offending field. Its 「Export cancelled」 is `cancelled`, so nothing is shown.
  */
 export function parseCommandError(value: unknown): CommandError {
   if (isMissingCommand(value)) return internal(MISSING_COMMAND_TEXT);
@@ -141,6 +144,7 @@ export function parseCommandError(value: unknown): CommandError {
   if (value instanceof Error) return internal(value.message);
   if (typeof value === 'string') {
     const text = value.trim();
+    if (text === LEGACY_CANCELLED) return { code: 'cancelled' };
     if (text.startsWith('[') || text.startsWith('{')) {
       try {
         const parsed: unknown = JSON.parse(text);

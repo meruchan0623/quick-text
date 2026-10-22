@@ -33,7 +33,10 @@ afterEach(async () => {
  * Render App against a fresh mock backend. Modules are reset so the app-wide RuntimeSync and the
  * transport start from scratch; React is imported from the same fresh module graph as App.
  */
-async function mount(options: MockOptions = {}): Promise<Mounted> {
+async function mount(
+  options: MockOptions = {},
+  setup?: (backend: MockBackend) => void,
+): Promise<Mounted> {
   vi.resetModules();
   const react = await import('react');
   const { createRoot } = await import('react-dom/client');
@@ -41,6 +44,7 @@ async function mount(options: MockOptions = {}): Promise<Mounted> {
   const { setTransport } = await import('./ipc/transport');
   const { default: App } = await import('./App');
   const backend = new MockBackend({ rules: 3, ...options });
+  setup?.(backend);
   setTransport(createMockTransport(backend));
   const container = document.createElement('div');
   document.body.append(container);
@@ -245,5 +249,239 @@ describe('runtime status area (S-19)', () => {
     });
     // The snapshot is not retried on refresh once the backend is known to lack it.
     expect(callsOf(backend, 'get_runtime_snapshot')).toHaveLength(1);
+  });
+});
+
+/** The input or textarea of the `<Field>` labelled `label`. */
+function field(root: ParentNode, label: string): HTMLInputElement | HTMLTextAreaElement {
+  const found = [...root.querySelectorAll('label.field')].find(
+    (l) => l.querySelector(':scope > span')?.textContent === label,
+  );
+  const control = found?.querySelector<HTMLInputElement | HTMLTextAreaElement>('input, textarea');
+  if (!control) throw new Error(`no field 「${label}」`);
+  return control;
+}
+
+/** Type into a controlled input the way React sees it (native setter + input event). */
+async function type(
+  mounted: Mounted,
+  control: HTMLInputElement | HTMLTextAreaElement,
+  value: string,
+): Promise<void> {
+  const proto =
+    control instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
+  await mounted.act(() => {
+    // The prototype's setter, not React's tracker on the element.
+    Reflect.set(proto, 'value', value, control);
+    control.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+}
+
+const dialog = (container: HTMLElement, title: string) =>
+  container.querySelector<HTMLDialogElement>(`dialog[aria-label="${title}"]`);
+
+async function clickIn(mounted: Mounted, root: ParentNode | null, text: string): Promise<void> {
+  const target = [...(root?.querySelectorAll('button') ?? [])].find((b) => b.textContent === text);
+  if (!target) throw new Error(`no button 「${text}」`);
+  await mounted.act(() => {
+    target.click();
+  });
+}
+
+const statusText = (container: HTMLElement) =>
+  container.querySelector('.status-text')?.textContent ?? '';
+
+describe('rule list, editor and settings (F-04)', () => {
+  it('lists rules without a group under 「默认」', async () => {
+    // Rule 1 is in 「默认」, rule 7 has group "".
+    const mounted = await mount({ rules: 7 });
+    const { container } = mounted;
+    await waitFor(mounted, () => {
+      expect(container.querySelectorAll('tbody tr')).toHaveLength(7);
+    });
+    const tabs = [...container.querySelectorAll('.group-tabs button')].map((b) => b.textContent);
+    expect(tabs.filter((t) => t.startsWith('默认'))).toEqual(['默认2']);
+    await click(mounted, '默认2');
+    const rows = [...container.querySelectorAll('tbody tr')];
+    expect(rows.map((r) => r.querySelector('strong')?.textContent)).toEqual([';s1', ';s7']);
+    expect(rows.every((r) => r.textContent.includes('默认'))).toBe(true);
+  });
+
+  it('keeps a trailing newline in the blacklist while typing', async () => {
+    const mounted = await mount();
+    const { backend, container } = mounted;
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'load_state')).toHaveLength(1);
+    });
+    await click(mounted, '文本指令参数设置');
+    const blacklist = field(container, '黑名单程序');
+    await type(mounted, blacklist, 'a.exe\n');
+    expect(blacklist.value).toBe('a.exe\n');
+    await type(mounted, blacklist, 'a.exe\n b.exe \n');
+    expect(blacklist.value).toBe('a.exe\n b.exe \n');
+    await click(mounted, '保存参数草稿');
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+    });
+    const saved = callsOf(backend, 'save_draft')[0]?.args.config as {
+      globals: { blacklist: string[]; terminators: string[] };
+    };
+    expect(saved.globals.blacklist).toEqual(['a.exe', 'b.exe']);
+  });
+
+  it('asks before Esc or 取消 throws away unsaved changes', async () => {
+    const mounted = await mount();
+    const { backend, container } = mounted;
+    await waitFor(mounted, () => {
+      expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
+    });
+    // Unchanged: closes right away.
+    await click(mounted, '编辑');
+    expect(dialog(container, '编辑文本指令')).not.toBeNull();
+    await clickIn(mounted, dialog(container, '编辑文本指令'), '取消');
+    expect(dialog(container, '编辑文本指令')).toBeNull();
+
+    await click(mounted, '编辑');
+    const editor = dialog(container, '编辑文本指令');
+    await type(mounted, field(container, '说明'), '改过的说明');
+    await mounted.act(() => {
+      editor?.dispatchEvent(new Event('cancel', { cancelable: true }));
+    });
+    // 取消 in the question keeps the editor and the change.
+    await waitFor(mounted, () => {
+      expect(dialog(container, '放弃未保存的改动？')).not.toBeNull();
+    });
+    await clickIn(mounted, dialog(container, '放弃未保存的改动？'), '取消');
+    await waitFor(mounted, () => {
+      expect(dialog(container, '放弃未保存的改动？')).toBeNull();
+    });
+    expect(field(container, '说明').value).toBe('改过的说明');
+
+    await clickIn(mounted, editor, '取消');
+    await waitFor(mounted, () => {
+      expect(dialog(container, '放弃未保存的改动？')).not.toBeNull();
+    });
+    await clickIn(mounted, dialog(container, '放弃未保存的改动？'), '放弃改动');
+    await waitFor(mounted, () => {
+      expect(dialog(container, '编辑文本指令')).toBeNull();
+    });
+    expect(callsOf(backend, 'save_draft')).toHaveLength(0);
+  });
+
+  it('grays out Tab and 回车 on Windows and lets an old config uncheck them', async () => {
+    const mounted = await mount({}, (backend) => {
+      backend.draft.globals.terminators = ['space', 'tab'];
+    });
+    const { backend, container } = mounted;
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'load_state')).toHaveLength(1);
+    });
+    await click(mounted, '文本指令参数设置');
+    const keys = container.querySelector('.end-keys');
+    const labels = [...(keys?.querySelectorAll('label.unsupported') ?? [])];
+    expect(labels.map((l) => l.textContent)).toEqual(['Tab', '回车']);
+    const [tab, enter] = labels.map((l) => l.querySelector('input'));
+    expect(tab?.checked).toBe(true);
+    expect(tab?.disabled).toBe(false);
+    expect(enter?.checked).toBe(false);
+    expect(enter?.disabled).toBe(true);
+    expect(keys?.textContent).toMatch(/Tab、回车：Windows 上暂不支持；已勾选的不会触发指令/);
+    // The 触发字符 column of a terminator rule says so too.
+    await click(mounted, '文本指令管理');
+    expect(container.querySelector('tbody')?.textContent).toMatch(/空格.*Tab 暂不支持/);
+  });
+
+  it('shows no unsupported terminators on macOS', async () => {
+    const mounted = await mount({ platform: 'macos' });
+    const { backend, container } = mounted;
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'load_state')).toHaveLength(1);
+    });
+    await click(mounted, '文本指令参数设置');
+    expect(container.querySelectorAll('.end-keys label.unsupported')).toHaveLength(0);
+    expect(container.querySelector('.end-keys small')).toBeNull();
+  });
+
+  it('shows save_draft validation in the editor and keeps it open', async () => {
+    const mounted = await mount();
+    const { backend, container } = mounted;
+    await waitFor(mounted, () => {
+      expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
+    });
+    await click(mounted, '编辑');
+    backend.failures.set('save_draft', {
+      code: 'validation',
+      detail: {
+        diagnostics: [
+          {
+            code: 'description_too_long',
+            message: '说明太长',
+            path: 'rules[0].description',
+            span: null,
+            severity: 'error',
+          },
+          {
+            code: 'duplicate',
+            message: '缩写重复',
+            path: 'rules[2].match',
+            span: null,
+            severity: 'error',
+          },
+        ],
+      },
+    });
+    await clickIn(mounted, dialog(container, '编辑文本指令'), '保存');
+    await waitFor(mounted, () => {
+      expect(container.querySelector('.field-errors')).not.toBeNull();
+    });
+    const items = [...container.querySelectorAll('.field-errors li')].map((li) => li.textContent);
+    expect(items).toEqual(['说明：说明太长', '第 3 条指令：缩写重复']);
+    expect(dialog(container, '编辑文本指令')).not.toBeNull();
+    expect(container.querySelector('.alert.error')?.textContent).toMatch(/有设置需要修改/);
+  });
+
+  it.each([false, true])(
+    'says nothing when the export dialog is cancelled (legacy %s)',
+    async (legacy) => {
+      const mounted = await mount({ dialog: 'cancel', legacy });
+      const { backend, container } = mounted;
+      await waitFor(mounted, () => {
+        expect(callsOf(backend, 'load_state')).toHaveLength(1);
+      });
+      const before = statusText(container);
+      await click(mounted, '导出');
+      await waitFor(mounted, () => {
+        expect(callsOf(backend, 'export_config')).toHaveLength(1);
+      });
+      await mounted.act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+      expect(statusText(container)).toBe(before);
+      expect(container.querySelector('.alert.error')).toBeNull();
+    },
+  );
+
+  it('reports a finished export', async () => {
+    const mounted = await mount();
+    const { container } = mounted;
+    await click(mounted, '导出');
+    await waitFor(mounted, () => {
+      expect(statusText(container)).toMatch(/mock:\/\/quicker-text-package\.json/);
+    });
+  });
+
+  it('shows the license notice and asks before 退出全部', async () => {
+    const mounted = await mount();
+    const { backend, container } = mounted;
+    await click(mounted, '文本指令参数设置');
+    expect(container.textContent).toMatch(/GPL-3\.0-or-later/);
+    await click(mounted, '运行状态与恢复');
+    await click(mounted, '退出全部');
+    await waitFor(mounted, () => {
+      expect(dialog(container, '退出 Quicker Text？')).not.toBeNull();
+    });
+    await clickIn(mounted, dialog(container, '退出 Quicker Text？'), '取消');
+    await mounted.act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+    expect(callsOf(backend, 'exit_app')).toHaveLength(0);
   });
 });

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { call } from './ipc/transport';
-import { errorText as describe } from './ipc/errors';
+import { errorText as describe, parseCommandError } from './ipc/errors';
 import {
   actionLabel,
   clone,
@@ -21,6 +21,16 @@ import { Modal } from './Modal';
 import { runtimeSync, useRuntime } from './ipc/events';
 import { liveStatus } from './status';
 import { BannerStack, HealthCard, HistoryList } from './StatusArea';
+import { LinesInput } from './LinesInput';
+import {
+  countByGroup,
+  diagnosticField,
+  groupKey,
+  pruneSelection,
+  ruleDiagnostics,
+  summarizeAction,
+} from './lib/rules';
+import { effectiveTerminators, unsupportedTerminators } from './lib/terminators';
 
 // `null` from describe() means the user cancelled: show nothing.
 const errorText = (e: unknown) => describe(e) ?? '';
@@ -41,23 +51,75 @@ function Field({
     </label>
   );
 }
-function EndKeys({ value, onChange }: { value: string[]; onChange: (v: string[]) => void }) {
+const platformNames: Record<string, string> = {
+  windows: 'Windows',
+  macos: 'macOS',
+  linux: 'Linux',
+};
+/**
+ * Terminator checkboxes. Keys the platform cannot use are grayed out with a note (S-12); one that
+ * an old config already has stays checked and can still be unchecked.
+ */
+function EndKeys({
+  value,
+  onChange,
+  platform,
+}: {
+  value: string[];
+  onChange: (v: string[]) => void;
+  platform?: string | undefined;
+}) {
   const keySet = new Set(value);
+  const unsupported = unsupportedTerminators(platform);
+  const stale = unsupported.some((k) => keySet.has(k));
   return (
-    <div className="inline">
-      {keys.map((k) => (
-        <label key={k}>
-          <input
-            type="checkbox"
-            checked={keySet.has(k)}
-            onChange={(e) =>
-              onChange(e.target.checked ? [...value, k] : value.filter((i) => i !== k))
-            }
-          />
-          {keyNames[k]}
-        </label>
-      ))}
+    <div className="inline end-keys">
+      {keys.map((k) => {
+        const off = unsupported.includes(k);
+        return (
+          <label key={k} className={off ? 'unsupported' : undefined}>
+            <input
+              type="checkbox"
+              checked={keySet.has(k)}
+              disabled={off && !keySet.has(k)}
+              onChange={(e) =>
+                onChange(e.target.checked ? [...value, k] : value.filter((i) => i !== k))
+              }
+            />
+            {keyNames[k]}
+          </label>
+        );
+      })}
+      {unsupported.length > 0 && (
+        <small className="muted">
+          {unsupported.map((k) => keyNames[k] ?? k).join('、')}：
+          {platformNames[platform ?? ''] ?? platform} 上暂不支持
+          {stale && '；已勾选的不会触发指令，可以取消勾选'}
+        </small>
+      )}
     </div>
+  );
+}
+/** 触发字符 column: supported keys, then the unsupported ones marked as such. */
+function TerminatorList({
+  keys: list,
+  platform,
+}: {
+  keys: string[];
+  platform?: string | undefined;
+}) {
+  const usable = effectiveTerminators(list, platform);
+  const unusable = list.filter((k) => !usable.includes(k));
+  return (
+    <>
+      {usable.map((k) => keyNames[k] || k).join(' / ') || '—'}
+      {unusable.length > 0 && (
+        <small className="muted">
+          {' '}
+          {unusable.map((k) => keyNames[k] || k).join('、')} 暂不支持
+        </small>
+      )}
+    </>
   );
 }
 
@@ -123,6 +185,8 @@ export default function App() {
   const receive = (s: State) => {
     setState(s);
     setConfig(s.draft);
+    // Rules removed by a delete, rollback or import must not stay selected (F-04).
+    setSelected((current) => pruneSelection(current, s.draft.rules));
     setLocalDirty(false);
     edited.current = false;
   };
@@ -206,6 +270,26 @@ export default function App() {
       if (path) setMessage(`诊断包已导出：${path}`);
     });
   const openDir = (command: 'open_log_dir' | 'open_data_dir') => run(() => call(command));
+  const platform: string | undefined = state?.platform ?? state?.engine_detail?.platform;
+  // The rule as opened, to tell whether closing the editor would lose changes (F-04).
+  const editingBase = useRef('');
+  const openEditor = (rule: Rule) => {
+    editingBase.current = JSON.stringify(rule);
+    setEditing(rule);
+  };
+  const closeEditor = async () => {
+    if (
+      editing &&
+      JSON.stringify(editing) !== editingBase.current &&
+      !(await confirmAction({
+        title: '放弃未保存的改动？',
+        detail: '这条指令的改动还没有保存到草稿，关闭后会丢失。',
+        confirm: '放弃改动',
+      }))
+    )
+      return;
+    setEditing(null);
+  };
   const change = (c: Config) => {
     setConfig(c);
     setLocalDirty(true);
@@ -219,28 +303,36 @@ export default function App() {
   const selectedSet = new Set(selected);
   const ruleNames = new Map<string, string>(config.rules.map((r) => [r.id, r.match.value || r.id]));
   const ruleName = (id: string) => ruleNames.get(id) ?? id;
-  const groupCounts = new Map<string, number>();
-  for (const r of config.rules) groupCounts.set(r.group, (groupCounts.get(r.group) || 0) + 1);
-  const groups = ['全部', ...new Set(config.rules.map((r) => r.group || '默认'))];
+  // An empty group is listed, counted and filtered as 「默认」 (F-04).
+  const groupCounts = countByGroup(config.rules);
+  const groups = ['全部', ...groupCounts.keys()];
+  const needle = search.toLowerCase();
   const rows = config.rules
     .filter(
       (r) =>
-        (group === '全部' || r.group === group) &&
-        `${r.match.value} ${r.description} ${r.group}`.toLowerCase().includes(search.toLowerCase()),
+        (group === '全部' || groupKey(r.group) === group) &&
+        `${r.match.value} ${r.description} ${groupKey(r.group)} ${summarizeAction(r.action)}`
+          .toLowerCase()
+          .includes(needle),
     )
     .sort((a, b) =>
-      (sort === 'match' ? a.match.value : a.group).localeCompare(
-        sort === 'match' ? b.match.value : b.group,
+      (sort === 'match' ? a.match.value : groupKey(a.group)).localeCompare(
+        sort === 'match' ? b.match.value : groupKey(b.group),
       ),
     );
+  // Diagnostics refer to the whole config; split out the ones about the rule being edited.
+  const editingFound = editing ? config.rules.findIndex((r) => r.id === editing.id) : -1;
+  const editingIndex = editingFound >= 0 ? editingFound : config.rules.length;
+  const editingDiagnostics = ruleDiagnostics(editingErrors, editingIndex);
   const mutate = async (fn: (rs: Rule[]) => Rule[]) =>
     run(() => save({ ...config, rules: fn(clone(config.rules)) }), '草稿已保存 · 请应用设置');
   const choose = async (kind = 'file') => call<string[] | null>('choose_file', { kind });
   const exportData = () =>
     run(async () => {
       if (localDirty) await save();
-      const path = await call<string>('export_config');
-      setMessage(`已导出：${path}`);
+      const path = await call<string | null>('export_config');
+      // null: the save dialog was cancelled; say nothing (ipc-contract §4).
+      if (path) setMessage(`已导出：${path}`);
     });
   const importData = () =>
     run(async () => {
@@ -261,24 +353,36 @@ export default function App() {
       });
       if (!strategy) return;
       const r = await call('import_config', { path: p[0], strategy });
+      if (!r) return; // cancelled
       setDialog({ title: '导入预览 · 确认后写入草稿', data: r.report, importConfig: r.config });
       setMessage('请核对导入报告后确认');
     });
   const commitEdit = () =>
     run(async () => {
       if (!editing) return;
+      const found = config.rules.findIndex((r) => r.id === editing.id);
       const c = {
         ...config,
-        rules: config.rules.some((r) => r.id === editing.id)
-          ? config.rules.map((r) => (r.id === editing.id ? editing : r))
-          : [...config.rules, editing],
+        rules:
+          found >= 0
+            ? config.rules.map((r, i) => (i === found ? editing : r))
+            : [...config.rules, editing],
+      };
+      const reject = (diagnostics: Data[]) => {
+        setEditingErrors(diagnostics);
+        return new Error('有设置需要修改，请查看编辑框中的提示；已填写的内容会保留。');
       };
       const v = await call('validate_config', { config: c });
-      if (!v.valid) {
-        setEditingErrors(v.errors);
-        throw new Error('有设置需要修改，请查看提示；已填写的内容会保留。');
+      if (!v.valid) throw reject(v.errors);
+      try {
+        await save(c);
+      } catch (e) {
+        // save_draft validates too (B-42); its diagnostics go to the same place.
+        const error = parseCommandError(e);
+        if (error.code === 'validation' && error.detail.diagnostics.length > 0)
+          throw reject(error.detail.diagnostics);
+        throw e;
       }
-      await save(c);
       setEditing(null);
     }, '指令已保存到草稿');
   return (
@@ -358,10 +462,7 @@ export default function App() {
               <input type="checkbox" checked={hide} onChange={(e) => setHide(e.target.checked)} />
               隐藏摘要
             </label>
-            <button
-              className="primary"
-              onClick={() => setEditing(newRule(state?.platform ?? state?.engine_detail?.platform))}
-            >
+            <button className="primary" onClick={() => openEditor(newRule(platform))}>
               ＋ 添加指令
             </button>
             <button onClick={importData}>导入</button>
@@ -452,7 +553,7 @@ export default function App() {
                   <tr
                     key={r.id}
                     className={!r.enabled ? 'disabled-row' : ''}
-                    onDoubleClick={() => setEditing(clone(r))}
+                    onDoubleClick={() => openEditor(clone(r))}
                   >
                     <td>
                       <input
@@ -472,34 +573,27 @@ export default function App() {
                       <strong>{r.match.value}</strong>
                       <span className="markers">
                         {r.ignore_case && <i>Aa</i>}
-                        {r.trigger_mode === 'immediate' && <i>直接</i>}
+                        {r.trigger_mode === 'immediate' && <i>即时</i>}
                         {r.match.kind === 'regex' && <i>正则</i>}
                       </span>
                     </td>
                     <td>
-                      {r.trigger_mode === 'immediate'
-                        ? '即时'
-                        : (r.terminator?.keys ?? config.globals.terminators)
-                            .map((k: string) => keyNames[k] || k)
-                            .join(' / ')}
+                      {r.trigger_mode === 'immediate' ? (
+                        '即时'
+                      ) : (
+                        <TerminatorList
+                          keys={r.terminator?.keys ?? config.globals.terminators}
+                          platform={platform}
+                        />
+                      )}
                       {!r.terminator && r.trigger_mode !== 'immediate' && (
                         <small className="muted">继承</small>
                       )}
                     </td>
                     <td>{r.description || '—'}</td>
-                    <td>{r.group}</td>
+                    <td>{groupKey(r.group)}</td>
                     <td>{actionLabel(r.action)}</td>
-                    {!hide && (
-                      <td className="summary">
-                        {r.action.source?.value ||
-                          r.action.source?.path ||
-                          r.action.html ||
-                          r.action.target ||
-                          r.action.function ||
-                          r.action.action_id ||
-                          `${r.action.plan?.steps?.length ?? 0} 个步骤`}
-                      </td>
-                    )}
+                    {!hide && <td className="summary">{summarizeAction(r.action)}</td>}
                     <td>
                       <input
                         aria-label={`停用 ${r.match.value}`}
@@ -515,7 +609,7 @@ export default function App() {
                       />
                     </td>
                     <td className="row-tools">
-                      <button onClick={() => setEditing(clone(r))}>编辑</button>
+                      <button onClick={() => openEditor(clone(r))}>编辑</button>
                       <button
                         onClick={async () => {
                           if (
@@ -534,18 +628,13 @@ export default function App() {
                 ))}
               </tbody>
             </table>
-            {!rows.length && (
+            {/* No empty state before the first load_state answer (F-04). */}
+            {state && !rows.length && (
               <div className="empty">
-                <div>⌨</div>
+                <div aria-hidden="true">⌨</div>
                 <strong>{search ? '没有匹配的指令' : '建立你的第一条文本指令'}</strong>
                 <p>设置缩写、触发条件和操作，保存后应用设置。</p>
-                <button
-                  onClick={() =>
-                    setEditing(newRule(state?.platform ?? state?.engine_detail?.platform))
-                  }
-                >
-                  添加指令
-                </button>
+                <button onClick={() => openEditor(newRule(platform))}>添加指令</button>
               </div>
             )}
           </div>
@@ -553,7 +642,7 @@ export default function App() {
             {groups.map((g) => (
               <button key={g} className={group === g ? 'active' : ''} onClick={() => setGroup(g)}>
                 {g}
-                <small>{g === '全部' ? config.rules.length : groupCounts.get(g) || 0}</small>
+                <small>{g === '全部' ? config.rules.length : (groupCounts.get(g) ?? 0)}</small>
               </button>
             ))}
           </div>
@@ -565,6 +654,7 @@ export default function App() {
           <p className="muted">以下选项与指令草稿一并发布，单条指令可覆盖触发字符。</p>
           <Field label="默认触发字符">
             <EndKeys
+              platform={platform}
               value={config.globals.terminators}
               onChange={(v) =>
                 change({ ...config, globals: { ...config.globals, terminators: v } })
@@ -600,17 +690,11 @@ export default function App() {
             label="黑名单程序"
             hint="每行一个 Windows 进程名或 Mac 应用标识；黑名单内不执行文本指令。"
           >
-            <textarea
+            <LinesInput
               rows={5}
-              value={config.globals.blacklist.join('\n')}
-              onChange={(e) =>
-                change({
-                  ...config,
-                  globals: {
-                    ...config.globals,
-                    blacklist: e.target.value.split('\n').filter(Boolean),
-                  },
-                })
+              value={config.globals.blacklist}
+              onChange={(blacklist) =>
+                change({ ...config, globals: { ...config.globals, blacklist } })
               }
             />
           </Field>
@@ -654,6 +738,12 @@ export default function App() {
           <button className="primary" onClick={() => run(() => save(), '参数已保存到草稿')}>
             保存参数草稿
           </button>
+          <h3>许可证与第三方声明</h3>
+          <p className="muted license">
+            Quicker Text 是自由软件，按 GNU 通用公共许可证第 3 版或（由你选择）任何更新的版本授权
+            （GPL-3.0-or-later），不提供任何担保。许可证全文见源码中的
+            LICENSE，所用第三方组件及其许可证见 THIRD_PARTY_NOTICES.md。
+          </p>
         </section>
       )}
       {tab === 'status' && (
@@ -696,7 +786,20 @@ export default function App() {
             <button onClick={() => run(() => call('cancel_execution'), '已请求停止')}>
               停止当前动作
             </button>
-            <button onClick={() => run(() => call('exit_app'))}>退出全部</button>
+            <button
+              onClick={async () => {
+                if (
+                  await confirmAction({
+                    title: '退出 Quicker Text？',
+                    detail: '退出后文本指令不再生效，直到再次启动。',
+                    confirm: '退出',
+                  })
+                )
+                  void run(() => call('exit_app'));
+              }}
+            >
+              退出全部
+            </button>
           </div>
           {runtime.status === 'ready' && (
             <div className="inline diagnostics">
@@ -719,7 +822,9 @@ export default function App() {
         </section>
       )}
       <footer>
-        <span className="status-text">{busy ? '正在处理…' : message}</span>
+        <span className="status-text" aria-live="polite">
+          {busy ? '正在处理…' : message}
+        </span>
         <button
           disabled={busy || !state}
           className="primary"
@@ -734,18 +839,30 @@ export default function App() {
         </button>
       </footer>
       {editing && (
-        <Modal title="编辑文本指令" className="overlay" onClose={() => setEditing(null)}>
+        <Modal title="编辑文本指令" className="overlay" onClose={() => void closeEditor()}>
           <div className="editor">
             <div className="modal-title">
               <h2>
                 {config.rules.some((r) => r.id === editing.id) ? '编辑文本指令' : '添加文本指令'}
               </h2>
-              <button aria-label="关闭编辑" onClick={() => setEditing(null)}>
+              <button aria-label="关闭编辑" onClick={() => void closeEditor()}>
                 ×
               </button>
             </div>
             <div className="edit-grid">
               <div className="trigger-panel">
+                {(editingDiagnostics.rule.length > 0 || editingDiagnostics.other.length > 0) && (
+                  <div className="field-errors" role="alert">
+                    <strong>需要修改的设置</strong>
+                    <ul>
+                      {[...editingDiagnostics.rule, ...editingDiagnostics.other].map((d, i) => (
+                        <li key={i}>
+                          {diagnosticField(d.path, editingIndex)}：{d.message}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
                 <h3>什么时候执行</h3>
                 <Field
                   label="缩写词"
@@ -820,7 +937,7 @@ export default function App() {
                   }
                 >
                   <select value={editing.trigger_mode} onChange={(e) => changeMode(e.target.value)}>
-                    <option value="terminator">输入缩写后，再按空格、回车等指定键执行</option>
+                    <option value="terminator">输入缩写后，再按空格、分号等指定键执行</option>
                     <option value="immediate">缩写输入完成后立即执行（不支持匹配规则）</option>
                   </select>
                 </Field>
@@ -842,6 +959,7 @@ export default function App() {
                       使用“文本指令参数设置”里的默认触发键
                     </label>
                     <EndKeys
+                      platform={platform}
                       value={editing.terminator?.keys ?? config.globals.terminators}
                       onChange={(v) =>
                         setEditing({
@@ -966,9 +1084,7 @@ export default function App() {
                 <h3>操作内容</h3>
                 <ActionEditor
                   platform={state?.platform ?? state?.engine_detail?.platform}
-                  diagnostics={editingErrors.filter((d) =>
-                    String(d.path || ' ').includes('action'),
-                  )}
+                  diagnostics={editingDiagnostics.action}
                   capabilities={state?.capabilities ?? []}
                   rules={config.rules.filter((r) => r.id !== editing.id)}
                   action={editing.action}
@@ -1008,7 +1124,7 @@ export default function App() {
             </div>
             <div className="modal-footer">
               <span>保存后还需点击主窗口的“应用设置”，指令才会生效</span>
-              <button onClick={() => setEditing(null)}>取消</button>
+              <button onClick={() => void closeEditor()}>取消</button>
               <button disabled={busy} className="primary" onClick={commitEdit}>
                 保存
               </button>

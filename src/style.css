@@ -3,7 +3,11 @@
   color: #263241;
   background: #eef1f5;
   font-size: 13px;
-  --blue: #1687ce;
+  /* Text and controls meet WCAG 2.1 AA (F-04): text >= 4.5:1, focus ring and switch track >= 3:1. */
+  --blue: #0f6cbd;
+  --blue-hover: #0c5a9e;
+  --text-secondary: #56657a;
+  --focus: #1a1a1a;
   --border: #d7dee7;
 }
 * {
@@ -41,7 +45,8 @@ button:disabled {
   color: white;
 }
 .primary:hover {
-  background: #0875bc;
+  background: var(--blue-hover);
+  border-color: var(--blue-hover);
   color: white;
 }
 input:not([type='checkbox']),
@@ -57,9 +62,11 @@ textarea {
 input:focus,
 select:focus,
 textarea:focus,
-button:focus-visible {
-  outline: 2px solid #55afe7;
-  outline-offset: 1px;
+button:focus-visible,
+.switch input:focus-visible + span {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px #fff;
 }
 input[type='checkbox'] {
   accent-color: var(--blue);
@@ -71,8 +78,8 @@ textarea {
   line-height: 1.65;
 }
 small {
-  font-size: 11px;
-  color: #7f8c9f;
+  font-size: 12px;
+  color: var(--text-secondary);
 }
 .app {
   height: 100vh;
@@ -118,7 +125,7 @@ header {
   display: flex;
   align-items: center;
   gap: 9px;
-  color: #6a7888;
+  color: var(--text-secondary);
 }
 .dot {
   width: 7px;
@@ -152,13 +159,13 @@ header {
 }
 .revision {
   margin-left: auto;
-  color: #758298;
-  font-size: 11px;
+  color: var(--text-secondary);
+  font-size: 12px;
 }
 .revision em {
   font-style: normal;
   background: #e8f2fb;
-  color: #3586bb;
+  color: var(--blue);
   padding: 3px 6px;
   margin-left: 10px;
 }
@@ -189,6 +196,7 @@ header {
   width: 32px;
   height: 18px;
   background: #aab6c5;
+  border: 1px solid #8a8a8a;
   border-radius: 12px;
   position: relative;
 }
@@ -199,14 +207,17 @@ header {
   height: 12px;
   background: white;
   border-radius: 50%;
-  top: 3px;
-  left: 3px;
+  top: 2px;
+  left: 2px;
 }
 .switch input:checked + span {
   background: var(--blue);
 }
+.switch input:checked + span {
+  border-color: var(--blue);
+}
 .switch input:checked + span:before {
-  left: 17px;
+  left: 16px;
 }
 .batch {
   display: flex;
@@ -219,10 +230,10 @@ header {
 }
 .batch span {
   margin-right: 13px;
-  color: #728197;
+  color: var(--text-secondary);
 }
 .batch button {
-  font-size: 11px;
+  font-size: 12px;
   padding: 3px 9px;
 }
 .batch button:last-child {
@@ -245,7 +256,7 @@ table {
 }
 th {
   font-weight: 500;
-  color: #67768a;
+  color: var(--text-secondary);
   background: #f0f3f7;
   text-align: left;
   position: sticky;
@@ -275,10 +286,10 @@ td strong {
 }
 .markers i {
   font-style: normal;
-  font-size: 9px;
+  font-size: 12px;
   padding: 1px 3px;
   background: #e7f0f8;
-  color: #4d87b2;
+  color: var(--blue);
   border-radius: 2px;
 }
 .summary {
@@ -286,7 +297,7 @@ td strong {
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 200px;
-  color: #8490a1;
+  color: var(--text-secondary);
 }
 .row-tools {
   white-space: nowrap;
@@ -295,14 +306,14 @@ td strong {
   border: 0;
   background: none;
   padding: 3px 6px;
-  color: #2585c2;
-  font-size: 11px;
+  color: var(--blue);
+  font-size: 12px;
 }
 .disabled-row {
   opacity: 0.55;
 }
 .muted {
-  color: #8190a3;
+  color: var(--text-secondary);
 }
 td .muted {
   display: block;
@@ -310,7 +321,7 @@ td .muted {
 .empty {
   padding: 75px 20px;
   text-align: center;
-  color: #8997a8;
+  color: var(--text-secondary);
 }
 .empty > div {
   font-size: 35px;
@@ -359,8 +370,8 @@ footer {
 }
 .status-text {
   flex: 1;
-  color: #73849a;
-  font-size: 11px;
+  color: var(--text-secondary);
+  font-size: 12px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -453,7 +464,7 @@ dl {
   gap: 12px;
 }
 dt {
-  color: #7b8b9c;
+  color: var(--text-secondary);
 }
 dd {
   margin: 0;
@@ -516,7 +527,7 @@ dd {
 }
 .edit-grid h3 {
   font-size: 12px;
-  color: #7c90a6;
+  color: var(--text-secondary);
   font-weight: 500;
   margin: 0 0 17px;
   letter-spacing: 1px;
@@ -531,8 +542,8 @@ dd {
 }
 .modal-footer span {
   margin-right: auto;
-  color: #8592a3;
-  font-size: 11px;
+  color: var(--text-secondary);
+  font-size: 12px;
 }
 .modal-footer .primary {
   min-width: 90px;
@@ -617,7 +628,7 @@ dd {
   width: 100%;
   text-align: left;
   padding: 9px 5px;
-  font-size: 11px;
+  font-size: 12px;
 }
 .steps li.active {
   background: #e5f2fc;
@@ -625,7 +636,7 @@ dd {
 .steps li span {
   display: inline-block;
   width: 20px;
-  color: #89a2b9;
+  color: var(--text-secondary);
 }
 .steps li small {
   display: block;
@@ -649,14 +660,14 @@ dd {
   max-width: 75px;
 }
 .step-form button {
-  font-size: 11px;
+  font-size: 12px;
   padding: 5px 8px;
 }
 .step-form .field {
   margin: 6px 0;
 }
 .step-form label {
-  font-size: 11px;
+  font-size: 12px;
 }
 iframe {
   width: 100%;
@@ -755,17 +766,17 @@ dialog.overlay::backdrop {
   width: 100%;
   color: #a04c35;
   margin-top: 6px;
-  font-size: 11px;
+  font-size: 12px;
 }
 .capability-warning {
   padding: 10px;
   background: #fff6dc;
-  color: #8b7031;
+  color: #7a5f20;
   border: 1px solid #efd893;
   margin-bottom: 12px;
 }
 .capability-warning p {
-  font-size: 11px;
+  font-size: 12px;
   margin-bottom: 0;
 }
 .selection-capture {
@@ -812,10 +823,10 @@ dialog.overlay::backdrop {
   width: 130px;
 }
 .available {
-  color: #22866d;
+  color: #1b7a61;
 }
 .unavailable {
-  color: #b0792b;
+  color: #9a5b13;
 }
 .execution-result {
   padding: 16px;
@@ -833,7 +844,7 @@ dialog.overlay::backdrop {
 }
 .expert-details {
   margin-top: 24px;
-  color: #8090a3;
+  color: var(--text-secondary);
 }
 /* Runtime status (S-03, S-19): text always accompanies the colour. */
 .dot.degraded {
@@ -931,4 +942,27 @@ dialog.overlay::backdrop {
 }
 .diagnostics {
   margin-top: 12px;
+}
+/* F-04: terminators the platform cannot use, editor diagnostics, license notice. */
+.end-keys label.unsupported {
+  color: var(--text-secondary);
+}
+.end-keys > small {
+  flex-basis: 100%;
+}
+.field-errors {
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  background: #fff2ec;
+  border: 1px solid #f0c4b1;
+  color: #8f3a26;
+  font-size: 12px;
+}
+.field-errors ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+.license {
+  max-width: 640px;
+  line-height: 1.7;
 }
