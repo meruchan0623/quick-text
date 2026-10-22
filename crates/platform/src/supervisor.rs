@@ -55,6 +55,10 @@ pub const STARTUP_GRACE: Duration = Duration::from_secs(10);
 /// this (real time; the driver sleeps in real time).
 pub const SUPERVISOR_STALE: Duration = Duration::from_secs(5);
 
+/// Failure text for a recovery attempt that panicked (fixed text: panic
+/// payloads are never logged).
+const ATTEMPT_PANICKED: &str = "attempt panicked";
+
 /// One component's condition as reported to the supervisor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -256,7 +260,17 @@ impl Supervisor {
         if self.repair_requested.swap(false, Ordering::SeqCst) {
             Self::arm_repair(&mut machine, now);
         }
-        let mut observed = self.observe(now);
+        let mut observed = match catch_unwind(AssertUnwindSafe(|| self.observe(now))) {
+            Ok(observed) => observed,
+            Err(panic) => {
+                // A probe that panics while a rebuild is being verified
+                // fails that attempt; otherwise the tick is just lost.
+                if machine.verify_until.take().is_some() {
+                    Self::failure(&mut machine, now, ATTEMPT_PANICKED);
+                }
+                std::panic::resume_unwind(panic);
+            }
+        };
         match machine.state {
             HealthState::Starting => {
                 if observed.required_down().is_empty() {
@@ -336,9 +350,9 @@ impl Supervisor {
         if machine.next_attempt.is_some_and(|due| now >= due) {
             machine.next_attempt = None;
             let forced = std::mem::take(&mut machine.forced);
-            match self.rebuild(observed, forced) {
-                Ok(()) => {
-                    *observed = self.observe(now);
+            match self.attempt(observed, forced, now) {
+                Ok(after) => {
+                    *observed = after;
                     if observed.required_down().is_empty() {
                         self.settle(machine, observed);
                     } else {
@@ -348,6 +362,18 @@ impl Supervisor {
                 Err(error) => Self::failure(machine, now, &error),
             }
         }
+    }
+
+    /// One recovery attempt: the rebuild plus the observation that judges
+    /// it. A panic anywhere in it (executor rebuild, input reattach, probe)
+    /// is an attempt failure like any other, so it is counted, backed off
+    /// and can open the circuit instead of silently ending the incident.
+    fn attempt(&self, observed: &Observed, forced: bool, now: Instant) -> Result<Observed, String> {
+        catch_unwind(AssertUnwindSafe(|| {
+            self.rebuild(observed, forced)?;
+            Ok(self.observe(now))
+        }))
+        .unwrap_or_else(|_| Err(ATTEMPT_PANICKED.into()))
     }
 
     /// The single rebuild path for automatic recovery and `repair()`:
@@ -607,6 +633,17 @@ mod tests {
     use crate::Shared;
     use std::sync::atomic::AtomicUsize;
 
+    /// Test hook run inside an adapter call (may panic, block or move the
+    /// fake clock).
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    fn run_hook(hook: &Mutex<Option<Hook>>) {
+        let hook = hook.lock().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     struct FakeExecutor {
         clock: Arc<FakeClock>,
         status: Mutex<Status>,
@@ -617,6 +654,8 @@ mod tests {
         /// Fake-clock time of every rebuild call.
         rebuilds: Mutex<Vec<Duration>>,
         budget_checks: AtomicUsize,
+        /// Runs at the start of every rebuild, after it is recorded.
+        on_rebuild: Mutex<Option<Hook>>,
     }
 
     impl FakeExecutor {
@@ -628,6 +667,7 @@ mod tests {
                 heals: Mutex::new(true),
                 rebuilds: Mutex::new(vec![]),
                 budget_checks: AtomicUsize::new(0),
+                on_rebuild: Mutex::new(None),
             })
         }
         fn rebuild_count(&self) -> usize {
@@ -644,6 +684,7 @@ mod tests {
         }
         fn rebuild(&self) -> Result<(), String> {
             self.rebuilds.lock().push(self.clock.elapsed());
+            run_hook(&self.on_rebuild);
             let mut refuse = self.refuse.lock();
             if *refuse > 0 {
                 *refuse -= 1;
@@ -663,6 +704,8 @@ mod tests {
         heal_on_reattach: Mutex<bool>,
         panic_once: Mutex<bool>,
         reads: AtomicUsize,
+        /// Runs at the start of every reattach, after it is recorded.
+        on_reattach: Mutex<Option<Hook>>,
     }
 
     impl FakeInputs {
@@ -674,6 +717,7 @@ mod tests {
                 heal_on_reattach: Mutex::new(true),
                 panic_once: Mutex::new(false),
                 reads: AtomicUsize::new(0),
+                on_reattach: Mutex::new(None),
             })
         }
         fn set(&self, component: Component, state: HealthState, reason: ReasonCode) {
@@ -715,6 +759,7 @@ mod tests {
         }
         fn reattach(&self, component: Component) -> Result<(), String> {
             self.reattached.lock().push(component);
+            run_hook(&self.on_reattach);
             if *self.heal_on_reattach.lock() {
                 self.set(component, HealthState::Healthy, ReasonCode::Ok);
                 Ok(())
@@ -774,9 +819,44 @@ mod tests {
                 .find(|c| c.component == component)
                 .unwrap()
         }
+        fn failures(&self) -> usize {
+            self.supervisor.machine.lock().failures.len()
+        }
     }
 
     const MS: Duration = Duration::from_millis(1);
+
+    /// A hook that counts its calls, then panics.
+    fn panicking(calls: &Arc<AtomicUsize>) -> Hook {
+        let calls = Arc::clone(calls);
+        Arc::new(move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            panic!("adapter bug");
+        })
+    }
+
+    /// Drives an incident in which every attempt panics (`attempts` counts
+    /// them): each panic is one failure, the next attempt follows BACKOFF
+    /// exactly, and the 5th failure opens the circuit.
+    fn assert_attempt_panics_are_failures(rig: &Rig, attempts: &AtomicUsize) {
+        rig.step(MS);
+        assert_eq!(rig.state(), HealthState::Recovering);
+        for (n, delay) in BACKOFF.into_iter().enumerate() {
+            rig.step(delay - MS);
+            assert_eq!(attempts.load(Ordering::SeqCst), n, "early at {n}");
+            rig.step(MS);
+            assert_eq!(attempts.load(Ordering::SeqCst), n + 1, "late at {n}");
+            assert_eq!(rig.failures(), n + 1, "one failure per panic");
+            let expected = if n + 1 < CIRCUIT_FAILURES {
+                HealthState::Recovering
+            } else {
+                HealthState::Failed
+            };
+            assert_eq!(rig.state(), expected, "after failure {}", n + 1);
+        }
+        rig.step(Duration::from_secs(3600));
+        assert_eq!(attempts.load(Ordering::SeqCst), CIRCUIT_FAILURES);
+    }
 
     #[test]
     fn starting_becomes_healthy_and_lists_every_component() {
@@ -1156,6 +1236,63 @@ mod tests {
         assert!(!rig.supervisor.tick_guarded());
         assert!(rig.supervisor.tick_guarded());
         assert_eq!(rig.state(), HealthState::Healthy);
+    }
+
+    #[test]
+    fn a_panicking_rebuild_counts_as_a_failure() {
+        let rig = Rig::healthy();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        *rig.executor.on_rebuild.lock() = Some(panicking(&attempts));
+        *rig.executor.status.lock() = Status::Down(ReasonCode::ExecutorPanic);
+        assert_attempt_panics_are_failures(&rig, &attempts);
+    }
+
+    #[test]
+    fn a_panicking_reattach_counts_as_a_failure() {
+        let rig = Rig::healthy();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        *rig.inputs.on_reattach.lock() = Some(panicking(&attempts));
+        rig.inputs.set(
+            Component::KeyboardHook,
+            HealthState::Failed,
+            ReasonCode::HookMissing,
+        );
+        assert_attempt_panics_are_failures(&rig, &attempts);
+        assert_eq!(rig.executor.rebuild_count(), 0, "executor was healthy");
+    }
+
+    #[test]
+    fn a_probe_panic_right_after_rebuild_counts_as_a_failure() {
+        let rig = Rig::healthy();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (calls, inputs) = (Arc::clone(&attempts), Arc::clone(&rig.inputs));
+        *rig.executor.on_rebuild.lock() = Some(Arc::new(move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            *inputs.panic_once.lock() = true; // the post-rebuild observe
+        }));
+        *rig.executor.heals.lock() = false;
+        *rig.executor.status.lock() = Status::Down(ReasonCode::ExecutorTimeout);
+        assert_attempt_panics_are_failures(&rig, &attempts);
+    }
+
+    #[test]
+    fn a_probe_panic_while_verifying_counts_as_a_failure() {
+        let rig = Rig::healthy();
+        *rig.executor.heals.lock() = false;
+        *rig.executor.status.lock() = Status::Down(ReasonCode::ExecutorTimeout);
+        rig.step(MS);
+        rig.step(BACKOFF[0]);
+        assert_eq!(rig.executor.rebuild_count(), 1);
+        assert!(rig.supervisor.machine.lock().verify_until.is_some());
+        *rig.inputs.panic_once.lock() = true;
+        rig.clock.advance(MS);
+        assert!(!rig.supervisor.tick_guarded(), "the tick itself is lost");
+        assert_eq!(rig.failures(), 1);
+        rig.step(BACKOFF[1] - MS);
+        assert_eq!(rig.executor.rebuild_count(), 1);
+        rig.step(MS);
+        assert_eq!(rig.executor.rebuild_count(), 2, "retried after BACKOFF[1]");
+        assert_eq!(rig.state(), HealthState::Recovering);
     }
 
     #[test]
