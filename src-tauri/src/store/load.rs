@@ -98,7 +98,9 @@ impl Store {
         let kept = before.into_iter().filter(|p| {
             matches!(
                 p.kind,
-                ProblemKind::AutostartRepaired {} | ProblemKind::SelfTestFailed { .. }
+                ProblemKind::AutostartRepaired {}
+                    | ProblemKind::SelfTestFailed { .. }
+                    | ProblemKind::LogLevelElevated { .. }
             )
         });
         self.startup_problems = report.problems;

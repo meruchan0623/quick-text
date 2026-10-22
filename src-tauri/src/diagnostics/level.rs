@@ -166,6 +166,8 @@ struct Inner {
 pub struct LogLevelControl {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
+    /// The override restored from prefs at start, if any.
+    restored: Option<LevelState>,
 }
 
 impl LogLevelControl {
@@ -182,7 +184,7 @@ impl LogLevelControl {
             }),
             wake: Condvar::new(),
         });
-        shared.restore();
+        let restored = shared.restore();
         let worker = shared.clone();
         let thread = std::thread::Builder::new()
             .name("quicker-log-level".into())
@@ -195,11 +197,21 @@ impl LogLevelControl {
                 )
             })
             .ok();
-        Self { shared, thread }
+        Self {
+            shared,
+            thread,
+            restored,
+        }
     }
 
     pub fn current(&self) -> LevelState {
         self.shared.state.lock().current
+    }
+
+    /// The temporary level restored from prefs at start (still in effect
+    /// then), for the `log_level_elevated` startup problem.
+    pub fn restored(&self) -> Option<LevelState> {
+        self.restored
     }
 
     /// `set_log_level`: persist first, then apply. Nothing changes if prefs
@@ -221,7 +233,8 @@ impl Drop for LogLevelControl {
 
 impl Shared {
     /// Applies the override saved in prefs while it is still in effect and
-    /// returns it; clears an expired one.
+    /// returns it (the caller reports `log_level_elevated`); clears an
+    /// expired one.
     fn restore(&self) -> Option<LevelState> {
         let now = self.clock.wall_ms();
         let mut decision = Restore::Default;
@@ -237,8 +250,6 @@ impl Shared {
             (Restore::Keep(state), _) => {
                 (self.apply)(state.level.filter());
                 self.state.lock().current = state;
-                // TODO(P3): report startup-problem `log_level_elevated { level, until_ms }`
-                // once the startup problem registry exists.
                 tracing::info!(
                     event = "log.level_restored",
                     level = state.level.as_str(),
@@ -598,7 +609,8 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Only an override that is still in effect is restored.
+    /// What startup reports as `log_level_elevated`: only an override that
+    /// is still in effect.
     #[test]
     fn restore_returns_only_an_override_still_in_effect() {
         let dir = temp_dir();
@@ -616,6 +628,28 @@ mod tests {
         clock.advance(HOUR);
         assert_eq!(control.restore(), None, "expired");
         assert_eq!(prefs_json(&dir)["app"]["log_level"], Value::Null);
+        fs::remove_dir_all(dir).unwrap();
+
+        // `LogLevelControl` keeps what it restored at start.
+        let dir = temp_dir();
+        fs::write(
+            dir.join("prefs.json"),
+            br#"{"app":{"log_level":{"level":"trace","until_ms":4102444800000}}}"#,
+        )
+        .unwrap();
+        let control = LogLevelControl::start(
+            dir.clone(),
+            Arc::new(quicker_platform::traits::SystemClock),
+            Arc::new(|_| {}),
+        );
+        assert_eq!(
+            control.restored(),
+            Some(LevelState {
+                level: LogLevel::Trace,
+                until_ms: Some(4_102_444_800_000)
+            })
+        );
+        drop(control);
         fs::remove_dir_all(dir).unwrap();
     }
 

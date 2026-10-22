@@ -104,7 +104,7 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 | `terminator_unsupported` | warning | `{ keys: string[] }`（旧配置中的 tab、enter） |
 | `autostart_repaired` | info | `{}`（自启项路径与当前程序不符，已修正） |
 | `self_test_failed` | warning | `{ checks: ("raw_input" \| "hook_heartbeat" \| "foreground" \| "clipboard")[] }`：启动自检未通过的项（原因为 `unsupported` 的项不计入），引擎保持暂停，界面提供「恢复监听」。见 §5「自检」 |
-| `log_level_elevated` | info | `{ level, until_ms }` |
+| `log_level_elevated` | info | `{ level: "error" \| "warn" \| "debug" \| "trace", until_ms: number }`：启动时从 prefs 恢复了仍在有效期内的临时日志级别，`until_ms` 为到期时间（Unix 毫秒） |
 | `store_meta_reset` | warning | `{}`（`store-meta.json` 无法解析，已重建） |
 
 后端可以新增 kind；前端对未知 kind 显示 `kind` 原文加通用文案。

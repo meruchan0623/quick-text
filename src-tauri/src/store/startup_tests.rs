@@ -1199,9 +1199,9 @@ fn later_problems_are_reported_once() {
     assert_eq!(*seen.lock(), [skipped, ProblemKind::AutostartRepaired {}]);
 }
 
-/// What was found outside the load (autostart, the startup self-test) is
-/// still listed after a Locked retry reloads; what the earlier load found
-/// is replaced by the reload's own findings.
+/// What was found outside the load (autostart, the startup self-test, a
+/// restored log level) is still listed after a Locked retry reloads; what
+/// the earlier load found is replaced by the reload's own findings.
 #[test]
 fn problems_found_outside_the_load_survive_a_reload() {
     let dir = TempDir::new();
@@ -1214,6 +1214,10 @@ fn problems_found_outside_the_load_survive_a_reload() {
         ProblemKind::AutostartRepaired {},
         ProblemKind::SelfTestFailed {
             checks: vec![quicker_platform::self_test::CheckName::Foreground],
+        },
+        ProblemKind::LogLevelElevated {
+            level: crate::diagnostics::level::LogLevel::Debug,
+            until_ms: 7,
         },
     ];
     for kind in outside.clone() {

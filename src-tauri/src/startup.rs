@@ -1,10 +1,11 @@
 //! Startup problems (docs/ipc-contract-0.4.md §3 `startup-problem`) and the
 //! startup/exit wiring around the store: autostart repair, the
-//! SafeMode(Locked) retry, the run marker lifecycle (B-04) and the startup
-//! self-test with auto-listen (S-09, B-10).
+//! SafeMode(Locked) retry, the run marker lifecycle (B-04), the restored
+//! log level and the startup self-test with auto-listen (S-09, B-10).
 use crate::{
     app_state::Managed,
     autostart::{self, LoginItem},
+    diagnostics::level::{LevelState, LogLevel, LogLevelControl},
     error::{CommandError, SafeModeReason},
     store::{self, prefs, RecoverySource, Store, StoreEnv},
     tray,
@@ -69,13 +70,21 @@ pub enum ProblemKind {
     SelfTestFailed {
         checks: Vec<CheckName>,
     },
+    /// A temporary log level restored from prefs at startup, in effect
+    /// until `until_ms` (Unix milliseconds).
+    LogLevelElevated {
+        level: LogLevel,
+        until_ms: i64,
+    },
 }
 
 impl From<ProblemKind> for StartupProblem {
     fn from(kind: ProblemKind) -> Self {
         let severity = match kind {
             ProblemKind::SafeMode { .. } => ProblemSeverity::Error,
-            ProblemKind::AutostartRepaired {} => ProblemSeverity::Info,
+            ProblemKind::AutostartRepaired {} | ProblemKind::LogLevelElevated { .. } => {
+                ProblemSeverity::Info
+            }
             _ => ProblemSeverity::Warning,
         };
         Self { kind, severity }
@@ -83,12 +92,13 @@ impl From<ProblemKind> for StartupProblem {
 }
 
 /// Runs once the store is managed: keeps the run marker reachable for
-/// session end, schedules the autostart repair, and starts the
-/// SafeMode(Locked) retry.
+/// session end, reports a restored temporary log level, schedules the
+/// autostart repair, and starts the SafeMode(Locked) retry.
 pub fn after_load(app: &AppHandle) {
     let state = app.state::<Managed>();
     let mut store = state.lock();
     store::register_session_meta(&store);
+    report_restored_level(&mut store, app.state::<LogLevelControl>().restored());
     // A development build would point the user's login item at itself.
     if !cfg!(debug_assertions) {
         if let Ok(exe) = std::env::current_exe() {
@@ -97,6 +107,19 @@ pub fn after_load(app: &AppHandle) {
     }
     if store.safe_mode() == Some(SafeModeReason::Locked) {
         spawn_locked_retry(app.clone(), store.dir().to_path_buf());
+    }
+}
+
+/// Reports a temporary log level restored from prefs (still in effect) as
+/// `log_level_elevated`, so the user sees that logging is more verbose than
+/// usual and until when.
+pub fn report_restored_level(store: &mut Store, restored: Option<LevelState>) {
+    if let Some(LevelState {
+        level,
+        until_ms: Some(until_ms),
+    }) = restored
+    {
+        store.add_problem(ProblemKind::LogLevelElevated { level, until_ms });
     }
 }
 
@@ -335,7 +358,13 @@ pub fn on_run_event(_app: &AppHandle, event: RunEvent) {
 
 const LOCKED_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
-// TODO(P1a): move this loop into the supervisor once it exists.
+/// Retries a SafeMode(Locked) store every [`LOCKED_RETRY_INTERVAL`] until
+/// the data directory can be read, on its own thread. Deliberately not part
+/// of the supervisor: that is the platform crate's engine supervisor, which
+/// knows nothing of the store, its files or Tauri, while this retry needs
+/// the data directory, the managed store and the `AppHandle`, runs only in
+/// this one safe mode and ends after its first success. Moving it there
+/// would couple the supervisor to the shell for no gain in recovery.
 fn spawn_locked_retry(app: AppHandle, dir: PathBuf) {
     let spawned = std::thread::Builder::new()
         .name("store-locked-retry".into())
@@ -420,6 +449,13 @@ mod tests {
                     checks: vec![CheckName::HookHeartbeat, CheckName::Clipboard],
                 },
                 json!({"kind": "self_test_failed", "severity": "warning", "args": {"checks": ["hook_heartbeat", "clipboard"]}}),
+            ),
+            (
+                ProblemKind::LogLevelElevated {
+                    level: LogLevel::Debug,
+                    until_ms: 1_792_664_493_000,
+                },
+                json!({"kind": "log_level_elevated", "severity": "info", "args": {"level": "debug", "until_ms": 1_792_664_493_000_i64}}),
             ),
         ];
         for (kind, expected) in cases {
@@ -572,5 +608,37 @@ mod tests {
             "{notice}"
         );
         assert!(notice.contains("「恢复监听」"));
+    }
+
+    /// Only a level still in effect is reported, as `log_level_elevated`.
+    #[test]
+    fn a_restored_log_level_is_reported_once() {
+        let dir = temp_dir();
+        let mut store = Store::load(dir.clone());
+        report_restored_level(&mut store, None);
+        report_restored_level(&mut store, Some(LevelState::default()));
+        assert!(store.startup_problems().is_empty());
+        report_restored_level(
+            &mut store,
+            Some(LevelState {
+                level: LogLevel::Trace,
+                until_ms: Some(42),
+            }),
+        );
+        assert_eq!(
+            store
+                .startup_problems()
+                .iter()
+                .map(|p| (&p.kind, p.severity))
+                .collect::<Vec<_>>(),
+            [(
+                &ProblemKind::LogLevelElevated {
+                    level: LogLevel::Trace,
+                    until_ms: 42
+                },
+                ProblemSeverity::Info
+            )]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
