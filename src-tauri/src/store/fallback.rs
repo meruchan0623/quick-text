@@ -404,10 +404,15 @@ impl Loader<'_> {
                 Candidate::Newer
             }
             Err(e) => {
+                // The diagnostics bundle shows the same kind, line and column.
+                let span = e.diagnostic().span;
                 tracing::warn!(
                     event = "store.corrupt",
                     file = %label(path),
                     code = e.code(),
+                    kind = e.malformed_kind().map(MalformedKind::as_str),
+                    line = span.line,
+                    column = span.column,
                     error = %e,
                     "configuration file does not parse"
                 );

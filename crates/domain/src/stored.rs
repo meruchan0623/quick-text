@@ -18,8 +18,13 @@ pub struct StoredConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoredConfigError {
     /// Not UTF-8, not JSON, the root is not an object, or `rules` is not an array
-    /// ([`diagnostic_code::CONFIG_MALFORMED`]).
-    Malformed { message: String, span: SourceSpan },
+    /// ([`diagnostic_code::CONFIG_MALFORMED`]). `kind` says which; it is for logs and the
+    /// diagnostics bundle and changes neither the code nor the diagnostic.
+    Malformed {
+        kind: MalformedKind,
+        message: String,
+        span: SourceSpan,
+    },
     /// `version` is above [`SUPPORTED_SCHEMA_VERSION`] ([`diagnostic_code::SCHEMA_NEWER`]):
     /// written by a newer release. Open read-only and never overwrite (SafeMode(NewerSchema)).
     NewerSchema { version: u64 },
@@ -45,6 +50,50 @@ impl StoredConfigError {
         };
         Diagnostic::error(self.code(), self.to_string(), span).at(path)
     }
+    /// The kind of a [`Self::Malformed`] error; `None` for the version errors.
+    pub fn malformed_kind(&self) -> Option<MalformedKind> {
+        match self {
+            Self::Malformed { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+}
+
+/// How a [`StoredConfigError::Malformed`] file is damaged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MalformedKind {
+    /// Not UTF-8 (past a UTF-8 BOM). No position.
+    Utf8,
+    /// Not JSON at the reported position: a stray character, a trailing comma, text after the
+    /// value.
+    Syntax,
+    /// JSON that stops before it is complete, including an empty file: what a torn write
+    /// leaves, which atomic writes are there to prevent.
+    Eof,
+    /// Complete JSON of the wrong shape: the root is not an object, or `rules` is not an
+    /// array. No position.
+    Shape,
+}
+impl MalformedKind {
+    /// `utf8`, `syntax`, `eof` or `shape`, as logged (`store.corrupt`) and in the bundle.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Utf8 => "utf8",
+            Self::Syntax => "syntax",
+            Self::Eof => "eof",
+            Self::Shape => "shape",
+        }
+    }
+    fn of_json(error: &serde_json::Error) -> Self {
+        use serde_json::error::Category;
+        match error.classify() {
+            Category::Eof => Self::Eof,
+            // Parsing a string into a `Value` reads nothing (no `Io`) and maps no data (no
+            // `Data`); were `Data` to occur, it would mean valid JSON the target rejects.
+            Category::Syntax | Category::Io => Self::Syntax,
+            Category::Data => Self::Shape,
+        }
+    }
 }
 impl fmt::Display for StoredConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -68,10 +117,12 @@ impl std::error::Error for StoredConfigError {}
 pub fn read_stored_config(bytes: &[u8]) -> Result<StoredConfig, StoredConfigError> {
     let bytes = strip_utf8_bom(bytes);
     let text = std::str::from_utf8(bytes).map_err(|e| StoredConfigError::Malformed {
+        kind: MalformedKind::Utf8,
         message: e.to_string(),
         span: SourceSpan::default(),
     })?;
     let value: Value = serde_json::from_str(text).map_err(|e| StoredConfigError::Malformed {
+        kind: MalformedKind::of_json(&e),
         message: e.to_string(),
         span: SourceSpan {
             line: e.line(),
@@ -91,6 +142,7 @@ pub fn read_stored_config(bytes: &[u8]) -> Result<StoredConfig, StoredConfigErro
     let mut diagnostics = vec![];
     let config = config_from_value(value, Mode::Lenient, &mut diagnostics).map_err(|message| {
         StoredConfigError::Malformed {
+            kind: MalformedKind::Shape,
             message,
             span: SourceSpan::default(),
         }

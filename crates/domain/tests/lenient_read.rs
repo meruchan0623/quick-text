@@ -224,6 +224,72 @@ fn malformed_files_are_reported_without_content() {
     assert_eq!(span.line, 2);
 }
 
+/// A file cut short (a torn write) is told apart from one that is wrong where it stands; the
+/// code and the diagnostic stay `config_malformed` either way.
+#[test]
+fn malformed_files_say_how_they_are_damaged() {
+    let cases: [(&[u8], MalformedKind, usize, usize); 12] = [
+        (b"{\"version\":1,\n\"rules\":[", MalformedKind::Eof, 2, 9),
+        (b"{\"version\":1,\"rules\":[]", MalformedKind::Eof, 1, 23),
+        (
+            b"{\"version\":1,\"rules\":[{\"id\":\"ru",
+            MalformedKind::Eof,
+            1,
+            31,
+        ),
+        (b"", MalformedKind::Eof, 1, 0),
+        (b"  \n", MalformedKind::Eof, 2, 0),
+        (
+            b"{\"version\":1,\n\"rules\":]}",
+            MalformedKind::Syntax,
+            2,
+            9,
+        ),
+        (b"{\"version\":1,}", MalformedKind::Syntax, 1, 14),
+        (b"{\"version\":1} {}", MalformedKind::Syntax, 1, 15),
+        (b"\xff\xfe{}", MalformedKind::Utf8, 0, 0),
+        (b"{\"rules\":[],\"x\":\"\xc3\"}", MalformedKind::Utf8, 0, 0),
+        (b"[]", MalformedKind::Shape, 0, 0),
+        (br#"{"rules":{"id":"x"}}"#, MalformedKind::Shape, 0, 0),
+    ];
+    for (bytes, kind, line, column) in cases {
+        let shown = String::from_utf8_lossy(bytes);
+        // Past a BOM the kind and the position are the same.
+        for input in [bytes.to_vec(), [&b"\xEF\xBB\xBF"[..], bytes].concat()] {
+            let error = read_stored_config(&input).unwrap_err();
+            let StoredConfigError::Malformed {
+                kind: found, span, ..
+            } = &error
+            else {
+                panic!("{shown}: {error:?}")
+            };
+            assert_eq!(*found, kind, "{shown}");
+            assert_eq!(error.malformed_kind(), Some(kind), "{shown}");
+            assert_eq!((span.line, span.column), (line, column), "{shown}");
+            assert_eq!(error.code(), diagnostic_code::CONFIG_MALFORMED, "{shown}");
+            let diagnostic = error.diagnostic();
+            assert_eq!(diagnostic.code, diagnostic_code::CONFIG_MALFORMED);
+            assert_eq!(diagnostic.span, *span);
+            assert!(diagnostic
+                .message
+                .starts_with("Configuration is malformed: "));
+        }
+    }
+    let names = [
+        MalformedKind::Utf8,
+        MalformedKind::Syntax,
+        MalformedKind::Eof,
+        MalformedKind::Shape,
+    ]
+    .map(MalformedKind::as_str);
+    assert_eq!(names, ["utf8", "syntax", "eof", "shape"]);
+    assert_eq!(StoredConfigError::UnsupportedVersion.malformed_kind(), None);
+    assert_eq!(
+        StoredConfigError::NewerSchema { version: 2 }.malformed_kind(),
+        None
+    );
+}
+
 #[test]
 fn byte_order_mark_is_skipped() {
     let mut bytes = b"\xEF\xBB\xBF".to_vec();

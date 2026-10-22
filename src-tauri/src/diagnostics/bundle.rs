@@ -480,9 +480,14 @@ pub enum FileState {
     /// Position only: the parser's message quotes the offending value.
     /// `category` is serde's (`io`, `syntax`, `data`, `eof`) for prefs.json,
     /// and the store loader's reason code (`config_malformed`,
-    /// `schema_version`) for active.json and draft.json.
+    /// `schema_version`) for active.json and draft.json. `kind` is there for
+    /// `config_malformed` only: the loader's `utf8`, `syntax`, `eof` (cut
+    /// short, as a torn write leaves it) or `shape`, which `store.corrupt`
+    /// logs with the same line and column.
     Unparsable {
         category: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kind: Option<&'static str>,
         line: usize,
         column: usize,
     },
@@ -563,19 +568,20 @@ fn config_file(path: &Path) -> ConfigFile {
     }
 }
 
-/// The loader's verdict under the code it logs (`store.corrupt`,
-/// `store.newer_schema`). A JSON error keeps the loader's line and column,
-/// which count from after a BOM.
+/// The loader's verdict under the code, kind, line and column it logs
+/// (`store.corrupt`, `store.newer_schema`). Positions count from after a BOM.
 fn stored_config_error(e: &StoredConfigError) -> FileState {
     match e {
         StoredConfigError::NewerSchema { version } => FileState::NewerSchema { version: *version },
-        StoredConfigError::Malformed { span, .. } => FileState::Unparsable {
+        StoredConfigError::Malformed { kind, span, .. } => FileState::Unparsable {
             category: e.code(),
+            kind: Some(kind.as_str()),
             line: span.line,
             column: span.column,
         },
         StoredConfigError::UnsupportedVersion => FileState::Unparsable {
             category: e.code(),
+            kind: None,
             line: 0,
             column: 0,
         },
@@ -598,6 +604,7 @@ fn json_error(e: &serde_json::Error) -> FileState {
     };
     FileState::Unparsable {
         category,
+        kind: None,
         line: e.line(),
         column: e.column(),
     }
@@ -1307,6 +1314,8 @@ mod tests {
             let state = serde_json::to_value(summarize(&dir).prefs).unwrap();
             assert_eq!(state["status"], "unparsable", "{state}");
             assert_eq!(state["category"], "eof", "{state}");
+            // `category` is already serde's here; `kind` is the config loader's.
+            assert!(state.get("kind").is_none(), "{state}");
             fs::remove_dir_all(dir).unwrap();
         }
     }
@@ -1399,6 +1408,94 @@ mod tests {
             }
             fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    /// The bundle and the startup log name the same damage in the same file:
+    /// kind, line and column. A file cut short (`eof`, what a torn write
+    /// leaves) must not read as a plain syntax error.
+    #[test]
+    fn the_bundle_and_the_startup_log_name_the_same_damage() {
+        use crate::diagnostics::logging::test_support::{read_logs, scoped};
+        use crate::store::Store;
+        use tracing::level_filters::LevelFilter;
+
+        type Case<'a> = (&'a [u8], &'a str, Option<&'a str>, usize, usize);
+        let cases: [Case; 5] = [
+            (
+                b"{\"version\":1,\n\"rules\":[",
+                "config_malformed",
+                Some("eof"),
+                2,
+                9,
+            ),
+            (
+                b"{\"version\":1,\n\"rules\":]}",
+                "config_malformed",
+                Some("syntax"),
+                2,
+                9,
+            ),
+            (
+                b"{\"version\":1,\"x\":\"\xc3\"}",
+                "config_malformed",
+                Some("utf8"),
+                0,
+                0,
+            ),
+            (b"[]", "config_malformed", Some("shape"), 0, 0),
+            (b"{\"version\":0}", "schema_version", None, 0, 0),
+        ];
+        for (damaged, category, kind, line, column) in cases {
+            for bom in [BOM, &b""[..]] {
+                let with_bom = !bom.is_empty();
+                let dir = temp_dir();
+                let bytes = [bom, damaged].concat();
+                fs::write(dir.join("active.json"), &bytes).unwrap();
+                fs::write(dir.join("draft.json"), &bytes).unwrap();
+                // Taken first: startup quarantines both files.
+                let summary = serde_json::to_value(summarize(&dir)).unwrap();
+                let built = scoped(&log_dir(&dir), LevelFilter::TRACE);
+                tracing::subscriber::with_default(built.subscriber, || {
+                    drop(Store::load(dir.clone()));
+                });
+                drop(built.guard);
+                let log = read_logs(&log_dir(&dir));
+                for name in ["active", "draft"] {
+                    let at = format!("{name}, {category} {kind:?}, BOM: {with_bom}");
+                    let file = &summary[name]["file"];
+                    assert_eq!(file["status"], "unparsable", "{at}");
+                    assert_eq!(file["category"], category, "{at}");
+                    assert_eq!(file.get("kind").and_then(|k| k.as_str()), kind, "{at}");
+                    assert_eq!(file["line"], line, "{at}");
+                    assert_eq!(file["column"], column, "{at}");
+                    // Startup logs the same for the same file.
+                    let logged = |field| corrupt_field(&log, &format!("{name}.json"), field);
+                    assert_eq!(logged("code"), Some(category), "{at}\n{log}");
+                    assert_eq!(logged("kind"), kind, "{at}\n{log}");
+                    let position = (logged("line"), logged("column"));
+                    let shown = (line.to_string(), column.to_string());
+                    assert_eq!(
+                        position,
+                        (Some(shown.0.as_str()), Some(shown.1.as_str())),
+                        "{at}\n{log}"
+                    );
+                }
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+
+    /// `field` of the first `store.corrupt` event for `file`, unquoted.
+    fn corrupt_field<'a>(log: &'a str, file: &str, field: &str) -> Option<&'a str> {
+        let file = format!(" file={file} ");
+        let entry = log
+            .lines()
+            .find(|entry| entry.contains("event=\"store.corrupt\"") && entry.contains(&file))?;
+        let start = entry.find(&format!(" {field}="))? + field.len() + 2;
+        entry[start..]
+            .split(' ')
+            .next()
+            .map(|v| v.trim_matches('"'))
     }
 
     #[test]

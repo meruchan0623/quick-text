@@ -131,7 +131,7 @@
 //! | `store.quarantine_failed` | error | the rename failed; the file stays in place |
 //! | `store.prefs_invalid` | warn | a prefs field had the wrong type or was out of range and its default is used; file name, field path, problem, the JSON type found (or an out-of-range number with `min` / `max`), never a string value |
 //! | `store.prefs_unavailable` | warn | prefs.json could not be read at startup; clipboard restore uses the defaults; file name and error |
-//! | `store.corrupt` | warn | a configuration file does not parse; file name, error code, error |
+//! | `store.corrupt` | warn | a configuration file does not parse; file name, error code, `kind` for `config_malformed` (`utf8`, `syntax`, `eof` = cut short, `shape`), `line` and `column` (0 without a position, as in the diagnostics bundle), error |
 //! | `store.crash_loop` | warn | consecutive crashes at startup; `crash_count` |
 //! | `store.create_dir_failed` | warn | the data directory could not be created; error |
 //! | `store.diagnostic` | warn | a diagnostic on the stored configuration; code and the path inside the configuration (never the message, which may echo values) |
