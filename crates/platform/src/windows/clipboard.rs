@@ -4,8 +4,9 @@ use super::inject::mark_external_effect;
 use super::*;
 use crate::fault::{self, FaultPoint};
 use crate::health::{Component, ComponentHealth, HealthState, ReasonCode};
-use crate::traits::{ClipboardBackend, FormatRead, LeaseOptions, RestorePolicy};
+use crate::traits::{ClipboardBackend, ClipboardRead, FormatRead, LeaseOptions, RestorePolicy};
 use std::cell::Cell;
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::PoisonError;
 use windows_sys::Win32::Graphics::Gdi::{
     DeleteEnhMetaFile, GetEnhMetaFileBits, SetEnhMetaFileBits,
@@ -16,9 +17,18 @@ use windows_sys::Win32::Graphics::Gdi::{
 pub(super) const OPEN_ATTEMPTS: usize = 10;
 /// Pause between `OpenClipboard` attempts, always with the clipboard closed.
 pub(super) const OPEN_RETRY_INTERVAL: Duration = Duration::from_millis(15);
-/// A critical section holding the clipboard open longer than this degrades
-/// the clipboard component: every other `OpenClipboard` fails meanwhile.
+/// Longest a lease holds the clipboard open: every other `OpenClipboard`
+/// fails meanwhile. Enforced while reading another owner's data (the read
+/// that crosses it stops the backup); reported after the fact for the
+/// lease's own writes. Either way the component is degraded.
 pub(super) const LOCK_HOLD_BUDGET: Duration = Duration::from_millis(250);
+/// How long a lease waits for one backup worker section: the hold budget,
+/// plus a margin for the read that crosses it and for scheduling. A section
+/// still running then (a read blocked on an owner rendering a delay-rendered
+/// format) is abandoned.
+const READ_WAIT: Duration = LOCK_HOLD_BUDGET.saturating_add(Duration::from_millis(50));
+/// Re-verification attempts while the clipboard sequence settles.
+const VERIFY_ATTEMPTS: usize = 8;
 /// Pause between ownership re-verification attempts (clipboard closed).
 const VERIFY_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 /// Largest single format a lease backs up; larger ones follow the policy.
@@ -43,19 +53,28 @@ const CF_TEXT: u32 = 1;
 const CF_BITMAP: u32 = 2;
 const CF_METAFILEPICT: u32 = 3;
 const CF_OEMTEXT: u32 = 7;
+const CF_DIB: u32 = 8;
 const CF_PALETTE: u32 = 9;
 const CF_UNICODETEXT: u32 = 13;
 const CF_ENHMETAFILE: u32 = 14;
 const CF_LOCALE: u32 = 16;
+const CF_DIBV5: u32 = 17;
 
 /// What a lease does with one format when backing up (B-08).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Handling {
     /// Back up its bytes and restore them.
     Copy,
-    /// Cannot be restored: skipped and recorded in `skipped_formats`.
+    /// Known not to be restorable (only its owner can copy the data):
+    /// BestEffort skips it and records it in `skipped_formats`; Full refuses.
     Skip,
-    /// Neither backed up nor recorded.
+    /// Re-synthesized by the system from any of these formats once they are
+    /// restored: dropped unrecorded when one of them is backed up, refused
+    /// otherwise.
+    Covered(&'static [u32]),
+    /// Unknown handle type, so nothing says it can be dropped: refused.
+    Unknown,
+    /// Neither backed up nor recorded (TextOnly's non-text formats).
     Ignore,
 }
 
@@ -69,14 +88,14 @@ fn handling(format: u32, policy: RestorePolicy) -> Handling {
         };
     }
     match format {
-        // HBITMAP: re-synthesized by the system from the restored
-        // CF_DIB/CF_DIBV5, which are always enumerated alongside it.
-        CF_BITMAP => Handling::Ignore,
+        // HBITMAP: re-synthesized by the system from a restored
+        // CF_DIB/CF_DIBV5 (it synthesizes those from it too, so they are
+        // enumerated alongside it).
+        CF_BITMAP => Handling::Covered(&[CF_DIB, CF_DIBV5]),
         // HGLOBAL to a METAFILEPICT holding an HMETAFILE that would need its
-        // own copy. 待实测后定: copy the HMETAFILE, or keep skipping it
-        // (it is re-synthesized from a restored CF_ENHMETAFILE, see
-        // `take_backup`).
-        CF_METAFILEPICT => Handling::Skip,
+        // own copy; re-synthesized from a restored CF_ENHMETAFILE (and the
+        // reverse). 待实测后定: copy the HMETAFILE so it survives alone.
+        CF_METAFILEPICT => Handling::Covered(&[CF_ENHMETAFILE]),
         // HPALETTE, and owner-display formats whose data is drawn by the
         // owner (CF_OWNERDISPLAY, CF_DSP* = 0x80..=0x8F).
         CF_PALETTE | 0x80..=0x8F => Handling::Skip,
@@ -90,8 +109,8 @@ fn handling(format: u32, policy: RestorePolicy) -> Handling {
         CF_TEXT | 4..=8 | 10..=17 => Handling::Copy,
         // Registered formats are HGLOBAL by convention.
         0xC000..=0xFFFF => Handling::Copy,
-        // Unknown handle type.
-        _ => Handling::Skip,
+        // Outside every defined range.
+        _ => Handling::Unknown,
     }
 }
 
@@ -117,8 +136,9 @@ fn record_health(state: HealthState, reason: Option<ReasonCode>) {
 }
 /// Clipboard component health for the supervisor (B-08): Degraded with
 /// `ClipboardBusy` after a lease could not open the clipboard within the
-/// bounded retry or held it open too long; Healthy again after the next
-/// lease whose critical sections all completed in time.
+/// bounded retry, held it open too long, gave up waiting for a backup read
+/// or found the owner not responding; Healthy again after the next lease
+/// whose critical sections all completed in time.
 pub fn clipboard_health() -> ComponentHealth {
     health_cell()
         .lock()
@@ -158,12 +178,39 @@ impl From<LeaseError> for String {
     }
 }
 
-/// Runs `f` with the clipboard open. The critical section is only
-/// open → read/write → close: callers never sleep, wait or inject input in
-/// `f`. A busy clipboard is retried `OPEN_ATTEMPTS` times with the clipboard
-/// closed in between. Staying busy, or holding it open longer than
-/// `LOCK_HOLD_BUDGET`, reports the component Degraded (`ClipboardBusy`) and
-/// keeps it Degraded for the rest of the lease (`degraded`).
+/// Reports the component Degraded (`ClipboardBusy`) and keeps it Degraded
+/// for the rest of the lease (`degraded`).
+fn degrade<C: ClipboardBackend>(backend: &C, degraded: &Cell<bool>) {
+    degraded.set(true);
+    backend.report_health(HealthState::Degraded, Some(ReasonCode::ClipboardBusy));
+}
+/// Health after a critical section that held the clipboard open for `held`.
+fn report_held<C: ClipboardBackend>(backend: &C, degraded: &Cell<bool>, held: Duration) {
+    if held > LOCK_HOLD_BUDGET {
+        tracing::warn!(
+            event = "clipboard.slow",
+            held_ms = held.as_millis() as u64,
+            budget_ms = LOCK_HOLD_BUDGET.as_millis() as u64
+        );
+        degrade(backend, degraded);
+    } else if !degraded.get() {
+        backend.report_health(HealthState::Healthy, None);
+    }
+}
+/// The clipboard stayed busy for every `OpenClipboard` attempt.
+fn exhausted<C: ClipboardBackend>(backend: &C, degraded: &Cell<bool>) {
+    tracing::warn!(event = "clipboard.busy", attempts = OPEN_ATTEMPTS as u64);
+    degrade(backend, degraded);
+}
+
+/// Runs `f` with the clipboard open on the lease thread. Only for sections
+/// over the lease's own data (its writes and their verification), which
+/// never wait on another owner; reads of another owner's data go through
+/// [`read_section`]. The critical section is only open → read/write →
+/// close: callers never sleep, wait or inject input in `f`. A busy
+/// clipboard is retried `OPEN_ATTEMPTS` times with the clipboard closed in
+/// between. Staying busy, or holding it open longer than `LOCK_HOLD_BUDGET`
+/// (measured after the fact), degrades the component.
 fn critical<C: ClipboardBackend, R>(
     backend: &C,
     degraded: &Cell<bool>,
@@ -180,26 +227,171 @@ fn critical<C: ClipboardBackend, R>(
             (result, backend.now().saturating_duration_since(start))
         });
         if let Some((Some(result), held)) = opened {
-            if held > LOCK_HOLD_BUDGET {
-                tracing::warn!(
-                    event = "clipboard.slow",
-                    held_ms = held.as_millis() as u64,
-                    budget_ms = LOCK_HOLD_BUDGET.as_millis() as u64
-                );
-                degraded.set(true);
-                backend.report_health(HealthState::Degraded, Some(ReasonCode::ClipboardBusy));
-            } else if !degraded.get() {
-                backend.report_health(HealthState::Healthy, None);
-            }
+            report_held(backend, degraded, held);
             return Ok(result);
         }
     }
-    tracing::warn!(event = "clipboard.busy", attempts = OPEN_ATTEMPTS as u64);
-    degraded.set(true);
-    backend.report_health(HealthState::Degraded, Some(ReasonCode::ClipboardBusy));
+    exhausted(backend, degraded);
     Err(LeaseError::new(
         ReasonCode::ClipboardBusy,
         "Clipboard is busy",
+    ))
+}
+
+/// Clipboard time of one backup worker section.
+struct Section<'a> {
+    opened: Instant,
+    abandoned: &'a AtomicBool,
+}
+impl Section<'_> {
+    /// Checked after every read: stop once the lease gave up waiting, or the
+    /// clipboard has been open longer than `LOCK_HOLD_BUDGET`.
+    fn expired(&self, reader: &impl ClipboardRead) -> bool {
+        self.abandoned.load(Ordering::SeqCst)
+            || reader.now().saturating_duration_since(self.opened) > LOCK_HOLD_BUDGET
+    }
+}
+/// A worker section stopped at a read that crossed the hold budget.
+fn overrun() -> LeaseError {
+    LeaseError::new(
+        ReasonCode::ClipboardBusy,
+        "Clipboard data took too long to read; trigger preserved",
+    )
+}
+fn worker_failed() -> LeaseError {
+    LeaseError::new(
+        ReasonCode::Internal,
+        "Clipboard backup failed; trigger preserved",
+    )
+}
+
+type Job<R> = Box<dyn FnOnce(&R, &AtomicBool) + Send>;
+
+/// A worker section's answer, sent once the clipboard is closed again.
+enum Attempt<S, T> {
+    /// The clipboard was busy; the state comes back for the next attempt.
+    Busy(S),
+    /// The section ran, holding the clipboard open for `held`.
+    Done { value: T, held: Duration },
+}
+
+/// The thread a lease reads another owner's clipboard data on (B-08).
+/// `GetClipboardData` on a delay-rendered format blocks until the owner
+/// renders it, so the lease waits for each section at most `READ_WAIT`.
+/// The thread holds only a [`ClipboardRead`]: abandoned, it can still finish
+/// a stuck call and close the clipboard, but it has nothing to write with.
+struct BackupWorker<R> {
+    jobs: mpsc::Sender<Job<R>>,
+    abandoned: Arc<AtomicBool>,
+}
+impl<R: ClipboardRead + Send + 'static> BackupWorker<R> {
+    fn start(reader: R) -> Result<Self, LeaseError> {
+        let (jobs, queue) = mpsc::channel::<Job<R>>();
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let flag = abandoned.clone();
+        std::thread::Builder::new()
+            .name("clipboard-backup".into())
+            .spawn(move || {
+                // Ends once the lease drops its sender.
+                for job in queue {
+                    if flag.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    job(&reader, &flag);
+                }
+            })
+            .map_err(|error| {
+                tracing::warn!(event = "clipboard.worker_failed", error = %error);
+                worker_failed()
+            })?;
+        Ok(Self { jobs, abandoned })
+    }
+    /// Queues one attempt at running `body` on `state` with the clipboard
+    /// open. The answer is sent after the worker closed the clipboard.
+    fn attempt<S: Send + 'static, T: Send + 'static>(
+        &self,
+        state: S,
+        body: fn(&R, S, &Section<'_>) -> T,
+    ) -> Option<mpsc::Receiver<Attempt<S, T>>> {
+        let (answer, receiver) = mpsc::sync_channel(1);
+        let job: Job<R> = Box::new(move |reader, abandoned| {
+            let mut state = Some(state);
+            let opened = reader.locked(|| {
+                let section = Section {
+                    opened: reader.now(),
+                    abandoned,
+                };
+                let value = state.take().map(|state| body(reader, state, &section));
+                (
+                    value,
+                    reader.now().saturating_duration_since(section.opened),
+                )
+            });
+            let attempt = match (opened, state) {
+                (Some((Some(value), held)), _) => Attempt::Done { value, held },
+                (_, Some(state)) => Attempt::Busy(state),
+                _ => return,
+            };
+            // After a timeout nobody receives it.
+            let _ = answer.send(attempt);
+        });
+        self.jobs.send(job).ok()?;
+        Some(receiver)
+    }
+    /// The lease stopped waiting: the section in progress stops after its
+    /// current read, and nothing else runs.
+    fn abandon(&self) {
+        self.abandoned.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Runs `body` on `state` on the backup worker with the clipboard open,
+/// retrying a busy clipboard like [`critical`]. Each attempt is waited for at
+/// most `READ_WAIT`; a section still running then is abandoned and the lease
+/// refuses (`ClipboardBusy`, degraded) with the trigger preserved.
+fn read_section<C, S, T>(
+    backend: &C,
+    worker: &BackupWorker<C::Reader>,
+    degraded: &Cell<bool>,
+    mut state: S,
+    body: fn(&C::Reader, S, &Section<'_>) -> T,
+) -> Result<T, LeaseError>
+where
+    C: ClipboardBackend,
+    S: Send + 'static,
+    T: Send + 'static,
+{
+    for attempt in 0..OPEN_ATTEMPTS {
+        if attempt > 0 {
+            backend.pause(OPEN_RETRY_INTERVAL);
+        }
+        let answer = worker.attempt(state, body).ok_or_else(worker_failed)?;
+        match backend.wait_for(&answer, READ_WAIT) {
+            Ok(Attempt::Busy(returned)) => state = returned,
+            Ok(Attempt::Done { value, held }) => {
+                report_held(backend, degraded, held);
+                return Ok(value);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                worker.abandon();
+                tracing::warn!(
+                    event = "clipboard.read_timeout",
+                    wait_ms = READ_WAIT.as_millis() as u64
+                );
+                degrade(backend, degraded);
+                return Err(LeaseError::new(
+                    ReasonCode::ClipboardBusy,
+                    "Clipboard data did not arrive in time; trigger preserved",
+                ));
+            }
+            // The section panicked; the clipboard was closed on unwind.
+            Err(RecvTimeoutError::Disconnected) => return Err(worker_failed()),
+        }
+    }
+    exhausted(backend, degraded);
+    Err(LeaseError::new(
+        ReasonCode::ClipboardBusy,
+        "Clipboard is busy; trigger preserved",
     ))
 }
 fn clipboard_operation(operation: &Operation) -> bool {
@@ -370,11 +562,37 @@ unsafe fn metafile_bits(handle: HANDLE, limit: usize) -> FormatRead {
     }
     FormatRead::Data(bytes)
 }
-impl ClipboardBackend for WinClipboard {
-    type Staged = WinStaged;
-    fn identity(&self) -> u64 {
-        self.window as u64
+/// Opens the clipboard associated with `window` (null: no owner window),
+/// runs `f` and closes it again, also when `f` unwinds. Both happen on the
+/// calling thread, as `CloseClipboard` requires. `None` when the clipboard
+/// is busy, or inside the `FaultPoint::ClipboardBusy` window.
+fn with_clipboard_open<R>(window: HWND, f: impl FnOnce() -> R) -> Option<R> {
+    struct Close;
+    impl Drop for Close {
+        fn drop(&mut self) {
+            unsafe {
+                CloseClipboard();
+            }
+        }
     }
+    let fault_busy = fault_busy_window(
+        fault::take(FaultPoint::ClipboardBusy),
+        &mut FAULT_BUSY_UNTIL
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+        Instant::now(),
+    );
+    if fault_busy || unsafe { OpenClipboard(window) } == 0 {
+        return None;
+    }
+    let _close = Close;
+    Some(f())
+}
+/// Read-only clipboard access for the backup worker thread: it opens the
+/// clipboard with no owner window (`OpenClipboard(NULL)`) and has no write
+/// methods.
+pub(super) struct WinReader;
+impl ClipboardRead for WinReader {
     fn owner(&self) -> u64 {
         unsafe { GetClipboardOwner() as u64 }
     }
@@ -382,24 +600,7 @@ impl ClipboardBackend for WinClipboard {
         unsafe { GetClipboardSequenceNumber() }
     }
     fn locked<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
-        let fault_busy = fault_busy_window(
-            fault::take(FaultPoint::ClipboardBusy),
-            &mut FAULT_BUSY_UNTIL
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-            Instant::now(),
-        );
-        if fault_busy {
-            return None;
-        }
-        unsafe {
-            if OpenClipboard(self.window) == 0 {
-                return None;
-            }
-            let result = f();
-            CloseClipboard();
-            Some(result)
-        }
+        with_clipboard_open(std::ptr::null_mut(), f)
     }
     fn formats(&self) -> Vec<u32> {
         let mut formats = Vec::new();
@@ -413,17 +614,12 @@ impl ClipboardBackend for WinClipboard {
         }
         formats
     }
-    fn read(&self, format: u32, limit: usize) -> Result<Option<Vec<u8>>, String> {
-        match self.read_format(format, limit) {
-            FormatRead::Data(bytes) => Ok(Some(bytes)),
-            FormatRead::Missing | FormatRead::TooLarge => Ok(None),
-            FormatRead::Unreadable => Err("Clipboard data lock failed".into()),
-        }
-    }
     fn read_format(&self, format: u32, limit: usize) -> FormatRead {
         unsafe {
             // Only formats `handling` copies get here: HGLOBAL ones and
-            // CF_ENHMETAFILE. A delay-rendered format is rendered now.
+            // CF_ENHMETAFILE. A delay-rendered format is rendered now: this
+            // blocks until the owner handles WM_RENDERFORMAT (待实测: how
+            // long Windows waits for an owner that never does).
             let handle = GetClipboardData(format);
             if handle.is_null() {
                 return FormatRead::Missing;
@@ -446,6 +642,33 @@ impl ClipboardBackend for WinClipboard {
             GlobalUnlock(handle);
             FormatRead::Data(bytes)
         }
+    }
+}
+impl ClipboardRead for WinClipboard {
+    fn owner(&self) -> u64 {
+        WinReader.owner()
+    }
+    fn sequence(&self) -> u32 {
+        WinReader.sequence()
+    }
+    fn locked<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
+        with_clipboard_open(self.window, f)
+    }
+    fn formats(&self) -> Vec<u32> {
+        WinReader.formats()
+    }
+    fn read_format(&self, format: u32, limit: usize) -> FormatRead {
+        WinReader.read_format(format, limit)
+    }
+}
+impl ClipboardBackend for WinClipboard {
+    type Staged = WinStaged;
+    type Reader = WinReader;
+    fn identity(&self) -> u64 {
+        self.window as u64
+    }
+    fn reader(&self) -> WinReader {
+        WinReader
     }
     fn clear(&self) -> bool {
         unsafe { EmptyClipboard() != 0 }
@@ -562,7 +785,6 @@ struct Backup {
     formats: Vec<u32>,
     data: ClipboardFormats,
     skipped: Vec<u32>,
-    sequence: u32,
 }
 fn refusal(too_large: bool) -> LeaseError {
     if too_large {
@@ -577,51 +799,160 @@ fn refusal(too_large: bool) -> LeaseError {
         )
     }
 }
-/// Locked: classifies and reads every format under `policy`. With a hung
-/// owner nothing is read: a delay-rendered format would block on it.
-fn take_backup<C: ClipboardBackend>(
-    backend: &C,
+/// Locked, on the backup worker: classifies and reads every format under
+/// `policy`, checking the section's time after every read. BestEffort may
+/// skip only the format table's skips and formats over `MAX_FORMAT_BYTES`;
+/// any failed read refuses under every policy.
+fn take_backup<R: ClipboardRead>(
+    reader: &R,
     policy: RestorePolicy,
-    hung: bool,
+    section: &Section<'_>,
 ) -> Result<Backup, LeaseError> {
-    let formats = backend.formats();
+    let formats = reader.formats();
     let mut data = vec![];
     let mut skipped = vec![];
+    let mut covered = vec![];
     let mut too_large = false;
     for &format in &formats {
         match handling(format, policy) {
             Handling::Ignore => continue,
-            Handling::Copy if !hung => match backend.read_format(format, MAX_FORMAT_BYTES) {
-                FormatRead::Data(bytes) => {
-                    data.push((format, bytes));
-                    continue;
+            // Its sources may come later in enumeration order.
+            Handling::Covered(sources) => {
+                covered.push(sources);
+                continue;
+            }
+            Handling::Unknown => return Err(refusal(false)),
+            Handling::Skip => {}
+            Handling::Copy => {
+                let read = reader.read_format(format, MAX_FORMAT_BYTES);
+                if section.expired(reader) {
+                    return Err(overrun());
                 }
-                FormatRead::TooLarge => too_large = true,
-                FormatRead::Missing | FormatRead::Unreadable => {}
-            },
-            Handling::Copy | Handling::Skip => {}
+                match read {
+                    FormatRead::Data(bytes) => {
+                        data.push((format, bytes));
+                        continue;
+                    }
+                    FormatRead::TooLarge => too_large = true,
+                    // GetClipboardData returned nothing for an enumerated
+                    // format, or its memory could not be read.
+                    FormatRead::Missing | FormatRead::Unreadable => {
+                        tracing::warn!(event = "clipboard.unreadable", format);
+                        return Err(LeaseError::new(
+                            ReasonCode::Internal,
+                            format!(
+                                "Clipboard format {format:#x} could not be read; trigger preserved"
+                            ),
+                        ));
+                    }
+                }
+            }
         }
         skipped.push(format);
-        // Full stops reading at the first loss; CF_METAFILEPICT waits for
-        // the CF_ENHMETAFILE it is synthesized from.
-        if policy == RestorePolicy::Full && format != CF_METAFILEPICT {
+        // Full stops reading at the first loss.
+        if policy == RestorePolicy::Full {
             return Err(refusal(too_large));
         }
     }
-    // The system re-synthesizes CF_METAFILEPICT from a restored
-    // CF_ENHMETAFILE (and the reverse), like CF_BITMAP from CF_DIB.
-    if data.iter().any(|(format, _)| *format == CF_ENHMETAFILE) {
-        skipped.retain(|format| *format != CF_METAFILEPICT);
+    let restored = |sources: &[u32]| data.iter().any(|(format, _)| sources.contains(format));
+    if !covered.iter().all(|sources| restored(sources)) {
+        return Err(refusal(too_large));
     }
-    if policy == RestorePolicy::Full && !skipped.is_empty() {
+    // The restore would empty a clipboard that held data. TextOnly opted
+    // into dropping everything that is not text.
+    if policy != RestorePolicy::TextOnly && data.is_empty() && !formats.is_empty() {
         return Err(refusal(too_large));
     }
     Ok(Backup {
         formats,
         data,
         skipped,
-        sequence: backend.sequence(),
     })
+}
+/// Locked: checks that `owner` still owns the clipboard and that it holds
+/// exactly `expected` (and, with `formats`, exactly that format set);
+/// `expired` is checked after every read. Returns the sequence it saw.
+fn check_payload<R: ClipboardRead>(
+    reader: &R,
+    owner: u64,
+    expected: &[(u32, Vec<u8>)],
+    formats: Option<&[u32]>,
+    expired: impl Fn() -> bool,
+) -> Result<u32, LeaseError> {
+    let changed = |message| LeaseError::new(ReasonCode::ClipboardChanged, message);
+    if reader.owner() != owner {
+        return Err(changed(
+            "Clipboard owner changed externally; clipboard preserved",
+        ));
+    }
+    if let Some(formats) = formats {
+        let now = reader.formats();
+        if now.len() != formats.len() || now.iter().any(|format| !formats.contains(format)) {
+            return Err(changed(
+                "Clipboard formats changed externally; clipboard preserved",
+            ));
+        }
+    }
+    for (format, bytes) in expected {
+        let read = reader.read_format(*format, bytes.len());
+        if expired() {
+            return Err(overrun());
+        }
+        match read {
+            FormatRead::Unreadable => {
+                return Err(LeaseError::new(
+                    ReasonCode::Internal,
+                    "Clipboard payload cannot be verified",
+                ))
+            }
+            FormatRead::Data(current) if current == *bytes => {}
+            _ => {
+                return Err(changed(
+                    "Clipboard payload changed externally; clipboard preserved",
+                ))
+            }
+        }
+    }
+    Ok(reader.sequence())
+}
+fn unverified() -> LeaseError {
+    LeaseError::new(
+        ReasonCode::ClipboardChanged,
+        "Clipboard ownership could not be verified within the retry limit",
+    )
+}
+/// Re-reads the backup on the worker so a copy racing it is detected, until
+/// the sequence it was read at is still current. Returns the backup and
+/// that sequence.
+fn verify_backup<C: ClipboardBackend>(
+    backend: &C,
+    worker: &BackupWorker<C::Reader>,
+    degraded: &Cell<bool>,
+    owner: u64,
+    mut backup: Backup,
+) -> Result<(Backup, u32), LeaseError> {
+    for _ in 0..VERIFY_ATTEMPTS {
+        let (returned, checked) = read_section(
+            backend,
+            worker,
+            degraded,
+            (owner, backup),
+            |reader, (owner, backup), section| {
+                let checked =
+                    check_payload(reader, owner, &backup.data, Some(&backup.formats), || {
+                        section.expired(reader)
+                    });
+                (backup, checked)
+            },
+        )?;
+        backup = returned;
+        let sequence = checked?;
+        if backend.sequence() == sequence && backend.owner() == owner {
+            return Ok((backup, sequence));
+        }
+        backend.pause(VERIFY_RETRY_INTERVAL);
+    }
+    Err(unverified())
 }
 fn finish_clipboard_restore<T>(
     backup: &mut Vec<T>,
@@ -632,85 +963,40 @@ fn finish_clipboard_restore<T>(
     Ok(())
 }
 fn retry_clipboard_verification<T>(
-    mut attempt: impl FnMut() -> Result<Option<T>, String>,
+    mut attempt: impl FnMut() -> Result<Option<T>, LeaseError>,
     mut pause: impl FnMut(),
-) -> Result<T, String> {
-    for _ in 0..8 {
+) -> Result<T, LeaseError> {
+    for _ in 0..VERIFY_ATTEMPTS {
         match attempt()? {
             Some(verified) => return Ok(verified),
             None => pause(),
         }
     }
-    Err("Clipboard ownership could not be verified within the retry limit".into())
+    Err(unverified())
 }
 impl<C: ClipboardBackend> ClipboardLease<C> {
+    /// Re-establishes the lease's own ownership after a write: `owner` still
+    /// owns the clipboard and it holds exactly `expected`. Runs on the lease
+    /// thread; the data is the lease's own, so no read waits on another
+    /// owner.
     fn verified_sequence(
         &self,
         owner: u64,
         expected: &[(u32, Vec<u8>)],
-        formats: Option<&[u32]>,
     ) -> Result<u32, LeaseError> {
         let backend = &self.backend;
-        // An exhausted retry means the sequence never settled.
-        let mut reason = ReasonCode::ClipboardChanged;
-        let verified = retry_clipboard_verification(
+        retry_clipboard_verification(
             || {
-                let checked = critical(backend, &self.degraded, || {
-                    if backend.owner() != owner {
-                        return Err((
-                            ReasonCode::ClipboardChanged,
-                            "Clipboard owner changed externally; clipboard preserved",
-                        ));
-                    }
-                    if let Some(formats) = formats {
-                        let now = backend.formats();
-                        if now.len() != formats.len()
-                            || now.iter().any(|format| !formats.contains(format))
-                        {
-                            return Err((
-                                ReasonCode::ClipboardChanged,
-                                "Clipboard formats changed externally; clipboard preserved",
-                            ));
-                        }
-                    }
-                    for (format, bytes) in expected {
-                        match backend.read_format(*format, bytes.len()) {
-                            FormatRead::Unreadable => {
-                                return Err((
-                                    ReasonCode::Internal,
-                                    "Clipboard payload cannot be verified",
-                                ))
-                            }
-                            FormatRead::Data(current) if current == *bytes => {}
-                            _ => {
-                                return Err((
-                                    ReasonCode::ClipboardChanged,
-                                    "Clipboard payload changed externally; clipboard preserved",
-                                ))
-                            }
-                        }
-                    }
-                    Ok(backend.sequence())
-                });
-                let sequence = match checked {
-                    Ok(Ok(sequence)) => sequence,
-                    Ok(Err((code, message))) => {
-                        reason = code;
-                        return Err(message.to_string());
-                    }
-                    Err(busy) => {
-                        reason = busy.reason;
-                        return Err(busy.message);
-                    }
-                };
-                if backend.sequence() == sequence && backend.owner() == owner {
-                    return Ok(Some(sequence));
-                }
-                Ok(None)
+                let sequence = critical(backend, &self.degraded, || {
+                    check_payload(backend, owner, expected, None, || false)
+                })??;
+                Ok(
+                    (backend.sequence() == sequence && backend.owner() == owner)
+                        .then_some(sequence),
+                )
             },
             || backend.pause(VERIFY_RETRY_INTERVAL),
-        );
-        verified.map_err(|message| LeaseError::new(reason, message))
+        )
     }
     pub(super) fn verify_current(&self) -> Result<(), String> {
         if self
@@ -792,8 +1078,7 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
             *written = Some(backend.sequence());
             Ok(())
         })??;
-        self.written =
-            Some(self.verified_sequence(self.backend.identity(), &prepared.expected, None)?);
+        self.written = Some(self.verified_sequence(self.backend.identity(), &prepared.expected)?);
         Ok(())
     }
     /// [`ClipboardLease::open`] with the default options.
@@ -801,25 +1086,37 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
         Self::open(backend, LeaseOptions::default()).map_err(String::from)
     }
     /// Backs up the clipboard under `options` (B-08), then verifies the
-    /// backup in a second critical section so a copy racing it is detected.
-    /// Fails before anything is written: the trigger is preserved.
+    /// backup in a second section so a copy racing it is detected. Every
+    /// read of the other owner's data runs on a backup worker thread the
+    /// lease waits on for at most [`READ_WAIT`] per section. Fails before
+    /// anything is written: the trigger is preserved.
     pub(super) fn open(backend: C, options: LeaseOptions) -> Result<Self, LeaseError> {
-        const BUSY: &str = "Clipboard is busy; trigger preserved";
-        let busy = |error: LeaseError| LeaseError::new(error.reason, BUSY);
         let degraded = Cell::new(false);
+        let worker = BackupWorker::start(backend.reader())?;
         let mut taken = None;
         for _ in 0..OWNER_PROBES {
             // Probed with the clipboard closed: the probe may wait.
             let owner = backend.owner();
-            let hung = backend.owner_hung(owner);
-            let backup = critical(&backend, &degraded, || {
-                (backend.owner() == owner).then(|| take_backup(&backend, options.policy, hung))
-            })
-            .map_err(busy)?;
+            if backend.owner_hung(owner) {
+                // Its delay-rendered formats would block every read, and
+                // emptying the clipboard would wait on it too.
+                tracing::warn!(event = "clipboard.owner_hung");
+                degrade(&backend, &degraded);
+                return Err(LeaseError::new(
+                    ReasonCode::ClipboardBusy,
+                    "Clipboard owner is not responding; trigger preserved",
+                ));
+            }
+            let backup = read_section(
+                &backend,
+                &worker,
+                &degraded,
+                (owner, options.policy),
+                |reader, (owner, policy), section| {
+                    (reader.owner() == owner).then(|| take_backup(reader, policy, section))
+                },
+            )?;
             if let Some(backup) = backup {
-                if hung {
-                    tracing::warn!(event = "clipboard.owner_hung");
-                }
                 let backup = backup.inspect_err(|error| {
                     tracing::warn!(event = "clipboard.lease_refused", reason = ?error.reason);
                 })?;
@@ -833,27 +1130,17 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
                 "Clipboard owner kept changing during backup; trigger preserved",
             ));
         };
-        let mut lease = Self {
+        let (backup, sequence) = verify_backup(&backend, &worker, &degraded, owner, backup)?;
+        let lease = Self {
             backend,
             backup: backup.data,
             owned_payload: vec![],
-            written: Some(backup.sequence),
+            written: Some(sequence),
             dirty: false,
             degraded,
             skipped: backup.skipped,
             restore_delay: options.restore_delay,
         };
-        match lease.verified_sequence(owner, &lease.backup, Some(&backup.formats)) {
-            Ok(sequence) => lease.written = Some(sequence),
-            Err(error) => {
-                lease.written = None;
-                return Err(if error.reason == ReasonCode::ClipboardBusy {
-                    busy(error)
-                } else {
-                    error
-                });
-            }
-        }
         if !lease.skipped_formats().is_empty() {
             tracing::info!(
                 event = "clipboard.skipped",
@@ -921,8 +1208,7 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
         // format can advance the sequence after our writes. Re-establish
         // ownership from the exact payload under a lock; never adopt a new
         // sequence solely because the previous one is no longer current.
-        self.written =
-            Some(self.verified_sequence(self.backend.identity(), &self.owned_payload, None)?);
+        self.written = Some(self.verified_sequence(self.backend.identity(), &self.owned_payload)?);
         let result = self.write(self.backup.clone());
         finish_clipboard_restore(&mut self.backup, result)?;
         self.written = None;
@@ -972,6 +1258,7 @@ mod tests {
     #[test]
     fn clipboard_retry_never_adopts_changed_owner_or_payload() {
         for reason in ["external owner", "modified payload"] {
+            let changed = LeaseError::new(ReasonCode::ClipboardChanged, reason);
             let mut attempts = 0;
             let result = retry_clipboard_verification::<u32>(
                 || {
@@ -979,24 +1266,26 @@ mod tests {
                     if attempts == 1 {
                         Ok(None)
                     } else {
-                        Err(reason.into())
+                        Err(changed.clone())
                     }
                 },
                 || {},
             );
-            assert_eq!(result, Err(reason.into()));
+            assert_eq!(result, Err(changed));
             assert_eq!(attempts, 2);
         }
         let mut attempts = 0;
-        assert!(retry_clipboard_verification::<u32>(
-            || {
-                attempts += 1;
-                Ok(None)
-            },
-            || {}
-        )
-        .is_err());
-        assert_eq!(attempts, 8);
+        assert_eq!(
+            retry_clipboard_verification::<u32>(
+                || {
+                    attempts += 1;
+                    Ok(None)
+                },
+                || {}
+            ),
+            Err(unverified())
+        );
+        assert_eq!(attempts, VERIFY_ATTEMPTS);
     }
     #[test]
     fn unavailable_clipboard_rejects_paste_before_erasure_without_downgrade() {
@@ -1143,20 +1432,97 @@ mod tests {
     #[test]
     fn slow_critical_section_degrades_for_the_rest_of_the_lease() {
         let clipboard = MockClipboard::new(7, text("original"));
+        let mut lease = ClipboardLease::new(clipboard.clone()).unwrap();
+        assert_eq!(clipboard.health(), HEALTHY);
+        let mut prepared = lease.prepare(text("expansion")).unwrap();
+        // Locks: 0 backup, 1 its verification, 2 paste write, 3 its
+        // verification (slow, over our own data: reported, not enforced),
+        // 4 restore verification (fast again), 5 restore write.
         clipboard.set_read_delay(LOCK_HOLD_BUDGET + Duration::from_millis(1));
         let script = clipboard.clone();
-        // Only the backup (lock 0) is slow; its verification is fast.
         clipboard.on_lock(move |index| {
-            if index == 1 {
+            if index == 4 {
                 script.set_read_delay(Duration::ZERO);
             }
         });
-        let lease = ClipboardLease::new(clipboard.clone()).unwrap();
+        lease.write_prepared(&mut prepared).unwrap();
+        assert_eq!(clipboard.health(), BUSY);
+        lease.restore().unwrap();
         assert_eq!(clipboard.health(), BUSY, "a fast section must not hide it");
+        assert_eq!(clipboard.content(), text("original"));
         drop(lease);
         // The next lease whose sections are all fast reports Healthy again.
         drop(ClipboardLease::new(clipboard.clone()).unwrap());
         assert_eq!(clipboard.health(), HEALTHY);
+    }
+    #[test]
+    fn blocked_read_times_out_and_the_worker_never_writes() {
+        let mut original = text("original");
+        original.push((0xC123, vec![1, 2, 3]));
+        let clipboard = MockClipboard::new(7, original.clone());
+        let sequence = clipboard.sequence_now();
+        // The first read waits on an owner that does not render it.
+        let release = clipboard.block_next_read();
+        let error = refused(open_with(&clipboard, RestorePolicy::BestEffort));
+        assert_eq!(error.reason, ReasonCode::ClipboardBusy);
+        assert_eq!(
+            error.message,
+            "Clipboard data did not arrive in time; trigger preserved"
+        );
+        assert_eq!(clipboard.waits(), [READ_WAIT], "one bounded wait");
+        assert_eq!(clipboard.health(), BUSY);
+        // The abandoned worker still holds the clipboard open in that read.
+        assert!(clipboard.read_parked());
+        assert!(clipboard.is_open());
+        assert!(clipboard.locked(|| ()).is_none());
+        release.send(()).unwrap();
+        assert!(clipboard.await_closed(Duration::from_secs(5)));
+        // It stopped after that read and never wrote.
+        assert_eq!(clipboard.reads(), 1);
+        assert_eq!(clipboard.content(), original);
+        assert_eq!(clipboard.sequence_now(), sequence);
+        assert_eq!(clipboard.owner_now(), 7);
+        assert_eq!(clipboard.clears(), 0);
+    }
+    #[test]
+    fn reads_that_add_up_past_the_budget_stop_the_backup() {
+        let mut original = text("original");
+        original.extend([(0xC001, vec![1]), (0xC002, vec![2]), (0xC003, vec![3])]);
+        let clipboard = MockClipboard::new(7, original.clone());
+        // Each read alone is within the budget; the third crosses it.
+        clipboard.set_read_delay(Duration::from_millis(100));
+        for policy in [RestorePolicy::Full, RestorePolicy::BestEffort] {
+            let reads = clipboard.reads();
+            let error = refused(open_with(&clipboard, policy));
+            assert_eq!(error.reason, ReasonCode::ClipboardBusy, "{policy:?}");
+            assert_eq!(
+                error.message,
+                "Clipboard data took too long to read; trigger preserved"
+            );
+            assert_eq!(
+                clipboard.reads() - reads,
+                3,
+                "{policy:?}: no partial backup"
+            );
+            assert_eq!(clipboard.health(), BUSY);
+            assert!(!clipboard.is_open());
+        }
+        // The verification section is held to the same budget.
+        let clipboard = MockClipboard::new(7, original.clone());
+        let script = clipboard.clone();
+        clipboard.on_lock(move |index| {
+            if index == 1 {
+                script.set_read_delay(Duration::from_millis(100));
+            }
+        });
+        let error = refused(ClipboardLease::open(
+            clipboard.clone(),
+            LeaseOptions::default(),
+        ));
+        assert_eq!(error, overrun());
+        assert_eq!(clipboard.health(), BUSY);
+        assert_eq!(clipboard.clears(), 0);
+        assert_eq!(clipboard.content(), original);
     }
     #[test]
     fn restore_retries_busy_clipboard_and_keeps_backup_for_drop() {
@@ -1237,15 +1603,18 @@ mod tests {
         }
         formats
     }
-    fn refusal_of(result: Result<ClipboardLease<MockClipboard>, LeaseError>) -> ReasonCode {
+    fn refused(result: Result<ClipboardLease<MockClipboard>, LeaseError>) -> LeaseError {
         match result {
             Ok(_) => panic!("lease must be refused"),
-            Err(error) => error.reason,
+            Err(error) => error,
         }
+    }
+    fn refusal_of(result: Result<ClipboardLease<MockClipboard>, LeaseError>) -> ReasonCode {
+        refused(result).reason
     }
     #[test]
     fn handling_follows_the_b08_format_table() {
-        use Handling::{Copy, Ignore, Skip};
+        use Handling::{Copy, Covered, Ignore, Skip, Unknown};
         let lossy = [RestorePolicy::Full, RestorePolicy::BestEffort];
         for policy in lossy {
             for format in [
@@ -1253,13 +1622,17 @@ mod tests {
             ] {
                 assert_eq!(handling(format, policy), Copy, "{format:#x}");
             }
-            for format in [
-                3, 9, 0x80, 0x81, 0x8E, 0x8F, 0x200, 0x2FF, 0x300, 0x3FF, 0, 18, 0x90, 0x1FF,
-                0x400, 0xBFFF,
-            ] {
+            for format in [9, 0x80, 0x81, 0x8E, 0x8F, 0x200, 0x2FF, 0x300, 0x3FF] {
                 assert_eq!(handling(format, policy), Skip, "{format:#x}");
             }
-            assert_eq!(handling(CF_BITMAP, policy), Ignore);
+            for format in [0, 18, 0x7F, 0x90, 0x1FF, 0x400, 0xBFFF] {
+                assert_eq!(handling(format, policy), Unknown, "{format:#x}");
+            }
+            assert_eq!(handling(CF_BITMAP, policy), Covered(&[CF_DIB, CF_DIBV5]));
+            assert_eq!(
+                handling(CF_METAFILEPICT, policy),
+                Covered(&[CF_ENHMETAFILE])
+            );
         }
         for format in [CF_UNICODETEXT, CF_TEXT, CF_OEMTEXT, CF_LOCALE] {
             assert_eq!(handling(format, RestorePolicy::TextOnly), Copy);
@@ -1351,28 +1724,139 @@ mod tests {
             paste_and_restore(lease, &clipboard);
             assert_eq!(clipboard.content(), rich[..2]);
         }
-        // Without the CF_ENHMETAFILE nothing re-synthesizes it.
-        let picture = vec![(CF_METAFILEPICT, vec![3])];
-        let clipboard = MockClipboard::new(7, picture.clone());
-        let lease = open_with(&clipboard, RestorePolicy::BestEffort).unwrap();
-        assert_eq!(lease.skipped_formats(), [CF_METAFILEPICT]);
-        drop(lease);
-        let clipboard = MockClipboard::new(7, picture);
-        let refused = open_with(&clipboard, RestorePolicy::Full);
-        assert_eq!(refusal_of(refused), ReasonCode::ClipboardFormatSkipped);
     }
     #[test]
-    fn unreadable_format_is_skipped_under_best_effort_only() {
-        // An enumerated format whose data is empty cannot be rendered.
+    fn synthesized_format_without_its_source_refuses() {
+        // Without the CF_ENHMETAFILE (or a CF_DIB/CF_DIBV5) nothing
+        // re-synthesizes it, and BestEffort may not drop it.
+        let lone = [(CF_METAFILEPICT, vec![3]), (CF_BITMAP, vec![0xB1])];
+        for format in lone {
+            let mut original = text("caption");
+            original.push(format.clone());
+            let clipboard = MockClipboard::new(7, original.clone());
+            for policy in [RestorePolicy::Full, RestorePolicy::BestEffort] {
+                assert_eq!(
+                    refusal_of(open_with(&clipboard, policy)),
+                    ReasonCode::ClipboardFormatSkipped,
+                    "{:#x} {policy:?}",
+                    format.0
+                );
+            }
+            // TextOnly drops it with every other non-text format.
+            let lease = open_with(&clipboard, RestorePolicy::TextOnly).unwrap();
+            assert!(lease.skipped_formats().is_empty());
+            drop(lease);
+            assert_eq!(clipboard.clears(), 0);
+            assert_eq!(clipboard.content(), original);
+        }
+        // A source that is only skipped (too large) covers nothing either.
+        let mut original = text("caption");
+        original.extend([
+            (CF_ENHMETAFILE, vec![1, 0, 0, 0]),
+            (CF_METAFILEPICT, vec![3]),
+        ]);
+        let clipboard = MockClipboard::new(7, original);
+        clipboard.report_size(CF_ENHMETAFILE, MAX_FORMAT_BYTES + 1);
+        assert_eq!(
+            refusal_of(open_with(&clipboard, RestorePolicy::BestEffort)),
+            ReasonCode::ClipboardTooLarge
+        );
+    }
+    #[test]
+    fn unknown_format_refuses_unless_text_only_drops_it() {
+        let mut original = text("original");
+        original.push((0x400, vec![4]));
+        let clipboard = MockClipboard::new(7, original.clone());
+        for policy in [RestorePolicy::Full, RestorePolicy::BestEffort] {
+            assert_eq!(
+                refusal_of(open_with(&clipboard, policy)),
+                ReasonCode::ClipboardFormatSkipped,
+                "{policy:?}"
+            );
+        }
+        let lease = open_with(&clipboard, RestorePolicy::TextOnly).unwrap();
+        assert!(lease.skipped_formats().is_empty());
+        drop(lease);
+        assert_eq!(clipboard.content(), original);
+    }
+    #[test]
+    fn unreadable_format_refuses_under_every_policy() {
+        // An enumerated format that renders no data (GetClipboardData NULL).
         let mut original = text("original");
         original.push((0xC123, vec![]));
         let clipboard = MockClipboard::new(7, original.clone());
-        let lease = open_with(&clipboard, RestorePolicy::BestEffort).unwrap();
-        assert_eq!(lease.skipped_formats(), [0xC123]);
+        for policy in [RestorePolicy::Full, RestorePolicy::BestEffort] {
+            let error = refused(open_with(&clipboard, policy));
+            assert_eq!(error.reason, ReasonCode::Internal, "{policy:?}");
+            assert_eq!(
+                error.message,
+                "Clipboard format 0xc123 could not be read; trigger preserved"
+            );
+        }
+        // Data that cannot be locked, including a text format under TextOnly.
+        let clipboard = MockClipboard::new(7, text("original"));
+        clipboard.fail_read(CF_UNICODETEXT);
+        for policy in [
+            RestorePolicy::Full,
+            RestorePolicy::BestEffort,
+            RestorePolicy::TextOnly,
+        ] {
+            assert_eq!(
+                refusal_of(open_with(&clipboard, policy)),
+                ReasonCode::Internal,
+                "{policy:?}"
+            );
+        }
+        assert_eq!(clipboard.clears(), 0);
+        assert_eq!(clipboard.content(), text("original"));
+    }
+    #[test]
+    fn best_effort_refuses_to_restore_a_non_empty_clipboard_to_nothing() {
+        // Only formats the table skips.
+        let handles = vec![(CF_PALETTE, vec![0x9A]), (0x200, vec![0x22])];
+        let clipboard = MockClipboard::new(7, handles.clone());
+        assert_eq!(
+            refusal_of(open_with(&clipboard, RestorePolicy::BestEffort)),
+            ReasonCode::ClipboardFormatSkipped
+        );
+        assert_eq!(clipboard.content(), handles);
+        // Only a format over the size limit.
+        let clipboard = MockClipboard::new(7, vec![(0xC0C0, vec![7; 16])]);
+        clipboard.report_size(0xC0C0, MAX_FORMAT_BYTES + 1);
+        assert_eq!(
+            refusal_of(open_with(&clipboard, RestorePolicy::BestEffort)),
+            ReasonCode::ClipboardTooLarge
+        );
+        // TextOnly opted into dropping every non-text format.
+        let lease = open_with(&clipboard, RestorePolicy::TextOnly).unwrap();
+        assert!(lease.skipped_formats().is_empty());
         drop(lease);
-        let refused = open_with(&clipboard, RestorePolicy::Full);
-        assert_eq!(refusal_of(refused), ReasonCode::ClipboardFormatSkipped);
-        assert_eq!(clipboard.content(), original);
+        // An empty clipboard is restored to empty.
+        let clipboard = MockClipboard::new(7, vec![]);
+        let lease = open_with(&clipboard, RestorePolicy::BestEffort).unwrap();
+        paste_and_restore(lease, &clipboard);
+        assert_eq!(clipboard.content(), ClipboardFormats::new());
+    }
+    #[test]
+    fn hung_owner_refuses_before_opening_the_clipboard() {
+        for policy in [
+            RestorePolicy::Full,
+            RestorePolicy::BestEffort,
+            RestorePolicy::TextOnly,
+        ] {
+            let clipboard = MockClipboard::new(7, text("original"));
+            clipboard.set_owner_hung(true);
+            let error = refused(open_with(&clipboard, policy));
+            assert_eq!(error.reason, ReasonCode::ClipboardBusy, "{policy:?}");
+            assert_eq!(
+                error.message,
+                "Clipboard owner is not responding; trigger preserved"
+            );
+            assert_eq!(clipboard.health(), BUSY);
+            assert_eq!(clipboard.reads(), 0);
+            assert_eq!(clipboard.clears(), 0);
+            assert_eq!(clipboard.content(), text("original"));
+        }
     }
     #[test]
     fn owner_change_before_the_backup_lock_takes_a_fresh_probe() {

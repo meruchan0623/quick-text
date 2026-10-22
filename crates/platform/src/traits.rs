@@ -2,6 +2,7 @@
 //! crate; 0.5 moves them to `crates/engine/src/ports.rs` (B-49).
 use crate::health::EngineEvent;
 use crate::Foreground;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 /// Engine → shell event channel. Implementations must not block: the
@@ -58,28 +59,55 @@ pub trait Injector: Send + Sync {
     fn send_mouse(&self, flags: u32, data: u32, x: i32, y: i32) -> u32;
 }
 
-/// Clipboard port for one lease (no-regression #1/#2): enough to back up all
-/// formats, write a pre-staged payload, and re-verify sequence, owner and
-/// content before restoring. Methods documented as "locked" are only valid
-/// inside [`ClipboardBackend::locked`]. Not `Send`: the Windows owner window
-/// is thread-affine.
-pub trait ClipboardBackend {
-    /// Payload allocated before any destructive step, handed over by `set`.
-    type Staged;
-    /// Owner identity the clipboard reports after this backend writes.
-    fn identity(&self) -> u64;
+/// Read-only clipboard access (B-08): everything a lease's backup needs, and
+/// nothing that writes, so the backup can run on a worker thread that the
+/// lease may abandon after a timeout. Methods documented as "locked" are only
+/// valid inside [`ClipboardRead::locked`], on the thread that called it.
+pub trait ClipboardRead {
     /// Current clipboard owner identity.
     fn owner(&self) -> u64;
     /// Current clipboard sequence number.
     fn sequence(&self) -> u32;
-    /// Opens the clipboard as `identity`, runs `f`, closes it. `None` when
-    /// the clipboard is busy.
+    /// Opens the clipboard, runs `f`, closes it (also when `f` unwinds).
+    /// `None` when the clipboard is busy. A [`ClipboardBackend`] opens it as
+    /// its `identity`.
     fn locked<R>(&self, f: impl FnOnce() -> R) -> Option<R>;
     /// Locked: formats currently on the clipboard, in enumeration order.
     fn formats(&self) -> Vec<u32>;
+    /// Locked: reads `format` for a backup. Handle formats the adapter can
+    /// serialize report their bytes (`CF_ENHMETAFILE`: the metafile bits).
+    /// May block while the owner renders a delay-rendered format.
+    fn read_format(&self, format: u32, limit: usize) -> FormatRead;
+    /// Monotonic time, used to measure how long the clipboard stays open.
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+/// Clipboard port for one lease (no-regression #1/#2): enough to back up all
+/// formats, write a pre-staged payload, and re-verify sequence, owner and
+/// content before restoring. Not `Send`: the Windows owner window is
+/// thread-affine. Reads of another owner's data go through
+/// [`ClipboardBackend::reader`] on a worker thread.
+pub trait ClipboardBackend: ClipboardRead {
+    /// Payload allocated before any destructive step, handed over by `set`.
+    type Staged;
+    /// Read-only access for the backup worker thread.
+    type Reader: ClipboardRead + Send + 'static;
+    /// Owner identity the clipboard reports after this backend writes.
+    fn identity(&self) -> u64;
+    /// A reader for the backup worker thread. It opens the clipboard on that
+    /// thread, so the worker opens, reads and closes it there.
+    fn reader(&self) -> Self::Reader;
     /// Locked: bytes of `format`; `Ok(None)` when absent, empty or larger
     /// than `limit`; `Err` when present but unreadable.
-    fn read(&self, format: u32, limit: usize) -> Result<Option<Vec<u8>>, String>;
+    fn read(&self, format: u32, limit: usize) -> Result<Option<Vec<u8>>, String> {
+        match self.read_format(format, limit) {
+            FormatRead::Data(bytes) => Ok(Some(bytes)),
+            FormatRead::Missing | FormatRead::TooLarge => Ok(None),
+            FormatRead::Unreadable => Err("Clipboard data lock failed".into()),
+        }
+    }
     /// Locked: empties the clipboard and takes ownership; `false` on failure.
     fn clear(&self) -> bool;
     /// Allocates `bytes` for a later `set`; also returns the bytes exactly as
@@ -88,32 +116,21 @@ pub trait ClipboardBackend {
     /// Locked: hands `staged` to the clipboard (consumed even on failure).
     fn set(&self, format: u32, staged: Self::Staged) -> bool;
     /// Waits `duration` between attempts. Never called inside
-    /// [`ClipboardBackend::locked`]: the clipboard stays closed while waiting.
+    /// [`ClipboardRead::locked`]: the clipboard stays closed while waiting.
     fn pause(&self, duration: Duration) {
         std::thread::sleep(duration)
     }
-    /// Monotonic time, used to measure how long the clipboard stays open.
-    fn now(&self) -> Instant {
-        Instant::now()
+    /// Waits at most `timeout` for the backup worker's answer on `rx`.
+    fn wait_for<T>(&self, rx: &Receiver<T>, timeout: Duration) -> Result<T, RecvTimeoutError> {
+        rx.recv_timeout(timeout)
     }
     /// Publishes the clipboard component's health (B-08). Called outside
-    /// [`ClipboardBackend::locked`]; the default discards it.
+    /// [`ClipboardRead::locked`]; the default discards it.
     fn report_health(
         &self,
         _state: crate::health::HealthState,
         _reason: Option<crate::health::ReasonCode>,
     ) {
-    }
-    /// Locked: reads `format` for a backup. Handle formats the adapter can
-    /// serialize report their bytes (`CF_ENHMETAFILE`: the metafile bits).
-    /// The default maps [`ClipboardBackend::read`], which cannot tell a
-    /// missing format from an oversized one.
-    fn read_format(&self, format: u32, limit: usize) -> FormatRead {
-        match self.read(format, limit) {
-            Ok(Some(bytes)) => FormatRead::Data(bytes),
-            Ok(None) => FormatRead::Missing,
-            Err(_) => FormatRead::Unreadable,
-        }
     }
     /// Like [`ClipboardBackend::stage`], allocating the handle type `format`
     /// needs (an `HENHMETAFILE` for `CF_ENHMETAFILE`).
@@ -145,18 +162,28 @@ pub enum FormatRead {
     Unreadable,
 }
 
-/// What a clipboard lease does with formats it cannot back up (B-08).
+/// What a clipboard lease does with formats it cannot back up (B-08). Under
+/// every policy a format that fails to read for any other reason, a hung
+/// owner, or a backup that cannot finish within the lock budget refuses the
+/// action before the trigger is erased.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RestorePolicy {
     /// Refuse the action (trigger preserved) unless every format that is
     /// not re-synthesized by the system can be backed up.
     Full,
-    /// Back up what can be restored; skip and record the rest.
+    /// Skip and record only what is known not to be restorable: formats
+    /// whose data is a handle only the owner can copy, and formats over the
+    /// size limit. Formats the system re-synthesizes (CF_BITMAP,
+    /// CF_METAFILEPICT) are dropped only when their source is backed up.
+    /// Refuses when that would leave a non-empty clipboard empty after the
+    /// restore.
     #[default]
     BestEffort,
     /// Back up only text formats (CF_UNICODETEXT, CF_TEXT, CF_OEMTEXT,
-    /// CF_LOCALE); other formats are dropped without being recorded.
+    /// CF_LOCALE); other formats are dropped without being recorded, even
+    /// when nothing else is left. A text format over the size limit is
+    /// recorded.
     TextOnly,
 }
 

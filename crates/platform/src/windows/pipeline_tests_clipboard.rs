@@ -1,8 +1,9 @@
 //! L2 clipboard cases (B-08): the production paste pipeline and clipboard
 //! lease over `MockClipboard` holding handle formats, oversized formats, a
-//! busy clipboard, a hung owner and external changes. The pipeline leases
-//! with `LeaseOptions::default()` (BestEffort); the other policies are
-//! exercised on the lease directly until preferences select one.
+//! busy clipboard, a hung owner, delay-rendered data that is slow or never
+//! arrives, unreadable data and external changes. The pipeline leases with
+//! `LeaseOptions::default()` (BestEffort); the other policies are exercised
+//! on the lease directly until preferences select one.
 use super::*;
 use crate::health::{HealthState, ReasonCode};
 use crate::traits::{LeaseOptions, RestorePolicy, DEFAULT_RESTORE_DELAY};
@@ -162,8 +163,11 @@ fn format_over_32_mib_follows_the_restore_policy() {
     assert_eq!(rig.clipboard.content(), clip("original"));
 }
 
+const DEGRADED: Option<(HealthState, Option<ReasonCode>)> =
+    Some((HealthState::Degraded, Some(ReasonCode::ClipboardBusy)));
+
 #[test]
-fn hung_owner_is_never_read_and_its_formats_are_recorded() {
+fn hung_owner_refuses_before_erasure_under_every_policy() {
     let formats = vec![(13, utf16("original")), (8, dib(40)), (9, vec![0x9A])];
     let hung = || {
         let clipboard = MockClipboard::new(7, formats.clone());
@@ -171,24 +175,88 @@ fn hung_owner_is_never_read_and_its_formats_are_recorded() {
         clipboard
     };
     // The mock panics on any read while the hung owner holds the clipboard.
-    let expected = [
-        (RestorePolicy::Full, Err(ReasonCode::ClipboardFormatSkipped)),
-        (RestorePolicy::BestEffort, Ok(vec![13, 8, 9])),
-        (RestorePolicy::TextOnly, Ok(vec![13])),
-    ];
-    for (policy, outcome) in expected {
-        assert_eq!(lease_result(&hung(), policy), outcome, "{policy:?}");
+    for policy in [
+        RestorePolicy::Full,
+        RestorePolicy::BestEffort,
+        RestorePolicy::TextOnly,
+    ] {
+        let clipboard = hung();
+        assert_eq!(
+            lease_result(&clipboard, policy),
+            Err(ReasonCode::ClipboardBusy),
+            "{policy:?}"
+        );
+        assert_eq!(clipboard.health(), DEGRADED, "{policy:?}");
     }
-    let mut rig = Rig::new(rule(None, OutputMethod::Paste));
-    rig.clipboard = hung();
-    let result = paste(&mut rig);
-    assert_eq!(result.status, "unknown", "{}", result.message);
-    assert_eq!(rig.chords(), 1);
+    let mut rig = rig_with(formats.clone());
+    rig.clipboard.set_owner_hung(true);
+    let candidate = rig.type_str("btw").unwrap();
     assert_eq!(
-        rig.clipboard.content(),
-        Formats::new(),
-        "nothing was backed up"
+        rig.execute(&candidate).unwrap_err(),
+        "Clipboard owner is not responding; trigger preserved"
     );
+    assert!(rig.injector.calls().is_empty(), "trigger preserved");
+    assert_eq!(rig.clipboard.content(), formats, "clipboard untouched");
+    assert_eq!(rig.clipboard.clears(), 0);
+    assert_eq!(rig.clipboard.reads(), 0);
+    assert_eq!(rig.clipboard.health(), DEGRADED);
+}
+
+#[test]
+fn delay_rendered_data_that_never_arrives_preserves_trigger_and_clipboard() {
+    let mut rig = rig_with(rich_text());
+    let candidate = rig.type_str("btw").unwrap();
+    let sequence = rig.clipboard.sequence_now();
+    // The owner never renders the first format the backup reads.
+    let release = rig.clipboard.block_next_read();
+    assert_eq!(
+        rig.execute(&candidate).unwrap_err(),
+        "Clipboard data did not arrive in time; trigger preserved"
+    );
+    assert!(rig.injector.calls().is_empty(), "trigger preserved");
+    assert_eq!(rig.clipboard.health(), DEGRADED);
+    // The owner answers late: the abandoned read returns, nothing follows.
+    drop(release);
+    assert!(rig.clipboard.await_closed(Duration::from_secs(5)));
+    assert_eq!(rig.clipboard.reads(), 1);
+    assert_eq!(rig.clipboard.content(), rich_text());
+    assert_eq!(rig.clipboard.sequence_now(), sequence);
+    assert_eq!(rig.clipboard.clears(), 0);
+}
+
+#[test]
+fn slow_delay_rendering_past_the_hold_budget_refuses() {
+    let mut rig = rig_with(rich_text());
+    let candidate = rig.type_str("btw").unwrap();
+    // 100 ms per format: the third read crosses the 250 ms budget.
+    rig.clipboard.set_read_delay(Duration::from_millis(100));
+    assert_eq!(
+        rig.execute(&candidate).unwrap_err(),
+        "Clipboard data took too long to read; trigger preserved"
+    );
+    assert_eq!(
+        rig.clipboard.reads(),
+        3,
+        "stopped at the read that crossed it"
+    );
+    assert!(rig.injector.calls().is_empty(), "trigger preserved");
+    assert_eq!(rig.clipboard.health(), DEGRADED);
+    assert_eq!(rig.clipboard.content(), rich_text());
+    assert_eq!(rig.clipboard.clears(), 0);
+}
+
+#[test]
+fn unreadable_format_refuses_before_erasure() {
+    let mut rig = rig_with(rich_text());
+    let candidate = rig.type_str("btw").unwrap();
+    rig.clipboard.fail_read(0xC0A2);
+    assert_eq!(
+        rig.execute(&candidate).unwrap_err(),
+        "Clipboard format 0xc0a2 could not be read; trigger preserved"
+    );
+    assert!(rig.injector.calls().is_empty(), "trigger preserved");
+    assert_eq!(rig.clipboard.content(), rich_text());
+    assert_eq!(rig.clipboard.clears(), 0);
 }
 
 #[test]
