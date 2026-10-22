@@ -124,7 +124,11 @@ pub fn start_recording(store: State<Managed>) -> Result<(), CommandError> {
 }
 #[tauri::command]
 pub fn stop_recording(store: State<Managed>) -> Result<ActionPlan, CommandError> {
+    let engine = store.lock().engine.clone();
+    // Windows stops and takes the recording in one critical section, so no
+    // hook event lands between the two (M2).
     #[cfg(windows)]
-    quicker_platform::finish_recording(&store.lock().engine);
-    quicker_platform::stop_recording(&store.lock().engine).map_err(CommandError::internal)
+    return quicker_platform::finish_and_take(&engine).map_err(CommandError::internal);
+    #[cfg(not(windows))]
+    quicker_platform::stop_recording(&engine).map_err(CommandError::internal)
 }
