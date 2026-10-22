@@ -14,9 +14,13 @@
 //! frozen (the guards below): probes repeat the last value read before the
 //! shutdown, rebuilds and reattaches do nothing, and one that was already
 //! running when the shutdown began reports success whatever it returned.
-//! The engine's own teardown (the Windows input consumer closes the RawInput
-//! window once it sees `shutdown`) is therefore never read as a failure: no
-//! incident, no failed attempt, no Failed during exit.
+//! The supervisor itself stops deciding (see the `supervisor` module doc):
+//! no deadline, no hung attempt, and an attempt that returns after the
+//! shutdown began is discarded even when it overran ATTEMPT_TIMEOUT. The
+//! watchdog reports nothing either. The engine's own teardown (the Windows
+//! input consumer closes the RawInput window once it sees `shutdown`) is
+//! therefore never read as a failure: no incident, no failed attempt, no
+//! Failed during exit.
 use crate::health::{Component, ComponentHealth, HealthSnapshot, HealthState, ReasonCode};
 use crate::runtime::Runtime;
 use crate::supervisor::{self, ExecutorControl, InputSources, Status, Supervisor};
@@ -142,9 +146,10 @@ fn start(
 
 /// The watchdog found no working driver [`UNSUPERVISED_AFTER`] times in a
 /// row: Failed without a supervisor, unless Health is Failed already (a
-/// hung driver, an open circuit), whose components say more.
+/// hung driver, an open circuit), whose components say more, or the engine
+/// is shutting down (a check that failed just before the shutdown).
 fn report_unsupervised(runtime: &Runtime) {
-    if runtime.health().state == HealthState::Failed {
+    if runtime.shutting_down() || runtime.health().state == HealthState::Failed {
         return;
     }
     tracing::error!(
@@ -213,8 +218,9 @@ pub fn begin_shutdown(runtime: &Runtime) -> bool {
 
 /// The executor as the supervisor sees it while the engine shuts down:
 /// probes repeat the last value read before, rebuilds do nothing, and a
-/// rebuild that returns after the shutdown began is discarded (`Ok`), so no
-/// failure is committed after it. The budget fence keeps running.
+/// rebuild that returns after the shutdown began reports `Ok` (the
+/// supervisor's commit then discards the whole attempt, timeout included).
+/// The budget fence keeps running.
 struct GuardedExecutor {
     runtime: Arc<Runtime>,
     inner: Arc<dyn ExecutorControl>,
@@ -257,7 +263,8 @@ impl ExecutorControl for GuardedExecutor {
 
 /// The input sources as the supervisor sees them while the engine shuts
 /// down: health repeats the last value read before, reattaches do nothing,
-/// and a reattach that returns after the shutdown began is discarded (`Ok`).
+/// and a reattach that returns after the shutdown began reports `Ok` (the
+/// supervisor's commit then discards the whole attempt, timeout included).
 struct GuardedInputs {
     runtime: Arc<Runtime>,
     inner: Arc<dyn InputSources>,
@@ -496,7 +503,7 @@ mod tests {
     use super::*;
     use crate::health::PauseReasons;
     use crate::mock::FakeClock;
-    use crate::supervisor::{BACKOFF, CIRCUIT_FAILURES, STARTUP_GRACE, TICK};
+    use crate::supervisor::{ATTEMPT_TIMEOUT, BACKOFF, CIRCUIT_FAILURES, STARTUP_GRACE, TICK};
     use crate::Shared;
     use parking_lot::Mutex;
     use std::collections::VecDeque;
@@ -899,6 +906,8 @@ mod tests {
         at: usize,
         entered: (Mutex<mpsc::Sender<()>>, Mutex<mpsc::Receiver<()>>),
         release: (Mutex<mpsc::Sender<()>>, Mutex<mpsc::Receiver<()>>),
+        /// The gated call succeeds once released (every other call fails).
+        released_ok: AtomicBool,
     }
 
     impl Gate {
@@ -910,13 +919,20 @@ mod tests {
                 at,
                 entered: (Mutex::new(entered_tx), Mutex::new(entered_rx)),
                 release: (Mutex::new(release_tx), Mutex::new(release_rx)),
+                released_ok: AtomicBool::new(false),
             }
         }
-        fn pass(&self) {
+        /// One adapter call: the `at`-th waits for `open`. Fails with
+        /// `error` unless it is the gated call and `released_ok` is set.
+        fn pass(&self, error: &str) -> Result<(), String> {
             if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.at {
                 let _ = self.entered.0.lock().send(());
                 let _ = self.release.1.lock().recv_timeout(Duration::from_secs(10));
+                if self.released_ok.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
             }
+            Err(error.into())
         }
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
@@ -945,8 +961,7 @@ mod tests {
             vec![(Component::Executor, *self.status.lock())]
         }
         fn rebuild(&self) -> Result<(), String> {
-            self.gate.pass();
-            Err("rebuild refused".into())
+            self.gate.pass("rebuild refused")
         }
     }
 
@@ -961,8 +976,7 @@ mod tests {
             self.inputs.input_health()
         }
         fn reattach(&self, _component: Component) -> Result<(), String> {
-            self.gate.pass();
-            Err("reattach refused".into())
+            self.gate.pass("reattach refused")
         }
     }
 
@@ -1027,6 +1041,218 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A Healthy supervisor on gated adapters whose `adapter` ("executor" or
+    /// "inputs") then goes down, so every recovery attempt passes that
+    /// adapter's gate, which holds the `at`-th call.
+    struct GatedRig {
+        rig: Rig,
+        executor: Arc<GatedExecutor>,
+        inputs: Arc<GatedInputs>,
+        supervisor: Arc<Supervisor>,
+        adapter: &'static str,
+    }
+
+    impl GatedRig {
+        fn new(adapter: &'static str, at: usize) -> Self {
+            let rig = Rig::new();
+            let executor = Arc::new(GatedExecutor {
+                status: Mutex::new(Status::Ok),
+                gate: Gate::new(at),
+            });
+            let inputs = Arc::new(GatedInputs {
+                inputs: Inputs::new(),
+                gate: Gate::new(at),
+            });
+            let supervisor = rig.build(executor.clone(), inputs.clone());
+            supervisor.tick();
+            assert_eq!(rig.state(), HealthState::Healthy);
+            if adapter == "executor" {
+                *executor.status.lock() = Status::Down(ReasonCode::ExecutorPanic);
+            } else {
+                *inputs.inputs.down.lock() = Some(ReasonCode::HookMissing);
+            }
+            Self {
+                rig,
+                executor,
+                inputs,
+                supervisor,
+                adapter,
+            }
+        }
+        fn gate(&self) -> &Gate {
+            if self.adapter == "executor" {
+                &self.executor.gate
+            } else {
+                &self.inputs.gate
+            }
+        }
+        /// Ticks in 100 ms steps until the gated call is entered; the tick
+        /// that entered it returns once the gate opens.
+        fn tick_into_gate(&self) {
+            for _ in 0..1200 {
+                if self.gate().calls() >= self.gate().at {
+                    break;
+                }
+                self.rig.clock.advance(Duration::from_millis(100));
+                self.supervisor.tick();
+            }
+        }
+    }
+
+    /// A7: the CIRCUIT_FAILURES-th attempt is blocked when the shutdown
+    /// begins and returns, failing or not, only after ATTEMPT_TIMEOUT. An
+    /// attempt that overran the limit is counted as a timeout at commit
+    /// whatever it returned, and here that failure would open the circuit.
+    /// During the shutdown it is discarded before that check: nothing
+    /// counted, nothing published. Without the shutdown the same sequence
+    /// ends in Failed.
+    #[test]
+    fn an_attempt_overrunning_the_timeout_across_the_shutdown_is_not_counted() {
+        for adapter in ["executor", "inputs"] {
+            for released_ok in [false, true] {
+                for shutdown in [false, true] {
+                    let case = format!("{adapter}, ok {released_ok}, shutdown {shutdown}");
+                    let g = GatedRig::new(adapter, CIRCUIT_FAILURES);
+                    g.gate().released_ok.store(released_ok, Ordering::SeqCst);
+                    let (entered, before, failures) = std::thread::scope(|scope| {
+                        let ticker = scope.spawn(|| g.tick_into_gate());
+                        let entered = g.gate().wait_entered();
+                        let before = g.rig.runtime.health();
+                        let failures = g.supervisor.failure_count();
+                        if shutdown {
+                            begin_shutdown(&g.rig.runtime);
+                        }
+                        g.rig.clock.advance(ATTEMPT_TIMEOUT + TICK);
+                        g.gate().open();
+                        ticker.join().unwrap();
+                        (entered, before, failures)
+                    });
+                    assert!(entered, "{case}: the gated attempt ran");
+                    assert_eq!(before.state, HealthState::Recovering, "{case}");
+                    assert_eq!(failures, CIRCUIT_FAILURES - 1, "{case}");
+                    if shutdown {
+                        assert_eq!(g.rig.runtime.health(), before, "{case}: nothing published");
+                        assert_eq!(g.supervisor.failure_count(), failures, "{case}");
+                    } else {
+                        assert_eq!(g.rig.state(), HealthState::Failed, "{case}");
+                        assert_eq!(g.supervisor.failure_count(), CIRCUIT_FAILURES, "{case}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A7: an attempt still blocked past ATTEMPT_TIMEOUT is hung (one
+    /// failure, circuit open, Failed) when a tick looks at it. Once the
+    /// shutdown began, neither a tick (as the replacement driver's would)
+    /// nor the watchdog's check judges it, and its late return is discarded:
+    /// nothing counted, nothing published. Without the shutdown the tick
+    /// reports Failed. (`check()` is called only during the shutdown: with no
+    /// driver running it would spawn one otherwise.)
+    #[test]
+    fn an_attempt_still_running_past_the_timeout_is_not_hung_during_shutdown() {
+        for adapter in ["executor", "inputs"] {
+            for shutdown in [false, true] {
+                let case = format!("{adapter}, shutdown {shutdown}");
+                let g = GatedRig::new(adapter, 1);
+                let (entered, before, during, failures_during, checked) =
+                    std::thread::scope(|scope| {
+                        let ticker = scope.spawn(|| g.tick_into_gate());
+                        let entered = g.gate().wait_entered();
+                        let before = g.rig.runtime.health();
+                        if shutdown {
+                            begin_shutdown(&g.rig.runtime);
+                        }
+                        g.rig.clock.advance(ATTEMPT_TIMEOUT + TICK);
+                        g.supervisor.tick();
+                        let checked = !shutdown || g.supervisor.check();
+                        let during = g.rig.runtime.health();
+                        let failures_during = g.supervisor.failure_count();
+                        g.gate().open();
+                        ticker.join().unwrap();
+                        (entered, before, during, failures_during, checked)
+                    });
+                assert!(entered, "{case}: the gated attempt ran");
+                assert_eq!(before.state, HealthState::Recovering, "{case}");
+                if shutdown {
+                    assert!(checked, "{case}: no respawn, no driver_hung");
+                    assert_eq!(during, before, "{case}: not judged hung");
+                    assert_eq!(failures_during, 0, "{case}");
+                    assert_eq!(g.rig.runtime.health(), before, "{case}: return discarded");
+                    assert_eq!(g.supervisor.failure_count(), 0, "{case}");
+                } else {
+                    assert_eq!(during.state, HealthState::Failed, "{case}: judged hung");
+                    assert_eq!(failures_during, 1, "{case}");
+                    assert_eq!(g.rig.state(), HealthState::Failed, "{case}");
+                }
+            }
+        }
+    }
+
+    /// An executor that reads down from the first probe after `armed`; with
+    /// `begins_shutdown` that probe also starts the shutdown, as the
+    /// teardown would while a tick is observing.
+    struct TeardownProbe {
+        runtime: Arc<Runtime>,
+        armed: AtomicBool,
+        begins_shutdown: bool,
+    }
+
+    impl ExecutorControl for TeardownProbe {
+        fn enforce_budget(&self, _now: Instant) {}
+        fn probe(&self, _now: Instant) -> Vec<(Component, Status)> {
+            if !self.armed.load(Ordering::SeqCst) {
+                return vec![(Component::Executor, Status::Ok)];
+            }
+            if self.begins_shutdown {
+                begin_shutdown(&self.runtime);
+            }
+            vec![(Component::Executor, Status::Down(ReasonCode::ExecutorPanic))]
+        }
+        fn rebuild(&self) -> Result<(), String> {
+            Err("rebuild refused".into())
+        }
+    }
+
+    /// A7: the shutdown begins while a tick is observing and what it read
+    /// is the teardown: the tick decides nothing (no incident, nothing
+    /// published). Without the shutdown the same reading starts recovery.
+    #[test]
+    fn a_tick_that_sees_the_shutdown_begin_while_observing_decides_nothing() {
+        for shutdown in [false, true] {
+            let rig = Rig::new();
+            let executor = Arc::new(TeardownProbe {
+                runtime: rig.runtime.clone(),
+                armed: AtomicBool::new(false),
+                begins_shutdown: shutdown,
+            });
+            let supervisor = rig.build(executor.clone(), Inputs::new());
+            supervisor.tick();
+            let before = rig.runtime.health();
+            assert_eq!(before.state, HealthState::Healthy);
+
+            executor.armed.store(true, Ordering::SeqCst);
+            rig.clock.advance(TICK);
+            supervisor.tick();
+            assert_eq!(rig.runtime.shutting_down(), shutdown);
+            if shutdown {
+                assert_eq!(rig.runtime.health(), before);
+            } else {
+                assert_eq!(rig.state(), HealthState::Recovering);
+            }
+        }
+    }
+
+    /// A7: a watchdog report that comes after the shutdown began (its
+    /// failed check ran just before) publishes nothing.
+    #[test]
+    fn the_watchdog_reports_nothing_once_the_engine_shuts_down() {
+        let rig = Rig::new();
+        assert!(begin_shutdown(&rig.runtime));
+        report_unsupervised(&rig.runtime);
+        assert_eq!(rig.state(), HealthState::Starting);
     }
 
     /// The Windows read: a busy table repeats the last value, and before
