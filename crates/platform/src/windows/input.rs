@@ -6,6 +6,11 @@
 //! drains both lanes: macro recording, gate text, acceptance translation and
 //! matching all happen here, never on a callback thread. Callback panics are
 //! caught where they happen and logged from here (`hook.panic`).
+//!
+//! B-06: [`Sources`] owns the health of the four input components and
+//! reattaches them; [`Liveness`] cross-checks the hook against RawInput on
+//! the consumer and reattaches a source that stopped seeing keys. Every
+//! system call goes through [`SourcePorts`], so tests run on fakes.
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -16,20 +21,22 @@ use super::*;
 use super::{
     executor::{enqueue, Candidate},
     foreground::WinForeground,
-    hook::{mouse_operation, pointer_move, test_input_enabled, HookPipe, HookRecord, HOOK_READY},
+    hook::{mouse_operation, pointer_move, test_input_enabled, HookPipe, HookRecord, HookSet},
     ime::ime_active,
     keystate::{AsyncKeyProbe, KeyBits, ModifierWatch, SystemAsyncKeys, PHYSICAL},
+    liveness::{component_name, reason_name, CrossCheck, HealthTable, Source, Verdict},
     rawinput::{
         acceptance_event, detect_candidate, event_from, note_source, Buffer, Event, RawRecord,
     },
     recording::{record_event, stop_record_events},
-    session::{self, SessionSignals},
+    session::{self, SessionSignals, Signal},
 };
+use crate::fault::{self, FaultPoint};
 use crate::health::{Component, ComponentHealth, HealthState, ReasonCode};
 use crate::traits::{Clock, ForegroundProbe, SystemClock};
 use crossbeam_queue::ArrayQueue;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::PoisonError;
+use std::sync::{MutexGuard, PoisonError};
 
 pub fn input_status() -> serde_json::Value {
     let layout = unsafe {
@@ -40,8 +47,10 @@ pub fn input_status() -> serde_json::Value {
     };
     serde_json::json!({"reason":LAST_GATE.get().map(|g|g.lock().unwrap_or_else(PoisonError::into_inner).clone()).unwrap_or_else(||"Engine starting".into()),"hooks_ready":engine_ready(),"layout":format!("0x{:04X}",layout & 0xffff),"layout_hkl":format!("0x{layout:016X}"),"external_injected_keys":if test_input_enabled(){"explicit_test_mode"}else{"filtered"},"ime_active":ime_active(),"target_observation":observer::status(),"physical_input":rawinput::status(),"espanso_input":rawinput::status(),"automatic_trigger_modes":["espanso_rawinput_immediate","espanso_rawinput_space","espanso_rawinput_semicolon"],"terminator_capture":"space/semicolon post-input; enter/tab disabled"})
 }
+/// Whether the keyboard, mouse and focus hooks are all installed and none of
+/// them is known to be lost (B-06).
 pub fn engine_ready() -> bool {
-    HOOK_READY.load(Ordering::SeqCst)
+    SOURCES.hooks_ready()
 }
 pub fn native_ready() -> Result<(), String> {
     if !engine_ready() {
@@ -128,11 +137,13 @@ fn delta(seen: &mut u64, now: u64) -> u64 {
     new
 }
 
-/// Consumer state: the typed-key buffer and the logged lane counters.
+/// Consumer state: the typed-key buffer, the logged lane counters and the
+/// physical key-downs each source saw since the last liveness tick.
 #[derive(Default)]
 pub(super) struct Consumer {
     buffer: Buffer,
     reported: Reported,
+    seen: Vec<(Source, u16)>,
 }
 impl Consumer {
     /// Drains both lanes once and returns how many records were handled.
@@ -148,16 +159,27 @@ impl Consumer {
         let mut handled = 0;
         while let Some(record) = hooks.lane().pop() {
             handled += 1;
+            if let HookRecord::Key(key) = &record {
+                if key.down && key.hardware {
+                    self.seen.push((Source::Hook, key.vk));
+                }
+            }
             self.hook_record(shared, record, probe, enqueue);
         }
         while let Some(record) = raw.pop() {
             handled += 1;
+            // Every record is a hardware key-down, with or without context.
+            self.seen.push((Source::Raw, record.vk()));
             if let Some(event) = event_from(shared, &record) {
                 self.detect(shared, event, probe, enqueue);
             }
         }
         self.report(hooks.lane(), raw);
         handled
+    }
+    /// Key-downs for [`Liveness::tick`], which drains them.
+    pub(super) fn seen(&mut self) -> &mut Vec<(Source, u16)> {
+        &mut self.seen
     }
     fn hook_record(
         &mut self,
@@ -235,6 +257,7 @@ impl Consumer {
     }
     fn reset(&mut self) {
         self.buffer = Buffer::default();
+        self.seen.clear();
     }
 }
 /// Second resync after a session signal, for key transitions that were
@@ -301,6 +324,402 @@ impl<'a, P: AsyncKeyProbe, C: Clock> Monitor<'a, P, C> {
     }
 }
 
+/// Where the process-wide RawInput keyboard registration points.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Registration {
+    /// Our detector window, with input sink.
+    Ours,
+    /// This process has no keyboard registration.
+    Missing,
+    /// Another window took it over (tao registers its own, G6).
+    Elsewhere,
+    /// The registration could not be read.
+    Unknown,
+}
+
+/// The system calls behind the input sources (B-06). Production uses
+/// [`WinPorts`]; tests use fakes, so no test installs a hook, registers
+/// RawInput or creates a window.
+pub(super) trait SourcePorts: Send + Sync {
+    /// (Re)installs `which` and returns the requested hooks now installed.
+    /// Blocks up to the hook thread's answer timeout.
+    fn install_hooks(&self, which: HookSet) -> HookSet;
+    /// Whether the RawInput detector window exists.
+    fn raw_alive(&self) -> bool;
+    fn raw_registration(&self) -> Registration;
+    /// Registers RawInput for the existing detector window again.
+    fn register_raw(&self) -> bool;
+    /// Replaces the detector window and thread; true when the new one runs.
+    fn rebuild_raw(&self) -> bool;
+    /// Fault injection only (HookUnhook): drop the low-level hooks silently.
+    fn drop_hooks(&self);
+    /// Fault injection only (RawinputUnregister).
+    fn unregister_raw(&self);
+    /// Fault injection only (RawinputClose): close the detector window as
+    /// an outside WM_CLOSE would.
+    fn close_raw(&self);
+}
+pub(super) struct WinPorts;
+impl SourcePorts for WinPorts {
+    fn install_hooks(&self, which: HookSet) -> HookSet {
+        hook::install(which)
+    }
+    fn raw_alive(&self) -> bool {
+        rawinput::alive()
+    }
+    fn raw_registration(&self) -> Registration {
+        rawinput::registration()
+    }
+    fn register_raw(&self) -> bool {
+        rawinput::register()
+    }
+    fn rebuild_raw(&self) -> bool {
+        rawinput::rebuild()
+    }
+    fn drop_hooks(&self) {
+        hook::drop_hooks();
+    }
+    fn unregister_raw(&self) {
+        rawinput::unregister();
+    }
+    fn close_raw(&self) {
+        rawinput::close_window(false);
+    }
+}
+
+/// Hook kinds behind each hook component.
+const HOOK_COMPONENTS: [(Component, HookSet); 3] = [
+    (Component::KeyboardHook, HookSet::KEYBOARD),
+    (Component::MouseHook, HookSet::MOUSE),
+    (Component::FocusEvents, HookSet::FOCUS),
+];
+
+/// Health and recovery of the input sources (B-06). The supervisor reads
+/// [`Sources::health`] and calls [`Sources::reattach`] for every component
+/// that is not healthy; [`Liveness`] calls it when the cross-check finds a
+/// source lost. Input sources never report `Failed`: the supervisor's
+/// circuit breaker decides when to give up.
+pub(super) struct Sources<'a, P: SourcePorts, C: Clock> {
+    ports: &'a P,
+    clock: &'a C,
+    signals: &'a SessionSignals,
+    table: Mutex<HealthTable>,
+    /// Serialises start and reattach (one install request at a time).
+    work: Mutex<()>,
+    started: AtomicBool,
+    /// Bumped by every successful reattach.
+    epoch: AtomicU64,
+}
+impl<'a, P: SourcePorts, C: Clock> Sources<'a, P, C> {
+    pub(super) const fn new(ports: &'a P, clock: &'a C, signals: &'a SessionSignals) -> Self {
+        Self {
+            ports,
+            clock,
+            signals,
+            table: Mutex::new(HealthTable::new()),
+            work: Mutex::new(()),
+            started: AtomicBool::new(false),
+            epoch: AtomicU64::new(0),
+        }
+    }
+    fn table(&self) -> MutexGuard<'_, HealthTable> {
+        self.table.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    fn set(&self, component: Component, state: HealthState, reason: Option<ReasonCode>) {
+        self.table()
+            .set(component, state, reason, self.clock.wall_ms());
+    }
+    /// Records what an install left: healthy, or recovering because the
+    /// install failed.
+    fn hooks_installed(&self, installed: HookSet, which: HookSet) {
+        for (component, kind) in HOOK_COMPONENTS {
+            if !which.contains(kind) {
+                continue;
+            }
+            if installed.contains(kind) {
+                self.set(component, HealthState::Healthy, None);
+            } else {
+                self.set(
+                    component,
+                    HealthState::Recovering,
+                    Some(ReasonCode::HookInstallFailed),
+                );
+            }
+        }
+    }
+    /// Installs every hook and records the state of the detector window
+    /// `rawinput::start` created. Returns the hooks installed.
+    pub(super) fn start(&self) -> HookSet {
+        let _work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
+        let installed = self.ports.install_hooks(HookSet::ALL);
+        self.hooks_installed(installed, HookSet::ALL);
+        if self.ports.raw_alive() {
+            self.set(Component::RawInput, HealthState::Healthy, None);
+            // G6: the last RawInput registration in the process wins. Check
+            // once more now that the detector runs, as insurance against a
+            // registration made while it started. If it cannot be taken back
+            // here, RawInput is reported missing and the supervisor's
+            // reattach rebuilds the detector.
+            if !self.registered() {
+                let ok = self.ports.register_raw() && self.registered();
+                tracing::warn!(
+                    event = "input.reattach",
+                    component = component_name(Component::RawInput),
+                    reason = reason_name(Some(ReasonCode::RawInputMissing)),
+                    ok
+                );
+                if !ok {
+                    self.lost(Component::RawInput, ReasonCode::RawInputMissing);
+                }
+            }
+        } else {
+            self.set(
+                Component::RawInput,
+                HealthState::Recovering,
+                Some(ReasonCode::RawInputMissing),
+            );
+        }
+        self.started.store(true, Ordering::SeqCst);
+        installed
+    }
+    /// The input components' health. Before [`Sources::start`] everything is
+    /// `Starting` and no system call is made; afterwards a detector window
+    /// that disappeared is reported at once.
+    pub(super) fn health(&self) -> Vec<ComponentHealth> {
+        let now = self.clock.wall_ms();
+        let mut table = self.table();
+        let raw_healthy = table
+            .get(Component::RawInput)
+            .is_some_and(|entry| entry.state == HealthState::Healthy);
+        if self.started.load(Ordering::SeqCst) && raw_healthy && !self.ports.raw_alive() {
+            table.set(
+                Component::RawInput,
+                HealthState::Recovering,
+                Some(ReasonCode::RawInputMissing),
+                now,
+            );
+        }
+        table.snapshot(now)
+    }
+    /// Whether every hook is installed and none is known to be lost.
+    pub(super) fn hooks_ready(&self) -> bool {
+        let table = self.table();
+        HOOK_COMPONENTS.iter().all(|(component, _)| {
+            table
+                .get(*component)
+                .is_some_and(|entry| entry.state == HealthState::Healthy)
+        })
+    }
+    /// Marks `component` lost until a reattach succeeds.
+    fn lost(&self, component: Component, reason: ReasonCode) {
+        self.set(component, HealthState::Recovering, Some(reason));
+    }
+    /// The detector window closed without being asked to.
+    pub(super) fn raw_lost(&self) {
+        if self.started.load(Ordering::SeqCst) {
+            self.lost(Component::RawInput, ReasonCode::RawInputMissing);
+        }
+    }
+    /// Whether the keyboard registration points at our detector (or cannot
+    /// be read, which is not evidence that it moved).
+    fn registered(&self) -> bool {
+        matches!(
+            self.ports.raw_registration(),
+            Registration::Ours | Registration::Unknown
+        )
+    }
+    /// Restores RawInput: re-register while the window exists, rebuild the
+    /// window when it is gone or registering does not stick.
+    fn restore_raw(&self) -> bool {
+        if self.ports.raw_alive() && self.ports.register_raw() && self.registered() {
+            return true;
+        }
+        self.ports.rebuild_raw() && self.ports.raw_alive()
+    }
+    /// Re-installs one input source: both low-level hooks for either hook
+    /// component, the focus hook, or RawInput. One attempt; the caller
+    /// retries with backoff. Logs `input.reattach` with the reason the
+    /// component had; on success the key mirror is resynchronised (key-ups
+    /// may have gone unseen) through [`Signal::InputReattached`]. A
+    /// component that is healthy by the time the call gets its turn (the
+    /// other hook component's reattach also replaced it) is left alone.
+    pub(super) fn reattach(&self, component: Component) -> Result<(), String> {
+        if !self.started.load(Ordering::SeqCst) {
+            return Err("input sources have not started".into());
+        }
+        let _work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some((state, prior)) = self
+            .table()
+            .get(component)
+            .map(|entry| (entry.state, entry.reason))
+        else {
+            return Err(format!("{component:?} is not an input source"));
+        };
+        if state == HealthState::Healthy
+            && (component != Component::RawInput || self.ports.raw_alive())
+        {
+            return Ok(());
+        }
+        let ok = match component {
+            Component::RawInput => {
+                let ok = self.restore_raw();
+                if ok {
+                    self.set(Component::RawInput, HealthState::Healthy, None);
+                } else {
+                    self.lost(Component::RawInput, ReasonCode::RawInputMissing);
+                }
+                ok
+            }
+            _ => {
+                let which = if component == Component::FocusEvents {
+                    HookSet::FOCUS
+                } else {
+                    HookSet::LOW_LEVEL
+                };
+                let installed = self.ports.install_hooks(which);
+                self.hooks_installed(installed, which);
+                HOOK_COMPONENTS
+                    .iter()
+                    .any(|(hooked, kind)| *hooked == component && installed.contains(*kind))
+            }
+        };
+        tracing::warn!(
+            event = "input.reattach",
+            component = component_name(component),
+            reason = reason_name(prior),
+            ok
+        );
+        if !ok {
+            return Err(format!(
+                "{} could not be reattached",
+                component_name(component)
+            ));
+        }
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        self.signals.raise(Signal::InputReattached);
+        wake();
+        Ok(())
+    }
+}
+static SOURCES: Sources<'static, WinPorts, SystemClock> =
+    Sources::new(&WinPorts, &SystemClock, &session::SIGNALS);
+/// The detector thread reports a window nobody asked to close.
+pub(super) fn raw_lost() {
+    SOURCES.raw_lost();
+    wake();
+}
+
+/// The consumer side of B-06: feeds the key-downs each source saw into a
+/// [`CrossCheck`] and acts on its verdicts. One reattach per verdict; the
+/// supervisor retries what stays unhealthy.
+pub(super) struct Liveness<'a, P: SourcePorts, C: Clock> {
+    sources: &'a Sources<'a, P, C>,
+    check: CrossCheck,
+    epoch: u64,
+}
+impl<'a, P: SourcePorts, C: Clock> Liveness<'a, P, C> {
+    pub(super) fn new(sources: &'a Sources<'a, P, C>) -> Self {
+        Self {
+            sources,
+            check: CrossCheck::default(),
+            epoch: sources.epoch.load(Ordering::SeqCst),
+        }
+    }
+    /// Takes armed input faults, drains `seen` into the cross-check and
+    /// handles due verdicts. Returns when the next sighting expires. Keys
+    /// seen before [`Sources::start`] (RawInput runs before the hooks are
+    /// installed) are dropped.
+    pub(super) fn tick(
+        &mut self,
+        shared: &Shared,
+        seen: &mut Vec<(Source, u16)>,
+    ) -> Option<Instant> {
+        self.inject_faults();
+        if !self.sources.started.load(Ordering::SeqCst) {
+            seen.clear();
+            return None;
+        }
+        let epoch = self.sources.epoch.load(Ordering::SeqCst);
+        if epoch != self.epoch {
+            self.epoch = epoch;
+            self.check.forget();
+        }
+        let now = self.sources.clock.now();
+        for (source, vk) in seen.drain(..) {
+            self.check.saw(source, vk, now);
+        }
+        while let Some(verdict) = self.check.expire(now) {
+            self.act(shared, verdict);
+        }
+        self.check.next_due()
+    }
+    fn inject_faults(&self) {
+        let ports = self.sources.ports;
+        if fault::take(FaultPoint::HookUnhook).is_some() {
+            tracing::warn!(event = "fault.injected", point = "hook_unhook");
+            ports.drop_hooks();
+        }
+        if fault::take(FaultPoint::RawinputUnregister).is_some() {
+            tracing::warn!(event = "fault.injected", point = "rawinput_unregister");
+            ports.unregister_raw();
+        }
+        if fault::take(FaultPoint::RawinputClose).is_some() {
+            tracing::warn!(event = "fault.injected", point = "rawinput_close");
+            ports.close_raw();
+        }
+    }
+    fn act(&mut self, shared: &Shared, verdict: Verdict) {
+        let sources = self.sources;
+        match verdict {
+            Verdict::HookLost => {
+                tracing::warn!(
+                    event = "input.check",
+                    source = "keyboard_hook",
+                    result = "lost"
+                );
+                sources.lost(Component::KeyboardHook, ReasonCode::HookMissing);
+                // Keys the hook missed never reached the mirror or the
+                // recorder: what was typed around the loss is not one word.
+                shared.generation.fetch_add(1, Ordering::SeqCst);
+                observer::CARET_EPOCH.fetch_add(1, Ordering::SeqCst);
+                let _ = sources.reattach(Component::KeyboardHook);
+            }
+            Verdict::RawLost => {
+                if !sources.ports.raw_alive() {
+                    // Rebuilding the window is the supervisor's job.
+                    tracing::warn!(
+                        event = "input.check",
+                        source = "raw_input",
+                        result = "window_missing"
+                    );
+                    sources.raw_lost();
+                    return;
+                }
+                match sources.ports.raw_registration() {
+                    Registration::Missing | Registration::Elsewhere => {
+                        tracing::warn!(
+                            event = "input.check",
+                            source = "raw_input",
+                            result = "unregistered"
+                        );
+                        sources.lost(Component::RawInput, ReasonCode::RawInputMissing);
+                        let _ = sources.reattach(Component::RawInput);
+                    }
+                    Registration::Ours | Registration::Unknown => {
+                        // 待实测: remote sessions deliver keys with no
+                        // device handle, which the detector drops.
+                        tracing::info!(
+                            event = "input.check",
+                            source = "raw_input",
+                            result = "registered"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Records a pointer operation unless the pointer is over our own window.
 /// Hit-testing runs only while a recording is active, never on the hook.
 fn record_pointer(shared: &Shared, operation: Operation, x: i32, y: i32) {
@@ -325,12 +744,24 @@ fn run_consumer(
     let clock = SystemClock;
     let mut consumer = Consumer::default();
     let mut monitor = Monitor::new(&PHYSICAL, &SystemAsyncKeys, &clock, &session::SIGNALS);
+    let mut liveness = Liveness::new(&SOURCES);
     while !shared.shutdown.load(Ordering::SeqCst) {
         let drained = catch_unwind(AssertUnwindSafe(|| {
             let handled = consumer.drain(&shared, hooks, raw, &WinForeground, &mut |candidate| {
+                // A lost hook leaves the key mirror and focus epochs stale:
+                // nothing is injected until it is back (B-06).
+                if !engine_ready() {
+                    tracing::warn!(event = "input.refused", reason = "hook_missing");
+                    return false;
+                }
                 enqueue(&shared, candidate)
             });
-            (handled, monitor.tick(&shared))
+            let checked = liveness.tick(&shared, consumer.seen());
+            let next = match (monitor.tick(&shared), checked) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            (handled, next)
         }));
         let (handled, next) = match drained {
             Ok(drained) => drained,
@@ -348,12 +779,13 @@ fn run_consumer(
             std::thread::park_timeout(wait);
         }
     }
-    rawinput::close_window();
+    rawinput::close_window(true);
 }
 
 /// Creates both lanes, starts the consumer and the session window, then the
 /// RawInput detector (which also starts the UIA protection sampler) and the
-/// hook thread.
+/// hooks. A hook that fails to install keeps the engine paused; the
+/// supervisor can reattach it later.
 pub(crate) fn start_input_sources(shared: Arc<Shared>) -> Result<(), String> {
     let hooks = hook::pipe(test_input_enabled());
     let raw = rawinput::lane();
@@ -364,42 +796,33 @@ pub(crate) fn start_input_sources(shared: Arc<Shared>) -> Result<(), String> {
         .map_err(|error| format!("Input consumer could not start: {error}"))?;
     CONSUMER.set(consumer.thread().clone()).ok();
     session::start();
-    rawinput::start(shared)?;
-    hook::spawn_hooks();
+    rawinput::start(shared.clone())?;
+    if SOURCES.start() != HookSet::ALL {
+        shared.paused.store(true, Ordering::SeqCst);
+        *shared.last.lock().unwrap_or_else(PoisonError::into_inner) = Some(ExecutionResult {
+            id: "engine".into(),
+            status: "failed".into(),
+            message:
+                "Windows keyboard/mouse hook installation failed; automatic input remains paused"
+                    .into(),
+            completed_steps: 0,
+            side_effects: false,
+        });
+    }
     Ok(())
 }
-/// Health of the input sources, derived from the existing readiness flags.
-/// Until the supervisor (B-06) tracks transitions, "not ready" is reported as
-/// `Starting` (install failure and not-yet-started are indistinguishable) and
-/// `since_ms` is the observation time.
-#[allow(dead_code, reason = "first caller is the supervisor (B-06)")]
-pub(crate) fn input_health() -> Vec<ComponentHealth> {
-    let now = chrono::Utc::now().timestamp_millis();
-    let hooks = HOOK_READY.load(Ordering::SeqCst);
-    let raw = rawinput::READY.load(Ordering::SeqCst);
-    let entry = |component, ready: bool, missing| ComponentHealth {
-        component,
-        state: if ready {
-            HealthState::Healthy
-        } else {
-            HealthState::Starting
-        },
-        reason: (!ready).then_some(missing),
-        since_ms: now,
-    };
-    vec![
-        entry(Component::KeyboardHook, hooks, ReasonCode::HookMissing),
-        entry(Component::MouseHook, hooks, ReasonCode::HookMissing),
-        entry(Component::FocusEvents, hooks, ReasonCode::HookMissing),
-        entry(Component::RawInput, raw, ReasonCode::RawInputMissing),
-    ]
+/// Health of the four input components (keyboard hook, mouse hook, focus
+/// events, RawInput) for the supervisor (B-06). `Starting` until the engine
+/// starts; `Recovering` with `HookInstallFailed`, `HookMissing` or
+/// `RawInputMissing` while a source is down. Never `Failed`.
+pub fn input_health() -> Vec<ComponentHealth> {
+    SOURCES.health()
 }
-/// Re-installs one input source after a failure.
-#[allow(dead_code, reason = "first caller is the supervisor (B-06)")]
-pub(crate) fn reattach(component: Component) -> Result<(), String> {
-    // TODO(B-06): reinstall the hook / RawInput window for `component` on its
-    // own thread with backoff; until then the supervisor cannot recover it.
-    Err(format!("reattach {component:?} is not implemented"))
+/// Re-installs one input component (one attempt; blocks up to a few
+/// seconds). Errors for components that are not input sources and before
+/// the engine starts.
+pub fn reattach(component: Component) -> Result<(), String> {
+    SOURCES.reattach(component)
 }
 
 #[cfg(test)]

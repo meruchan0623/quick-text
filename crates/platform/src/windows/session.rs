@@ -37,9 +37,12 @@ pub(super) enum Signal {
     Resume,
     /// The input desktop changed (UAC prompt, Ctrl+Alt+Del screen).
     DesktopSwitch,
+    /// A lost hook or RawInput source was reattached (B-06); key-ups may
+    /// have gone unseen while it was missing. Raised by the input facade.
+    InputReattached,
 }
 impl Signal {
-    const ALL: [Signal; 7] = [
+    const ALL: [Signal; 8] = [
         Signal::Lock,
         Signal::Unlock,
         Signal::Connect,
@@ -47,6 +50,7 @@ impl Signal {
         Signal::RemoteControl,
         Signal::Resume,
         Signal::DesktopSwitch,
+        Signal::InputReattached,
     ];
     const fn bit(self) -> u32 {
         1 << self as u32
@@ -60,6 +64,7 @@ impl Signal {
             Signal::RemoteControl => "remote_control",
             Signal::Resume => "resume",
             Signal::DesktopSwitch => "desktop_switch",
+            Signal::InputReattached => "input_reattached",
         }
     }
 }

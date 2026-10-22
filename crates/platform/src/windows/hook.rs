@@ -6,6 +6,11 @@
 //! (`input.rs`). A panic inside a callback is caught and counted, the event
 //! still goes to `CallNextHookEx`, and the consumer logs `hook.panic`.
 //! Hooks never perform file I/O or execute actions.
+//!
+//! B-06: the hooks live on one thread that can be told to (re)install them
+//! at any time ([`install`]); a hook Windows removed silently is replaced
+//! without restarting anything. Whether a hook still works is decided by
+//! the input facade's cross-check, not here.
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -20,9 +25,9 @@ use super::{
 };
 use crate::fault::{self, FaultPoint};
 use crate::traits::{ForegroundProbe, InputContext};
-use std::sync::PoisonError;
+use std::sync::atomic::{AtomicU32, AtomicU8};
+use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 
-pub(super) static HOOK_READY: AtomicBool = AtomicBool::new(false);
 /// Hook queue capacity in records. 待实测: sized for about a second of key
 /// autorepeat plus clicks while the consumer is descheduled. A full queue
 /// drops records; it never blocks the hook thread.
@@ -95,6 +100,9 @@ pub(super) struct KeyRecord {
     pub(super) vk: u16,
     pub(super) scan: u32,
     pub(super) down: bool,
+    /// Physical input ([`Origin::Hardware`]); only these take part in the
+    /// RawInput cross-check (B-06).
+    pub(super) hardware: bool,
     pub(super) generation: u64,
     pub(super) acceptance: Option<Acceptance>,
 }
@@ -208,6 +216,7 @@ pub(super) fn on_key(
         vk: key.vk,
         scan: key.scan,
         down,
+        hardware: origin == Origin::Hardware,
         generation,
         acceptance,
     }));
@@ -388,7 +397,7 @@ pub(super) unsafe fn expected_key_text(
     String::from_utf16(units.get(..len)?).ok()
 }
 unsafe extern "system" fn focus_event(
-    _: windows_sys::Win32::UI::Accessibility::HWINEVENTHOOK,
+    _: HWINEVENTHOOK,
     _: u32,
     window: HWND,
     _: i32,
@@ -408,54 +417,262 @@ unsafe extern "system" fn focus_event(
     observer::FOCUS_EPOCH.fetch_add(1, Ordering::SeqCst);
     observer::CARET_EPOCH.fetch_add(1, Ordering::SeqCst);
 }
-pub(super) fn spawn_hooks() {
-    std::thread::spawn(|| unsafe {
-        let focus_hook = windows_sys::Win32::UI::Accessibility::SetWinEventHook(
-            EVENT_OBJECT_FOCUS,
-            EVENT_OBJECT_FOCUS,
-            std::ptr::null_mut(),
-            Some(focus_event),
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT,
-        );
-        let keyboard_hook =
-            SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard), std::ptr::null_mut(), 0);
-        let mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse), std::ptr::null_mut(), 0);
-        if keyboard_hook.is_null() || mouse_hook.is_null() || focus_hook.is_null() {
-            if !keyboard_hook.is_null() {
-                UnhookWindowsHookEx(keyboard_hook);
-            }
-            if !mouse_hook.is_null() {
-                UnhookWindowsHookEx(mouse_hook);
-            }
-            if !focus_hook.is_null() {
-                windows_sys::Win32::UI::Accessibility::UnhookWinEvent(focus_hook);
-            }
-            if let Some(s) = ENGINE.get() {
-                s.paused.store(true, Ordering::SeqCst);
-                *s.last.lock().unwrap_or_else(PoisonError::into_inner) = Some(ExecutionResult {
-                    id: "engine".into(),
-                    status: "failed".into(),
-                    message: "Windows keyboard/mouse hook installation failed; automatic input remains paused".into(),
-                    completed_steps: 0,
-                    side_effects: false,
-                })
-            }
-            return;
+/// A set of hooks (bit set): what to install, or what is installed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct HookSet(u8);
+impl HookSet {
+    pub(super) const NONE: Self = Self(0);
+    pub(super) const KEYBOARD: Self = Self(1);
+    pub(super) const MOUSE: Self = Self(2);
+    /// The foreground focus WinEvent hook.
+    pub(super) const FOCUS: Self = Self(4);
+    /// The two low-level hooks, which Windows can remove silently.
+    pub(super) const LOW_LEVEL: Self = Self(1 | 2);
+    pub(super) const ALL: Self = Self(1 | 2 | 4);
+    pub(super) const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+    #[must_use]
+    pub(super) const fn and(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+    const fn from_bits(bits: usize) -> Self {
+        Self((bits & 7) as u8)
+    }
+}
+
+/// The hook thread's id once its message queue exists,
+/// [`HOOK_THREAD_STARTING`] while it is being created, 0 when not running.
+static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
+const HOOK_THREAD_STARTING: u32 = u32::MAX;
+/// Install requests issued, and the last one the hook thread answered
+/// (request sequence numbers; a late answer to a request that timed out
+/// never satisfies a newer one).
+static REQUESTS: AtomicU64 = AtomicU64::new(0);
+static ANSWERED: AtomicU64 = AtomicU64::new(0);
+/// The hooks the last answered request left installed ([`HookSet`] bits).
+/// A hook Windows removed silently still counts until it is replaced.
+static INSTALLED: AtomicU8 = AtomicU8::new(0);
+/// Hook-thread message: (re)install the hooks in `wParam` ([`HookSet`]
+/// bits) for request number `lParam`.
+const WM_HOOK_INSTALL: u32 = WM_APP + 0x51;
+/// Hook-thread message, fault injection only (HookUnhook): remove the
+/// low-level hooks without updating [`INSTALLED`], as Windows does after a
+/// callback timeout. Ignored in builds without `fault-injection`.
+const WM_HOOK_DROP: u32 = WM_APP + 0x53;
+/// How long [`install`] waits for the hook thread.
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(2);
+const INSTALL_POLL: Duration = Duration::from_millis(2);
+
+/// The hooks the hook thread owns.
+struct Hooks {
+    keyboard: HHOOK,
+    mouse: HHOOK,
+    focus: HWINEVENTHOOK,
+    installed: HookSet,
+}
+/// Installs a fresh low-level hook and only then removes the one it
+/// replaces. Both happen inside one hook-thread message, so none of our
+/// callbacks runs in between (待实测: an event already in flight to the old
+/// hook). A failed install keeps the old handle.
+unsafe fn replace_hook(old: &mut HHOOK, id: WINDOWS_HOOK_ID, proc: HOOKPROC) -> bool {
+    let new = SetWindowsHookExW(id, proc, std::ptr::null_mut(), 0);
+    if new.is_null() {
+        return false;
+    }
+    if !old.is_null() {
+        // Fails harmlessly for a hook Windows already removed.
+        UnhookWindowsHookEx(*old);
+    }
+    *old = new;
+    true
+}
+impl Hooks {
+    const fn new() -> Self {
+        Self {
+            keyboard: std::ptr::null_mut(),
+            mouse: std::ptr::null_mut(),
+            focus: std::ptr::null_mut(),
+            installed: HookSet::NONE,
         }
-        HOOK_READY.store(true, Ordering::SeqCst);
+    }
+    fn mark(&mut self, kind: HookSet, ok: bool) {
+        self.installed = HookSet(if ok {
+            self.installed.0 | kind.0
+        } else {
+            self.installed.0 & !kind.0
+        });
+        INSTALLED.store(self.installed.0, Ordering::SeqCst);
+    }
+    unsafe fn install(&mut self, which: HookSet) {
+        if which.contains(HookSet::KEYBOARD) {
+            let ok = replace_hook(&mut self.keyboard, WH_KEYBOARD_LL, Some(keyboard));
+            self.mark(HookSet::KEYBOARD, ok);
+        }
+        if which.contains(HookSet::MOUSE) {
+            let ok = replace_hook(&mut self.mouse, WH_MOUSE_LL, Some(mouse));
+            self.mark(HookSet::MOUSE, ok);
+        }
+        if which.contains(HookSet::FOCUS) {
+            let new = SetWinEventHook(
+                EVENT_OBJECT_FOCUS,
+                EVENT_OBJECT_FOCUS,
+                std::ptr::null_mut(),
+                Some(focus_event),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT,
+            );
+            if !new.is_null() && !self.focus.is_null() {
+                UnhookWinEvent(self.focus);
+            }
+            if !new.is_null() {
+                self.focus = new;
+            }
+            self.mark(HookSet::FOCUS, !new.is_null());
+        }
+    }
+    unsafe fn drop_low_level(&mut self) {
+        for hook in [&mut self.keyboard, &mut self.mouse] {
+            if !hook.is_null() {
+                UnhookWindowsHookEx(*hook);
+                *hook = std::ptr::null_mut();
+            }
+        }
+    }
+    unsafe fn remove_all(&mut self) {
+        self.drop_low_level();
+        if !self.focus.is_null() {
+            UnhookWinEvent(self.focus);
+            self.focus = std::ptr::null_mut();
+        }
+        self.mark(HookSet::ALL, false);
+    }
+}
+
+/// The hook thread: installs `initial` for request `seq`, then pumps
+/// messages (which is when Windows calls the hooks) and answers install
+/// requests.
+fn run_hooks(initial: HookSet, seq: u64) {
+    // SAFETY: the hooks belong to this thread, which pumps their messages
+    // until it exits and removes them.
+    unsafe {
         let mut msg: MSG = zeroed();
+        // Creates the message queue before the id is published, so the
+        // first posted request is not lost.
+        PeekMessageW(
+            &mut msg,
+            std::ptr::null_mut(),
+            WM_USER,
+            WM_USER,
+            PM_NOREMOVE,
+        );
+        HOOK_THREAD.store(GetCurrentThreadId(), Ordering::SeqCst);
+        let mut hooks = Hooks::new();
+        hooks.install(initial);
+        ANSWERED.store(seq, Ordering::SeqCst);
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            match (msg.hwnd.is_null(), msg.message) {
+                (true, WM_HOOK_INSTALL) => {
+                    hooks.install(HookSet::from_bits(msg.wParam));
+                    ANSWERED.store(msg.lParam as u64, Ordering::SeqCst);
+                }
+                // Another process can post thread messages too; only fault
+                // builds honour the drop request.
+                (true, WM_HOOK_DROP) if cfg!(feature = "fault-injection") => {
+                    hooks.drop_low_level();
+                }
+                _ => {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
         }
-        UnhookWindowsHookEx(keyboard_hook);
-        windows_sys::Win32::UI::Accessibility::UnhookWinEvent(focus_hook);
-        if !mouse_hook.is_null() {
-            UnhookWindowsHookEx(mouse_hook);
+        hooks.remove_all();
+        HOOK_THREAD.store(0, Ordering::SeqCst);
+    }
+}
+
+enum Request {
+    Sent,
+    /// The hook thread is starting; try again shortly.
+    Wait,
+    Failed,
+}
+/// Hands request `seq` for `which` to the hook thread, starting it when it
+/// is not running.
+fn request(which: HookSet, seq: u64) -> Request {
+    match HOOK_THREAD.load(Ordering::SeqCst) {
+        0 => {
+            if HOOK_THREAD
+                .compare_exchange(0, HOOK_THREAD_STARTING, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return Request::Wait;
+            }
+            let spawned = std::thread::Builder::new()
+                .name("quicker-hooks".into())
+                .spawn(move || run_hooks(which, seq));
+            if spawned.is_err() {
+                HOOK_THREAD.store(0, Ordering::SeqCst);
+                return Request::Failed;
+            }
+            Request::Sent
         }
-    });
+        HOOK_THREAD_STARTING => Request::Wait,
+        thread => {
+            // SAFETY: posting to a thread that has exited fails harmlessly.
+            let posted = unsafe {
+                PostThreadMessageW(thread, WM_HOOK_INSTALL, usize::from(which.0), seq as isize) != 0
+            };
+            if posted {
+                Request::Sent
+            } else {
+                // The thread is gone; the next round starts a new one.
+                let _ = HOOK_THREAD.compare_exchange(thread, 0, Ordering::SeqCst, Ordering::SeqCst);
+                Request::Wait
+            }
+        }
+    }
+}
+/// Installs (or re-installs) the hooks in `which` on the hook thread,
+/// starting the thread if needed, and waits up to [`INSTALL_TIMEOUT`] for
+/// the answer. Returns the requested hooks that are installed afterwards.
+/// Callers serialise (the input facade's work lock); never call this from
+/// a hook callback.
+pub(super) fn install(which: HookSet) -> HookSet {
+    let seq = REQUESTS.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+    let deadline = Instant::now() + INSTALL_TIMEOUT;
+    let mut sent = false;
+    while Instant::now() < deadline {
+        if !sent {
+            match request(which, seq) {
+                Request::Sent => sent = true,
+                Request::Wait => {}
+                Request::Failed => {
+                    tracing::error!(event = "hook.thread_failed");
+                    return HookSet::NONE;
+                }
+            }
+        }
+        if sent && ANSWERED.load(Ordering::SeqCst) == seq {
+            return HookSet::from_bits(usize::from(INSTALLED.load(Ordering::SeqCst))).and(which);
+        }
+        std::thread::sleep(INSTALL_POLL);
+    }
+    tracing::warn!(event = "hook.install_timeout");
+    HookSet::NONE
+}
+/// Fault injection (HookUnhook): removes the low-level hooks the way
+/// Windows does after a callback timeout, without telling anyone.
+pub(super) fn drop_hooks() {
+    let thread = HOOK_THREAD.load(Ordering::SeqCst);
+    if thread != 0 && thread != HOOK_THREAD_STARTING {
+        // SAFETY: posting to a thread that has exited fails harmlessly.
+        unsafe {
+            PostThreadMessageW(thread, WM_HOOK_DROP, 0, 0);
+        }
+    }
 }
 
 #[cfg(test)]

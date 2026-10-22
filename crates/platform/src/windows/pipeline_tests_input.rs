@@ -10,14 +10,18 @@
 )]
 use super::executor::Candidate;
 use super::hook::{
-    classify, handle_key, handle_mouse, HookAction, HookPipe, HookRecord, KeyInfo, KeyRecord,
-    MouseInfo, Origin,
+    classify, handle_key, handle_mouse, HookAction, HookPipe, HookRecord, HookSet, KeyInfo,
+    KeyRecord, MouseInfo, Origin,
 };
-use super::input::{Consumer, Lane, Monitor, RESYNC_SECOND_PASS};
+use super::input::{
+    Consumer, Lane, Liveness, Monitor, Registration, SourcePorts, Sources, RESYNC_SECOND_PASS,
+};
 use super::keystate::{AsyncKeyProbe, KeyBits, MODIFIER_VERIFY_AFTER};
+use super::liveness::{MATCH_WINDOW, MISS_LIMIT};
 use super::rawinput::{raw_record, InputEvent, RawRecord, KEYBOARD_LAYOUT_CACHE_INTERVAL};
 use super::session::{SessionSignals, Signal};
 use super::*;
+use crate::health::{Component, ComponentHealth, HealthState, ReasonCode};
 use crate::mock::{FakeClock, MockForeground};
 use crate::traits::{Clock, ForegroundProbe, InputContext};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -816,4 +820,794 @@ fn after_an_unlock_a_trigger_works_immediately() {
     assert_eq!(next, None);
     type_word(&shared, keys, &raw, &probe, "w");
     assert_eq!(drain(&mut consumer, &shared, &hooks, &raw, &probe).len(), 1);
+}
+
+/// The hook kinds behind [`FakeSources::hooked`], in order.
+const HOOK_KINDS: [HookSet; 3] = [HookSet::KEYBOARD, HookSet::MOUSE, HookSet::FOCUS];
+
+/// Fake input-source system calls (B-06): which hooks are in place, the
+/// detector window and the process RawInput registration. Records every
+/// install, registration and rebuild; never touches Windows.
+struct FakeSources {
+    /// Hook kinds an install succeeds for.
+    installable: Mutex<HookSet>,
+    /// Keyboard, mouse and focus hook in place (and seeing input).
+    hooked: Mutex<[bool; 3]>,
+    alive: AtomicBool,
+    registration: Mutex<Registration>,
+    /// Whether `register_raw` takes the registration back.
+    register_sticks: AtomicBool,
+    /// Registered, but no key arrives (待实测: remote sessions).
+    raw_muted: AtomicBool,
+    installs: Mutex<Vec<HookSet>>,
+    registers: AtomicUsize,
+    rebuilds: AtomicUsize,
+}
+impl FakeSources {
+    /// What `rawinput::start` leaves: a live, registered detector window.
+    fn new() -> Self {
+        Self {
+            installable: Mutex::new(HookSet::ALL),
+            hooked: Mutex::new([false; 3]),
+            alive: AtomicBool::new(true),
+            registration: Mutex::new(Registration::Ours),
+            register_sticks: AtomicBool::new(true),
+            raw_muted: AtomicBool::new(false),
+            installs: Mutex::new(Vec::new()),
+            registers: AtomicUsize::new(0),
+            rebuilds: AtomicUsize::new(0),
+        }
+    }
+    fn hooked(&self, kind: HookSet) -> bool {
+        HOOK_KINDS
+            .iter()
+            .zip(self.hooked.lock().unwrap().iter())
+            .any(|(hooked, on)| *hooked == kind && *on)
+    }
+    /// Whether a physical key reaches the detector.
+    fn raw_delivers(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+            && *self.registration.lock().unwrap() == Registration::Ours
+            && !self.raw_muted.load(Ordering::SeqCst)
+    }
+    fn set_installable(&self, which: HookSet) {
+        *self.installable.lock().unwrap() = which;
+    }
+    fn set_registration(&self, registration: Registration) {
+        *self.registration.lock().unwrap() = registration;
+    }
+    fn installs(&self) -> Vec<HookSet> {
+        self.installs.lock().unwrap().clone()
+    }
+    fn registers(&self) -> usize {
+        self.registers.load(Ordering::SeqCst)
+    }
+    fn rebuilds(&self) -> usize {
+        self.rebuilds.load(Ordering::SeqCst)
+    }
+}
+impl SourcePorts for FakeSources {
+    fn install_hooks(&self, which: HookSet) -> HookSet {
+        self.installs.lock().unwrap().push(which);
+        let installed = which.and(*self.installable.lock().unwrap());
+        let mut hooked = self.hooked.lock().unwrap();
+        for (kind, on) in HOOK_KINDS.iter().zip(hooked.iter_mut()) {
+            if which.contains(*kind) {
+                *on = installed.contains(*kind);
+            }
+        }
+        installed
+    }
+    fn raw_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
+    fn raw_registration(&self) -> Registration {
+        *self.registration.lock().unwrap()
+    }
+    fn register_raw(&self) -> bool {
+        self.registers.fetch_add(1, Ordering::SeqCst);
+        if !self.alive.load(Ordering::SeqCst) {
+            return false;
+        }
+        if self.register_sticks.load(Ordering::SeqCst) {
+            self.set_registration(Registration::Ours);
+        }
+        true
+    }
+    fn rebuild_raw(&self) -> bool {
+        self.rebuilds.fetch_add(1, Ordering::SeqCst);
+        self.alive.store(true, Ordering::SeqCst);
+        self.set_registration(Registration::Ours);
+        true
+    }
+    fn drop_hooks(&self) {
+        let mut hooked = self.hooked.lock().unwrap();
+        hooked[0] = false;
+        hooked[1] = false;
+    }
+    fn unregister_raw(&self) {
+        self.set_registration(Registration::Missing);
+    }
+    fn close_raw(&self) {
+        self.alive.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Time between two physical keys in the B-06 tests.
+const GAP: Duration = Duration::from_millis(50);
+
+/// The consumer side of one engine for the B-06 tests: both lanes, the key
+/// mirror and the consumer, fed by physical keys that reach only the
+/// sources a [`FakeSources`] says work.
+struct Pipeline {
+    shared: Arc<Shared>,
+    keys: &'static KeyBits,
+    hooks: HookPipe<'static>,
+    raw: Lane<RawRecord>,
+    probe: FixedProbe,
+    consumer: Consumer,
+    /// Keys pressed so far; picks the next letter, so no key repeats.
+    pressed: u32,
+}
+impl Pipeline {
+    fn new() -> Self {
+        let keys = leaked_keys();
+        Self {
+            shared: engine("btw"),
+            keys,
+            hooks: HookPipe::new(keys, 256, false, nothing),
+            raw: Lane::new(256, nothing),
+            probe: FixedProbe(context()),
+            consumer: Consumer::default(),
+            pressed: 0,
+        }
+    }
+    /// One physical key (down and up), then one consumer pass.
+    fn press(&mut self, fake: &FakeSources) {
+        let ch = char::from(b'a' + (self.pressed % 26) as u8);
+        self.pressed += 1;
+        let vk = ch.to_ascii_uppercase() as u16;
+        let hooked = fake.hooked(HookSet::KEYBOARD);
+        if hooked {
+            handle_key(
+                &self.hooks,
+                &self.shared,
+                &self.probe,
+                WM_KEYDOWN,
+                hardware(vk),
+            );
+        }
+        if fake.raw_delivers() {
+            let event = InputEvent::key_down(vk, &ch.to_string(), true);
+            let record = raw_record(&self.shared, self.keys, &event, &self.probe).unwrap();
+            assert!(self.raw.push(record));
+        }
+        if hooked {
+            handle_key(
+                &self.hooks,
+                &self.shared,
+                &self.probe,
+                WM_KEYUP,
+                hardware(vk),
+            );
+        }
+        self.drain();
+    }
+    fn drain(&mut self) {
+        self.consumer.drain(
+            &self.shared,
+            &self.hooks,
+            &self.raw,
+            &self.probe,
+            &mut |_| true,
+        );
+    }
+    fn tick(&mut self, liveness: &mut Liveness<'_, FakeSources, FakeClock>) -> Option<Instant> {
+        liveness.tick(&self.shared, self.consumer.seen())
+    }
+    /// `count` physical keys [`GAP`] apart, ticking the cross-check after
+    /// each.
+    fn type_keys(
+        &mut self,
+        fake: &FakeSources,
+        clock: &FakeClock,
+        liveness: &mut Liveness<'_, FakeSources, FakeClock>,
+        count: u32,
+    ) {
+        for _ in 0..count {
+            self.press(fake);
+            self.tick(liveness);
+            clock.advance(GAP);
+        }
+    }
+    /// Lets every pending sighting expire and ticks once.
+    fn settle(
+        &mut self,
+        clock: &FakeClock,
+        liveness: &mut Liveness<'_, FakeSources, FakeClock>,
+    ) -> Option<Instant> {
+        clock.advance(MATCH_WINDOW);
+        self.tick(liveness)
+    }
+}
+fn health_of(
+    health: &[ComponentHealth],
+    component: Component,
+) -> (HealthState, Option<ReasonCode>) {
+    let entry = health
+        .iter()
+        .find(|entry| entry.component == component)
+        .unwrap();
+    (entry.state, entry.reason)
+}
+fn line(text: &str) -> String {
+    text.to_string()
+}
+
+/// S-06: Windows silently removes the keyboard hook. RawInput keeps seeing
+/// the keys; after K of them go unmatched for N ms the hook is reinstalled
+/// (well within 10 s and 50 keys), the mirror is resynced and the next
+/// keys pair up again. The log carries no key content.
+#[test]
+fn a_silently_removed_keyboard_hook_is_reinstalled_after_k_unmatched_keys() {
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    assert_eq!(sources.start(), HookSet::ALL);
+    let mut liveness = Liveness::new(&sources);
+    let mut pipe = Pipeline::new();
+    pipe.type_keys(&fake, &clock, &mut liveness, 3);
+    assert_eq!(
+        pipe.settle(&clock, &mut liveness),
+        None,
+        "both sources agree"
+    );
+    fake.drop_hooks();
+    let (lost_at, pressed) = (clock.elapsed(), pipe.pressed);
+    let (_, lines) = capture::logs(|| {
+        pipe.type_keys(&fake, &clock, &mut liveness, MISS_LIMIT - 1);
+        pipe.settle(&clock, &mut liveness)
+    });
+    assert_eq!(count_of(&lines, "input."), 0, "{lines:?}");
+    assert!(sources.hooks_ready(), "not detected yet");
+    pipe.type_keys(&fake, &clock, &mut liveness, 1);
+    let generation = pipe.shared.generation.load(Ordering::SeqCst);
+    let (_, lines) = capture::logs(|| pipe.settle(&clock, &mut liveness));
+    assert_eq!(
+        lines,
+        [
+            line(r#"WARN event="input.check" source="keyboard_hook" result="lost""#),
+            line(
+                r#"WARN event="input.reattach" component="keyboard_hook" reason="hook_missing" ok=true"#
+            ),
+        ]
+    );
+    assert!(clock.elapsed() - lost_at < Duration::from_secs(10));
+    assert!(pipe.pressed - pressed <= 50);
+    assert_eq!(fake.installs(), [HookSet::ALL, HookSet::LOW_LEVEL]);
+    assert!(fake.hooked(HookSet::KEYBOARD) && fake.hooked(HookSet::MOUSE));
+    assert!(sources.hooks_ready());
+    assert!(
+        pipe.shared.generation.load(Ordering::SeqCst) > generation,
+        "the keys around the loss are not one word"
+    );
+    assert_eq!(
+        signals.take().collect::<Vec<_>>(),
+        [Signal::InputReattached],
+        "the key mirror is resynced"
+    );
+    let (_, lines) = capture::logs(|| {
+        pipe.type_keys(&fake, &clock, &mut liveness, 3 * MISS_LIMIT);
+        pipe.settle(&clock, &mut liveness)
+    });
+    assert_eq!(count_of(&lines, "input."), 0, "{lines:?}");
+    assert_eq!(fake.installs().len(), 2);
+}
+
+/// The HookUnhook fault drops both low-level hooks the way Windows does;
+/// the cross-check finds and reinstalls them.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn the_hook_unhook_fault_is_detected_and_repaired() {
+    use crate::fault::{self, FaultPoint};
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    sources.start();
+    let mut liveness = Liveness::new(&sources);
+    let mut pipe = Pipeline::new();
+    fault::debug_inject_fault(FaultPoint::HookUnhook, 0);
+    let (_, lines) = capture::logs(|| pipe.tick(&mut liveness));
+    fault::disarm(FaultPoint::HookUnhook);
+    assert_eq!(
+        lines,
+        [line(r#"WARN event="fault.injected" point="hook_unhook""#)]
+    );
+    assert!(!fake.hooked(HookSet::KEYBOARD) && !fake.hooked(HookSet::MOUSE));
+    assert!(fake.hooked(HookSet::FOCUS));
+    let (_, lines) = capture::logs(|| {
+        pipe.type_keys(&fake, &clock, &mut liveness, MISS_LIMIT);
+        pipe.settle(&clock, &mut liveness)
+    });
+    assert_eq!(
+        count_of(
+            &lines,
+            r#"event="input.reattach" component="keyboard_hook" reason="hook_missing" ok=true"#
+        ),
+        1,
+        "{lines:?}"
+    );
+    assert!(fake.hooked(HookSet::KEYBOARD) && sources.hooks_ready());
+}
+
+/// The registration is removed, or taken over by another window (tao, G6):
+/// the hook keeps seeing keys RawInput never gets, and the registration is
+/// checked and restored. When registering again does not stick, the
+/// detector window is rebuilt.
+#[test]
+fn a_lost_raw_input_registration_is_restored() {
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    sources.start();
+    assert_eq!(fake.registers(), 0, "registration already ours");
+    let mut liveness = Liveness::new(&sources);
+    let mut pipe = Pipeline::new();
+    fake.unregister_raw();
+    let (_, lines) = capture::logs(|| {
+        pipe.type_keys(&fake, &clock, &mut liveness, MISS_LIMIT);
+        pipe.settle(&clock, &mut liveness)
+    });
+    assert_eq!(
+        lines,
+        [
+            line(r#"WARN event="input.check" source="raw_input" result="unregistered""#),
+            line(
+                r#"WARN event="input.reattach" component="raw_input" reason="raw_input_missing" ok=true"#
+            ),
+        ]
+    );
+    assert_eq!((fake.registers(), fake.rebuilds()), (1, 0));
+    assert_eq!(fake.raw_registration(), Registration::Ours);
+    assert_eq!(
+        health_of(&sources.health(), Component::RawInput),
+        (HealthState::Healthy, None)
+    );
+    assert_eq!(
+        signals.take().collect::<Vec<_>>(),
+        [Signal::InputReattached]
+    );
+    // Both sources agree again, which clears the backoff.
+    pipe.type_keys(&fake, &clock, &mut liveness, 2);
+    pipe.settle(&clock, &mut liveness);
+    // Another window takes the registration and keeps it.
+    fake.set_registration(Registration::Elsewhere);
+    fake.register_sticks.store(false, Ordering::SeqCst);
+    let (_, lines) = capture::logs(|| {
+        pipe.type_keys(&fake, &clock, &mut liveness, MISS_LIMIT);
+        pipe.settle(&clock, &mut liveness)
+    });
+    assert_eq!(count_of(&lines, r#"result="unregistered""#), 1, "{lines:?}");
+    assert_eq!(count_of(&lines, r#"component="raw_input""#), 1);
+    assert_eq!((fake.registers(), fake.rebuilds()), (2, 1));
+    assert!(fake.raw_delivers());
+    assert_eq!(fake.installs(), [HookSet::ALL], "the hooks were left alone");
+}
+
+/// The RawinputUnregister fault removes the process registration.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn the_rawinput_unregister_fault_is_detected_and_repaired() {
+    use crate::fault::{self, FaultPoint};
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    sources.start();
+    let mut liveness = Liveness::new(&sources);
+    let mut pipe = Pipeline::new();
+    fault::debug_inject_fault(FaultPoint::RawinputUnregister, 0);
+    let (_, lines) = capture::logs(|| pipe.tick(&mut liveness));
+    fault::disarm(FaultPoint::RawinputUnregister);
+    assert_eq!(
+        lines,
+        [line(
+            r#"WARN event="fault.injected" point="rawinput_unregister""#
+        )]
+    );
+    assert_eq!(fake.raw_registration(), Registration::Missing);
+    let (_, lines) = capture::logs(|| {
+        pipe.type_keys(&fake, &clock, &mut liveness, MISS_LIMIT);
+        pipe.settle(&clock, &mut liveness)
+    });
+    assert_eq!(
+        count_of(
+            &lines,
+            r#"event="input.reattach" component="raw_input" reason="raw_input_missing" ok=true"#
+        ),
+        1,
+        "{lines:?}"
+    );
+    assert!(fake.raw_delivers());
+}
+
+/// S-03: the detector window is closed from outside. Health reports
+/// RawInput missing at once (no key needed); the cross-check only reports
+/// the window gone and leaves the rebuild to the supervisor, whose
+/// `reattach(RawInput)` builds a new detector.
+#[test]
+fn a_closed_detector_window_is_reported_and_rebuilt_on_reattach() {
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    sources.start();
+    let mut liveness = Liveness::new(&sources);
+    let mut pipe = Pipeline::new();
+    fake.close_raw();
+    assert_eq!(
+        health_of(&sources.health(), Component::RawInput),
+        (HealthState::Recovering, Some(ReasonCode::RawInputMissing))
+    );
+    let (_, lines) = capture::logs(|| {
+        pipe.type_keys(&fake, &clock, &mut liveness, MISS_LIMIT);
+        pipe.settle(&clock, &mut liveness)
+    });
+    assert_eq!(
+        lines,
+        [line(
+            r#"WARN event="input.check" source="raw_input" result="window_missing""#
+        )]
+    );
+    assert_eq!((fake.registers(), fake.rebuilds()), (0, 0));
+    let (result, lines) = capture::logs(|| sources.reattach(Component::RawInput));
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        lines,
+        [line(
+            r#"WARN event="input.reattach" component="raw_input" reason="raw_input_missing" ok=true"#
+        )]
+    );
+    assert_eq!(fake.rebuilds(), 1);
+    assert_eq!(
+        health_of(&sources.health(), Component::RawInput),
+        (HealthState::Healthy, None)
+    );
+    assert!(fake.raw_delivers());
+}
+
+/// The RawinputClose fault closes the window as an outside WM_CLOSE would;
+/// the detector thread's report (`raw_lost`) marks RawInput missing.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn the_rawinput_close_fault_is_reported_and_rebuilt() {
+    use crate::fault::{self, FaultPoint};
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    sources.start();
+    let mut liveness = Liveness::new(&sources);
+    let mut pipe = Pipeline::new();
+    fault::debug_inject_fault(FaultPoint::RawinputClose, 0);
+    let (_, lines) = capture::logs(|| pipe.tick(&mut liveness));
+    fault::disarm(FaultPoint::RawinputClose);
+    assert_eq!(
+        lines,
+        [line(
+            r#"WARN event="fault.injected" point="rawinput_close""#
+        )]
+    );
+    assert!(!fake.raw_alive());
+    sources.raw_lost();
+    assert_eq!(
+        health_of(&sources.health(), Component::RawInput),
+        (HealthState::Recovering, Some(ReasonCode::RawInputMissing))
+    );
+    assert_eq!(sources.reattach(Component::RawInput), Ok(()));
+    assert_eq!(fake.rebuilds(), 1);
+    assert!(fake.raw_delivers());
+}
+
+/// Normal typing: autorepeat that only one source reports and sided versus
+/// generic modifier codes still pair up; nothing is reattached.
+#[test]
+fn keys_both_sources_see_never_trigger_a_reattach() {
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    sources.start();
+    let mut liveness = Liveness::new(&sources);
+    let mut pipe = Pipeline::new();
+    let (_, lines) = capture::logs(|| {
+        let p = &mut pipe;
+        for _ in 0..3 {
+            // Shift held with autorepeat: the hook reports LShift three
+            // times, RawInput generic Shift once.
+            handle_key(
+                &p.hooks,
+                &p.shared,
+                &p.probe,
+                WM_KEYDOWN,
+                hardware(VK_LSHIFT),
+            );
+        }
+        let shift = InputEvent::key_down(VK_SHIFT, "", true);
+        assert!(p
+            .raw
+            .push(raw_record(&p.shared, p.keys, &shift, &p.probe).unwrap()));
+        handle_key(&p.hooks, &p.shared, &p.probe, WM_KEYUP, hardware(VK_LSHIFT));
+        p.drain();
+        p.tick(&mut liveness);
+        p.type_keys(&fake, &clock, &mut liveness, 4 * MISS_LIMIT);
+        p.settle(&clock, &mut liveness)
+    });
+    assert_eq!(count_of(&lines, "input."), 0, "{lines:?}");
+    assert_eq!(fake.installs(), [HookSet::ALL]);
+    assert_eq!((fake.registers(), fake.rebuilds()), (0, 0));
+    assert_eq!(signals.take().count(), 0);
+}
+
+/// no-regression #4: our own tagged input reaches neither source as a
+/// physical key (the hook skips it, its RawInput echo has no device), and
+/// neither does input another program injects; no amount of it is a
+/// verdict against either source.
+#[test]
+fn injected_keys_are_invisible_to_the_cross_check() {
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    sources.start();
+    let mut liveness = Liveness::new(&sources);
+    let mut pipe = Pipeline::new();
+    let own = |vk| KeyInfo {
+        extra: MARK,
+        ..injected(vk)
+    };
+    let (_, lines) = capture::logs(|| {
+        for i in 0..4 * MISS_LIMIT as u16 {
+            let vk = 0x41 + i % 26;
+            for key in [own(vk), injected(vk)] {
+                let p = &mut pipe;
+                handle_key(&p.hooks, &p.shared, &p.probe, WM_KEYDOWN, key);
+                let echo = InputEvent::key_down(vk, "x", false);
+                assert!(raw_record(&p.shared, p.keys, &echo, &p.probe).is_none());
+                handle_key(&p.hooks, &p.shared, &p.probe, WM_KEYUP, key);
+            }
+            pipe.drain();
+            assert!(pipe.consumer.seen().is_empty());
+            pipe.tick(&mut liveness);
+            clock.advance(GAP);
+        }
+        pipe.settle(&clock, &mut liveness)
+    });
+    assert_eq!(count_of(&lines, "input."), 0, "{lines:?}");
+    assert_eq!(fake.installs(), [HookSet::ALL]);
+}
+
+/// `reattach` before the engine starts and for components that are not
+/// input sources is refused without a system call; a component that is
+/// already healthy is left alone.
+#[test]
+fn reattach_refuses_unstarted_sources_and_other_components() {
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    assert!(sources.reattach(Component::KeyboardHook).is_err());
+    assert!(sources
+        .health()
+        .iter()
+        .all(|entry| entry.state == HealthState::Starting));
+    assert!(fake.installs().is_empty());
+    assert!(!sources.hooks_ready());
+    sources.start();
+    assert!(sources.hooks_ready());
+    assert!(sources.reattach(Component::Executor).is_err());
+    let (result, lines) = capture::logs(|| sources.reattach(Component::MouseHook));
+    assert_eq!(result, Ok(()));
+    assert!(lines.is_empty(), "{lines:?}");
+    assert_eq!(fake.installs(), [HookSet::ALL], "a healthy hook stays");
+    assert_eq!(signals.take().count(), 0);
+}
+
+/// The reinstall itself fails: both low-level hook components stay
+/// recovering, injection stays refused (`hooks_ready`), the cross-check
+/// backs off (2K keys for the next attempt) and the supervisor's retry
+/// restores the hooks once installing works again.
+#[test]
+fn a_failed_reinstall_backs_off_and_a_later_retry_restores_the_hooks() {
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    sources.start();
+    let mut liveness = Liveness::new(&sources);
+    let mut pipe = Pipeline::new();
+    fake.drop_hooks();
+    fake.set_installable(HookSet::FOCUS);
+    let (_, lines) = capture::logs(|| {
+        pipe.type_keys(&fake, &clock, &mut liveness, MISS_LIMIT);
+        pipe.settle(&clock, &mut liveness)
+    });
+    assert_eq!(
+        count_of(
+            &lines,
+            r#"event="input.reattach" component="keyboard_hook" reason="hook_missing" ok=false"#
+        ),
+        1,
+        "{lines:?}"
+    );
+    let health = sources.health();
+    for component in [Component::KeyboardHook, Component::MouseHook] {
+        assert_eq!(
+            health_of(&health, component),
+            (HealthState::Recovering, Some(ReasonCode::HookInstallFailed))
+        );
+    }
+    assert!(!sources.hooks_ready(), "injection is refused");
+    assert_eq!(signals.take().count(), 0);
+    // K more unmatched keys: not yet (the next verdict needs 2K).
+    let (_, lines) = capture::logs(|| {
+        pipe.type_keys(&fake, &clock, &mut liveness, MISS_LIMIT);
+        pipe.settle(&clock, &mut liveness)
+    });
+    assert_eq!(count_of(&lines, "input."), 0, "{lines:?}");
+    let (_, lines) = capture::logs(|| {
+        pipe.type_keys(&fake, &clock, &mut liveness, MISS_LIMIT);
+        pipe.settle(&clock, &mut liveness)
+    });
+    assert_eq!(count_of(&lines, r#"ok=false"#), 1, "{lines:?}");
+    assert_eq!(fake.installs().len(), 3);
+    // The supervisor retries once installing works again.
+    fake.set_installable(HookSet::ALL);
+    let (result, lines) = capture::logs(|| sources.reattach(Component::KeyboardHook));
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        lines,
+        [line(
+            r#"WARN event="input.reattach" component="keyboard_hook" reason="hook_install_failed" ok=true"#
+        )]
+    );
+    assert!(sources.hooks_ready());
+    assert_eq!(sources.reattach(Component::MouseHook), Ok(()));
+    assert_eq!(fake.installs().len(), 4, "the mouse hook came back with it");
+}
+
+/// A hook that fails at startup is reported on its own component; the
+/// others stay installed, and reattaching it installs only that hook.
+#[test]
+fn a_partial_startup_install_is_reported_per_component() {
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    fake.set_installable(HookSet::LOW_LEVEL);
+    assert_eq!(sources.start(), HookSet::LOW_LEVEL);
+    let health = sources.health();
+    assert_eq!(
+        health_of(&health, Component::KeyboardHook),
+        (HealthState::Healthy, None)
+    );
+    assert_eq!(
+        health_of(&health, Component::FocusEvents),
+        (HealthState::Recovering, Some(ReasonCode::HookInstallFailed))
+    );
+    assert_eq!(
+        health_of(&health, Component::RawInput),
+        (HealthState::Healthy, None)
+    );
+    assert!(!sources.hooks_ready());
+    fake.set_installable(HookSet::ALL);
+    let (result, lines) = capture::logs(|| sources.reattach(Component::FocusEvents));
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        lines,
+        [line(
+            r#"WARN event="input.reattach" component="focus_events" reason="hook_install_failed" ok=true"#
+        )]
+    );
+    assert_eq!(fake.installs(), [HookSet::ALL, HookSet::FOCUS]);
+    assert!(sources.hooks_ready());
+}
+
+/// G6: tao registers RawInput for its own window when its event loop is
+/// created and the last registration wins; startup takes it back once the
+/// detector runs.
+#[test]
+fn startup_takes_back_a_raw_input_registration_another_window_made() {
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    fake.set_registration(Registration::Elsewhere);
+    let (_, lines) = capture::logs(|| sources.start());
+    assert_eq!(
+        lines,
+        [line(
+            r#"WARN event="input.reattach" component="raw_input" reason="raw_input_missing" ok=true"#
+        )]
+    );
+    assert_eq!(fake.registers(), 1);
+    assert_eq!(fake.raw_registration(), Registration::Ours);
+    assert_eq!(
+        health_of(&sources.health(), Component::RawInput),
+        (HealthState::Healthy, None)
+    );
+}
+
+/// The other window keeps the registration at startup: RawInput is reported
+/// missing, and the supervisor's reattach rebuilds the detector.
+#[test]
+fn a_registration_startup_cannot_take_back_is_reported_missing() {
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    fake.set_registration(Registration::Elsewhere);
+    fake.register_sticks.store(false, Ordering::SeqCst);
+    let (_, lines) = capture::logs(|| sources.start());
+    assert_eq!(
+        lines,
+        [line(
+            r#"WARN event="input.reattach" component="raw_input" reason="raw_input_missing" ok=false"#
+        )]
+    );
+    assert_eq!(
+        health_of(&sources.health(), Component::RawInput),
+        (HealthState::Recovering, Some(ReasonCode::RawInputMissing))
+    );
+    assert!(sources.hooks_ready(), "the hooks do not depend on RawInput");
+    assert_eq!(sources.reattach(Component::RawInput), Ok(()));
+    assert_eq!((fake.registers(), fake.rebuilds()), (2, 1));
+    assert_eq!(
+        health_of(&sources.health(), Component::RawInput),
+        (HealthState::Healthy, None)
+    );
+}
+
+/// RawInput registered to our window but silent (待实测: a remote session
+/// whose keys carry no device handle): only logged, nothing reattached,
+/// and logged ever more rarely while it lasts.
+#[test]
+fn a_silent_but_registered_raw_input_is_only_logged() {
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    sources.start();
+    let mut liveness = Liveness::new(&sources);
+    let mut pipe = Pipeline::new();
+    fake.raw_muted.store(true, Ordering::SeqCst);
+    let (_, lines) = capture::logs(|| {
+        pipe.type_keys(&fake, &clock, &mut liveness, MISS_LIMIT);
+        pipe.settle(&clock, &mut liveness)
+    });
+    assert_eq!(
+        lines,
+        [line(
+            r#"INFO event="input.check" source="raw_input" result="registered""#
+        )]
+    );
+    let (_, lines) = capture::logs(|| {
+        pipe.type_keys(&fake, &clock, &mut liveness, MISS_LIMIT);
+        pipe.settle(&clock, &mut liveness)
+    });
+    assert!(lines.is_empty(), "{lines:?}");
+    assert_eq!((fake.registers(), fake.rebuilds()), (0, 0));
+    assert_eq!(
+        health_of(&sources.health(), Component::RawInput),
+        (HealthState::Healthy, None)
+    );
+}
+
+/// RawInput runs before the hooks are installed; keys it sees then are no
+/// evidence against the hook.
+#[test]
+fn keys_before_start_are_not_held_against_the_hooks() {
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    let mut liveness = Liveness::new(&sources);
+    let mut pipe = Pipeline::new();
+    let (_, lines) = capture::logs(|| {
+        pipe.type_keys(&fake, &clock, &mut liveness, 4 * MISS_LIMIT);
+        pipe.settle(&clock, &mut liveness)
+    });
+    assert_eq!(count_of(&lines, "input."), 0, "{lines:?}");
+    assert!(fake.installs().is_empty());
+    sources.start();
+    assert_eq!(pipe.settle(&clock, &mut liveness), None);
+    assert!(sources.hooks_ready());
 }

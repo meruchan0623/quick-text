@@ -26,6 +26,7 @@ mod ime;
 mod inject;
 mod input;
 mod keystate;
+mod liveness;
 mod observer;
 #[cfg(test)]
 mod pipeline_tests;
@@ -39,6 +40,7 @@ mod session;
 pub use actions::{execute, preflight};
 pub use foreground::{cursor, foreground};
 pub use input::{engine_ready, input_status, native_ready};
+pub use input::{input_health, reattach};
 pub use recording::finish_recording;
 pub use selection::capture_selection;
 const MARK: usize = 0x51545854;

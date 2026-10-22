@@ -4,6 +4,11 @@
 //! B-02: the detector callback only reads atomics and the foreground input
 //! context, pushes one fixed-size [`RawRecord`] onto a bounded lock-free
 //! queue and returns. Text decoding and matching run on the input consumer.
+//!
+//! B-06: the detector window can be closed (WM_CLOSE from anyone) and the
+//! process-wide registration can be replaced or removed. An unexpected
+//! close is reported to the input facade at once; [`registration`],
+//! [`register`] and [`rebuild`] let the facade check and restore both.
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -17,13 +22,18 @@ use super::{
     hook::{expected_key_text, KeyRecord},
     ime::ime_active,
     inject::Erasure,
-    input::{self, Lane},
+    input::{self, Lane, Registration},
     keystate::{KeyBits, PHYSICAL},
     protection::{protection_block, protection_worker},
 };
 use crate::traits::{ForegroundProbe, InputContext};
 use std::ffi::c_void;
 use std::sync::{atomic::AtomicUsize, PoisonError};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Input::{
+    GetRegisteredRawInputDevices, RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_INPUTSINK,
+    RIDEV_REMOVE,
+};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -85,6 +95,19 @@ pub(super) const KEYBOARD_LAYOUT_CACHE_INTERVAL: i32 = 0;
 static RAW_LANE: OnceLock<Lane<RawRecord>> = OnceLock::new();
 /// The detector window while its event loop runs (0 otherwise).
 static RAW_WINDOW: AtomicUsize = AtomicUsize::new(0);
+/// Set before we close the detector window ourselves (shutdown, rebuild);
+/// the detector thread consumes it and does not report the close as a loss.
+static EXPECTED_CLOSE: AtomicBool = AtomicBool::new(false);
+/// The window class the vendored detector registers (native.cpp).
+const DETECTOR_CLASS: &str = "EspansoDetect";
+/// How long startup waits for the detector window.
+const DETECTOR_START_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a rebuild waits for the old detector thread to exit.
+const DETECTOR_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+/// RawInput usage page and usages the detector registers.
+const USAGE_PAGE_GENERIC: u16 = 0x01;
+const USAGE_MOUSE: u16 = 0x02;
+const USAGE_KEYBOARD: u16 = 0x06;
 static LAST_SOURCE: Mutex<&str> = Mutex::new("waiting_for_input");
 static LAST_PROCESS: Mutex<String> = Mutex::new(String::new());
 thread_local! { static PROOF: std::cell::RefCell<Option<Proof>> = const {std::cell::RefCell::new(None)}; }
@@ -200,10 +223,18 @@ pub(super) struct RawRecord {
     vk: u16,
     text: [u16; 24],
     len: usize,
-    context: InputContext,
+    /// `None` when the foreground input context could not be read; the key
+    /// still counts for the hook cross-check (B-06) but never becomes text.
+    context: Option<InputContext>,
     pub(super) generation: u64,
     modified: bool,
     allowed: bool,
+}
+impl RawRecord {
+    /// The detector's virtual-key code (generic Shift/Ctrl/Alt).
+    pub(super) fn vk(&self) -> u16 {
+        self.vk
+    }
 }
 /// Callback body: filters the detector event and captures everything the
 /// consumer needs. Atomics plus the probe's input context only. Every
@@ -222,7 +253,7 @@ pub(super) fn raw_record(
         .generation
         .fetch_add(1, Ordering::SeqCst)
         .wrapping_add(1);
-    let context = probe.input_context()?;
+    let context = probe.input_context();
     Some(RawRecord {
         vk: event.key_code as u16,
         text: event.buffer,
@@ -238,9 +269,11 @@ pub(super) fn lane() -> &'static Lane<RawRecord> {
     RAW_LANE.get_or_init(|| Lane::new(RAW_QUEUE_CAPACITY, input::wake))
 }
 /// Consumer side: the matcher event for a captured hardware key. The
-/// configuration revision is read here; a poisoned compiler fails closed
-/// (the key is dropped and its generation gap clears the buffer).
+/// configuration revision is read here; a poisoned compiler or a missing
+/// input context fails closed (the key is dropped and its generation gap
+/// clears the buffer).
 pub(super) fn event_from(shared: &Shared, record: &RawRecord) -> Option<Event> {
+    let context = record.context?;
     let revision = shared.compiled.lock().ok()?.config.revision;
     let text = record
         .text
@@ -248,7 +281,7 @@ pub(super) fn event_from(shared: &Shared, record: &RawRecord) -> Option<Event> {
         .and_then(|units| String::from_utf16(units).ok());
     Some(Event {
         kind: kind(record.vk, text, record.modified),
-        stamp: stamp_of(record.context, revision),
+        stamp: stamp_of(context, revision),
         generation: record.generation,
         source: "rawinput_hardware",
         captured_allowed: record.allowed,
@@ -413,46 +446,227 @@ pub(super) fn detect_candidate(
 /// exist (see [`lane`]) before keys can be captured.
 pub(super) fn start(shared: Arc<Shared>) -> Result<(), String> {
     protection_worker(shared.clone());
+    spawn_detector(shared)
+}
+/// Starts one detector thread and waits until its window exists.
+fn spawn_detector(shared: Arc<Shared>) -> Result<(), String> {
     let (startup_tx, startup_rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || unsafe {
-        let context = Box::new(shared);
-        let mut options = InitOptions {
-            keyboard_layout_cache_interval: KEYBOARD_LAYOUT_CACHE_INTERVAL,
-        };
-        let mut error = 0;
-        let window = detect_initialize(
+    std::thread::Builder::new()
+        .name("quicker-rawinput".into())
+        .spawn(move || run_detector(shared, &startup_tx))
+        .map_err(|_| "RawInput thread failed to start".to_string())?;
+    startup_rx
+        .recv_timeout(DETECTOR_START_TIMEOUT)
+        .map_err(|_| "Espanso RawInput initialization timed out".to_string())?
+}
+/// Detector thread body: create the window, run its loop, and report a
+/// close nobody asked for to the input facade (B-06). The loss no longer
+/// pauses the engine; health reports the window missing until a rebuild.
+fn run_detector(shared: Arc<Shared>, startup: &mpsc::SyncSender<Result<(), String>>) {
+    let class = wide(DETECTOR_CLASS);
+    // SAFETY: plain Win32 call; `class` outlives it. A previous detector
+    // thread leaves its class registered (native.cpp never unregisters), and
+    // RegisterClassEx would then fail; this fails harmlessly while a window
+    // of the class still exists.
+    unsafe {
+        UnregisterClassW(class.as_ptr(), GetModuleHandleW(std::ptr::null()));
+    }
+    let context = Box::new(shared);
+    let mut options = InitOptions {
+        keyboard_layout_cache_interval: KEYBOARD_LAYOUT_CACHE_INTERVAL,
+    };
+    let mut error = 0;
+    // SAFETY: `context` outlives the event loop below; the detector only
+    // hands the pointer back to `callback` on this thread.
+    let window = unsafe {
+        detect_initialize(
             (&*context as *const Arc<Shared>).cast_mut().cast(),
             &mut options,
             &mut error,
-        );
-        if window.is_null() {
-            let _ = startup_tx.send(Err(format!(
-                "Espanso RawInput initialization failed ({error})"
-            )));
-            return;
+        )
+    };
+    if window.is_null() {
+        // native.cpp keeps its window when only the registration failed;
+        // destroy it so the class can be registered again.
+        // SAFETY: enumerates this thread's own windows.
+        unsafe {
+            EnumThreadWindows(GetCurrentThreadId(), Some(destroy_detector), 0);
         }
-        RAW_WINDOW.store(window as usize, Ordering::SeqCst);
-        READY.store(true, Ordering::SeqCst);
-        let _ = startup_tx.send(Ok(()));
+        let _ = startup.send(Err(format!(
+            "Espanso RawInput initialization failed ({error})"
+        )));
+        return;
+    }
+    RAW_WINDOW.store(window as usize, Ordering::SeqCst);
+    READY.store(true, Ordering::SeqCst);
+    let _ = startup.send(Ok(()));
+    // SAFETY: `window` came from detect_initialize on this thread.
+    unsafe {
         detect_eventloop(window, callback);
-        READY.store(false, Ordering::SeqCst);
-        RAW_WINDOW.store(0, Ordering::SeqCst);
-        context.paused.store(true, Ordering::SeqCst);
+    }
+    let expected =
+        EXPECTED_CLOSE.swap(false, Ordering::SeqCst) || context.shutdown.load(Ordering::SeqCst);
+    READY.store(false, Ordering::SeqCst);
+    // SAFETY: `window` belongs to this thread; IsWindow guards a window the
+    // loop already destroyed.
+    unsafe {
         if IsWindow(window as HWND) != 0 {
             detect_destroy(window);
         }
-    });
-    startup_rx
-        .recv_timeout(Duration::from_secs(3))
-        .map_err(|_| "Espanso RawInput initialization timed out".to_string())?
+    }
+    let _ = RAW_WINDOW.compare_exchange(window as usize, 0, Ordering::SeqCst, Ordering::SeqCst);
+    tracing::info!(event = "rawinput.closed", expected);
+    if !expected {
+        input::raw_lost();
+    }
 }
-/// Asks the detector window to close (engine shutdown).
-pub(super) fn close_window() {
+/// EnumThreadWindows callback: destroys detector-class windows only.
+unsafe extern "system" fn destroy_detector(window: HWND, _: LPARAM) -> windows_sys::core::BOOL {
+    let mut name = [0u16; 32];
+    // SAFETY: `name` holds the length we pass.
+    let len = unsafe { GetClassNameW(window, name.as_mut_ptr(), name.len() as i32) };
+    let ours = usize::try_from(len)
+        .ok()
+        .and_then(|len| name.get(..len))
+        .is_some_and(|name| DETECTOR_CLASS.encode_utf16().eq(name.iter().copied()));
+    if ours {
+        // SAFETY: a window of this thread, found by enumeration.
+        unsafe {
+            DestroyWindow(window);
+        }
+    }
+    1
+}
+/// Asks the detector window to close. `expected` for engine shutdown; the
+/// RawinputClose fault passes `false` so the loss is reported like any
+/// outside WM_CLOSE.
+pub(super) fn close_window(expected: bool) {
     let window = RAW_WINDOW.load(Ordering::SeqCst);
     if window != 0 {
+        if expected {
+            EXPECTED_CLOSE.store(true, Ordering::SeqCst);
+        }
         // SAFETY: posting to a stale handle fails harmlessly.
         unsafe {
             PostMessageW(window as HWND, WM_CLOSE, 0, 0);
+        }
+    }
+}
+/// Whether the detector window exists.
+pub(super) fn alive() -> bool {
+    let window = RAW_WINDOW.load(Ordering::SeqCst);
+    // SAFETY: IsWindow accepts any handle value.
+    window != 0 && unsafe { IsWindow(window as HWND) } != 0
+}
+fn device(usage: u16, flags: u32, target: HWND) -> RAWINPUTDEVICE {
+    RAWINPUTDEVICE {
+        usUsagePage: USAGE_PAGE_GENERIC,
+        usUsage: usage,
+        dwFlags: flags,
+        hwndTarget: target,
+    }
+}
+/// Where the process-wide keyboard RawInput registration points. Only one
+/// target per usage exists per process and the last registration wins
+/// (tao registers its own at event-loop creation, G6).
+pub(super) fn registration() -> Registration {
+    let window = RAW_WINDOW.load(Ordering::SeqCst);
+    let mut devices = [device(0, 0, std::ptr::null_mut()); 16];
+    let mut count = devices.len() as u32;
+    // SAFETY: `devices` holds `count` entries of the size we pass.
+    let found = unsafe {
+        GetRegisteredRawInputDevices(
+            devices.as_mut_ptr(),
+            &mut count,
+            size_of::<RAWINPUTDEVICE>() as u32,
+        )
+    };
+    if found == u32::MAX {
+        return Registration::Unknown;
+    }
+    let keyboard = devices
+        .iter()
+        .take(found as usize)
+        .find(|entry| entry.usUsagePage == USAGE_PAGE_GENERIC && entry.usUsage == USAGE_KEYBOARD);
+    match keyboard {
+        None => Registration::Missing,
+        Some(entry)
+            if window != 0
+                && entry.hwndTarget as usize == window
+                && entry.dwFlags & RIDEV_INPUTSINK != 0 =>
+        {
+            Registration::Ours
+        }
+        Some(_) => Registration::Elsewhere,
+    }
+}
+/// Registers keyboard and mouse RawInput for the detector window again, as
+/// native.cpp does at startup. 待实测: registering from a thread that does
+/// not own the window; the facade falls back to [`rebuild`] on failure.
+pub(super) fn register() -> bool {
+    let window = RAW_WINDOW.load(Ordering::SeqCst);
+    if window == 0 {
+        return false;
+    }
+    let devices = [
+        device(USAGE_KEYBOARD, RIDEV_INPUTSINK, window as HWND),
+        device(USAGE_MOUSE, RIDEV_INPUTSINK, window as HWND),
+    ];
+    // SAFETY: `devices` holds the count and entry size we pass.
+    unsafe {
+        RegisterRawInputDevices(
+            devices.as_ptr(),
+            devices.len() as u32,
+            size_of::<RAWINPUTDEVICE>() as u32,
+        ) != 0
+    }
+}
+/// Removes the process keyboard and mouse registrations (RawinputUnregister
+/// fault only).
+pub(super) fn unregister() {
+    let devices = [
+        device(USAGE_KEYBOARD, RIDEV_REMOVE, std::ptr::null_mut()),
+        device(USAGE_MOUSE, RIDEV_REMOVE, std::ptr::null_mut()),
+    ];
+    // SAFETY: `devices` holds the count and entry size we pass.
+    unsafe {
+        RegisterRawInputDevices(
+            devices.as_ptr(),
+            devices.len() as u32,
+            size_of::<RAWINPUTDEVICE>() as u32,
+        );
+    }
+}
+/// Replaces the detector: closes a window that still exists, waits for its
+/// thread to let go, and starts a new one (S-03). 待实测: rebuild latency.
+pub(super) fn rebuild() -> bool {
+    let Some(shared) = ENGINE.get() else {
+        return false;
+    };
+    let old = RAW_WINDOW.load(Ordering::SeqCst);
+    if old != 0 {
+        EXPECTED_CLOSE.store(true, Ordering::SeqCst);
+        // SAFETY: posting to a stale handle fails harmlessly.
+        if unsafe { PostMessageW(old as HWND, WM_CLOSE, 0, 0) } == 0 {
+            EXPECTED_CLOSE.store(false, Ordering::SeqCst);
+        }
+        let deadline = Instant::now() + DETECTOR_CLOSE_TIMEOUT;
+        while RAW_WINDOW.load(Ordering::SeqCst) == old {
+            if Instant::now() >= deadline {
+                tracing::warn!(event = "rawinput.rebuild_stuck");
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    // A flag the old thread did not consume must not mark the next close
+    // as expected.
+    EXPECTED_CLOSE.store(false, Ordering::SeqCst);
+    match spawn_detector(shared.clone()) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(event = "rawinput.rebuild_failed", error = %error);
+            false
         }
     }
 }
