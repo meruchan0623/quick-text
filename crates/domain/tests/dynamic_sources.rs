@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default)]
 use quicker_domain::*;
 
 #[test]

@@ -451,10 +451,12 @@ async fn execute_action(action: Action, app: tauri::AppHandle) -> Result<Executi
         std::thread::sleep(std::time::Duration::from_secs(3));
         let target = quicker_platform::foreground();
         let generation = e.generation.load(Ordering::SeqCst);
-        let mut context = VariableContext::default();
-        context.clipboard = arboard::Clipboard::new()
-            .ok()
-            .and_then(|mut cb| cb.get_text().ok());
+        let mut context = VariableContext {
+            clipboard: arboard::Clipboard::new()
+                .ok()
+                .and_then(|mut cb| cb.get_text().ok()),
+            ..Default::default()
+        };
         let needs_selection = serde_json::to_string(&action)
             .unwrap_or_default()
             .contains("{selection}")

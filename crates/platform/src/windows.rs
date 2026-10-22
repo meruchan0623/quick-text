@@ -651,10 +651,12 @@ pub fn start_engine(shared: Arc<Shared>) -> Result<(), String> {
     SENDER.set(tx).ok();
     std::thread::spawn(move || {
         for c in rx {
-            let mut ctx = VariableContext::default();
-            ctx.clipboard = arboard::Clipboard::new()
-                .ok()
-                .and_then(|mut cb| cb.get_text().ok());
+            let mut ctx = VariableContext {
+                clipboard: arboard::Clipboard::new()
+                    .ok()
+                    .and_then(|mut cb| cb.get_text().ok()),
+                ..Default::default()
+            };
             let selection_needed = serde_json::to_string(&c.rule.action)
                 .unwrap_or_default()
                 .contains("{selection}")
@@ -1469,7 +1471,8 @@ fn html_clipboard(fragment: &str) -> String {
     let start_fragment = start + prefix.len();
     format!("Version:0.9\r\nStartHTML:{:010}\r\nEndHTML:{:010}\r\nStartFragment:{:010}\r\nEndFragment:{:010}\r\n{}{}{}\0",start,start+prefix.len()+fragment.len()+suffix.len(),start_fragment,start_fragment+fragment.len(),prefix,fragment,suffix)
 }
-fn clipboard_formats(op: &Operation) -> Result<Option<Vec<(u32, Vec<u8>)>>, String> {
+type ClipboardFormats = Vec<(u32, Vec<u8>)>;
+fn clipboard_formats(op: &Operation) -> Result<Option<ClipboardFormats>, String> {
     Ok(Some(match op {
         Operation::Text {
             text,
