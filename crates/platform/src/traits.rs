@@ -87,6 +87,23 @@ pub trait ClipboardBackend {
     fn stage(&self, bytes: &[u8]) -> Result<(Self::Staged, Vec<u8>), String>;
     /// Locked: hands `staged` to the clipboard (consumed even on failure).
     fn set(&self, format: u32, staged: Self::Staged) -> bool;
+    /// Waits `duration` between attempts. Never called inside
+    /// [`ClipboardBackend::locked`]: the clipboard stays closed while waiting.
+    fn pause(&self, duration: Duration) {
+        std::thread::sleep(duration)
+    }
+    /// Monotonic time, used to measure how long the clipboard stays open.
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    /// Publishes the clipboard component's health (B-08). Called outside
+    /// [`ClipboardBackend::locked`]; the default discards it.
+    fn report_health(
+        &self,
+        _state: crate::health::HealthState,
+        _reason: Option<crate::health::ReasonCode>,
+    ) {
+    }
 }
 
 /// Input context a match is bound to (no-regression #3). Together with the

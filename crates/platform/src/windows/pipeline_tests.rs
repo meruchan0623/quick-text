@@ -302,7 +302,7 @@ fn clipboard_write_failure_fails_without_typing_fallback() {
 fn busy_clipboard_rejects_paste_before_erasure() {
     let mut rig = Rig::new(rule(None, OutputMethod::Paste));
     let candidate = rig.type_str("btw").unwrap();
-    rig.clipboard.set_busy(1);
+    rig.clipboard.set_busy(super::clipboard::OPEN_ATTEMPTS);
     assert_eq!(
         rig.execute(&candidate).unwrap_err(),
         "Clipboard is busy; trigger preserved"

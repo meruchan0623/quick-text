@@ -1,5 +1,6 @@
 //! Test doubles for the platform ports (S-23). Built for unit tests and, with
 //! `--features mock`, for downstream pipeline tests. Never touches the OS.
+use crate::health::{HealthState, ReasonCode};
 use crate::traits::{ClipboardBackend, Clock, ForegroundProbe, Injector, InputContext};
 use crate::Foreground;
 use parking_lot::Mutex;
@@ -138,6 +139,12 @@ struct ClipboardModel {
     clears: usize,
     locks: usize,
     lock_hook: Option<LockHook>,
+    /// Virtual time: advanced by `pause` and by slow reads, never by the OS.
+    base: Instant,
+    elapsed: Duration,
+    pauses: Vec<Duration>,
+    read_delay: Duration,
+    health: Option<(HealthState, Option<ReasonCode>)>,
 }
 
 /// In-memory clipboard following Win32 rules: clearing takes ownership and
@@ -165,6 +172,11 @@ impl MockClipboard {
                 clears: 0,
                 locks: 0,
                 lock_hook: None,
+                base: Instant::now(),
+                elapsed: Duration::ZERO,
+                pauses: vec![],
+                read_delay: Duration::ZERO,
+                health: None,
             })),
         }
     }
@@ -220,6 +232,24 @@ impl MockClipboard {
         assert!(state.open, "clipboard accessed outside locked()");
         state
     }
+    /// Whether a lease currently holds the clipboard open (e.g. checked from
+    /// an injector hook: input must never be sent inside a critical section).
+    pub fn is_open(&self) -> bool {
+        self.state.lock().open
+    }
+    /// Every [`ClipboardBackend::pause`] request, in order.
+    pub fn pauses(&self) -> Vec<Duration> {
+        self.state.lock().pauses.clone()
+    }
+    /// Each read with the clipboard open takes `delay` of virtual time (a
+    /// slow owner rendering data), to exercise the lock-hold budget.
+    pub fn set_read_delay(&self, delay: Duration) {
+        self.state.lock().read_delay = delay;
+    }
+    /// Latest [`ClipboardBackend::report_health`] call, if any.
+    pub fn health(&self) -> Option<(HealthState, Option<ReasonCode>)> {
+        self.state.lock().health
+    }
 }
 
 impl ClipboardBackend for MockClipboard {
@@ -269,8 +299,10 @@ impl ClipboardBackend for MockClipboard {
             .collect()
     }
     fn read(&self, format: u32, limit: usize) -> Result<Option<Vec<u8>>, String> {
-        Ok(self
-            .open()
+        let mut state = self.open();
+        let delay = state.read_delay;
+        state.elapsed += delay;
+        Ok(state
             .formats
             .iter()
             .find(|(f, bytes)| *f == format && !bytes.is_empty() && bytes.len() <= limit)
@@ -285,6 +317,11 @@ impl ClipboardBackend for MockClipboard {
         true
     }
     fn stage(&self, bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+        // Allocation belongs before the critical section, never inside it.
+        assert!(
+            !self.state.lock().open,
+            "payload staged with the clipboard open"
+        );
         Ok((bytes.to_vec(), bytes.to_vec()))
     }
     fn set(&self, format: u32, staged: Vec<u8>) -> bool {
@@ -297,6 +334,21 @@ impl ClipboardBackend for MockClipboard {
         state.formats.push((format, staged));
         state.sequence += 1;
         true
+    }
+    fn pause(&self, duration: Duration) {
+        let mut state = self.state.lock();
+        assert!(!state.open, "paused with the clipboard open");
+        state.elapsed += duration;
+        state.pauses.push(duration);
+    }
+    fn now(&self) -> Instant {
+        let state = self.state.lock();
+        state.base + state.elapsed
+    }
+    fn report_health(&self, state: HealthState, reason: Option<ReasonCode>) {
+        let mut model = self.state.lock();
+        assert!(!model.open, "health reported with the clipboard open");
+        model.health = Some((state, reason));
     }
 }
 
@@ -463,6 +515,13 @@ mod tests {
             clipboard.locked(|| clipboard.read(13, 1)).unwrap(),
             Ok(None)
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "paused with the clipboard open")]
+    fn clipboard_rejects_waiting_inside_the_critical_section() {
+        let clipboard = MockClipboard::new(7, vec![]);
+        clipboard.locked(|| clipboard.pause(Duration::from_millis(1)));
     }
 
     #[test]

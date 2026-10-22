@@ -2,7 +2,130 @@
 //! writes and verified restore, plus the Windows adapter.
 use super::inject::mark_external_effect;
 use super::*;
+use crate::fault::{self, FaultPoint};
+use crate::health::{Component, ComponentHealth, HealthState, ReasonCode};
 use crate::traits::ClipboardBackend;
+use std::cell::Cell;
+use std::sync::PoisonError;
+
+/// Bounded `OpenClipboard` retry (B-08): clipboard managers, remote-desktop
+/// clients and listeners open the clipboard briefly after every change.
+pub(super) const OPEN_ATTEMPTS: usize = 10;
+/// Pause between `OpenClipboard` attempts, always with the clipboard closed.
+pub(super) const OPEN_RETRY_INTERVAL: Duration = Duration::from_millis(15);
+/// A critical section holding the clipboard open longer than this degrades
+/// the clipboard component: every other `OpenClipboard` fails meanwhile.
+pub(super) const LOCK_HOLD_BUDGET: Duration = Duration::from_millis(250);
+/// Pause between ownership re-verification attempts (clipboard closed).
+const VERIFY_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Process-wide clipboard component health, published by every lease.
+static HEALTH: OnceLock<Mutex<ComponentHealth>> = OnceLock::new();
+fn health_cell() -> &'static Mutex<ComponentHealth> {
+    HEALTH.get_or_init(|| {
+        Mutex::new(ComponentHealth {
+            component: Component::Clipboard,
+            state: HealthState::Healthy,
+            reason: None,
+            since_ms: chrono::Utc::now().timestamp_millis(),
+        })
+    })
+}
+fn record_health(state: HealthState, reason: Option<ReasonCode>) {
+    let mut health = health_cell().lock().unwrap_or_else(PoisonError::into_inner);
+    if health.state != state {
+        health.since_ms = chrono::Utc::now().timestamp_millis();
+    }
+    health.state = state;
+    health.reason = reason;
+}
+/// Clipboard component health for the supervisor (B-08): Degraded with
+/// `ClipboardBusy` after a lease could not open the clipboard within the
+/// bounded retry or held it open too long; Healthy again after the next
+/// lease whose critical sections all completed in time.
+pub fn clipboard_health() -> ComponentHealth {
+    health_cell()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+/// End of the `FaultPoint::ClipboardBusy` window (B-52).
+static FAULT_BUSY_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+/// Arms the busy window for `armed` milliseconds when the fault fired and
+/// reports whether `now` falls inside it.
+fn fault_busy_window(armed: Option<u64>, until: &mut Option<Instant>, now: Instant) -> bool {
+    if let Some(ms) = armed {
+        *until = Some(now + Duration::from_millis(ms));
+    }
+    until.is_some_and(|until| now < until)
+}
+
+/// Why a lease step failed: a stable reason code for history (B-35) plus the
+/// message the action result has always carried.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct LeaseError {
+    pub(super) reason: ReasonCode,
+    pub(super) message: String,
+}
+impl LeaseError {
+    fn new(reason: ReasonCode, message: impl Into<String>) -> Self {
+        Self {
+            reason,
+            message: message.into(),
+        }
+    }
+}
+impl From<LeaseError> for String {
+    fn from(error: LeaseError) -> Self {
+        error.message
+    }
+}
+
+/// Runs `f` with the clipboard open. The critical section is only
+/// open → read/write → close: callers never sleep, wait or inject input in
+/// `f`. A busy clipboard is retried `OPEN_ATTEMPTS` times with the clipboard
+/// closed in between. Staying busy, or holding it open longer than
+/// `LOCK_HOLD_BUDGET`, reports the component Degraded (`ClipboardBusy`) and
+/// keeps it Degraded for the rest of the lease (`degraded`).
+fn critical<C: ClipboardBackend, R>(
+    backend: &C,
+    degraded: &Cell<bool>,
+    f: impl FnOnce() -> R,
+) -> Result<R, LeaseError> {
+    let mut f = Some(f);
+    for attempt in 0..OPEN_ATTEMPTS {
+        if attempt > 0 {
+            backend.pause(OPEN_RETRY_INTERVAL);
+        }
+        let opened = backend.locked(|| {
+            let start = backend.now();
+            let result = f.take().map(|f| f());
+            (result, backend.now().saturating_duration_since(start))
+        });
+        if let Some((Some(result), held)) = opened {
+            if held > LOCK_HOLD_BUDGET {
+                tracing::warn!(
+                    event = "clipboard.slow",
+                    held_ms = held.as_millis() as u64,
+                    budget_ms = LOCK_HOLD_BUDGET.as_millis() as u64
+                );
+                degraded.set(true);
+                backend.report_health(HealthState::Degraded, Some(ReasonCode::ClipboardBusy));
+            } else if !degraded.get() {
+                backend.report_health(HealthState::Healthy, None);
+            }
+            return Ok(result);
+        }
+    }
+    tracing::warn!(event = "clipboard.busy", attempts = OPEN_ATTEMPTS as u64);
+    degraded.set(true);
+    backend.report_health(HealthState::Degraded, Some(ReasonCode::ClipboardBusy));
+    Err(LeaseError::new(
+        ReasonCode::ClipboardBusy,
+        "Clipboard is busy",
+    ))
+}
 fn clipboard_operation(operation: &Operation) -> bool {
     matches!(
         operation,
@@ -155,6 +278,16 @@ impl ClipboardBackend for WinClipboard {
         unsafe { GetClipboardSequenceNumber() }
     }
     fn locked<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
+        let fault_busy = fault_busy_window(
+            fault::take(FaultPoint::ClipboardBusy),
+            &mut FAULT_BUSY_UNTIL
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            Instant::now(),
+        );
+        if fault_busy {
+            return None;
+        }
         unsafe {
             if OpenClipboard(self.window) == 0 {
                 return None;
@@ -226,6 +359,9 @@ impl ClipboardBackend for WinClipboard {
             true
         }
     }
+    fn report_health(&self, state: HealthState, reason: Option<ReasonCode>) {
+        record_health(state, reason);
+    }
 }
 /// Payloads allocated before trigger deletion; unused ones free on drop.
 pub(super) struct PreparedClipboard<S> {
@@ -239,6 +375,9 @@ pub(super) struct ClipboardLease<C: ClipboardBackend> {
     owned_payload: ClipboardFormats,
     written: Option<u32>,
     dirty: bool,
+    /// Set once this lease reported the component Degraded, so a later fast
+    /// critical section of the same lease does not hide it.
+    degraded: Cell<bool>,
 }
 fn finish_clipboard_restore<T>(
     backup: &mut Vec<T>,
@@ -266,15 +405,18 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
         owner: u64,
         expected: &[(u32, Vec<u8>)],
         exact_formats: bool,
-    ) -> Result<u32, String> {
+    ) -> Result<u32, LeaseError> {
         let backend = &self.backend;
-        retry_clipboard_verification(
+        // An exhausted retry means the sequence never settled.
+        let mut reason = ReasonCode::ClipboardChanged;
+        let verified = retry_clipboard_verification(
             || {
-                let Some(verified) = backend.locked(|| -> Result<u32, String> {
+                let checked = critical(backend, &self.degraded, || {
                     if backend.owner() != owner {
-                        return Err(
-                            "Clipboard owner changed externally; clipboard preserved".into()
-                        );
+                        return Err((
+                            ReasonCode::ClipboardChanged,
+                            "Clipboard owner changed externally; clipboard preserved",
+                        ));
                     }
                     if exact_formats {
                         let formats = backend.formats();
@@ -283,35 +425,50 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
                                 .iter()
                                 .any(|format| !expected.iter().any(|(wanted, _)| wanted == format))
                         {
-                            return Err(
-                                "Clipboard formats changed externally; clipboard preserved".into(),
-                            );
+                            return Err((
+                                ReasonCode::ClipboardChanged,
+                                "Clipboard formats changed externally; clipboard preserved",
+                            ));
                         }
                     }
                     for (format, bytes) in expected {
                         match backend.read(*format, bytes.len()) {
-                            Err(_) => return Err("Clipboard payload cannot be verified".into()),
+                            Err(_) => {
+                                return Err((
+                                    ReasonCode::Internal,
+                                    "Clipboard payload cannot be verified",
+                                ))
+                            }
                             Ok(Some(current)) if current == *bytes => {}
                             Ok(_) => {
-                                return Err(
-                                    "Clipboard payload changed externally; clipboard preserved"
-                                        .into(),
-                                )
+                                return Err((
+                                    ReasonCode::ClipboardChanged,
+                                    "Clipboard payload changed externally; clipboard preserved",
+                                ))
                             }
                         }
                     }
                     Ok(backend.sequence())
-                }) else {
-                    return Ok(None);
+                });
+                let sequence = match checked {
+                    Ok(Ok(sequence)) => sequence,
+                    Ok(Err((code, message))) => {
+                        reason = code;
+                        return Err(message.to_string());
+                    }
+                    Err(busy) => {
+                        reason = busy.reason;
+                        return Err(busy.message);
+                    }
                 };
-                let sequence = verified?;
                 if backend.sequence() == sequence && backend.owner() == owner {
                     return Ok(Some(sequence));
                 }
                 Ok(None)
             },
-            || std::thread::sleep(Duration::from_millis(5)),
-        )
+            || backend.pause(VERIFY_RETRY_INTERVAL),
+        );
+        verified.map_err(|message| LeaseError::new(reason, message))
     }
     pub(super) fn verify_current(&self) -> Result<(), String> {
         if self
@@ -350,9 +507,10 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
             owned_payload,
             written,
             dirty,
+            degraded,
             ..
         } = self;
-        let result = backend.locked(|| -> Result<(), String> {
+        critical(backend, degraded, || -> Result<(), String> {
             if written.is_some_and(|seq| backend.sequence() != seq) {
                 return Err("Clipboard changed externally; stopped without overwriting it".into());
             }
@@ -375,14 +533,15 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
             }
             *written = Some(backend.sequence());
             Ok(())
-        });
-        result.ok_or("Clipboard is busy")??;
+        })??;
         self.written =
             Some(self.verified_sequence(self.backend.identity(), &prepared.expected, false)?);
         Ok(())
     }
     pub(super) fn new(backend: C) -> Result<Self, String> {
-        let Some(result) = backend.locked(|| -> Result<(u64, ClipboardFormats, u32), String> {
+        const BUSY: &str = "Clipboard is busy; trigger preserved";
+        let degraded = Cell::new(false);
+        let result = critical(&backend, &degraded, || -> Result<(u64, ClipboardFormats, u32), String> {
             let original_owner = backend.owner();
             let mut backup = vec![];
             for format in backend.formats() {
@@ -400,9 +559,8 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
                 }
             }
             Ok((original_owner, backup, backend.sequence()))
-        }) else {
-            return Err("Clipboard is busy; trigger preserved".into());
-        };
+        })
+        .map_err(|_| BUSY.to_string())?;
         let (original_owner, backup, sequence) = result?;
         let mut lease = Self {
             backend,
@@ -410,51 +568,60 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
             owned_payload: vec![],
             written: Some(sequence),
             dirty: false,
+            degraded,
         };
         match lease.verified_sequence(original_owner, &lease.backup, true) {
             Ok(sequence) => {
                 lease.written = Some(sequence);
                 Ok(lease)
             }
-            Err(reason) => {
+            Err(error) => {
                 lease.written = None;
-                Err(reason)
+                Err(if error.reason == ReasonCode::ClipboardBusy {
+                    BUSY.into()
+                } else {
+                    error.message
+                })
             }
         }
     }
     fn write(&mut self, formats: ClipboardFormats) -> Result<(), String> {
+        // Allocate before opening: the critical section only clears and sets.
+        let mut staged = Vec::with_capacity(formats.len());
+        for (format, bytes) in formats {
+            let (handle, expected) = self.backend.stage(&bytes)?;
+            staged.push((format, handle, expected));
+        }
         let Self {
             backend,
             owned_payload,
             written,
+            degraded,
             ..
         } = self;
-        backend
-            .locked(|| -> Result<(), String> {
-                if let Some(seq) = *written {
-                    if backend.sequence() != seq {
-                        return Err(
-                            "Clipboard changed externally; stopped without overwriting it".into(),
-                        );
-                    }
+        critical(backend, degraded, || -> Result<(), String> {
+            if let Some(seq) = *written {
+                if backend.sequence() != seq {
+                    return Err(
+                        "Clipboard changed externally; stopped without overwriting it".into(),
+                    );
                 }
-                if !backend.clear() {
-                    return Err("Clipboard clear failed".into());
+            }
+            if !backend.clear() {
+                return Err("Clipboard clear failed".into());
+            }
+            mark_external_effect();
+            owned_payload.clear();
+            *written = Some(backend.sequence());
+            for (format, handle, expected) in staged {
+                if !backend.set(format, handle) {
+                    return Err("Clipboard write failed".into());
                 }
-                mark_external_effect();
-                owned_payload.clear();
-                *written = Some(backend.sequence());
-                for (format, bytes) in formats {
-                    let (staged, expected) = backend.stage(&bytes)?;
-                    if !backend.set(format, staged) {
-                        return Err("Clipboard write failed".into());
-                    }
-                    owned_payload.push((format, expected));
-                }
-                *written = Some(backend.sequence());
-                Ok(())
-            })
-            .unwrap_or_else(|| Err("Clipboard is busy".into()))
+                owned_payload.push((format, expected));
+            }
+            *written = Some(backend.sequence());
+            Ok(())
+        })?
     }
     pub(super) fn restore(&mut self) -> Result<(), String> {
         if !self.dirty {
@@ -632,5 +799,126 @@ mod tests {
         let offset = html.find("StartFragment:").unwrap() + 14;
         let start: usize = html[offset..offset + 10].parse().unwrap();
         assert!(html[start..].starts_with("😀 <b>合成</b>"));
+    }
+
+    use crate::mock::MockClipboard;
+    type Health = Option<(HealthState, Option<ReasonCode>)>;
+    const HEALTHY: Health = Some((HealthState::Healthy, None));
+    const BUSY: Health = Some((HealthState::Degraded, Some(ReasonCode::ClipboardBusy)));
+    fn text(value: &str) -> ClipboardFormats {
+        vec![(
+            13,
+            wide(value).iter().flat_map(|v| v.to_le_bytes()).collect(),
+        )]
+    }
+    #[test]
+    fn open_retries_a_busy_clipboard_within_the_bound() {
+        let clipboard = MockClipboard::new(7, text("original"));
+        clipboard.set_busy(OPEN_ATTEMPTS - 1);
+        let lease = ClipboardLease::new(clipboard.clone()).unwrap();
+        assert_eq!(
+            clipboard.pauses(),
+            vec![OPEN_RETRY_INTERVAL; OPEN_ATTEMPTS - 1]
+        );
+        assert_eq!(clipboard.health(), HEALTHY);
+        drop(lease);
+        assert_eq!(clipboard.clears(), 0);
+    }
+    #[test]
+    fn clipboard_busy_for_every_attempt_degrades_and_preserves_trigger() {
+        let clipboard = MockClipboard::new(7, text("original"));
+        clipboard.set_busy(OPEN_ATTEMPTS);
+        assert_eq!(
+            ClipboardLease::new(clipboard.clone()).err().as_deref(),
+            Some("Clipboard is busy; trigger preserved")
+        );
+        assert_eq!(clipboard.pauses().len(), OPEN_ATTEMPTS - 1);
+        assert_eq!(clipboard.health(), BUSY);
+        assert_eq!(clipboard.clears(), 0);
+        assert_eq!(clipboard.content(), text("original"));
+    }
+    #[test]
+    fn busy_backup_verification_is_reported_as_busy() {
+        let clipboard = MockClipboard::new(7, text("original"));
+        let script = clipboard.clone();
+        // Lock 0 takes the backup; every attempt at verifying it is busy.
+        clipboard.on_lock(move |index| {
+            if index == 0 {
+                script.set_busy(OPEN_ATTEMPTS);
+            }
+        });
+        assert_eq!(
+            ClipboardLease::new(clipboard.clone()).err().as_deref(),
+            Some("Clipboard is busy; trigger preserved")
+        );
+        assert_eq!(clipboard.health(), BUSY);
+    }
+    #[test]
+    fn slow_critical_section_degrades_for_the_rest_of_the_lease() {
+        let clipboard = MockClipboard::new(7, text("original"));
+        clipboard.set_read_delay(LOCK_HOLD_BUDGET + Duration::from_millis(1));
+        let script = clipboard.clone();
+        // Only the backup (lock 0) is slow; its verification is fast.
+        clipboard.on_lock(move |index| {
+            if index == 1 {
+                script.set_read_delay(Duration::ZERO);
+            }
+        });
+        let lease = ClipboardLease::new(clipboard.clone()).unwrap();
+        assert_eq!(clipboard.health(), BUSY, "a fast section must not hide it");
+        drop(lease);
+        // The next lease whose sections are all fast reports Healthy again.
+        drop(ClipboardLease::new(clipboard.clone()).unwrap());
+        assert_eq!(clipboard.health(), HEALTHY);
+    }
+    #[test]
+    fn restore_retries_busy_clipboard_and_keeps_backup_for_drop() {
+        let clipboard = MockClipboard::new(7, text("original"));
+        let mut lease = ClipboardLease::new(clipboard.clone()).unwrap();
+        let mut prepared = lease.prepare(text("expansion")).unwrap();
+        lease.write_prepared(&mut prepared).unwrap();
+        assert_eq!(clipboard.content(), text("expansion"));
+        clipboard.set_busy(OPEN_ATTEMPTS);
+        assert_eq!(lease.restore(), Err("Clipboard is busy".into()));
+        assert_eq!(clipboard.content(), text("expansion"));
+        assert_eq!(clipboard.health(), BUSY);
+        clipboard.set_busy(OPEN_ATTEMPTS - 1);
+        drop(lease);
+        assert_eq!(clipboard.content(), text("original"));
+        assert_eq!(clipboard.clears(), 2);
+    }
+    #[test]
+    fn clipboard_busy_fault_holds_for_its_duration() {
+        let start = Instant::now();
+        let mut until = None;
+        assert!(!fault_busy_window(None, &mut until, start));
+        assert!(fault_busy_window(Some(250), &mut until, start));
+        assert!(fault_busy_window(
+            None,
+            &mut until,
+            start + Duration::from_millis(249)
+        ));
+        assert!(!fault_busy_window(
+            None,
+            &mut until,
+            start + Duration::from_millis(250)
+        ));
+    }
+    #[test]
+    fn clipboard_health_keeps_entry_time_until_the_state_changes() {
+        record_health(HealthState::Degraded, Some(ReasonCode::ClipboardBusy));
+        let degraded = clipboard_health();
+        assert_eq!(degraded.component, Component::Clipboard);
+        assert_eq!(degraded.state, HealthState::Degraded);
+        assert_eq!(degraded.reason, Some(ReasonCode::ClipboardBusy));
+        record_health(HealthState::Degraded, Some(ReasonCode::ClipboardBusy));
+        assert_eq!(clipboard_health().since_ms, degraded.since_ms);
+        record_health(HealthState::Healthy, None);
+        let healthy = clipboard_health();
+        assert_eq!(
+            (healthy.state, healthy.reason),
+            (HealthState::Healthy, None)
+        );
+        assert!(healthy.since_ms >= degraded.since_ms);
     }
 }
