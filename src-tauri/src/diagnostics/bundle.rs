@@ -523,6 +523,13 @@ pub fn summarize(data_dir: &Path) -> ConfigSummary {
     ConfigSummary {
         active: config_file(&data_dir.join("active.json")),
         draft: config_file(&data_dir.join("draft.json")),
+        // Not under the `PREFS_FILE` lock (store/prefs.rs): this only reads.
+        // prefs.json is only ever replaced whole (`atomic_json`: temp file,
+        // `sync_all`, then rename over it), so the read gets the old file or
+        // the new one, never a half-written one; a damaged file a concurrent
+        // load quarantines shows up as missing or as the damaged file it was.
+        // A stale read costs the bundle this one entry, and nothing is
+        // written back.
         prefs: read_json::<serde_json::Value>(&data_dir.join("prefs.json")).0,
         revisions_on_disk,
         quarantined_files: names
