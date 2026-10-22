@@ -1,0 +1,4 @@
+# Shell scripts are run by bash on CI and in Git Bash; CRLF line endings break them
+# ("pipefail\r: invalid option name"). core.autocrlf=true on Windows would otherwise
+# convert them on checkout.
+*.sh text eol=lf
