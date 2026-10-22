@@ -57,6 +57,7 @@ const REFRESHED = {
   reread: ['已重新读取配置', `${OVERTAKEN}，这次没有读取到。请再点一次「重新读取」。`],
 } as const;
 const NOT_READY = '还没有读取到当前配置，暂时不能修改指令和设置。';
+const SAVE_PENDING = '上一次保存尚未完成，请稍候。';
 // A store revision this window has not read yet is read this many times in all, the retries
 // RECONCILE_RETRY_MS apart and doubling, before a notice offers 「重新读取」 (review C5).
 const RECONCILE_ATTEMPTS = 3;
@@ -343,6 +344,13 @@ export default function App() {
   // This window's writes of the store in flight. The store-state a write causes may arrive before
   // its answer; the answer carries the new revision, so no reload is needed for it (see below).
   const [writing, setWriting] = useState(0);
+  // A save with a change (`op`) in flight, until concluded or failed (review C10). The editor does
+  // not have the change until then: a save sent meanwhile would send the editor's config without
+  // it and undo it; 放弃未应用草稿 or 恢复上一个版本 would undo it, and the change would then be
+  // made again over them. So no store write is sent meanwhile, for one IPC round trip: the entries
+  // are disabled (`writable`), and `write` refuses again, from the ref, which is never behind.
+  const changePending = useRef(false);
+  const [changing, setChanging] = useState(false);
   /**
    * The editor's part of write `command` that succeeded with answer `s`, done whether or not the
    * answer was installed (`answerShown`, review C7): a dropped answer must not leave behind edits
@@ -365,10 +373,11 @@ export default function App() {
    * edits, installed or not (review C7 §4). The editor is the draft it took in and the edits made
    * since; that draft was read before the save ran, so without the change the editor would lack
    * what was saved, and its next save would undo it. Exact: edits change the globals alone (see
-   * `change`), these saves the rules or 总开关 (an import all of it, see there). Not over a view
-   * the editor took in that was read after the save ran (放弃未应用草稿 sent after the edits, say):
-   * that view has the save's outcome already, or what undid it. A save that failed is not concluded,
-   * so its change is not made again.
+   * `change`), these saves the rules or 总开关 (an import all of it, see there). No store write of
+   * this window is sent while such a save runs (`write`), so a view read after it ran is a load's,
+   * and has its outcome; the editor that took one in (「放弃修改，载入新配置」) does not have the
+   * change made again over it, nor over what undid it elsewhere (review C10). A save that failed is
+   * not concluded, so its change is not made again.
    */
   const conclude = (
     command: StoreWrite,
@@ -412,8 +421,16 @@ export default function App() {
       }
     } else if (answerShown) sayNewer(s.revision);
   };
-  /** Write `command`; `op`: how a save of a config other than the editor's changes it. */
+  /**
+   * Write `command`; `op`: how a save of a config other than the editor's changes it. None while
+   * such a save is in flight (`changePending`).
+   */
   const write = async (command: StoreWrite, args?: Record<string, unknown>, op?: Change) => {
+    if (changePending.current) throw new Error(SAVE_PENDING);
+    if (op) {
+      changePending.current = true;
+      setChanging(true);
+    }
     setWriting((n) => n + 1);
     // As the request is sent: the revision the editor's config is based on (review C6), and the
     // local edits so far (review C7). Applying publishes the store's draft, without the editor's
@@ -455,8 +472,13 @@ export default function App() {
       conclude(command, s, request, view !== null, !unsaved && edits.current === sent, op);
       return s;
     } finally {
-      // In the same step as the answer, so no render sees the write done without its answer.
+      // In the same step as the answer, so no render sees the write done without its answer; and
+      // with `conclude` done (or the save failed), the change is in the editor (or nowhere).
       setWriting((n) => n - 1);
+      if (op) {
+        changePending.current = false;
+        setChanging(false);
+      }
     }
   };
   // Until the first load_state snapshot is applied, `config` is emptyConfig, not the user's: a write
@@ -479,6 +501,9 @@ export default function App() {
   // CrashLoop). The backend decides: the handlers do not check safe mode, and a write made before
   // the event arrives is refused there with the reason.
   const editable = ready && safeMode === null;
+  // The entries that send a store write: not while a save's change is in flight (`changePending`).
+  // 导入 and the rule editor only open; what they save is sent by an entry disabled meanwhile.
+  const writable = editable && !changing;
   /** Apply a load_state snapshot; the first one initializes the editor and unlocks the writes. */
   const applySnapshot = (s: State) => {
     reconcileTo(s.revision);
@@ -991,7 +1016,7 @@ export default function App() {
               <input
                 type="checkbox"
                 checked={config.enabled}
-                disabled={!editable}
+                disabled={!writable}
                 onChange={(e) => {
                   // Taken now: the change may be made again later (see `save`), when the box shows
                   // config.enabled again. Set to it, not turned over.
@@ -1023,7 +1048,7 @@ export default function App() {
             <button disabled={!ready} onClick={importData}>
               导入
             </button>
-            <button disabled={!ready} onClick={exportData}>
+            <button disabled={!ready || changing} onClick={exportData}>
               导出
             </button>
           </div>
@@ -1035,7 +1060,7 @@ export default function App() {
               {selected.length} 条
             </span>
             <button
-              disabled={!editable || !selected.length}
+              disabled={!writable || !selected.length}
               onClick={() =>
                 mutate((rs) => rs.map((r) => (selectedSet.has(r.id) ? { ...r, enabled: true } : r)))
               }
@@ -1043,7 +1068,7 @@ export default function App() {
               启用
             </button>
             <button
-              disabled={!editable || !selected.length}
+              disabled={!writable || !selected.length}
               onClick={() =>
                 mutate((rs) =>
                   rs.map((r) => (selectedSet.has(r.id) ? { ...r, enabled: false } : r)),
@@ -1053,7 +1078,7 @@ export default function App() {
               停用
             </button>
             <button
-              disabled={!editable || !selected.length}
+              disabled={!writable || !selected.length}
               onClick={async () => {
                 const g = await askValue({
                   title: `把所选 ${selected.length} 条指令移到哪个分组？`,
@@ -1069,7 +1094,7 @@ export default function App() {
               移至分组
             </button>
             <button
-              disabled={!editable || !selected.length}
+              disabled={!writable || !selected.length}
               onClick={async () => {
                 if (
                   await confirmAction({
@@ -1160,7 +1185,7 @@ export default function App() {
                         aria-label={`停用 ${r.match.value}`}
                         type="checkbox"
                         checked={!r.enabled}
-                        disabled={!editable}
+                        disabled={!writable}
                         onChange={(e) => {
                           const off = e.target.checked;
                           void mutate((rs) =>
@@ -1172,7 +1197,7 @@ export default function App() {
                     <td className="row-tools">
                       <button onClick={() => openEditor(clone(r))}>编辑</button>
                       <button
-                        disabled={!editable}
+                        disabled={!writable}
                         onClick={async () => {
                           if (
                             await confirmAction({
@@ -1362,7 +1387,7 @@ export default function App() {
           </div>
           <button
             className="primary"
-            disabled={!editable}
+            disabled={!writable}
             onClick={() => run(() => save(), '参数已保存到草稿')}
           >
             保存参数草稿
@@ -1397,7 +1422,7 @@ export default function App() {
           <div className="inline">
             <button onClick={() => refresh('refresh')}>刷新状态</button>
             <button
-              disabled={!editable}
+              disabled={!writable}
               onClick={async () => {
                 if (await confirmAction({ title: '放弃全部未应用草稿？', confirm: '放弃草稿' }))
                   void run(async () => {
@@ -1409,7 +1434,7 @@ export default function App() {
               放弃未应用草稿
             </button>
             <button
-              disabled={!editable}
+              disabled={!writable}
               onClick={async () => {
                 if (await confirmAction({ title: '回滚到上一个生效版本？', confirm: '回滚' }))
                   void run(async () => {
@@ -1463,7 +1488,7 @@ export default function App() {
           {busy ? '正在处理…' : message}
         </span>
         <button
-          disabled={busy || !ready}
+          disabled={busy || !ready || changing}
           className="primary"
           onClick={() =>
             run(async () => {
@@ -1773,7 +1798,7 @@ export default function App() {
             <div className="modal-footer">
               <span>保存后还需点击主窗口的“应用设置”，指令才会生效</span>
               <button onClick={() => void closeEditor()}>取消</button>
-              <button disabled={busy || !editable} className="primary" onClick={commitEdit}>
+              <button disabled={busy || !writable} className="primary" onClick={commitEdit}>
                 保存
               </button>
             </div>
@@ -1796,6 +1821,7 @@ export default function App() {
               {dialog.importConfig && (
                 <button
                   className="primary"
+                  disabled={changing}
                   onClick={() => {
                     const imported = dialog.importConfig;
                     if (!imported) return;

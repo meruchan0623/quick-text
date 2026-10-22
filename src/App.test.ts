@@ -373,6 +373,25 @@ async function clickIn(mounted: Mounted, root: ParentNode | null, text: string):
   });
 }
 
+/**
+ * Call `element`'s React handler `name` itself, as an event the UI did not stop would. A disabled
+ * control gets no events; this reaches the handler's own refusal. Not awaited: it may wait on a
+ * dialog.
+ */
+async function callHandler(
+  mounted: Mounted,
+  element: Element | null | undefined,
+  name: 'onClick' | 'onChange',
+  event: object = {},
+): Promise<void> {
+  const props = Object.entries(element ?? {}).find(([key]) => key.startsWith('__reactProps$'));
+  const handler = (props?.[1] as Record<string, unknown> | undefined)?.[name];
+  if (typeof handler !== 'function') throw new Error(`no ${name} on the element`);
+  await mounted.act(() => {
+    void (handler as (event: object) => unknown)(event);
+  });
+}
+
 const statusText = (container: HTMLElement) =>
   container.querySelector('.status-text')?.textContent ?? '';
 
@@ -2196,28 +2215,47 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
         expect(sentSeparators(backend)).toBe(' |');
       });
 
-      it('sets 总开关 as each click chose when two saves of it are put under an edit', async () => {
+      it('sets 总开关 as the click chose, over a view taken in that turned it elsewhere', async () => {
         const hold = holdAnswers('save_draft');
         const mounted = await mountReady(hold);
         const { backend, container } = mounted;
-        const before = await toggleHeld(mounted, hold);
-        // The box shows the editor's config until an answer: clicked again, it asks for the same.
-        expect(enabled(container)).toBe(before);
+        await click(mounted, '文本指令参数设置');
+        await type(mounted, field(container, '词分隔符'), ' ;');
+        // Another window turns 总开关, read over the edit: the editor keeps its own.
+        await mounted.act(() => {
+          backend.publishExternally((config) => {
+            config.enabled = !config.enabled;
+          });
+        });
+        await waitFor(mounted, () => {
+          expect(notices(container)).toContain(
+            '配置已在后台更新为 v2。编辑器中未保存的修改仍然保留',
+          );
+        });
+        await click(mounted, '文本指令管理');
+        const before = enabled(container);
         hold.arm();
         await toggle(mounted);
         await waitFor(mounted, () => {
-          expect(hold.held[1]?.read).toBe(true);
+          expect(hold.held[0]?.read).toBe(true);
         });
         expect(sentEnabled(backend)).toBe(!before);
         await click(mounted, '文本指令参数设置');
         await type(mounted, field(container, '词分隔符'), ' |');
+        // Another command done meanwhile leaves the notice's buttons usable.
+        await mounted.act(() => {
+          checkbox(container, '登录后自动启动')?.click();
+        });
+        await waitFor(mounted, () => {
+          expect(button(container, '放弃修改，载入新配置')?.disabled).toBe(false);
+        });
+        // v2, read before the save ran, has 总开关 as the click set it: turned over, it is undone.
+        await click(mounted, '放弃修改，载入新配置');
         await answerHeld(mounted, hold, 0);
-        await answerHeld(mounted, hold, 1);
         await click(mounted, '文本指令管理');
         expect(enabled(container)).toBe(!before);
         expect(await exportSaves(mounted)).toBe(true);
         expect(sentEnabled(backend)).toBe(!before);
-        expect(sentSeparators(backend)).toBe(' |');
       });
 
       it('deletes the selected rules under edits made while the delete ran, and unselects them', async () => {
@@ -2335,52 +2373,69 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
         expect(sentSeparators(backend)).toBe(' |');
       });
 
-      it('makes nothing again over 放弃未应用草稿 sent after the edits, which ran after the save', async () => {
+      // No store write is sent while the save runs (review C10): another window undoes it, and a
+      // load reads that after the save ran, which the editor takes in.
+      it('makes nothing again over a view read after the save ran, undoing it, taken in', async () => {
         const hold = holdAnswers('save_draft');
         const mounted = await mountReady(hold);
-        const { container } = mounted;
-        await click(mounted, '文本指令参数设置');
-        const original = separators(container);
+        const { backend, container } = mounted;
         const before = await toggleHeld(mounted, hold);
         await click(mounted, '文本指令参数设置');
         await type(mounted, field(container, '词分隔符'), ' |');
-        await confirmOnStatus(mounted, DISCARD);
-        await waitFor(mounted, () => {
-          expect(separators(container)).toBe(original);
+        await mounted.act(() => {
+          backend.publishExternally((config) => {
+            config.enabled = !config.enabled;
+          });
         });
-        // Dropped: the discard's answer is of a later request. The discarded draft stays.
+        await focusLoad(mounted);
+        expect(notices(container)).toContain('配置已在后台更新为 v2。编辑器中未保存的修改仍然保留');
+        // Another command done meanwhile leaves the notice's buttons usable.
+        await mounted.act(() => {
+          checkbox(container, '登录后自动启动')?.click();
+        });
+        await waitFor(mounted, () => {
+          expect(button(container, '放弃修改，载入新配置')?.disabled).toBe(false);
+        });
+        await click(mounted, '放弃修改，载入新配置');
+        // v2: the draft the save left (with the edit it sent), 总开关 turned back.
+        expect(separators(container)).toBe(' ;');
+        // Dropped: v2 is newer. The view taken in stays as it is.
         await answerHeld(mounted, hold, 0);
-        expect(separators(container)).toBe(original);
+        expect(separators(container)).toBe(' ;');
         await click(mounted, '文本指令管理');
         expect(enabled(container)).toBe(before);
         expect(await exportSaves(mounted)).toBe(false);
       });
 
-      it('lets 放弃未应用草稿 sent after the edits take the editor once a save is made again', async () => {
+      // As above, the view read after the save ran comes after its answer: the change is made again
+      // under the edits, and the view, said newer, takes the editor when asked to.
+      it('lets a view read after the save ran take the editor, asked to, after the change is made again', async () => {
         const hold = holdAnswers('save_draft');
         const mounted = await mountReady(hold);
-        const discard = holdAnswers('discard_draft');
-        discard.attach(mounted.backend);
-        const { container } = mounted;
-        await click(mounted, '文本指令参数设置');
-        const original = separators(container);
+        const { backend, container } = mounted;
         const before = await toggleHeld(mounted, hold);
         await click(mounted, '文本指令参数设置');
         await type(mounted, field(container, '词分隔符'), ' |');
-        discard.arm();
-        await confirmOnStatus(mounted, DISCARD);
-        await waitFor(mounted, () => {
-          expect(discard.held[0]?.read).toBe(true);
+        // Read once the save is done: a revision's read waits for the writes in flight.
+        await mounted.act(() => {
+          backend.publishExternally((config) => {
+            config.enabled = !config.enabled;
+          });
         });
-        // The save's answer first: its change put under the edit, which is no edit itself.
         await answerHeld(mounted, hold, 0);
+        await waitFor(mounted, () => {
+          expect(notices(container)).toContain(
+            '配置已在后台更新为 v2。编辑器中未保存的修改仍然保留',
+          );
+        });
         expect(separators(container)).toBe(' |');
-        // Then the discard's, with no edit since it was sent: the editor takes the discarded draft.
-        await answerHeld(mounted, discard, 0);
-        expect(separators(container)).toBe(original);
         await click(mounted, '文本指令管理');
+        expect(enabled(container)).toBe(!before);
+        await click(mounted, '放弃修改，载入新配置');
         expect(enabled(container)).toBe(before);
         expect(await exportSaves(mounted)).toBe(false);
+        await click(mounted, '文本指令参数设置');
+        expect(separators(container)).toBe(' ;');
       });
 
       it('keeps the editor unsaved when a save is made again over a view read before it ran', async () => {
@@ -2452,6 +2507,175 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
         expect(await exportSaves(mounted)).toBe(true);
         expect(sentEnabled(backend)).toBe(!before);
         expect(sent(backend)?.globals.blacklist).toContain('notepad.exe');
+      });
+
+      describe("no store write while a save's change is in flight (review C10)", () => {
+        const PENDING = '上一次保存尚未完成，请稍候';
+        const errorShown = (container: HTMLElement) =>
+          container.querySelector('.alert.error')?.textContent ?? '';
+        const batchDelete = (container: HTMLElement) =>
+          [...container.querySelectorAll<HTMLButtonElement>('.batch button')].find(
+            (b) => b.textContent === '删除',
+          );
+
+        it('sends no other save while 总开关 saves, and saves again once it answers', async () => {
+          const hold = holdAnswers('save_draft');
+          const mounted = await mountReady(hold);
+          const { backend, container } = mounted;
+          const before = await toggleHeld(mounted, hold);
+          await click(mounted, '文本指令参数设置');
+          await type(mounted, field(container, '词分隔符'), ' |');
+          const saveButton = () => button(container, '保存参数草稿');
+          expect(saveButton()?.disabled).toBe(true);
+          // Sent, it would have the edits without 总开关 turned, and undo it.
+          await callHandler(mounted, saveButton(), 'onClick');
+          await settle(mounted);
+          expect(errorShown(container)).toContain(PENDING);
+          expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+          await answerHeld(mounted, hold, 0);
+          expect(saveButton()?.disabled).toBe(false);
+          await saveSettings(mounted);
+          expect(sentEnabled(backend)).toBe(!before);
+          expect(sentSeparators(backend)).toBe(' |');
+        });
+
+        it('deletes nothing while 总开关 saves its change', async () => {
+          const hold = holdAnswers('save_draft');
+          const mounted = await mountReady(hold);
+          const { backend, container } = mounted;
+          for (const label of ['选择 ;s1', '选择 ;s3']) {
+            const box = container.querySelector<HTMLInputElement>(`input[aria-label="${label}"]`);
+            await mounted.act(() => {
+              box?.click();
+            });
+          }
+          const before = enabled(container);
+          hold.arm();
+          await toggle(mounted);
+          await waitFor(mounted, () => {
+            expect(hold.held[0]?.read).toBe(true);
+          });
+          expect(batchDelete(container)?.disabled).toBe(true);
+          await callHandler(mounted, batchDelete(container), 'onClick');
+          const question = '删除所选 2 条指令？';
+          await waitFor(mounted, () => {
+            expect(dialog(container, question)).not.toBeNull();
+          });
+          await clickIn(mounted, dialog(container, question), '删除');
+          await settle(mounted);
+          expect(errorShown(container)).toContain(PENDING);
+          expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+          await answerHeld(mounted, hold, 0);
+          expect(listed(container)).toEqual([';s1', ';s2', ';s3']);
+          expect(enabled(container)).toBe(!before);
+          expect(batchDelete(container)?.disabled).toBe(false);
+        });
+
+        it("leaves 总开关 usable while a save of the editor's config is in flight", async () => {
+          const hold = holdAnswers('save_draft');
+          const mounted = await mountReady(hold);
+          const { backend, container } = mounted;
+          await click(mounted, '文本指令参数设置');
+          await type(mounted, field(container, '词分隔符'), ' ;');
+          hold.arm();
+          await click(mounted, '保存参数草稿');
+          await waitFor(mounted, () => {
+            expect(hold.held[0]?.read).toBe(true);
+          });
+          await click(mounted, '文本指令管理');
+          const before = enabled(container);
+          expect(checkbox(container, '启用文本指令')?.disabled).toBe(false);
+          await toggle(mounted);
+          await waitFor(mounted, () => {
+            expect(callsOf(backend, 'save_draft')).toHaveLength(2);
+          });
+          await settle(mounted);
+          // Sent after the save of the edit, and with it.
+          expect(sentEnabled(backend)).toBe(!before);
+          expect(sentSeparators(backend)).toBe(' ;');
+          await answerHeld(mounted, hold, 0);
+          expect(errorShown(container)).toBe('');
+          expect(enabled(container)).toBe(!before);
+          expect(backend.draft.enabled).toBe(!before);
+        });
+
+        it('allows the writes again once a save of a change fails', async () => {
+          const hold = holdFailures('save_draft', FAILURE);
+          const mounted = await mountReady(hold);
+          const { backend, container } = mounted;
+          const before = await toggleHeld(mounted, hold);
+          expect(checkbox(container, '启用文本指令')?.disabled).toBe(true);
+          expect(button(container, '导出')?.disabled).toBe(true);
+          await answerHeld(mounted, hold, 0);
+          expect(errorShown(container)).toContain(FAILURE);
+          expect(checkbox(container, '启用文本指令')?.disabled).toBe(false);
+          expect(button(container, '导出')?.disabled).toBe(false);
+          const saves = callsOf(backend, 'save_draft').length;
+          await toggle(mounted);
+          await waitFor(mounted, () => {
+            expect(callsOf(backend, 'save_draft')).toHaveLength(saves + 1);
+          });
+          await settle(mounted);
+          expect(sentEnabled(backend)).toBe(!before);
+          expect(backend.draft.enabled).toBe(!before);
+        });
+
+        it('sends no 放弃未应用草稿, 恢复上一个版本 or 应用设置 while 总开关 saves its change', async () => {
+          const hold = holdAnswers('save_draft');
+          const mounted = await mountReady(hold);
+          const { backend, container } = mounted;
+          await click(mounted, '文本指令参数设置');
+          const original = separators(container);
+          await click(mounted, '文本指令管理');
+          const before = enabled(container);
+          hold.arm();
+          await toggle(mounted);
+          await waitFor(mounted, () => {
+            expect(hold.held[0]?.read).toBe(true);
+          });
+          // 应用设置 is disabled while busy too: another command done meanwhile ends that.
+          await click(mounted, '文本指令参数设置');
+          await mounted.act(() => {
+            checkbox(container, '登录后自动启动')?.click();
+          });
+          await waitFor(mounted, () => {
+            expect(callsOf(backend, 'set_autostart')).toHaveLength(1);
+          });
+          await settle(mounted);
+          expect(statusText(container)).not.toBe('正在处理…');
+          const apply = () => button(container, '应用设置');
+          expect(apply()?.disabled).toBe(true);
+          // Nothing unsaved: it would publish the draft at once.
+          await callHandler(mounted, apply(), 'onClick');
+          await settle(mounted);
+          expect(errorShown(container)).toContain(PENDING);
+          // An edit, then the commands that would undo the save, its change made again over them.
+          await type(mounted, field(container, '词分隔符'), ' |');
+          await click(mounted, '运行状态与恢复');
+          for (const [text, title, confirm] of [DISCARD, ROLLBACK]) {
+            expect(button(container, text)?.disabled).toBe(true);
+            await callHandler(mounted, button(container, text), 'onClick');
+            await waitFor(mounted, () => {
+              expect(dialog(container, title)).not.toBeNull();
+            });
+            await clickIn(mounted, dialog(container, title), confirm);
+            await settle(mounted);
+          }
+          for (const command of ['apply_settings', 'discard_draft', 'rollback'])
+            expect(callsOf(backend, command)).toEqual([]);
+          expect(errorShown(container)).toContain(PENDING);
+          await answerHeld(mounted, hold, 0);
+          for (const text of ['放弃未应用草稿', '恢复上一个版本', '应用设置'])
+            expect(button(container, text)?.disabled).toBe(false);
+          // Sent now, 放弃未应用草稿 puts in the editor the draft as discarded: the active config.
+          await confirmOnStatus(mounted, DISCARD);
+          await waitFor(mounted, () => {
+            expect(separators(container)).toBe(original);
+          });
+          await click(mounted, '文本指令管理');
+          expect(enabled(container)).toBe(before);
+          expect(await exportSaves(mounted)).toBe(false);
+        });
       });
     });
   });
