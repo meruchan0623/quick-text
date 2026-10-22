@@ -1,7 +1,8 @@
 //! User preferences in `prefs.json` (§9 「prefs.json」): `app` is defined by
 //! the backend, `ui` by the frontend and stored verbatim. Not part of the
 //! revision history or exports. A damaged file is quarantined and replaced by
-//! defaults, so it never blocks rule loading.
+//! defaults, so it never blocks rule loading. If it cannot be moved aside,
+//! loading fails instead, so no caller can overwrite the only copy.
 // Not wired to commands yet (phase 2: auto-listen, log level, hotkeys).
 #![allow(dead_code)]
 
@@ -62,9 +63,13 @@ pub struct LogLevelOverride {
 
 /// Reads `prefs.json` leniently. A missing file gives defaults; a file that
 /// is not valid prefs JSON is renamed to `prefs.corrupt-<time>.json` and
-/// defaults are returned. Only a file that exists but cannot be read (locked,
-/// access denied) is an error, so callers never overwrite preferences they
-/// could not see.
+/// defaults are returned. Errors, so callers never overwrite preferences
+/// they could not see or could not preserve:
+/// - the file exists but cannot be read (locked, access denied): `Io { op: read }`;
+/// - the file is damaged and the rename fails: `Io { op: rename }`, and the
+///   original stays where it is.
+///
+/// Callers that write prefs must load them first and give up on error.
 pub fn load_prefs(dir: &Path) -> Result<Prefs, CommandError> {
     let path = dir.join(FILE);
     let bytes = match fs::read(&path) {
@@ -76,7 +81,8 @@ pub fn load_prefs(dir: &Path) -> Result<Prefs, CommandError> {
     match serde_json::from_slice(bytes) {
         Ok(prefs) => Ok(prefs),
         Err(e) => {
-            quarantine(&path, &e);
+            quarantine(&path, &e)
+                .map_err(|err| CommandError::io(IoOp::Rename, Some(&path), &err))?;
             Ok(Prefs::default())
         }
     }
@@ -89,24 +95,34 @@ pub fn save_prefs(dir: &Path, prefs: &Prefs) -> Result<(), CommandError> {
     atomic_json(&dir.join(FILE), prefs)
 }
 
-/// Moves a damaged file aside. If that fails the defaults are still used and
-/// the next save replaces the damaged file.
-fn quarantine(path: &Path, reason: &dyn std::fmt::Display) {
+/// Moves a damaged file aside, keeping its bytes. Only the error category
+/// and position are logged: serde messages can quote file content.
+fn quarantine(path: &Path, reason: &serde_json::Error) -> io::Result<PathBuf> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let target = quarantine_path(dir, SystemTime::now());
     match fs::rename(path, &target) {
-        Ok(()) => tracing::warn!(
-            file = FILE,
-            to = ?file_label(&target),
-            reason = %reason,
-            "store.quarantine"
-        ),
-        Err(e) => tracing::error!(
-            file = FILE,
-            reason = %reason,
-            error = %e,
-            "store.quarantine failed"
-        ),
+        Ok(()) => {
+            tracing::warn!(
+                event = "store.quarantine",
+                file = FILE,
+                to = ?file_label(&target),
+                reason = ?reason.classify(),
+                line = reason.line(),
+                column = reason.column(),
+                "quarantined corrupt file"
+            );
+            Ok(target)
+        }
+        Err(e) => {
+            tracing::error!(
+                event = "store.quarantine_failed",
+                file = FILE,
+                reason = ?reason.classify(),
+                error = %e,
+                "could not move corrupt file aside; leaving it in place"
+            );
+            Err(e)
+        }
     }
 }
 
@@ -310,6 +326,40 @@ mod tests {
         assert_eq!(path.as_deref(), Some(FILE));
         assert!(dir.join(FILE).is_dir());
         assert!(quarantined(&dir).is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Codex review: a damaged file that cannot be moved aside must not be
+    /// replaced by defaults on the next save.
+    #[cfg(windows)]
+    #[test]
+    fn failed_quarantine_is_an_error_and_keeps_the_original() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let damaged = b"{\"app\": {\"auto_listen_on_start\": tr";
+        fs::write(dir.join(FILE), damaged).unwrap();
+        // Another process holding the file without delete sharing: reads
+        // work, the rename does not.
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(dir.join(FILE))
+            .unwrap();
+        let Err(CommandError::Io { op, path, .. }) = load_prefs(&dir) else {
+            panic!("a failed quarantine must be an Io error");
+        };
+        assert_eq!(op, IoOp::Rename);
+        assert_eq!(path.as_deref(), Some(FILE));
+        drop(holder);
+        assert_eq!(fs::read(dir.join(FILE)).unwrap(), damaged);
+        assert!(quarantined(&dir).is_empty());
+        // Once the file can be moved, the normal path applies again.
+        assert_eq!(load_prefs(&dir).unwrap(), Prefs::default());
+        let files = quarantined(&dir);
+        assert_eq!(files.len(), 1);
+        assert_eq!(fs::read(&files[0]).unwrap(), damaged);
         fs::remove_dir_all(dir).unwrap();
     }
 
