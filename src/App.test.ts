@@ -408,6 +408,28 @@ describe('rule list, editor and settings (F-04)', () => {
     expect(container.querySelector('.end-keys small')).toBeNull();
   });
 
+  it.each(['windows', 'macos'] as const)(
+    'offers the Esc IME erasure only where it runs, and says macOS is experimental (S-16): %s',
+    async (platform) => {
+      const mounted = await mount({ platform });
+      const { container } = mounted;
+      await waitFor(mounted, () => {
+        expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
+      });
+      await click(mounted, '文本指令参数设置');
+      const settings = container.querySelector('.settings')?.textContent ?? '';
+      expect(settings.includes('按 Esc')).toBe(platform !== 'windows');
+      expect(settings.includes('按缩写长度退格删除')).toBe(platform === 'windows');
+      expect(settings.includes('macOS 版尚未经过实机验收')).toBe(platform === 'macos');
+      await click(mounted, '文本指令管理');
+      await click(mounted, '编辑');
+      const editor = dialog(container, '编辑文本指令')?.textContent ?? '';
+      expect(editor).toMatch(/编辑文本指令|触发/);
+      expect(editor.includes('如何清除输入法中的缩写')).toBe(platform !== 'windows');
+      expect(editor.includes('按 Esc')).toBe(platform !== 'windows');
+    },
+  );
+
   it('shows save_draft validation in the editor and keeps it open', async () => {
     const mounted = await mount();
     const { backend, container } = mounted;

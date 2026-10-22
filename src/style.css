@@ -822,11 +822,29 @@ dialog.overlay::backdrop {
 .capability-table td:nth-child(2) {
   width: 130px;
 }
-.available {
+/* Capability status (principle 5, S-16): unavailable rows are grayed, the others tagged. */
+.capability-row.unavailable {
+  opacity: 0.55;
+}
+.capability-tag {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  border: 1px solid currentColor;
   color: #1b7a61;
 }
-.unavailable {
+.capability-tag.experimental {
+  color: #4a4fa8;
+}
+.capability-tag.degraded {
+  color: #8a5a00;
+}
+.capability-tag.unavailable {
   color: #9a5b13;
+}
+.fixed-value {
+  font-size: 13px;
 }
 .execution-result {
   padding: 16px;

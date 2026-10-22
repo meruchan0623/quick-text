@@ -1,7 +1,7 @@
 import { Fragment, useId, useRef, useState } from 'react';
 import { call } from './ipc/transport';
 import { diagnosticText, parseCommandError } from './ipc/errors';
-import { capabilityReasonText } from './ipc/labels';
+import { choiceCapability, findCapability } from './lib/capabilities';
 import { actionChoice, actionLabel, actionOptions, clone, Data, Rule } from './model';
 import { moveItem, withoutKey } from './lib/list';
 import {
@@ -20,7 +20,8 @@ type Props = {
   rules: Rule[];
   action: Data;
   diagnostics?: Data[];
-  capabilities?: Data[];
+  /** `get_capabilities` entries, as the backend sent them. */
+  capabilities?: unknown;
   onChange: (a: Data) => void;
   run: (f: () => Promise<any>, s?: string) => Promise<any>;
   show: (d: { title: string; data: any }) => void;
@@ -475,6 +476,11 @@ export default function ActionEditor({
       const p = await call<string[] | null>('choose_file', { kind });
       if (p?.length) fn(p);
     });
+  // Principle 5 (S-16): the capability the chosen action needs, and the action types this platform
+  // can never run, which are not offered (an action of such a type keeps its own entry).
+  const needed = findCapability(capabilities, choiceCapability(actionChoice(a)), platform);
+  const neverProvided = (choice: string) =>
+    findCapability(capabilities, choiceCapability(choice), platform)?.presentation === 'hidden';
   return (
     <>
       <p className="muted">{actionHelp[actionChoice(a)]}</p>
@@ -500,26 +506,25 @@ export default function ActionEditor({
           })}
         </div>
       )}
-      {capabilities
-        .filter(
-          (c) =>
-            !c.available &&
-            ((a.type === 'text' && c.id === a.method) ||
-              (a.type === 'send_keys' && c.id === 'keys') ||
-              (a.type === 'quicker' && c.id === 'quicker_private_action') ||
-              (a.type === 'replay' && c.id === 'recording') ||
-              (a.type === 'html' && c.id === 'html')),
-        )
-        .map((c) => (
-          <div className="capability-warning" key={c.id}>
-            <strong>当前电脑暂不支持此操作</strong>
-            <p>
-              {c.id === 'quicker_private_action'
-                ? '当前版本不能执行原 Quicker 动作；请改成这里支持的操作。'
-                : capabilityReasonText(c.reason)}
-            </p>
-          </div>
-        ))}
+      {needed && needed.presentation !== 'available' && (
+        <div className={`capability-warning ${needed.presentation}`}>
+          <strong>
+            {needed.usable ? (
+              <>
+                <span className={`capability-tag ${needed.presentation}`}>{needed.tag}</span>{' '}
+                {needed.name}
+              </>
+            ) : (
+              '当前电脑暂不支持此操作'
+            )}
+          </strong>
+          <p>
+            {needed.id === 'quicker_private_action'
+              ? '当前版本不能执行原 Quicker 动作；请改成这里支持的操作。'
+              : (needed.reason ?? '暂无额外说明')}
+          </p>
+        </div>
+      )}
       <label className="field">
         <span>操作类型</span>
         <select
@@ -539,11 +544,13 @@ export default function ActionEditor({
             setHistory([]);
           }}
         >
-          {actionOptions.map(([k, v]) => (
-            <option key={k} value={k}>
-              {v}
-            </option>
-          ))}
+          {actionOptions
+            .filter(([k]) => k === actionChoice(a) || !neverProvided(k))
+            .map(([k, v]) => (
+              <option key={k} value={k}>
+                {v}
+              </option>
+            ))}
         </select>
       </label>
       {(a.type === 'text' || a.type === 'send_keys') && (

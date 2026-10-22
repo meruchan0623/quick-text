@@ -37,6 +37,7 @@ import {
   unreadableEntries,
 } from './lib/rules';
 import { effectiveTerminators, unsupportedTerminators } from './lib/terminators';
+import { fixedImeErasure } from './lib/capabilities';
 import { ruleEditDiagnostics } from './lib/numberFields';
 
 // `null` from describe() means the user cancelled: show nothing.
@@ -713,6 +714,12 @@ export default function App() {
         <section className="settings">
           <h2>文本指令参数设置</h2>
           <p className="muted">以下选项与指令草稿一并发布，单条指令可覆盖触发字符。</p>
+          {platform === 'macos' && (
+            <p className="muted">
+              <span className="capability-tag experimental">实验性</span> macOS
+              版尚未经过实机验收，各项功能均为实验性，可能不稳定。
+            </p>
+          )}
           {/* IPC number contract (docs/ipc-contract-0.4.md §6); saving is not blocked. */}
           {settingsHaveUnsafeNumber(config) && (
             <p className="unsafe-number-note">
@@ -739,20 +746,31 @@ export default function App() {
               }
             />
           </Field>
-          <Field
-            label="默认输入法删除方式"
-            hint="Windows 新输入后端统一按缩写长度退格；Esc 选项仅保留原配置，当前不会执行 Esc。中文选字中的数字或空格可能选择候选词，建议切到英文输入后使用。"
-          >
-            <select
-              value={config.globals.ime_erasure}
-              onChange={(e) =>
-                change({ ...config, globals: { ...config.globals, ime_erasure: e.target.value } })
-              }
+          {fixedImeErasure(platform) ? (
+            // Principle 5 (S-16): the Windows input backend only erases by Backspace, so the Esc
+            // method it never runs is not offered; a stored `escape` is kept for other platforms.
+            <Field
+              label="默认输入法删除方式"
+              hint="Windows 版固定按缩写长度退格删除，不提供其他方式。中文选字中的数字或空格可能选择候选词，建议切到英文输入后使用。"
             >
-              <option value="escape">按 Esc 关闭选字框</option>
-              <option value="backspace">Backspace 删除已上屏字符</option>
-            </select>
-          </Field>
+              <span className="fixed-value">按缩写长度退格删除</span>
+            </Field>
+          ) : (
+            <Field
+              label="默认输入法删除方式"
+              hint="中文选字中的数字或空格可能选择候选词，建议切到英文输入后使用。"
+            >
+              <select
+                value={config.globals.ime_erasure}
+                onChange={(e) =>
+                  change({ ...config, globals: { ...config.globals, ime_erasure: e.target.value } })
+                }
+              >
+                <option value="escape">按 Esc 关闭选字框</option>
+                <option value="backspace">Backspace 删除已上屏字符</option>
+              </select>
+            </Field>
+          )}
           <Field
             label="黑名单程序"
             hint="每行一个 Windows 进程名或 Mac 应用标识；黑名单内不执行文本指令。"
@@ -1059,30 +1077,32 @@ export default function App() {
                     )}
                   </>
                 )}
-                <Field
-                  label="如何清除输入法中的缩写"
-                  hint="此项保留原配置，便于导入和跨平台使用。Windows 新输入后端当前统一按缩写长度退格，不执行 Esc；输出后请查看目标结果。"
-                >
-                  <select
-                    value={editing.ime_erasure ?? 'inherit'}
-                    onChange={(e) =>
-                      setEditing({
-                        ...editing,
-                        ime_erasure: e.target.value === 'inherit' ? null : e.target.value,
-                      })
-                    }
+                {!fixedImeErasure(platform) && (
+                  <Field
+                    label="如何清除输入法中的缩写"
+                    hint="通常使用默认设置；输出后请查看目标结果。"
                   >
-                    <option value="inherit">
-                      使用默认设置（
-                      {config.globals.ime_erasure === 'backspace'
-                        ? '按退格键删除已输入的字'
-                        : '按 Esc 关闭选字框'}
-                      ）
-                    </option>
-                    <option value="escape">按 Esc 关闭选字框</option>
-                    <option value="backspace">按退格键删除已输入的字</option>
-                  </select>
-                </Field>
+                    <select
+                      value={editing.ime_erasure ?? 'inherit'}
+                      onChange={(e) =>
+                        setEditing({
+                          ...editing,
+                          ime_erasure: e.target.value === 'inherit' ? null : e.target.value,
+                        })
+                      }
+                    >
+                      <option value="inherit">
+                        使用默认设置（
+                        {config.globals.ime_erasure === 'backspace'
+                          ? '按退格键删除已输入的字'
+                          : '按 Esc 关闭选字框'}
+                        ）
+                      </option>
+                      <option value="escape">按 Esc 关闭选字框</option>
+                      <option value="backspace">按退格键删除已输入的字</option>
+                    </select>
+                  </Field>
+                )}
                 <Field
                   label="传给操作的内容来自哪里"
                   hint="通常保持默认。调用另一条指令或打开链接时，可把匹配到的文字作为附带内容传过去。"
