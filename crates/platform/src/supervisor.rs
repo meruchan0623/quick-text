@@ -70,6 +70,8 @@ pub const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Failure text for a recovery attempt that panicked (fixed text: panic
 /// payloads are never logged).
 const ATTEMPT_PANICKED: &str = "attempt panicked";
+/// Failure text for a recovery attempt that ran past [`ATTEMPT_TIMEOUT`].
+const ATTEMPT_TIMED_OUT: &str = "attempt did not return within ATTEMPT_TIMEOUT";
 
 /// One component's condition as reported to the supervisor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -437,27 +439,42 @@ impl Supervisor {
     /// Commits the result of attempt `id` (`before` is the observation it
     /// started from) if it is still the attempt in flight; otherwise it
     /// timed out or was abandoned by `repair()` and the result is dropped.
+    ///
+    /// The attempt's duration is checked here as well, under the lock: one
+    /// that took longer than ATTEMPT_TIMEOUT is a timeout even if no tick
+    /// noticed it while it ran, so it counts as one failure and whatever it
+    /// returned (success included) is discarded.
     fn commit(&self, id: u64, outcome: Result<Observed, String>, before: &Observed) {
         let mut machine = self.machine.lock();
         // The attempt can block for seconds (sequential reattach): backoff
         // and the verification window start when it returned.
         let now = self.clock.now();
-        let current = machine.in_flight.is_some_and(|attempt| attempt.id == id);
+        let current = machine.in_flight.filter(|attempt| attempt.id == id);
         let mut beat = self.beat.lock();
         if beat.attempt.is_some_and(|(running, _)| running == id) {
             beat.attempt = None;
         }
-        if !current {
+        let Some(attempt) = current else {
             tracing::warn!(
                 event = "supervisor.attempt_discarded",
                 attempt = id,
                 "result of an attempt that timed out or was superseded"
             );
             return;
-        }
+        };
         beat.progress = now;
         drop(beat);
         machine.in_flight = None;
+        if now.saturating_duration_since(attempt.started) > ATTEMPT_TIMEOUT {
+            tracing::warn!(
+                event = "supervisor.attempt_discarded",
+                attempt = id,
+                "attempt returned after ATTEMPT_TIMEOUT; counted as a timeout"
+            );
+            Self::failure(&mut machine, now, ATTEMPT_TIMED_OUT);
+            self.publish(&mut machine, before);
+            return;
+        }
         let after;
         let observed = match outcome {
             Ok(observed) => {
@@ -486,11 +503,7 @@ impl Supervisor {
         };
         if now.saturating_duration_since(attempt.started) > ATTEMPT_TIMEOUT {
             machine.in_flight = None;
-            Self::failure(
-                machine,
-                now,
-                "attempt did not return within ATTEMPT_TIMEOUT",
-            );
+            Self::failure(machine, now, ATTEMPT_TIMED_OUT);
         }
     }
 
@@ -1496,6 +1509,33 @@ mod tests {
         assert_eq!(rig.state(), HealthState::Recovering);
         rig.step(BACKOFF[1]);
         assert_eq!(rig.executor.rebuild_count(), 2);
+    }
+
+    /// The rebuild overruns ATTEMPT_TIMEOUT and then reports success, with
+    /// no tick or check in between to notice: the commit itself treats it
+    /// as a timeout, so it is one failure and the success is discarded.
+    #[test]
+    fn an_attempt_that_overran_the_timeout_fails_at_commit() {
+        let rig = Rig::healthy();
+        let clock = Arc::clone(&rig.clock);
+        *rig.executor.on_rebuild.lock() = Some(Arc::new(move || {
+            clock.advance(ATTEMPT_TIMEOUT + MS);
+        }));
+        *rig.executor.status.lock() = Status::Down(ReasonCode::ExecutorTimeout);
+        rig.step(MS);
+        rig.step(BACKOFF[0]);
+        assert_eq!(rig.executor.rebuild_count(), 1);
+        assert_eq!(
+            *rig.executor.status.lock(),
+            Status::Ok,
+            "the rebuild healed"
+        );
+        assert_eq!(rig.failures(), 1);
+        assert_eq!(rig.state(), HealthState::Recovering, "success discarded");
+        let machine = rig.supervisor.machine.lock();
+        assert!(machine.in_flight.is_none());
+        assert_eq!(machine.streak, 1);
+        assert_eq!(machine.next_attempt, Some(rig.clock.now() + BACKOFF[1]));
     }
 
     /// Puts a parked thread in the driver slot: `check()` sees a live
