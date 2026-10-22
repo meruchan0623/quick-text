@@ -27,6 +27,7 @@ use super::{
     protection::{protection_block, protection_worker},
 };
 use crate::traits::{ForegroundProbe, InputContext};
+use arc_swap::ArcSwapOption;
 use std::ffi::c_void;
 use std::sync::{atomic::AtomicUsize, PoisonError};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -183,20 +184,25 @@ impl Buffer {
         if !allowed {
             return;
         }
-        match &event.kind {
-            Kind::Text(text) => self.text.push_str(text),
-            Kind::Backspace => {
-                self.text.pop();
-            }
-            Kind::Neutral => {}
-            Kind::Reset => self.text.clear(),
+        edit(&mut self.text, &event.kind);
+    }
+}
+/// Applies one key to a typed-key buffer. The matcher's buffer and the busy
+/// shadow (S-19) edit by the same rules.
+fn edit(text: &mut String, kind: &Kind) {
+    match kind {
+        Kind::Text(typed) => text.push_str(typed),
+        Kind::Backspace => {
+            text.pop();
         }
-        while self.text.chars().count() > 1024 {
-            let Some(first) = self.text.chars().next() else {
-                break;
-            };
-            self.text.drain(..first.len_utf8());
-        }
+        Kind::Neutral => {}
+        Kind::Reset => text.clear(),
+    }
+    while text.chars().count() > 1024 {
+        let Some(first) = text.chars().next() else {
+            break;
+        };
+        text.drain(..first.len_utf8());
     }
 }
 fn kind(vkey: u16, text: Option<String>, modified: bool) -> Kind {
@@ -245,7 +251,16 @@ pub(super) struct RawRecord {
     context: Option<InputContext>,
     pub(super) generation: u64,
     modified: bool,
-    allowed: bool,
+    /// Matching was paused when the key-down was captured.
+    paused: bool,
+    /// An action was running when the key-down was captured: the matcher
+    /// drops the key, the busy shadow takes it (S-19).
+    busy: bool,
+    /// How many records the lane had dropped, or lost to a callback panic,
+    /// when this one was queued ([`push_raw`]). A change between two
+    /// records means a key between them is missing; the busy shadow breaks
+    /// its prefix there (S-19), as the generation gap breaks the matcher's.
+    lost: u64,
 }
 impl RawRecord {
     /// The detector's virtual-key code (generic Shift/Ctrl/Alt).
@@ -278,7 +293,9 @@ pub(super) fn raw_record(
             context: None,
             generation: shared.generation.load(Ordering::SeqCst),
             modified: false,
-            allowed: false,
+            paused: false,
+            busy: false,
+            lost: 0,
         });
     }
     let generation = shared
@@ -294,8 +311,17 @@ pub(super) fn raw_record(
         context,
         generation,
         modified: keys.modified(),
-        allowed: !shared.paused.load(Ordering::SeqCst) && !shared.busy.load(Ordering::SeqCst),
+        paused: shared.paused.load(Ordering::SeqCst),
+        busy: shared.busy.load(Ordering::SeqCst),
+        lost: 0,
     })
+}
+/// Queues a captured record on the RawInput lane, stamped with the lane's
+/// loss count so far ([`RawRecord::lost`]). The detector callback is the
+/// only producer, so the stamp is exact. Lock-free, no allocation.
+pub(super) fn push_raw(lane: &Lane<RawRecord>, mut record: RawRecord) -> bool {
+    record.lost = lane.dropped().wrapping_add(lane.panics());
+    lane.push(record)
 }
 /// The RawInput lane; created once, before the detector starts.
 pub(super) fn lane() -> &'static Lane<RawRecord> {
@@ -320,7 +346,7 @@ pub(super) fn event_from(shared: &Shared, record: &RawRecord) -> Option<Event> {
         stamp: stamp_of(context, revision),
         generation: record.generation,
         source: "rawinput_hardware",
-        captured_allowed: record.allowed,
+        captured_allowed: !record.paused && !record.busy,
     })
 }
 /// Consumer side, acceptance mode only: the matcher event for an injected
@@ -401,9 +427,220 @@ extern "C" fn callback(context: *mut c_void, event: InputEvent) {
     let shared = unsafe { &*(context as *const Arc<Shared>) };
     lane.contained((), || {
         if let Some(record) = raw_record(shared, &PHYSICAL, &event, &WinForeground) {
-            lane.push(record);
+            push_raw(lane, record);
         }
     });
+}
+/// The terminator a key types, if it is one. Safe text terminators already
+/// reach the target: erase shortcut plus terminator. RawInput never claims
+/// to swallow Enter or Tab.
+fn terminator_of(kind: &Kind) -> Option<&'static str> {
+    match kind {
+        Kind::Text(value) if value == " " => Some("space"),
+        Kind::Text(value) if value == ";" => Some("semicolon"),
+        _ => None,
+    }
+}
+/// Whether a match typed under `stamp` may count in `target`: the focus is
+/// still the one the key was typed into, the process is known and not ours,
+/// and no protected control has it.
+fn eligible(target: &Foreground, stamp: &Stamp, probe: &impl ForegroundProbe) -> bool {
+    target.id == stamp.focus
+        && !target.process.is_empty()
+        && !target.process.eq_ignore_ascii_case("quicker-text.exe")
+        && probe.protection().is_none()
+}
+/// A rule the user typed while an action was running, which the matcher
+/// dropped because it was busy (S-19). Identifiers only: never the
+/// abbreviation, the typed keys or any other text.
+#[allow(
+    dead_code,
+    reason = "S-19: read by the sink the runtime installs at merge"
+)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DroppedBusy {
+    /// The id of the matched rule.
+    pub(crate) rule_id: String,
+    /// The foreground process, from the same probe read that feeds
+    /// `LAST_PROCESS`.
+    pub(crate) process: String,
+}
+/// Where [`DroppedBusy`] reports go ([`set_dropped_busy_sink`]).
+type DroppedBusySink = Box<dyn Fn(DroppedBusy) + Send + Sync>;
+static DROPPED_BUSY_SINK: ArcSwapOption<DroppedBusySink> = ArcSwapOption::const_empty();
+/// Installs the sink for busy drops (S-19), replacing any earlier one.
+/// Until a sink is installed the busy shadow does nothing at all.
+///
+/// The sink is called synchronously on the input consumer thread, the one
+/// that drains the RawInput lane, once per report. It must not block (the
+/// runtime hands each report to a bounded queue); matching waits for it.
+/// A rule is reported at most once per busy period, however often it is
+/// typed.
+#[allow(dead_code, reason = "S-19: the runtime installs the sink at merge")]
+pub(crate) fn set_dropped_busy_sink(sink: Box<dyn Fn(DroppedBusy) + Send + Sync>) {
+    DROPPED_BUSY_SINK.store(Some(Arc::new(sink)));
+}
+/// Removes the sink again (tests only).
+#[cfg(test)]
+pub(super) fn clear_dropped_busy_sink() {
+    DROPPED_BUSY_SINK.store(None);
+}
+/// The busy shadow (S-19): a second typed-key buffer, apart from the
+/// matcher's, for the hardware keys the matcher drops only because an
+/// action is running. It matches and never executes: a match produces no
+/// candidate, is reported as [`DroppedBusy`] and forgotten. The matcher's
+/// buffer is untouched by it (busy keys still clear it, so a word typed
+/// during an action never triggers after it).
+///
+/// A key enters only when everything but busy would let the matcher take
+/// it: a hardware key-down (RawInput sees no injected key, ours included),
+/// captured busy, not paused at capture or now, with a readable input
+/// context and configuration. The match conditions are the matcher's: same
+/// stamp, focus unchanged, a known process that is not ours, no protected
+/// control, the same configuration revision, the same terminator rule, and
+/// the key still the latest input (its generation is current).
+///
+/// Prefix continuity (no-regression #3) applies here too, but not through
+/// consecutive generations: while busy the keyboard hook also advances the
+/// generation for every hardware key-down (so a running action stops at its
+/// next step), on another thread, so two consecutive busy keys lie 1, 2 or
+/// more generations apart depending on how the two threads interleave.
+/// Between two keys the shadow requires instead the same stamp, whose caret
+/// epoch every other prefix break advances together with the generation
+/// (external injected input, clicks and wheel, the stop gesture, focus
+/// events, session signals and lost or rebuilt sources), and the same lane
+/// loss count ([`RawRecord::lost`]), so a key the lane dropped breaks it
+/// like the gap it leaves in the matcher; a key that cannot become an event
+/// breaks it too. Acceptance mode's injected keys advance only the
+/// generation and do not break it (test harness only).
+///
+/// A busy period lasts until a key is captured while not busy; that key
+/// discards the shadow and its reports. Two busy periods with no such key
+/// between them would count as one, but they cannot meet: busy is set only
+/// when the consumer hands the executor a candidate, completed by a key
+/// captured while not busy that came through here first. Acceptance mode,
+/// whose trigger keys come from the hook, is the exception (test harness
+/// only).
+#[derive(Default)]
+pub(super) struct Shadow {
+    text: String,
+    /// The stamp of the last key folded in; `None` once the prefix broke.
+    stamp: Option<Stamp>,
+    /// The lane loss count of the last key folded in.
+    lost: u64,
+    /// The rules already reported in this busy period.
+    reported: Vec<String>,
+}
+impl Shadow {
+    /// The next key starts a new word.
+    fn break_prefix(&mut self) {
+        self.text.clear();
+        self.stamp = None;
+    }
+    /// The busy period is over: nothing of it is kept.
+    fn end_period(&mut self) {
+        self.break_prefix();
+        self.reported.clear();
+    }
+}
+/// Folds one RawInput record into the busy shadow and returns the busy
+/// drop it completes, if any ([`Shadow`]). `event` is what [`event_from`]
+/// made of the record.
+pub(super) fn shadow_match(
+    shared: &Shared,
+    shadow: &mut Shadow,
+    record: &RawRecord,
+    event: Option<&Event>,
+    probe: &impl ForegroundProbe,
+) -> Option<DroppedBusy> {
+    if !record.down {
+        return None;
+    }
+    if !record.busy {
+        shadow.end_period();
+        return None;
+    }
+    let Some(event) = event.filter(|_| !record.paused && !shared.paused.load(Ordering::SeqCst))
+    else {
+        shadow.break_prefix();
+        return None;
+    };
+    let terminator = terminator_of(&event.kind);
+    // no-regression #3, for the shadow: a terminator match needs the
+    // contiguous, same-stamp prefix.
+    let contiguous = shadow.stamp.as_ref() == Some(&event.stamp) && shadow.lost == record.lost;
+    let previous = (terminator.is_some() && contiguous).then(|| shadow.text.clone());
+    if !contiguous {
+        shadow.text.clear();
+    }
+    shadow.stamp = Some(event.stamp.clone());
+    shadow.lost = record.lost;
+    edit(&mut shadow.text, &event.kind);
+    if !matches!(event.kind, Kind::Text(_))
+        || event.generation != shared.generation.load(Ordering::SeqCst)
+    {
+        return None;
+    }
+    let target = probe.foreground();
+    if !eligible(&target, &event.stamp, probe) {
+        return None;
+    }
+    let Ok(compiler) = shared.compiled.lock() else {
+        return None;
+    };
+    if compiler.config.revision != event.stamp.revision {
+        shadow.text.clear();
+        return None;
+    }
+    let foreground_context = ForegroundContext {
+        platform: Platform::Windows,
+        process: target.process.clone(),
+        bundle_id: String::new(),
+    };
+    let (matched, _) = match_buffer(
+        &compiler,
+        &shadow.text,
+        previous.as_deref().zip(terminator),
+        &foreground_context,
+    )?;
+    let rule_id = compiler
+        .config
+        .rules
+        .iter()
+        .find(|rule| rule.id == matched.rule_id)?
+        .id
+        .clone();
+    drop(compiler);
+    shadow.text.clear();
+    if shadow.reported.contains(&rule_id) {
+        return None;
+    }
+    shadow.reported.push(rule_id.clone());
+    Some(DroppedBusy {
+        rule_id,
+        process: target.process,
+    })
+}
+/// The consumer's busy-shadow step for one RawInput record: a completed
+/// busy drop goes to the sink ([`set_dropped_busy_sink`]). Without a sink
+/// nothing is matched or kept.
+pub(super) fn shadow_step(
+    shared: &Shared,
+    shadow: &mut Shadow,
+    record: &RawRecord,
+    event: Option<&Event>,
+    probe: &impl ForegroundProbe,
+) {
+    let sink = DROPPED_BUSY_SINK.load();
+    let Some(sink) = sink.as_ref() else {
+        *shadow = Shadow::default();
+        return;
+    };
+    if let Some(dropped) = shadow_match(shared, shadow, record, event, probe) {
+        tracing::debug!(event = "rawinput.dropped_busy");
+        let sink: &DroppedBusySink = sink;
+        sink(dropped);
+    }
 }
 /// Match step: folds `event` into `buffer` and returns a candidate when a
 /// rule matches the current, unprotected target.
@@ -416,13 +653,7 @@ pub(super) fn detect_candidate(
     let allowed = event.captured_allowed
         && !shared.paused.load(Ordering::SeqCst)
         && !shared.busy.load(Ordering::SeqCst);
-    // Safe text terminators already reach the target: erase shortcut plus
-    // terminator. RawInput never claims to swallow Enter or Tab.
-    let terminator = match &event.kind {
-        Kind::Text(value) if value == " " => Some("space"),
-        Kind::Text(value) if value == ";" => Some("semicolon"),
-        _ => None,
-    };
+    let terminator = terminator_of(&event.kind);
     // no-regression #3: a terminator match needs the contiguous, same-stamp prefix.
     let previous = if terminator.is_some()
         && buffer.stamp.as_ref() == Some(&event.stamp)
@@ -441,11 +672,7 @@ pub(super) fn detect_candidate(
     }
     let target = probe.foreground();
     *LAST_PROCESS.lock().unwrap_or_else(PoisonError::into_inner) = target.process.clone();
-    if target.id != event.stamp.focus
-        || target.process.is_empty()
-        || target.process.eq_ignore_ascii_case("quicker-text.exe")
-        || probe.protection().is_some()
-    {
+    if !eligible(&target, &event.stamp, probe) {
         return None;
     }
     let Ok(compiler) = shared.compiled.lock() else {

@@ -46,6 +46,12 @@ pub use recording::finish_recording;
 pub(crate) use recording::recording_started;
 pub use selection::capture_selection;
 pub use session::on_session_end;
+// S-19: the runtime wires the busy-drop sink to the executor's history at merge.
+#[allow(
+    unused_imports,
+    reason = "S-19: used once the runtime installs the sink"
+)]
+pub(crate) use rawinput::{set_dropped_busy_sink, DroppedBusy};
 const MARK: usize = 0x51545854;
 static LAST_GATE: OnceLock<Mutex<String>> = OnceLock::new();
 fn gate(reason: &str) {

@@ -29,7 +29,8 @@ use super::{
     },
     liveness::{component_name, reason_name, CrossCheck, HealthTable, Source, Verdict},
     rawinput::{
-        acceptance_event, detect_candidate, event_from, note_source, Buffer, Event, RawRecord,
+        acceptance_event, detect_candidate, event_from, note_source, shadow_step, Buffer, Event,
+        RawRecord, Shadow,
     },
     recording::{record_event, stop_requested},
     session::{self, SessionSignals, Signal},
@@ -197,6 +198,8 @@ fn take_overflowed_stop(shared: &Shared, hooks: &HookPipe) {
 #[derive(Default)]
 pub(super) struct Consumer {
     buffer: Buffer,
+    /// Keys the matcher drops only because an action is running (S-19).
+    shadow: Shadow,
     reported: Reported,
     seen: Vec<Sighting>,
     own: OwnWindows,
@@ -241,7 +244,10 @@ impl Consumer {
             // Every record is a hardware key transition, with or without
             // context; only key-downs become text.
             self.seen.push((Source::Raw, record.vk(), record.down()));
-            if let Some(event) = event_from(shared, &record) {
+            let event = event_from(shared, &record);
+            // S-19: matched in the busy shadow, reported, never executed.
+            shadow_step(shared, &mut self.shadow, &record, event.as_ref(), probe);
+            if let Some(event) = event {
                 self.detect(shared, event, probe, enqueue);
             }
         }
@@ -365,6 +371,7 @@ impl Consumer {
     }
     fn reset(&mut self) {
         self.buffer = Buffer::default();
+        self.shadow = Shadow::default();
         self.seen.clear();
     }
 }

@@ -23,7 +23,10 @@ use super::keystate::{
     PHYSICAL,
 };
 use super::liveness::{MATCH_WINDOW, MISS_LIMIT, REPEAT_RUN};
-use super::rawinput::{raw_record, InputEvent, RawRecord, KEYBOARD_LAYOUT_CACHE_INTERVAL};
+use super::rawinput::{
+    clear_dropped_busy_sink, push_raw, raw_record, set_dropped_busy_sink, DroppedBusy, InputEvent,
+    RawRecord, KEYBOARD_LAYOUT_CACHE_INTERVAL,
+};
 use super::recording::{capture_gap, recording_started};
 use super::session::{end_message, SessionEnd, SessionSignals, Signal};
 use super::*;
@@ -189,16 +192,20 @@ fn nothing() {}
 
 /// An unpaused engine with one immediate literal rule.
 fn engine(trigger: &str) -> Arc<Shared> {
+    engine_with(trigger, trigger, TriggerMode::Immediate)
+}
+/// An unpaused engine with one literal rule `id` typed as `trigger`.
+fn engine_with(id: &str, trigger: &str, trigger_mode: TriggerMode) -> Arc<Shared> {
     let shared = Shared::new();
     shared.paused.store(false, Ordering::SeqCst);
     let config = Config {
         rules: vec![Rule {
-            id: trigger.into(),
+            id: id.into(),
             match_spec: MatchSpec {
                 kind: MatchKind::Literal,
                 value: trigger.into(),
             },
-            trigger_mode: TriggerMode::Immediate,
+            trigger_mode,
             ..Default::default()
         }],
         ..Default::default()
@@ -250,7 +257,7 @@ fn raw_key(
     ch: char,
 ) -> bool {
     let event = InputEvent::key_down(ch.to_ascii_uppercase() as u16, &ch.to_string(), true);
-    raw_record(shared, keys, &event, probe).is_some_and(|record| lane.push(record))
+    raw_record(shared, keys, &event, probe).is_some_and(|record| push_raw(lane, record))
 }
 /// Drains both lanes once; returns (rule id, generation) per accepted candidate.
 fn drain(
@@ -2977,4 +2984,400 @@ fn the_session_end_fault_replays_the_shutdown_messages() {
         ]
     );
     assert_eq!(*ran.lock().unwrap(), ["marker"]);
+}
+
+// ---- S-19: busy drops are reported, never executed ----
+
+/// What the busy-drop sink received, from every test; each S-19 test uses
+/// its own rule id and reads only its own reports.
+static BUSY_DROPS: Mutex<Vec<DroppedBusy>> = Mutex::new(Vec::new());
+fn collect_busy_drops() {
+    set_dropped_busy_sink(Box::new(|dropped| {
+        BUSY_DROPS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(dropped);
+    }));
+}
+fn busy_drops(rule: &str) -> Vec<DroppedBusy> {
+    BUSY_DROPS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .filter(|dropped| dropped.rule_id == rule)
+        .cloned()
+        .collect()
+}
+fn dropped_in_app(rule: &str) -> DroppedBusy {
+    DroppedBusy {
+        rule_id: rule.into(),
+        process: APP.into(),
+    }
+}
+/// An engine with one rule, both lanes and a consumer; keys reach the
+/// keyboard hook and then the RawInput callback, as on a real keyboard.
+struct BusyRig<P: ForegroundProbe> {
+    shared: Arc<Shared>,
+    keys: &'static KeyBits,
+    hooks: HookPipe<'static>,
+    raw: Lane<RawRecord>,
+    probe: P,
+    consumer: Consumer,
+}
+impl<P: ForegroundProbe> BusyRig<P> {
+    fn new(rule: &str, trigger: &str, mode: TriggerMode, probe: P, raw_capacity: usize) -> Self {
+        let keys = leaked_keys();
+        Self {
+            shared: engine_with(rule, trigger, mode),
+            keys,
+            hooks: HookPipe::new(keys, 64, false, nothing),
+            raw: Lane::new(raw_capacity, nothing),
+            probe,
+            consumer: Consumer::default(),
+        }
+    }
+    fn busy(&self, busy: bool) {
+        self.shared.busy.store(busy, Ordering::SeqCst);
+    }
+    fn hook_key(&self, ch: char) {
+        let vk = ch.to_ascii_uppercase() as u16;
+        assert_eq!(
+            handle_key(
+                &self.hooks,
+                &self.shared,
+                &self.probe,
+                WM_KEYDOWN,
+                hardware(vk)
+            ),
+            HookAction::Pass
+        );
+    }
+    fn raw_key(&self, ch: char) -> bool {
+        raw_key(&self.shared, self.keys, &self.raw, &self.probe, ch)
+    }
+    /// Each key reaches the hook, then RawInput: while busy the hook takes
+    /// a generation too, so busy keys are two generations apart.
+    fn type_keys(&self, word: &str) {
+        for ch in word.chars() {
+            self.hook_key(ch);
+            assert!(self.raw_key(ch));
+        }
+    }
+    /// The hook sees the whole word before RawInput delivers any of it.
+    fn type_lagging(&self, word: &str) {
+        word.chars().for_each(|ch| self.hook_key(ch));
+        word.chars().for_each(|ch| assert!(self.raw_key(ch)));
+    }
+    fn drain(&mut self) -> Vec<(String, u64)> {
+        drain(
+            &mut self.consumer,
+            &self.shared,
+            &self.hooks,
+            &self.raw,
+            &self.probe,
+        )
+    }
+    /// Types `word`, drains, and returns the candidates it produced.
+    fn enter(&mut self, word: &str) -> Vec<(String, u64)> {
+        self.type_keys(word);
+        self.drain()
+    }
+}
+/// The production probe's caret epoch: the one the hooks advance on
+/// external injected input and clicks. Other tests may advance it at any
+/// time, so it serves only cases that expect no report.
+struct LiveCaret(MockForeground);
+impl ForegroundProbe for LiveCaret {
+    fn foreground(&self) -> Foreground {
+        self.0.foreground()
+    }
+    fn protection(&self) -> Option<String> {
+        self.0.protection()
+    }
+    fn input_context(&self) -> Option<InputContext> {
+        self.0.input_context().map(|context| InputContext {
+            caret_epoch: super::observer::CARET_EPOCH.load(Ordering::SeqCst),
+            ..context
+        })
+    }
+}
+
+/// S-19: an abbreviation typed while an action runs reaches the sink once
+/// per busy period, as its rule id and process, and never becomes a
+/// candidate.
+#[test]
+fn a_rule_typed_while_busy_is_reported_once_and_never_executed() {
+    let _serial = serial();
+    collect_busy_drops();
+    let mut rig = BusyRig::new(
+        "s19-once",
+        "qzx",
+        TriggerMode::Immediate,
+        MockForeground::new(window()),
+        64,
+    );
+    rig.busy(true);
+    assert!(rig.enter("qzx").is_empty(), "no candidate while busy");
+    assert_eq!(busy_drops("s19-once"), [dropped_in_app("s19-once")]);
+    assert!(rig.enter("qzx").is_empty());
+    assert_eq!(busy_drops("s19-once").len(), 1, "once per busy period");
+    // A key captured while idle ends the period; in the next one the rule
+    // is reported again, here with RawInput lagging behind the hook.
+    rig.busy(false);
+    assert!(rig.enter("b").is_empty());
+    rig.busy(true);
+    rig.type_lagging("qzx");
+    assert!(rig.drain().is_empty());
+    assert_eq!(busy_drops("s19-once").len(), 2);
+    // A terminator rule needs its terminator, as in the matcher.
+    let mut rig = BusyRig::new(
+        "s19-word",
+        "qzt",
+        TriggerMode::Terminator,
+        MockForeground::new(window()),
+        64,
+    );
+    rig.busy(true);
+    assert!(rig.enter("qzt").is_empty());
+    assert!(busy_drops("s19-word").is_empty());
+    assert!(rig.enter(" ").is_empty());
+    assert_eq!(busy_drops("s19-word"), [dropped_in_app("s19-word")]);
+}
+
+/// S-19: keys typed while busy never reach the matcher's buffer, so
+/// nothing fires late, and the busy period's shadow ends with it.
+#[test]
+fn keys_typed_while_busy_never_complete_a_rule_afterwards() {
+    let _serial = serial();
+    collect_busy_drops();
+    let mut rig = BusyRig::new(
+        "s19-late",
+        "qzx",
+        TriggerMode::Immediate,
+        MockForeground::new(window()),
+        64,
+    );
+    // "qz" while busy, "x" after it.
+    rig.busy(true);
+    assert!(rig.enter("qz").is_empty());
+    rig.busy(false);
+    assert!(rig.enter("x").is_empty(), "the busy keys are not buffered");
+    // "qz" in one busy period, "x" in the next: the shadow did not survive.
+    rig.busy(true);
+    assert!(rig.enter("qz").is_empty());
+    rig.busy(false);
+    assert!(rig.enter("b").is_empty());
+    rig.busy(true);
+    assert!(rig.enter("x").is_empty());
+    assert!(busy_drops("s19-late").is_empty());
+    // The whole word while busy: reported, and nothing fires once idle.
+    assert!(rig.enter("qzx").is_empty());
+    rig.busy(false);
+    assert!(rig.drain().is_empty());
+    assert!(rig.enter("x").is_empty());
+    assert_eq!(busy_drops("s19-late").len(), 1);
+    // Idle, the matcher works as before.
+    rig.busy(false);
+    assert_eq!(rig.enter("qzx").len(), 1);
+    assert_eq!(busy_drops("s19-late").len(), 1);
+}
+
+/// S-19, no-regression #3 for the shadow: a word whose prefix broke while
+/// busy (focus, caret or layout stamp changed, a key lost or unreadable,
+/// external injected input, a click) is not reported.
+#[test]
+fn a_busy_word_with_a_broken_prefix_is_not_reported() {
+    let _serial = serial();
+    collect_busy_drops();
+    let probe = MockForeground::new(window());
+    let mut rig = BusyRig::new(
+        "s19-break",
+        "qzx",
+        TriggerMode::Immediate,
+        probe.clone(),
+        64,
+    );
+    rig.busy(true);
+    let breaks: [&dyn Fn(); 4] = [
+        &|| probe.update_input_context(|context| context.focus_epoch += 1),
+        &|| probe.update_input_context(|context| context.caret_epoch += 1),
+        &|| probe.update_input_context(|context| context.layout = 0x0407),
+        &|| {
+            probe.set_foreground(MockForeground::window(0x2b, APP));
+            probe.update_input_context(|context| context.focus = 0x2b);
+        },
+    ];
+    for change in breaks {
+        assert!(rig.enter("qz").is_empty());
+        change();
+        assert!(rig.enter("x").is_empty());
+    }
+    assert!(busy_drops("s19-break").is_empty());
+    assert!(rig.enter("qzx").is_empty());
+    assert_eq!(busy_drops("s19-break").len(), 1, "control");
+    // Before a terminator too.
+    let probe = MockForeground::new(window());
+    let mut rig = BusyRig::new(
+        "s19-break-word",
+        "qzt",
+        TriggerMode::Terminator,
+        probe.clone(),
+        64,
+    );
+    rig.busy(true);
+    assert!(rig.enter("qzt").is_empty());
+    probe.update_input_context(|context| context.caret_epoch += 1);
+    assert!(rig.enter(" ").is_empty());
+    assert!(busy_drops("s19-break-word").is_empty());
+    assert!(rig.enter("qzt ").is_empty());
+    assert_eq!(busy_drops("s19-break-word").len(), 1, "control");
+    // A key the RawInput lane dropped, or one without an input context,
+    // leaves no text behind but still breaks the word.
+    let probe = MockForeground::new(window());
+    let mut rig = BusyRig::new("s19-gap", "qx", TriggerMode::Immediate, probe.clone(), 1);
+    rig.busy(true);
+    assert!(rig.raw_key('q'));
+    assert!(!rig.raw_key('z'), "lane full");
+    assert!(rig.drain().is_empty());
+    assert!(rig.raw_key('x'));
+    assert!(rig.drain().is_empty());
+    assert!(rig.enter("q").is_empty());
+    probe.set_input_context(None);
+    assert!(rig.enter("z").is_empty());
+    probe.set_input_context(Some(context()));
+    assert!(rig.enter("x").is_empty());
+    assert!(busy_drops("s19-gap").is_empty());
+    assert!(rig.enter("q").is_empty());
+    assert!(rig.enter("x").is_empty());
+    assert_eq!(busy_drops("s19-gap").len(), 1, "control");
+    // External injected input and clicks advance the caret epoch the
+    // production probe reads.
+    let mut rig = BusyRig::new(
+        "s19-caret",
+        "qzx",
+        TriggerMode::Immediate,
+        LiveCaret(MockForeground::new(window())),
+        64,
+    );
+    rig.busy(true);
+    assert!(rig.enter("qz").is_empty());
+    for msg in [WM_KEYDOWN, WM_KEYUP] {
+        assert_eq!(
+            handle_key(&rig.hooks, &rig.shared, &rig.probe, msg, injected(0x58)),
+            HookAction::Pass
+        );
+    }
+    assert!(rig.enter("x").is_empty());
+    assert!(rig.enter("qz").is_empty());
+    handle_mouse(&rig.hooks, &rig.shared, mouse(WM_LBUTTONDOWN, 5, 5));
+    handle_mouse(&rig.hooks, &rig.shared, mouse(WM_LBUTTONUP, 5, 5));
+    assert!(rig.enter("x").is_empty());
+    assert!(busy_drops("s19-caret").is_empty());
+}
+
+/// S-19: the shadow matches only where the matcher would: not in a
+/// protected control, our own process, an unknown process or a window
+/// other than the one typed into, not while paused, and not across a
+/// configuration change.
+#[test]
+fn a_busy_word_is_reported_only_where_the_matcher_would_take_it() {
+    let _serial = serial();
+    collect_busy_drops();
+    let probe = MockForeground::new(window());
+    let mut rig = BusyRig::new(
+        "s19-target",
+        "qzx",
+        TriggerMode::Immediate,
+        probe.clone(),
+        64,
+    );
+    rig.busy(true);
+    probe.set_protection(Some("password field"));
+    assert!(rig.enter("qzx").is_empty());
+    probe.set_protection(None);
+    for process in ["quicker-text.exe", "Quicker-Text.EXE", ""] {
+        probe.set_foreground(MockForeground::window(FOCUS, process));
+        assert!(rig.enter("qzx").is_empty());
+    }
+    probe.set_foreground(MockForeground::window(0x2b, APP));
+    assert!(rig.enter("qzx").is_empty(), "typed into another window");
+    probe.set_foreground(window());
+    // Paused when the keys were captured, or by the time they are drained.
+    rig.shared.paused.store(true, Ordering::SeqCst);
+    rig.type_keys("qzx");
+    rig.shared.paused.store(false, Ordering::SeqCst);
+    assert!(rig.drain().is_empty());
+    rig.type_keys("qzx");
+    rig.shared.paused.store(true, Ordering::SeqCst);
+    assert!(rig.drain().is_empty());
+    rig.shared.paused.store(false, Ordering::SeqCst);
+    // Another key followed before the word was drained: only the latest
+    // key completes a rule.
+    rig.type_keys("qzx");
+    rig.type_keys("b");
+    assert!(rig.drain().is_empty());
+    // The configuration changed between the prefix and the last key.
+    assert!(rig.enter("qz").is_empty());
+    rig.shared.compiled.lock().unwrap().config.revision += 1;
+    assert!(rig.enter("x").is_empty());
+    assert!(busy_drops("s19-target").is_empty());
+    assert!(rig.enter("qzx").is_empty());
+    assert_eq!(busy_drops("s19-target"), [dropped_in_app("s19-target")]);
+}
+
+/// S-19: a report carries the rule id and the process only; neither the
+/// report nor the log has any of the typed abbreviation.
+#[test]
+fn a_busy_drop_report_carries_no_typed_text() {
+    let _serial = serial();
+    collect_busy_drops();
+    let mut rig = BusyRig::new(
+        "s19-sentinel",
+        "zqjk",
+        TriggerMode::Immediate,
+        MockForeground::new(window()),
+        64,
+    );
+    rig.busy(true);
+    let (found, lines) = capture::logs(|| rig.enter("zqjk"));
+    assert!(found.is_empty());
+    let drops = busy_drops("s19-sentinel");
+    assert_eq!(drops, [dropped_in_app("s19-sentinel")]);
+    assert_eq!(
+        count_of(&lines, "event=\"rawinput.dropped_busy\""),
+        1,
+        "{lines:?}"
+    );
+    let shown = format!("{drops:?}");
+    for typed in ["zq", "qj", "jk", "zqj", "qjk", "zqjk"] {
+        assert!(!shown.contains(typed), "{shown}");
+        assert!(lines.iter().all(|line| !line.contains(typed)), "{lines:?}");
+    }
+}
+
+/// S-19: without a sink the shadow matches and keeps nothing, and the
+/// matcher is unchanged.
+#[test]
+fn without_a_sink_busy_keys_have_no_effect() {
+    let _serial = serial();
+    clear_dropped_busy_sink();
+    let mut rig = BusyRig::new(
+        "s19-nosink",
+        "qzx",
+        TriggerMode::Immediate,
+        MockForeground::new(window()),
+        64,
+    );
+    rig.busy(true);
+    // Nothing typed before the sink was installed counts after it.
+    assert!(rig.enter("qz").is_empty());
+    collect_busy_drops();
+    assert!(rig.enter("x").is_empty());
+    assert!(busy_drops("s19-nosink").is_empty());
+    clear_dropped_busy_sink();
+    let (found, lines) = capture::logs(|| rig.enter("qzx"));
+    assert!(found.is_empty());
+    assert_eq!(count_of(&lines, "rawinput.dropped_busy"), 0, "{lines:?}");
+    rig.busy(false);
+    assert_eq!(rig.enter("qzx").len(), 1);
 }
