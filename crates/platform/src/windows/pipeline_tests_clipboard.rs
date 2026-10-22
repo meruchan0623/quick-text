@@ -384,6 +384,32 @@ fn refused_paste_write_keeps_the_trigger() {
 }
 
 #[test]
+fn busy_paste_capture_keeps_the_trigger_and_restores() {
+    let mut rig = Rig::new(rule(None, OutputMethod::Paste));
+    let candidate = rig.type_str("btw").unwrap();
+    // Locks: 0 backup, 1 backup verification, 2 paste write; every attempt
+    // at verifying it is busy, so the capture read nothing.
+    let script = rig.clipboard.clone();
+    rig.clipboard.on_lock(move |index| {
+        if index == 2 {
+            script.set_busy(OPEN_ATTEMPTS);
+        }
+    });
+    let result = rig.execute(&candidate).unwrap();
+    assert_eq!(result.status, "failed");
+    assert_eq!(result.message, "Clipboard is busy");
+    assert_eq!(result.completed_steps, 0);
+    assert!(result.side_effects, "the clipboard was written");
+    assert!(
+        rig.injector.calls().is_empty(),
+        "no backspace, no paste chord"
+    );
+    // Never captured, not failed: the restore brings the original back.
+    assert_eq!(rig.clipboard.content(), clip("original"));
+    assert_eq!(rig.clipboard.clears(), 2);
+}
+
+#[test]
 fn open_retry_is_bounded_and_exhaustion_degrades_the_clipboard() {
     let mut rig = Rig::new(rule(None, OutputMethod::Paste));
     rig.clipboard.set_busy(OPEN_ATTEMPTS - 1);
