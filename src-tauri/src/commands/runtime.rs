@@ -41,7 +41,7 @@ pub async fn execute_action(
     action: Action,
     app: tauri::AppHandle,
 ) -> Result<ExecutionResult, CommandError> {
-    let (engine, busy, compiled, action, speed) = {
+    let (engine, runtime, busy, compiled, action, speed) = {
         let state = app.state::<Managed>();
         let s = state.lock();
         // Safe mode: the data is for viewing; nothing runs (B-04).
@@ -56,6 +56,7 @@ pub async fn execute_action(
         let compiled = s.engine.compiled.lock().unwrap().clone();
         (
             s.engine.clone(),
+            s.runtime.clone(),
             busy,
             compiled,
             action.clone(),
@@ -65,10 +66,14 @@ pub async fn execute_action(
             },
         )
     };
+    // The runtime does not watch `busy`; a manual run records no history,
+    // so the claim and its release are announced here (`engine-state`).
+    runtime.refresh_state();
     let window = app.get_webview_window("main");
     if let Some(w) = &window {
         if let Err(e) = w.hide() {
             drop(busy);
+            runtime.refresh_state();
             return Err(CommandError::internal(e));
         }
     }
@@ -101,6 +106,7 @@ pub async fn execute_action(
     })
     .await;
     drop(busy);
+    runtime.refresh_state();
     if let Some(w) = window {
         let _ = w.show();
     }

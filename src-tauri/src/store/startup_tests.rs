@@ -1156,6 +1156,49 @@ fn autostart_repair_waits_until_the_store_is_writable() {
     }
 }
 
+/// Problems found after the load reach the problem sink, one
+/// `startup-problem` event each (contract §3): a reload (the Locked retry)
+/// reports only what was not listed before, `add_problem` what it adds.
+/// What the load itself found is read with `startup_problems`.
+#[test]
+fn later_problems_are_reported_once() {
+    let dir = TempDir::new();
+    let world = world();
+    write(&dir, "active.json", &bytes(&config_at(2)));
+    write(&dir, "draft.json", &bytes(&config_at(2)));
+    world.locked.lock().push("active.json");
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.safe_mode(), Some(SafeModeReason::Locked));
+    let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    store.set_problem_sink(Arc::new(move |problem: crate::startup::StartupProblem| {
+        sink.lock().push(problem.kind);
+    }));
+    assert!(
+        seen.lock().is_empty(),
+        "the load's own problems are not resent"
+    );
+
+    world.locked.lock().clear();
+    let skipped = ProblemKind::RulesSkipped {
+        count: 1,
+        ids: vec!["x".into()],
+    };
+    let mut report = retry_locked(&dir, &env(&world)).unwrap();
+    report.problems.push(skipped.clone().into());
+    store.apply_retry(report);
+    assert_eq!(store.safe_mode(), None);
+    assert_eq!(seen.lock().as_slice(), std::slice::from_ref(&skipped));
+    // Found again by a later reload: already listed, not sent again.
+    let mut report = load_or_fallback(&dir, &env(&world));
+    report.problems.push(skipped.clone().into());
+    store.apply_retry(report);
+    assert_eq!(seen.lock().as_slice(), std::slice::from_ref(&skipped));
+
+    store.add_problem(ProblemKind::AutostartRepaired {});
+    assert_eq!(*seen.lock(), [skipped, ProblemKind::AutostartRepaired {}]);
+}
+
 /// Fault injection (B-52): the store points behave as the real failures.
 #[cfg(feature = "fault-injection")]
 mod injected {

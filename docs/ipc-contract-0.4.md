@@ -57,11 +57,18 @@ Rust 侧的共享类型在 `crates/platform/src/health.rs`，JSON 形状由其 s
 
 | 事件 | 载荷 | 频率控制 |
 |---|---|---|
-| `engine-health` | `{ seq, state: HealthState, components: ComponentHealth[] }` | 状态变化时立即发送；状态不变时最多每 5 秒重发一次 |
-| `engine-state` | `{ seq, listening: boolean, paused_reasons: PauseReason[], busy: boolean, current_process: string \| null }` | 100ms 内的多次变化合并为一次 |
-| `execution-result` | `{ seq, entry: HistoryEntry, suppressed: number }` | ≤ 10 条/秒；超出的条目不单独推送，下一条推送的 `suppressed` 记被合并的条数，前端据此显示「另有 N 条」，需要明细时调用 `list_history` |
-| `startup-problem` | `{ seq, kind: string, severity: "info" \| "warning" \| "error", args: object }` | 每个问题一次；同时可通过 `startup_problems` 命令取全集 |
-| `engine-status` | 旧字符串 `"running"` \| `"paused"` \| `"listening"` | 0.4–0.5 保留为别名，不带 `seq`，新代码不要订阅 |
+| `engine-health` | `{ seq, state: HealthState, components: ComponentHealth[] }` | 状态变化时立即发送；状态不变时最多每 5 秒重发一次。细则：`state` 变化立即发送；`state` 不变、只有 `components` 变化时，距上次发送满 5 秒立即发送，否则只保留最新值，到 5 秒时发出（其间变回上次发出的值则不发）；没有变化不重发（无心跳） |
+| `engine-state` | `{ seq, listening: boolean, paused_reasons: PauseReason[], busy: boolean, current_process: string \| null }` | 100ms 内的多次变化合并为一次。细则：距上次发送满 100ms 的变化立即发送，否则只保留最新值，在上次发送后 100ms 发出（其间变回上次发出的值则不发） |
+| `execution-result` | `{ seq, entry: HistoryEntry, suppressed: number }` | ≤ 10 条/秒；超出的条目不单独推送，下一条推送的 `suppressed` 记被合并的条数，前端据此显示「另有 N 条」，需要明细时调用 `list_history`。细则：1 秒滑动窗口；窗口满时只保留最新一条，窗口一有空位就发出（或被随后的新条目带走），`suppressed` 是被它合并、没有单独推送的条数 |
+| `startup-problem` | `{ seq, kind: string, severity: "info" \| "warning" \| "error", args: object }` | 每个问题一次；同时可通过 `startup_problems` 命令取全集。只推送加载之后才出现的问题（SafeMode(Locked) 重试成功后新出现的问题、`autostart_repaired`、`self_test_failed`、`log_level_elevated`）；加载时已有的问题不推送，由 `load_state.startup_problems` 提供。问题消失（例如 Locked 重试成功后移除 `safe_mode`）不发事件，前端在 `engine-state` 的 `paused_reasons` 不再含 `safe_mode` 时重新调用 `startup_problems` |
+| `engine-status` | 旧字符串 `"running"` \| `"paused"` \| `"listening"` | 0.4–0.5 保留为别名，不带 `seq`，新代码不要订阅。某条 `engine-state` 使这个字符串变化时紧随其后发送 |
+
+发送规则（`src-tauri/src/events.rs`）：
+
+- 只有 EventBus 的一个线程发送事件，`seq` 在发送时分配，所以事件按 `seq` 顺序到达。第一条事件的 `seq` 是 1。
+- 启动时的初始 Health / State 不推送，前端从 `load_state`（或 `get_runtime_snapshot`）取初值。
+- 合并与限速只影响推送；托盘图标的提示、「暂停监听 / 恢复监听」菜单项和执行通知看到每一次变化。
+- 合并中、尚未发出的值不会出现在任何事件里，也不在 `get_runtime_snapshot` 里，直到它以更大的 `seq` 发出。
 
 类型细节（与 `health.rs` 一致）：
 
@@ -108,7 +115,7 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 |---|---|
 | 全部 | 错误类型改为 `CommandError` |
 | `load_state` | 返回值在原字段之外新增 `health: HealthSnapshot`、`engine_state: EngineState`（不含 `seq`）、`startup_problems: StartupProblem[]`、`safe_mode: SafeModeReason \| null`；`engine_status` 字符串保留 |
-| `set_paused(paused)` | 只置位或清除 `manual`；其他暂停原因仍在时，返回的状态仍是暂停。恢复（`paused: false`）在安全模式下返回 `safe_mode`；Health 不是 `healthy` / `degraded` 时返回 `engine_unavailable { health }`；录制中恢复不再返回 `busy`，而是清除 `manual` 后仍因 `recording` 保持暂停。托盘「暂停 / 恢复」走同一逻辑 |
+| `set_paused(paused)` | 只置位或清除 `manual`；其他暂停原因仍在时，返回的状态仍是暂停。恢复（`paused: false`）在安全模式下返回 `safe_mode`；Health 不是 `healthy` / `degraded` 时返回 `engine_unavailable { health }`；录制中恢复不再返回 `busy`，而是清除 `manual` 后仍因 `recording` 保持暂停。托盘菜单项走同一逻辑：监听中显示「暂停监听」，否则显示「恢复监听」；托盘恢复被拒绝时发系统通知说明原因（安全模式、引擎启动中、恢复中、已停止） |
 | `start_recording`、`stop_recording` | 录制期间置位 `recording` 暂停原因，录制结束即清除；结束后引擎回到其他原因决定的状态（录制前已手动暂停的仍暂停，原来在监听的恢复监听） |
 | `load_state.paused`、`engine_status` | 由运行时推导：`paused` = 不在监听（任何暂停原因，或 Health 不接受恢复）；`engine_status` 为 `running`（执行中）、`paused` 或 `listening` |
 | `save_draft(config)` | 先做校验，存在 error 级诊断时返回 `validation`（B-42） |

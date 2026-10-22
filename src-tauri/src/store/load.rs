@@ -58,6 +58,7 @@ impl Store {
             safe_import: false,
             writable_hooks: vec![],
             writable_done: vec![],
+            problem_sink: None,
         };
         store.install(report);
         store
@@ -86,11 +87,15 @@ impl Store {
         self.pending_import = None;
         self.load_metadata(safe_mode.is_none());
         // Problems found outside the load (autostart) survive a reload.
-        let kept: Vec<_> = self
-            .startup_problems
-            .drain(..)
-            .filter(|p| matches!(p.kind, ProblemKind::AutostartRepaired {}))
-            .collect();
+        let before = std::mem::take(&mut self.startup_problems);
+        // A reload (Locked retry) reports what it found that was not
+        // already listed; at the first load nobody listens yet.
+        for problem in report.problems.iter().filter(|p| !before.contains(p)) {
+            self.report_problem(problem);
+        }
+        let kept = before
+            .into_iter()
+            .filter(|p| matches!(p.kind, ProblemKind::AutostartRepaired {}));
         self.startup_problems = report.problems;
         self.startup_problems.extend(kept);
         self.set_safe_mode(safe_mode);

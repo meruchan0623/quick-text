@@ -61,10 +61,18 @@ fn main() {
             let engine = store.engine.clone();
             let runtime = store.runtime.clone();
             app.manage(Managed::new(store));
+            // The tray and the EventBus come before anything that can
+            // change the engine or find a problem, so the frontend and the
+            // tray miss nothing after the state `load_state` reads.
+            let pause_item = tray::build(app)?;
+            let status = tray::TrayStatus::new(app.handle().clone(), pause_item, engine.clone());
+            let bus = events::EventBus::start(&runtime, app.handle().clone(), Box::new(status));
+            app.state::<Managed>()
+                .lock()
+                .set_problem_sink(bus.problem_sink());
+            app.manage(bus);
             startup::after_load(app.handle());
-            tray::spawn_status_watcher(app.handle().clone(), engine.clone());
             startup::start_engine(engine, runtime);
-            tray::build(app)?;
             if std::env::args().any(|x| x == "--background") {
                 if let Some(w) = app.get_webview_window("main") {
                     w.hide()?;

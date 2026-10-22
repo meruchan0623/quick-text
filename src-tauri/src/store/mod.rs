@@ -18,6 +18,7 @@ pub use metadata::merge_import_metadata;
 
 use crate::{
     error::{CommandError, IoOp, SafeModeReason},
+    events::ProblemSink,
     startup::{ProblemKind, StartupProblem},
 };
 use atomic::atomic_json;
@@ -57,6 +58,9 @@ pub struct Store {
     writable_hooks: Vec<(&'static str, WritableHook)>,
     /// Keys of hooks that already ran.
     writable_done: Vec<&'static str>,
+    /// Where problems found after startup go (the EventBus, which sends
+    /// `startup-problem`); `None` until the bus is up and in unit tests.
+    problem_sink: Option<ProblemSink>,
 }
 
 /// Deferred work run with the store once it is writable.
@@ -89,9 +93,23 @@ impl Store {
     pub fn startup_problems(&self) -> &[StartupProblem] {
         &self.startup_problems
     }
+    /// Records a problem found after the load (autostart repaired, self-test
+    /// failed, ...) and reports it as one `startup-problem` event.
     pub fn add_problem(&mut self, kind: ProblemKind) {
-        // P5: push the `startup-problem` event here.
-        self.startup_problems.push(kind.into());
+        let problem = StartupProblem::from(kind);
+        self.report_problem(&problem);
+        self.startup_problems.push(problem);
+    }
+    /// From now on every new problem is also given to `sink`. Problems
+    /// already recorded are not: the frontend reads them with
+    /// `startup_problems` / `load_state`.
+    pub fn set_problem_sink(&mut self, sink: ProblemSink) {
+        self.problem_sink = Some(sink);
+    }
+    fn report_problem(&self, problem: &StartupProblem) {
+        if let Some(sink) = &self.problem_sink {
+            sink(problem.clone());
+        }
     }
     /// The safe-mode gate for write commands (plan §7.2): everything that
     /// writes data or settings, or would resume the engine, is refused.

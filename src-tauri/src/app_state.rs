@@ -1,9 +1,9 @@
 //! Tauri-managed state and the `load_state` snapshot sent to the frontend.
-use crate::{autostart, error::SafeModeReason, startup::StartupProblem, store::Store};
+use crate::{autostart, error::SafeModeReason, events, startup::StartupProblem, store::Store};
 use quicker_domain::Config;
 use quicker_platform::ExecutionResult;
 use serde::Serialize;
-use std::{path::PathBuf, sync::atomic::Ordering};
+use std::path::PathBuf;
 
 /// The store lock is `parking_lot` so a panic while it is held cannot poison
 /// it for every later command (B-01).
@@ -33,21 +33,15 @@ impl Store {
     pub fn state(&self) -> AppState {
         // Derived from the runtime, the pause authority: paused is "not
         // listening", whatever holds it (a reason or the engine not up).
-        let listening = self.runtime.engine_state().listening;
+        let engine = self.runtime.engine_state();
         AppState {
             draft: self.draft.clone(),
             active: self.active.clone(),
             revision: self.active.revision,
             dirty: self.draft != self.active,
-            paused: !listening,
-            engine_status: if self.engine.busy.load(Ordering::SeqCst) {
-                "running"
-            } else if !listening {
-                "paused"
-            } else {
-                "listening"
-            }
-            .into(),
+            paused: !engine.listening,
+            // The same mapping as the legacy `engine-status` event.
+            engine_status: events::legacy_status(&engine).into(),
             last_result: self.engine.last.lock().unwrap().clone(),
             capabilities: quicker_platform::capabilities(),
             autostart: autostart::is_enabled(),
