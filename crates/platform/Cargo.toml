@@ -1,0 +1,21 @@
+[package]
+name = "quicker-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+quicker-domain = { path = "../domain" }
+arboard = { version = "3", features = ["image-data"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "tiff", "webp"] }
+chrono = "0.4"
+encoding_rs = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_UI_Input_Ime", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_Shell"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_Accessibility", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant"] }
+
+[build-dependencies]
+cc = "1"

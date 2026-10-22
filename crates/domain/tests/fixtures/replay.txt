@@ -1,0 +1,12 @@
+// Synthetic 11-opcode corpus. Contains pointer movement and clicks; review before explicitly running.
+10; MV; None,-100,100,0;
+10; MD; Left,,,0;
+10; MC; Right,-99999,-99999,1;
+10; MU; Left,,,0;
+10; MH; None,,,1;
+10; MW; None,,,-1;
+10; DL;
+10; KD; Ctrl;
+10; KU; Ctrl;
+10; KP; Space;
+10; MVD; None,-10,0,0;

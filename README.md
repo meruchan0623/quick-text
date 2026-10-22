@@ -1,0 +1,59 @@
+# Quicker Text
+
+用于 Windows / macOS 的文本指令管理桌面应用。Tauri 2 + React 提供管理、参数设置和高级动作编辑，Rust 负责规则与三种脚本解析。Windows 输入检测与注入纳入 espanso v2.4.1 的原生组件，不需要另装 Espanso。规则、导入、界面与动作仍由本项目管理。源码依据见 [espanso 核对记录](docs/espanso-source-audit.md)。
+
+当前版本为 **0.3.1**，提供 Windows x64 绿色版，解压后运行 `quicker-text.exe`。需要 Windows 的 WebView2 运行环境。绿色版表示免安装，配置仍保存在当前用户的应用数据目录，不会放在 exe 旁边。0.3.1 移除规则的允许进程限制；macOS 未迁移到 espanso，尚无实机运行、完整应用链接、签名或公证验证。
+
+## Windows 绿色版与第一条指令
+
+1. 退出旧版 Quicker Text（托盘菜单中的“退出全部”），解压新绿色版，再启动 `quicker-text.exe`。关闭窗口只会隐藏到托盘；首次使用默认暂停。
+2. 添加一条测试指令，例如缩写 `thx`、立即执行、操作“粘贴纯文本”、正文 `Thanks very much.`。保存后点击主窗口“应用设置”，再恢复监听。
+3. 先在记事本等普通输入框试用。“粘贴纯文本”一次输出整段文字；“键入纯文本”一个字一个字输入。两个操作可以在下拉框中直接选择，来回切换会保留正文。
+4. 指令不再需要设置“生效进程”，Windows 和 Mac 均已移除允许列表。旧配置中的程序限制在加载时自动忽略，例如原先只允许 `notepad.exe` 的规则，现在也会在其他符合触发条件的程序中参与匹配。
+5. Windows 使用 espanso RawInput 检测字符，对最近的输入做规则匹配，随后退格并输出。支持立即、空格和分号触发；Tab、Enter 触发不可用。RawInput 不能在目标程序收到这两个按键前阻止它们。正文不可读取不会阻止触发；这不等于所有聊天软件已经实测通过。
+6. 黑名单、暂停、本程序窗口及已识别的密码/只读控件检查仍然有效。中文布局下的英文模式可输入字母、数字、标点缩写；中文选字时数字或空格可能用于选择候选词，建议切到英文模式后使用。
+7. 输出报告 `unknown` 表示系统已接受输入，目标程序是否收到尚未确认。新链路不会仅因无法读取正文而停止后续动作；焦点变化、继续按键、暂停或取消仍会中断执行。
+
+本次允许进程移除与验证结果见 [0.3.1 更新记录](docs/windows-0.3.1-notes.md)。输入输出重构的历史依据见 [0.3.0 重构记录](docs/windows-0.3.0-refactor.md)。旧版修复说明属于历史记录，不代表当前实现或当前验收状态。
+
+测试动作会在目标窗口真实输入。不要把浏览器中的管理界面预览当作原生输入验证。普通权限应用不能操作管理员权限窗口。粘贴文字、HTML、文件或图片后，软件仍可能无法确认接收结果；已经发生的输入、点击或程序启动无法自动撤销。
+
+## macOS 开发与权限
+
+在本机 Mac 安装 Xcode Command Line Tools、Rust stable 和 Node.js，运行 `npm ci`、`npm run tauri dev`；打包运行 `npm run tauri build -- --bundles app,dmg`。应先在 Apple Silicon Mac 验证；Intel Mac 另行编译和验收。仓库 Windows 环境成功执行了 `cargo check -p quicker-platform --target aarch64-apple-darwin`，该命令不链接 macOS frameworks，也不代表完整 Tauri 应用或安装包可运行。
+
+此前还尝试了 `cargo check -p quicker-text --target aarch64-apple-darwin`，在 `objc2-exception-helper v0.1.1` 编译 Objective-C `try_catch.m` 时失败：`failed to find tool "cc": program not found`。当前 Windows 环境没有 Apple Objective-C 编译/SDK工具链；需在用户本机 Mac 完成这个完整应用检查。
+
+首次运行在“系统设置 → 隐私与安全性”中给实际安装的 Quicker Text 应用授予“辅助功能”和“输入监控”。开发运行可能需要给当前可执行文件或宿主终端授权；以实际系统提示为准。授权后可能需重启，再手动恢复。权限不足时 GUI 保持可用、引擎保持暂停并显示原因；不会绕过 Secure Input。更换应用路径或签名后重新核对授权。
+
+选择 **ABC 或 U.S.** 输入源（支持 `com.apple.keylayout.ABC` / `com.apple.keylayout.US`），再在 TextEdit 的纯文本窗口测试 `qtzzx`。ABC Extended、U.S. International等dead-key布局和IME拒绝，避免把组合中的ASCII误当已经上屏。安全输入、不可识别的窗口/控件或本应用自身均拒绝触发。Ctrl 导入仍为 Ctrl；新动作可用平台常用修饰键，在 Mac 映射 Cmd。Windows `#键值` 只走显式映射，未知值在删除缩写前报错。
+
+Mac adapter 已实现 CGEventTap、CGEvent、AX 焦点/选区、NSPasteboard 文本/HTML/file-URL/PNG、多屏 Quartz 坐标、键鼠及媒体/音量/亮度事件。不同应用和硬件可能不消费这些事件，成功发送返回“未知”。Windows 1/120-click 滚轮 delta 没有经过验证的 Mac 等价映射，预检拒绝并提示使用 clicks。
+
+Mac自动目标也保守限定为AX可观察的 `AXTextArea` / `AXTextField`，安全字段和其他角色拒绝。任意浏览器编辑区、特殊应用控件并未因此获得通用支持。
+
+macOS 分发的 Developer ID、签名和公证凭据未提供；尚未生成已签名/公证的 Mac 安装包。登录启动使用本应用用户级 LaunchAgent，显式开启后下次登录运行 `--background`，关闭只移除本应用plist；用户自己的 Mac 仍需核对登录项权限和实际启动。详细边界见 [平台支持](docs/platform-support.md)。
+
+## 开发与配置
+
+在仓库根目录运行 `npm ci`、`npm run tauri dev`。自动检查使用 `npm run build` 和 `cargo test --workspace`；最终通过数量以本轮检查输出为准。这些检查不证明目标程序实际收到输入。免安装 exe 构建使用 `cargo build -p quicker-text --release`（先执行前端 build），安装包可使用 `npm run tauri build`。
+
+配置在 Tauri 当前用户应用数据目录，包含 `draft.json`、`active.json` 和 `revisions/` 历史版本。原始迁移条目分别保存在草稿的 `migration-unresolved.json`、生效版本的 `active-migration-unresolved.json` 和历史版本的 `revisions/<revision>.metadata.json` 中；放弃草稿或回滚版本时同步恢复对应原始元数据。草稿与生效版本分开；应用设置先校验再发布，外部修改冲突会拒绝覆盖。升级前通过 GUI 导出本地包并保留旧版程序；回滚配置会创建新的 revision。不要直接读取原 Quicker 的加密数据库。
+
+SendKeys B、inputscript、replay 是三个独立格式；导入保留 dialect、行列和不支持报告。高级源码不是主入口。原 Quicker 私有动作、账户、私有云和任意脚本没有直接运行承诺；需明确映射为自有动作。
+
+导入也接受 Quicker「文本指令」导出的 JSON 数组（可带 UTF-8 BOM），无需手工转换成本应用配置。已核对本机 Quicker.Common 的数值动作类型：0 无操作、2 SendKeys、3 粘贴文本、6 键入文本、7 inputscript；其他类型保留原条目并禁用。SendKeys 和 inputscript 导入后须审阅并显式启用。`TriggerKey: 0` 表示即时触发，null/缺省继承全局结束键；9/13/32/186 分别映射 Tab/Enter/Space/分号，其他值禁用待改写。原 Quicker 的进程绑定不再限制触发，原始绑定仅保存在迁移元数据中；原禁用、分组、标题、大小写、IME 删除、参数与通知设置均保留。未知字段、错误字段类型、无法兼容的正则/脚本/日期模板和 `FILE:` 内容会禁用并给出报告，重复 ID 拒绝整个导入。每条原始 JSON（包括时间戳）保存在导出包的迁移元数据中；Compatible 状态的保留项不代表迁移失败。该格式支持不包含原 Quicker 加密数据库或私有动作执行。
+
+完整 F/G/A/T 状态、已取得证据与用户手工步骤见 [验收记录](docs/acceptance.md)。
+
+新规则默认继承全局 IME 删除方式，旧规则显式设置保留。运行状态页显示当前目标观察方式、进程、组合状态及拒绝原因，不显示正文；管理窗口获焦也会改变目标。匿名浏览器测试页位于 `scripts/fixtures/browser-input.html`，使用真实键盘按 [浏览器与中文IME手测矩阵](docs/browser-ime-manual-tests.md) 验证。
+
+Windows 输出检查焦点、配置版本和执行代次，使用带本程序标记的 espanso 注入实现，防止输出再次触发规则。剪贴板继续使用本项目的多格式备份和变更保护。此实现不逐字符读取目标正文，不保证目标的自定义退格、页面脚本移动光标或输入法选词行为；复杂多步骤与 p95 延迟尚未完成完整实机验收。
+
+自动验收使用独立配置与显式双门槛启动模式，详见 [Windows 验收模式](docs/windows-acceptance-mode.md)。正常启动使用真实 RawInput；自动注入验收通过不代表实物键盘入口或中文 IME 已验收。
+
+## 许可与绿色包构建
+
+Windows 交付静态纳入 GPL-3.0-or-later 的 espanso 组件，整个项目（含自研代码）按 GPL-3.0-or-later 授权与分发，完整许可见 [LICENSE](LICENSE)。上游版权、完整许可和本地补丁清单见 [第三方声明](THIRD_PARTY_NOTICES.md)。绿色包附带当前对应源码，包括修改后的原生组件与构建脚本。
+
+使用 PowerShell 7：先运行 `npm ci`、`npm run build`、`cargo build -p quicker-text --release`，然后运行 `./scripts/package-portable.ps1 -OutputDirectory <新输出目录>`。构建需要 Rust、Node.js、MSVC C++ 工具和 Windows SDK。脚本会逐文件校验 ZIP 与源目录的 SHA256，不覆盖已有交付包。

@@ -1,0 +1,10 @@
+node_modules/
+target/
+dist/
+work/
+private-imports/
+*.qka
+*.qkdata
+*.log
+*.tsbuildinfo
+.DS_Store

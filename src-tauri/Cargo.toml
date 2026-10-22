@@ -1,0 +1,31 @@
+[package]
+name = "quicker-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "quicker-text"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-notification = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+quicker-domain = { path = "../crates/domain" }
+quicker-platform = { path = "../crates/platform" }
+rfd = "0.17"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "tiff", "webp"] }
+arboard = "3"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"

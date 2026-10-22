@@ -1,0 +1,15 @@
+{
+  "format": "quicker-text",
+  "version": 1,
+  "config": {
+    "version": 1, "revision": 0, "enabled": true,
+    "globals": { "terminators": ["space", "tab", "enter", "semicolon"], "word_separators": " \t\r\n", "blacklist": [], "ime_erasure": "escape" },
+    "rules": [
+      { "id": "synthetic-keys", "enabled": true, "group": "合成测试", "description": "Unicode keys", "match": { "kind": "literal", "value": ";hello" }, "trigger_mode": "immediate", "action": { "type": "text", "method": "keys", "source": { "type": "inline", "value": "Hello 合成文本🙂" } } },
+      { "id": "synthetic-paste", "enabled": true, "group": "合成测试", "description": "Multiline paste", "match": { "kind": "literal", "value": ";paste" }, "trigger_mode": "terminator", "action": { "type": "text", "method": "paste", "source": { "type": "inline", "value": "Synthetic line 1\n合成 line 2" } } },
+      { "id": "synthetic-regex", "enabled": true, "group": "参数", "match": { "kind": "regex", "value": "ticket([0-9]+)" }, "parameter": { "type": "capture_template", "template": "id={$1}" }, "action": { "type": "none" } },
+      { "id": "synthetic-sendkeys", "enabled": false, "group": "高级", "description": "Explicit activation required", "match": { "kind": "literal", "value": ";keys" }, "action": { "type": "send_keys", "source": { "type": "inline", "value": "^(a){RIGHT 2}hello~" } } },
+      { "id": "synthetic-replay", "enabled": false, "group": "高级", "match": { "kind": "literal", "value": ";replay" }, "action": { "type": "replay", "speed": 1.0, "plan": { "version": 1, "dialect": "replay", "source": "10;KP;Space;", "steps": [ { "operation": { "type": "delay", "ms": 10 } }, { "operation": { "type": "key_press", "key": { "type": "named", "name": "Space" } } } ] } } }
+    ]
+  }
+}

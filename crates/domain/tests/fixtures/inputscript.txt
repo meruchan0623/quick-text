@@ -1,0 +1,22 @@
+// Synthetic 21-command corpus. File operations require replacing paths with local fixtures before execution.
+input:合成 Unicode🙂
+input2:A\tB\r\nC
+sendkeys:{RIGHT 2}
+delay:20
+paste:Synthetic paste
+keydown:Ctrl
+keyup:Ctrl
+keypress:D1
+hotkey:Ctrl+Alt+D1
+moveto:50%,50%
+move:-10,10
+click:left
+dbclick:right
+down:middle
+up:middle
+wheel:1
+wheeldelta:120
+hwheel:-1
+hwheeldelta:-120
+pastefile:C:\synthetic\one.txt;C:\synthetic\two.txt
+pasteimage:C:\synthetic\image.png
