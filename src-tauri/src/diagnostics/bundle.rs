@@ -907,7 +907,7 @@ mod tests {
     fn full_bundles_carry_phrases_in_the_active_configuration_only() {
         use super::test_support::entries;
         use crate::{
-            commands::diagnostics::log_frontend_error,
+            commands::diagnostics::{record_frontend_error, BundledAssets},
             diagnostics::{logging::test_support::scoped, panic::test_support::panic_into},
         };
         use tracing::level_filters::LevelFilter;
@@ -917,16 +917,19 @@ mod tests {
         fs::write(dir.join("active.json"), config).unwrap();
         let body = format!("body-{SENTINEL}");
         let failed: Result<(), String> = std::hint::black_box(Err(format!("x\"{body}\"y")));
+        let assets = BundledAssets::new(["/index.html", "/assets/index-D3f9Kq_x.js"]);
         let built = scoped(&log_dir(&dir), LevelFilter::TRACE);
         tracing::subscriber::with_default(built.subscriber, || {
             panic_into(&dir, || panic!("could not expand {body}"));
             panic_into(&dir, || failed.clone().unwrap());
-            log_frontend_error(
-                format!("TypeError: could not expand {body}"),
-                Some(format!(
-                    "    at {SENTINEL} (http://tauri.localhost/assets/{SENTINEL}-D3f9Kq_x.js:1:2)"
+            record_frontend_error(
+                &assets,
+                &format!("TypeError: could not expand {body}"),
+                Some(&format!(
+                    "    at {SENTINEL} (http://tauri.localhost/assets/{SENTINEL}-D3f9Kq_x.js:1:2)\n\
+                     \x20   at {SENTINEL} (http://tauri.localhost/assets/index-D3f9Kq_x.js:3:4)"
                 )),
-                Some(body.clone()),
+                Some(&body),
             );
         });
         drop(built.guard);
@@ -940,6 +943,7 @@ mod tests {
             .collect();
         assert_eq!(logs.matches("app.panic").count(), 2, "{logs}");
         assert_eq!(logs.matches("frontend.error").count(), 1, "{logs}");
+        assert!(logs.contains(r#"stack=["D3f9Kq_x.js:3:4"]"#), "{logs}");
         let crashes = files.keys().filter(|name| name.starts_with("crashes/"));
         assert_eq!(crashes.count(), 2);
         for (name, text) in files.iter().filter(|(name, _)| *name != "active.json") {

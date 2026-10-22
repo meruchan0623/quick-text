@@ -18,6 +18,7 @@ use crate::{
     error::{CommandError, IoOp},
 };
 use std::{
+    collections::HashSet,
     fs, io,
     path::{Path, PathBuf},
     sync::atomic::Ordering,
@@ -152,14 +153,51 @@ fn reveal(dir: &Path) -> io::Result<()> {
 /// Logs a frontend error as `frontend.error` (warn): its structure only,
 /// see [`FrontendError`].
 #[tauri::command(rename_all = "snake_case")]
-pub fn log_frontend_error(message: String, stack: Option<String>, source: Option<String>) {
-    let report = FrontendError::fit(&message, stack.as_deref(), source.as_deref());
+pub fn log_frontend_error(
+    assets: State<BundledAssets>,
+    message: String,
+    stack: Option<String>,
+    source: Option<String>,
+) {
+    record_frontend_error(&assets, &message, stack.as_deref(), source.as_deref());
+}
+
+/// The frontend files embedded in this binary, by path
+/// (`assets/index-D3f9Kq_x.js`): the trusted list a script location in a
+/// frontend error must be on to be logged. Empty (so every location is
+/// dropped) unless built from the app's assets; in dev builds the dev
+/// server serves the frontend and nothing is embedded.
+#[derive(Debug, Default)]
+pub struct BundledAssets(HashSet<String>);
+
+impl BundledAssets {
+    /// From asset keys as Tauri lists them (`/assets/index-D3f9Kq_x.js`),
+    /// `AssetResolver::iter` in production.
+    pub fn new<P: AsRef<str>>(paths: impl IntoIterator<Item = P>) -> Self {
+        let relative = |path: P| path.as_ref().trim_start_matches('/').to_string();
+        Self(paths.into_iter().map(relative).collect())
+    }
+
+    fn contains(&self, path: &str) -> bool {
+        self.0.contains(path)
+    }
+}
+
+/// [`log_frontend_error`] with the trusted asset list passed in.
+pub fn record_frontend_error(
+    assets: &BundledAssets,
+    message: &str,
+    stack: Option<&str>,
+    source: Option<&str>,
+) {
+    let report = FrontendError::fit(assets, message, stack, source);
     tracing::warn!(
         event = "frontend.error",
         class = report.class.as_str(),
         message_len = report.message_len,
         message_hash = %report.message_hash,
         source = report.source.as_deref(),
+        source_dropped = report.source_dropped,
         stack = ?report.frames,
         dropped_lines = report.dropped_lines,
         truncated = report.truncated,
@@ -171,7 +209,7 @@ pub fn log_frontend_error(message: String, stack: Option<String>, source: Option
 /// error is supplied by the caller and can carry phrase content (a message
 /// built from a rule, a function or file name, a query string), so none of
 /// it is logged (S-08): only a fixed class label, the message's length and
-/// fingerprint, and the content hashes of the app's bundled scripts.
+/// fingerprint, and the content hashes of scripts embedded in the binary.
 #[derive(Debug, PartialEq, Eq)]
 struct FrontendError {
     class: ErrorClass,
@@ -181,6 +219,8 @@ struct FrontendError {
     message_hash: String,
     /// See [`asset_location`].
     source: Option<String>,
+    /// A source was given but is not in the app's bundled scripts.
+    source_dropped: bool,
     /// The frames in the app's bundled scripts, see [`asset_location`].
     frames: Vec<String>,
     /// Stack lines left out: not a frame, or a frame outside the app's
@@ -191,7 +231,12 @@ struct FrontendError {
     truncated: bool,
 }
 impl FrontendError {
-    fn fit(message: &str, stack: Option<&str>, source: Option<&str>) -> Self {
+    fn fit(
+        assets: &BundledAssets,
+        message: &str,
+        stack: Option<&str>,
+        source: Option<&str>,
+    ) -> Self {
         let stack = stack.unwrap_or("");
         let mut head = truncate_utf8(stack, FRONTEND_ERROR_MAX_BYTES);
         let truncated = head.len() < stack.len();
@@ -202,16 +247,18 @@ impl FrontendError {
         let mut frames = Vec::new();
         let mut dropped_lines = 0;
         for line in head.lines().map(str::trim).filter(|line| !line.is_empty()) {
-            match stack_frame(line) {
+            match stack_frame(assets, line) {
                 Some(frame) => frames.push(frame),
                 None => dropped_lines += 1,
             }
         }
+        let kept_source = source.and_then(|source| asset_location(assets, source));
         Self {
             class: ErrorClass::of(message),
             message_len: message.len(),
             message_hash: fingerprint(message),
-            source: source.and_then(asset_location),
+            source_dropped: source.is_some() && kept_source.is_none(),
+            source: kept_source,
             frames,
             dropped_lines,
             truncated,
@@ -288,7 +335,7 @@ impl ErrorClass {
 /// (`at fn (url:1:2)`, `at url:1:2`) or SpiderMonkey and JavaScriptCore
 /// (`fn@url:1:2`). Function names are never kept: nothing tells a real
 /// function name from caller-supplied text.
-fn stack_frame(line: &str) -> Option<String> {
+fn stack_frame(assets: &BundledAssets, line: &str) -> Option<String> {
     let location = match line.strip_prefix("at ") {
         Some(rest) => rest
             .strip_suffix(')')
@@ -296,7 +343,7 @@ fn stack_frame(line: &str) -> Option<String> {
             .map_or(rest, |(_, location)| location),
         None => line.rsplit_once('@')?.1,
     };
-    asset_location(location)
+    asset_location(assets, location)
 }
 
 /// Origins the app's own pages are served from.
@@ -307,24 +354,27 @@ const APP_ORIGINS: [&str; 3] = [
 ];
 
 /// `D3f9Kq_x.js:line:col` of `url:line:col` when `url` is one of the app's
-/// bundled scripts: served from an [`APP_ORIGINS`] origin, directly under
-/// `/assets/`, named the way Vite names chunks (see [`vite_chunk_hash`]).
-/// Only the content hash is kept: it identifies the chunk of a build (and
-/// its source map) and is not free text. Anything else (another host, the
-/// dev server, a relative path, `blob:`, `data:`, `eval`, `<anonymous>`, a
-/// query string or fragment) is `None`.
-fn asset_location(location: &str) -> Option<String> {
+/// bundled scripts: served from an [`APP_ORIGINS`] origin, a Vite chunk
+/// (see [`vite_chunk_hash`]) directly under `/assets/`, and embedded in this
+/// binary ([`BundledAssets`]). The last check is what makes the hash safe to
+/// log: a caller can shape any text like a chunk name (`index-SECRETAB.js`),
+/// but only a real build output is on the list. Only the content hash is
+/// kept, which identifies the chunk (and its source map). Anything else
+/// (another host, the dev server, a relative path, `blob:`, `data:`, `eval`,
+/// `<anonymous>`, a query string or fragment) is `None`.
+fn asset_location(assets: &BundledAssets, location: &str) -> Option<String> {
     let (rest, col) = location.trim().rsplit_once(':')?;
     let (url, line) = rest.rsplit_once(':')?;
     if !is_number(line) || !is_number(col) {
         return None;
     }
-    let file = APP_ORIGINS
+    let path = APP_ORIGINS
         .into_iter()
-        .find_map(|origin| url.strip_prefix(origin))?
-        .strip_prefix("assets/")?;
-    let hash = vite_chunk_hash(file)?;
-    Some(format!("{hash}:{line}:{col}"))
+        .find_map(|origin| url.strip_prefix(origin))?;
+    let hash = vite_chunk_hash(path.strip_prefix("assets/")?)?;
+    assets
+        .contains(path)
+        .then(|| format!("{hash}:{line}:{col}"))
 }
 
 /// `D3f9Kq_x.js` of a Vite chunk file name `index-D3f9Kq_x.js`: a non-empty
@@ -405,6 +455,17 @@ mod tests {
         fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
+    /// What a build embeds, as `AssetResolver::iter` lists it: the trusted
+    /// list the tests run against.
+    fn bundled() -> BundledAssets {
+        BundledAssets::new([
+            "/index.html",
+            "/assets/index-D3f9Kq_x.js",
+            "/assets/index-D3f9Kq_x.css",
+            "/assets/vendor-a1B2-c_D.mjs",
+        ])
+    }
+
     /// Only the head of a long stack is read, cut on a line (and so on a
     /// char boundary); the message is measured and fingerprinted whole.
     #[test]
@@ -413,7 +474,7 @@ mod tests {
         let mut stack = frame.repeat(FRONTEND_ERROR_MAX_BYTES / frame.len() + 10);
         stack.push_str(&"中".repeat(5000));
         let long = "中".repeat(5000); // 15 000 bytes
-        let cut = FrontendError::fit(&long, Some(&stack), Some(&long));
+        let cut = FrontendError::fit(&bundled(), &long, Some(&stack), Some(&long));
         assert!(cut.truncated);
         assert_eq!(cut.frames.len(), FRONTEND_ERROR_MAX_BYTES / frame.len());
         assert!(cut.frames.iter().all(|f| f == "D3f9Kq_x.js:12:345"));
@@ -421,12 +482,14 @@ mod tests {
         assert_eq!(cut.message_len, 15_000);
         assert_eq!(cut.message_hash, fingerprint(&long));
         assert_eq!((cut.class, cut.source), (ErrorClass::Other, None));
+        assert!(cut.source_dropped);
         let logged: usize = cut.frames.iter().map(String::len).sum();
         assert!(logged <= FRONTEND_ERROR_MAX_BYTES, "{logged}");
 
-        let cjk = FrontendError::fit("boom", Some(&long), None);
+        let cjk = FrontendError::fit(&bundled(), "boom", Some(&long), None);
         assert!(cjk.truncated);
         assert_eq!((cjk.frames.len(), cjk.dropped_lines), (0, 0));
+        assert!(!cjk.source_dropped);
     }
 
     #[test]
@@ -441,7 +504,9 @@ mod tests {
         // Each line is dropped: the dev server, no hash, `<anonymous>`,
         // relative paths, outside `/assets/`, a subdirectory, eval,
         // `Function`, `blob:`, `data:`, another host, a style sheet, a
-        // query string, a fragment, a 6-character hash, no name.
+        // query string, a fragment, a 6-character hash, no name, and
+        // Vite-shaped names the build did not embed (any text, one character
+        // off, a known hash under another name).
         let dropped = [
             "at new Store (http://localhost:1420/src/store.ts?t=1729591293:7:8)",
             "at http://tauri.localhost/assets/vendor.js:1:2",
@@ -462,15 +527,18 @@ mod tests {
             "at load (http://tauri.localhost/assets/index-D3f9Kq.js:5:6)",
             "at load (http://tauri.localhost/assets/-D3f9Kq_x.js:5:6)",
             "at load (http://tauri.localhost/assets/D3f9Kq_x.js:5:6)",
+            "at load (http://tauri.localhost/assets/index-SECRETAB.js:5:6)",
+            "at load (http://tauri.localhost/assets/index-D3f9Kq_y.js:5:6)",
+            "at load (http://tauri.localhost/assets/vendor-D3f9Kq_x.js:5:6)",
+            "load@tauri://localhost/assets/index-a1B2-c_D.mjs:5:6",
         ];
         let stack = format!("{kept}{}", dropped.join("\n"));
-        let report = FrontendError::fit(
-            "Uncaught TypeError: Cannot read properties of undefined (reading 'body')",
-            Some(&stack),
-            Some("http://tauri.localhost/assets/index-D3f9Kq_x.js:40:5"),
-        );
+        let message = "Uncaught TypeError: Cannot read properties of undefined (reading 'body')";
+        let source = "http://tauri.localhost/assets/index-D3f9Kq_x.js:40:5";
+        let report = FrontendError::fit(&bundled(), message, Some(&stack), Some(source));
         assert_eq!(report.class, ErrorClass::TypeError);
         assert_eq!(report.source.as_deref(), Some("D3f9Kq_x.js:40:5"));
+        assert!(!report.source_dropped);
         assert_eq!(
             report.frames,
             [
@@ -484,6 +552,22 @@ mod tests {
         // And the message line.
         assert_eq!(report.dropped_lines, dropped.len() + 1);
         assert!(!report.truncated);
+
+        // Without the app's asset list (no `AppHandle`, a dev build), no
+        // location is trusted: everything but the class is dropped.
+        let closed = FrontendError::fit(
+            &BundledAssets::default(),
+            message,
+            Some(&stack),
+            Some(source),
+        );
+        assert_eq!((closed.class, closed.source), (ErrorClass::TypeError, None));
+        assert!(closed.source_dropped);
+        assert!(closed.frames.is_empty(), "{:?}", closed.frames);
+        assert_eq!(
+            closed.dropped_lines,
+            report.frames.len() + dropped.len() + 1
+        );
 
         for (message, class) in [
             ("Error: boom", ErrorClass::Error),
@@ -515,7 +599,7 @@ mod tests {
             ("Type Error: x", ErrorClass::Other),
             ("", ErrorClass::Other),
         ] {
-            let report = FrontendError::fit(message, None, None);
+            let report = FrontendError::fit(&bundled(), message, None, None);
             assert_eq!(report.class, class, "{message}");
             assert_eq!(report.message_len, message.len());
             assert_eq!((report.frames.len(), report.dropped_lines), (0, 0));
@@ -531,8 +615,15 @@ mod tests {
             "file:///C:/Users/alice/assets/index-D3f9Kq_x.js:1:2",
             "http://localhost:1420/src/main.tsx:1:1",
             "http://tauri.localhost/assets/index-D3f9Kq_x.js:x:1",
+            "http://tauri.localhost/assets/index-SECRETAB.js:1:2",
+            "http://tauri.localhost/index.html:1:2",
         ] {
-            assert_eq!(FrontendError::fit("e", None, Some(source)).source, None);
+            let report = FrontendError::fit(&bundled(), "e", None, Some(source));
+            assert_eq!(
+                (report.source, report.source_dropped),
+                (None, true),
+                "{source}"
+            );
         }
     }
 
@@ -575,9 +666,10 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("quicker-fe-test-{}", uuid::Uuid::new_v4()));
         let built = scoped(&log_dir(&dir), LevelFilter::TRACE);
+        let assets = bundled();
         tracing::subscriber::with_default(built.subscriber, || {
-            for (message, stack, source) in reports {
-                log_frontend_error(message, stack, source);
+            for (message, stack, source) in &reports {
+                record_frontend_error(&assets, message, stack.as_deref(), source.as_deref());
             }
         });
         drop(built.guard);
@@ -625,9 +717,8 @@ mod tests {
     /// S-08 privacy test for the shapes a syntax check lets through: phrases
     /// shaped like error classes (`SecretPhraseError`), like function names
     /// (`SecretPhrase`) and like script names (`SecretAbbreviation.js`, the
-    /// Vite-shaped `Sentinel-abcdefgh.js`) reach no file in the data
-    /// directory and no entry of a Summary bundle; of a Vite-shaped name only
-    /// the hash is left.
+    /// Vite-shaped `Sentinel-abcdefgh.js`, which the build did not embed)
+    /// reach no file in the data directory and no entry of a Summary bundle.
     #[test]
     fn phrase_shaped_classes_and_names_reach_no_log_crash_record_or_bundle_entry() {
         use crate::diagnostics::{
@@ -636,7 +727,7 @@ mod tests {
         };
         use tracing::level_filters::LevelFilter;
 
-        const SENTINELS: [&str; 3] = ["SecretPhrase", "SecretAbbreviation", "Sentinel"];
+        const SENTINELS: [&str; 4] = ["SecretPhrase", "SecretAbbreviation", "Sentinel", "abcdefgh"];
         let reports = [
             ("SecretPhraseError", None, None),
             ("SecretPhraseError: SentinelXyzException", None, None),
@@ -664,13 +755,10 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("quicker-fe-test-{}", uuid::Uuid::new_v4()));
         let built = scoped(&log_dir(&dir), LevelFilter::TRACE);
+        let assets = bundled();
         tracing::subscriber::with_default(built.subscriber, || {
             for (message, stack, source) in reports {
-                log_frontend_error(
-                    message.into(),
-                    stack.map(Into::into),
-                    source.map(Into::into),
-                );
+                record_frontend_error(&assets, message, stack, source);
             }
         });
         drop(built.guard);
@@ -679,10 +767,12 @@ mod tests {
         assert_eq!(log.matches("frontend.error").count(), 4, "{log}");
         assert_eq!(log.matches(r#"class="other""#).count(), 3, "{log}");
         assert_eq!(log.matches(r#"class="TypeError""#).count(), 1, "{log}");
+        assert_eq!(log.matches("source_dropped=true").count(), 2, "{log}");
+        assert!(!log.contains(r#"source=""#), "{log}");
         for expected in [
-            r#"stack=["abcdefgh.js:3:4", "D3f9Kq_x.js:5:6", "abcdefgh.mjs:7:8"]"#,
-            r#"source="abcdefgh.js:11:12""#,
+            r#"stack=["D3f9Kq_x.js:5:6"]"#,
             "dropped_lines=2",
+            "dropped_lines=4",
         ] {
             assert!(log.contains(expected), "{expected} missing:\n{log}");
         }
@@ -698,6 +788,106 @@ mod tests {
                 bundle
                     .iter()
                     .map(|(name, text)| (format!("bundle:{name}"), text)),
+            );
+        for (name, text) in every_entry {
+            for sentinel in SENTINELS {
+                assert!(!text.contains(sentinel), "{name} leaks {sentinel}:\n{text}");
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// S-08 privacy test for the chunk hash: a caller can shape any short
+    /// text like a Vite chunk (`index-SECRETAB.js`, an abbreviation padded to
+    /// 8 characters), so a hash is logged only for a script the build
+    /// embedded. Through `source` and stack frames alike, such a name reaches
+    /// no file in the data directory and no entry of a Summary or Full bundle
+    /// (but Full's `active.json`, which carries phrases by design); a chunk
+    /// that is embedded keeps its hash.
+    #[test]
+    fn caller_chosen_chunk_hashes_reach_no_log_crash_record_or_bundle_entry() {
+        use crate::diagnostics::{
+            bundle::test_support::{entries, summary_entries},
+            logging::test_support::{read_logs, scoped},
+        };
+        use quicker_domain::{Config, MatchKind, MatchSpec, Rule};
+        use tracing::level_filters::LevelFilter;
+
+        const SENTINELS: [&str; 3] = ["SECRETAB", "ab______", "abc-----"];
+        let dir = std::env::temp_dir().join(format!("quicker-fe-test-{}", uuid::Uuid::new_v4()));
+        let built = scoped(&log_dir(&dir), LevelFilter::TRACE);
+        let assets = bundled();
+        tracing::subscriber::with_default(built.subscriber, || {
+            for hash in SENTINELS {
+                let stack = format!(
+                    "TypeError: x\n\
+                     \x20   at render (http://tauri.localhost/assets/index-{hash}.js:1:2)\n\
+                     load@tauri://localhost/assets/vendor-{hash}.mjs:3:4\n\
+                     \x20   at https://tauri.localhost/assets/index-{hash}.js:5:6"
+                );
+                let source = format!("tauri://localhost/assets/index-{hash}.js:1:2");
+                record_frontend_error(&assets, "TypeError: x", Some(&stack), Some(&source));
+            }
+            // The positive case: the same shapes, for a chunk the build embedded.
+            record_frontend_error(
+                &assets,
+                "TypeError: x",
+                Some("    at render (http://tauri.localhost/assets/index-D3f9Kq_x.js:3:4)"),
+                Some("tauri://localhost/assets/index-D3f9Kq_x.js:1:2"),
+            );
+        });
+        drop(built.guard);
+
+        let log = read_logs(&log_dir(&dir));
+        assert_eq!(log.matches("frontend.error").count(), 4, "{log}");
+        assert_eq!(log.matches("source_dropped=true").count(), 3, "{log}");
+        assert_eq!(log.matches("stack=[]").count(), 3, "{log}");
+        assert_eq!(log.matches("dropped_lines=4").count(), 3, "{log}");
+        let kept = r#"source="D3f9Kq_x.js:1:2" source_dropped=false stack=["D3f9Kq_x.js:3:4"] dropped_lines=0"#;
+        assert!(log.contains(kept), "{kept} missing:\n{log}");
+
+        // Before `active.json` exists, every file in the data directory is
+        // one the sinks wrote.
+        let on_disk = files_under(&dir);
+        assert!(!on_disk.is_empty());
+        for (path, text) in &on_disk {
+            for sentinel in SENTINELS {
+                let path = path.display();
+                assert!(!text.contains(sentinel), "{path} leaks {sentinel}:\n{text}");
+            }
+        }
+
+        // A configuration that carries the sentinels, so the bundles have
+        // them to leak.
+        let config = Config {
+            rules: vec![Rule {
+                id: "chunk-hash".into(),
+                match_spec: MatchSpec {
+                    kind: MatchKind::Literal,
+                    value: SENTINELS.join(" "),
+                },
+                ..Rule::default()
+            }],
+            ..Config::default()
+        };
+        fs::write(
+            dir.join("active.json"),
+            serde_json::to_string(&config).unwrap(),
+        )
+        .unwrap();
+        let summary = summary_entries(&dir);
+        let full = entries(&dir, Redaction::Full);
+        assert!(summary.keys().any(|name| name.starts_with("logs/")));
+        for sentinel in SENTINELS {
+            assert!(full["active.json"].contains(sentinel), "{sentinel}");
+        }
+        let every_entry = summary
+            .iter()
+            .map(|(name, text)| (format!("summary:{name}"), text))
+            .chain(
+                full.iter()
+                    .filter(|(name, _)| *name != "active.json")
+                    .map(|(name, text)| (format!("full:{name}"), text)),
             );
         for (name, text) in every_entry {
             for sentinel in SENTINELS {

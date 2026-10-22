@@ -39,7 +39,7 @@
 //! | `command.io` | warn | `CommandError::Io`; operation, file name, OS error |
 //! | `diagnostics.export` | info | a bundle was written; redaction, entry count, `elapsed_ms` |
 //! | `engine.unavailable` | warn | the platform refused to start or resume |
-//! | `frontend.error` | warn | `log_frontend_error`; error class (a built-in name or `other`), message length and fingerprint, source and stack frames in the app's bundled scripts as `<chunk hash>.js:line:col`, count of dropped lines; never any caller text |
+//! | `frontend.error` | warn | `log_frontend_error`; error class (a built-in name or `other`), message length and fingerprint, source and stack frames as `<chunk hash>.js:line:col` only for Vite chunks embedded in the binary (the list `AssetResolver::iter` gives; empty in dev builds), whether the source was dropped, count of dropped stack lines; never any caller text |
 //! | `log.file_unavailable` | error | log files could not be opened; stderr only |
 //! | `log.level_set` | info | `set_log_level`; level and `until_ms` |
 //! | `log.level_restored` | info | a saved temporary level was re-applied at startup |
