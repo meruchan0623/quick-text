@@ -120,7 +120,7 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 |---|---|---|
 | `get_runtime_snapshot` | — | `{ seq, health: HealthSnapshot, state: EngineState, revision: number, history_seq: number, safe_mode: SafeModeReason \| null }`；`seq` 是生成快照时的全局事件序号，前端以它为新的基准 |
 | `get_health` | — | `HealthSnapshot` = `{ state, components }` |
-| `repair_engine` | — | `HealthSnapshot`（触发重建后立即返回，通常为 `recovering`；结果通过 `engine-health` 推送） |
+| `repair_engine` | — | `HealthSnapshot`：立即返回当前快照；`recovering` 和结果通过 `engine-health` 推送。Failed 已锁存（supervisor 的 watchdog 判定卡死）时返回 `failed`，锁存要等 supervisor 受理这次修复才解除 |
 | `startup_problems` | — | `StartupProblem[]`（不含 `seq`） |
 | `get_capabilities` | — | `Capability[]`，`Capability = { id: string, status: "available" \| "unavailable" \| "experimental" \| "degraded", reason: string \| null, available: boolean }`；`reason` 是原因码，`available` 保留给旧界面（`status` 不是 `unavailable` 即为真） |
 | `export_diagnostics` | `{ redaction: "summary" \| "full" }` | `string \| null`：弹出保存对话框，返回写入的 zip 路径；取消返回 `null` |
