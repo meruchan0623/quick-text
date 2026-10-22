@@ -67,6 +67,9 @@ const stale = (shown: number | undefined, caught: number | null) =>
   shown !== undefined && caught !== null && shown < caught;
 /** Commands that write the store and answer with the whole state. */
 type StoreWrite = 'save_draft' | 'apply_settings' | 'discard_draft' | 'rollback';
+/** The writes that publish a revision of their own, and how a notice about it names them. */
+const MADE_BY = { rollback: '恢复上一个版本', apply_settings: '应用设置' } as const;
+type Own = keyof typeof MADE_BY;
 /** State fields a command answers alone, without the state around them. */
 const SETTINGS = ['autostart', 'auto_listen_on_start'] as const;
 type Setting = (typeof SETTINGS)[number];
@@ -226,9 +229,17 @@ export default function App() {
   // unsaved edits, or one whose draft a save then replaced (`saved`; save_draft has no revision
   // check). Saving, applying and the other answers leave the notice standing (review C5); it goes
   // with its buttons, or when the editor takes in the store's config: a load of a later revision,
-  // 放弃未应用草稿, 恢复上一个版本.
+  // 放弃未应用草稿, 恢复上一个版本, a save whose answer a later view overtook (see `conclude`).
+  // `by`: the command of this window that made the revision, said instead of 「后台」, which is for
+  // revisions made elsewhere.
   const editorRevision = useRef<number | null>(null);
-  const [newer, setNewer] = useState<{ revision: number; saved: boolean } | null>(null);
+  const [newer, setNewer] = useState<{ revision: number; saved: boolean; by: Own | null } | null>(
+    null,
+  );
+  // The revisions this window's 恢复上一个版本 and 应用设置 made. Each publishes one revision, above
+  // every other (see `install`), and answers with it: no other command or window makes it.
+  const made = useRef(new Map<number, Own>());
+  const madeBy = (revision: number) => made.current.get(revision) ?? null;
   // The state shown, as soon as it is set: a write whose answer was not installed puts what is
   // shown in the editor (review C7), maybe before the render that shows it.
   const shown = useRef<State | null>(null);
@@ -252,8 +263,10 @@ export default function App() {
     // Unsaved local edits are never replaced by an answer. When the store moved on under them, say
     // so; the user loads the new config or keeps editing (and saving overwrites).
     const base = editorRevision.current;
-    if (base !== null && revision > base)
-      setNewer((n) => (n !== null && n.revision >= revision ? n : { revision, saved: false }));
+    if (base !== null && revision > base) {
+      const by = madeBy(revision);
+      setNewer((n) => (n !== null && n.revision >= revision ? n : { revision, saved: false, by }));
+    }
   };
   // Review C6: one rule installs every answer that carries the state: load_state, save_draft,
   // apply_settings, discard_draft, rollback, set_paused. Each request takes the next request id as
@@ -318,35 +331,44 @@ export default function App() {
   // its answer; the answer carries the new revision, so no reload is needed for it (see below).
   const [writing, setWriting] = useState(0);
   /**
-   * The editor's part of a write that succeeded, done the same whether or not its answer was
-   * installed (`answerShown`, review C7): a dropped answer must not leave behind edits the command
-   * did away with. An answer not installed was overtaken by a view that read the store after the
-   * command ran, so the view shown has the command's outcome. `untouched`: no local edit since the
-   * request was sent. Edits made since are kept, never replaced by an answer, as with a load.
+   * The editor's part of write `command` that succeeded with answer `s`, done whether or not the
+   * answer was installed (`answerShown`, review C7): a dropped answer must not leave behind edits
+   * the command did away with, nor an editor without what it saved. `untouched`: no local edit
+   * since the request was sent.
+   *
+   * Untouched, the editor takes the latest view installed, whatever the command: the answer, or
+   * the view that overtook it. So for every save (of the editor's config, or of another one: a
+   * rule committed, a list changed, 总开关, an import), 放弃未应用草稿 and 恢复上一个版本. An
+   * answer is dropped only for a view installed with a higher revision, or the same revision and a
+   * later request (`install`).
+   * The store commands are synchronous and run one at a time in the order they arrive, and the
+   * revision never goes down while the app runs: that view is of a read run after this write, so
+   * it has the write's outcome, and maybe later changes from elsewhere. Taking it ends where the
+   * answers in order would have: this answer, then that view.
+   *
+   * Edits made since the request was sent are kept, never replaced by an answer, as with a load;
+   * the editor stays dirty.
    */
-  const conclude = (command: StoreWrite, answerShown: boolean, untouched: boolean) => {
+  const conclude = (command: StoreWrite, s: State, answerShown: boolean, untouched: boolean) => {
     const now = shown.current;
     // Never null: every write waits for the first snapshot.
     if (now === null) return;
     if (untouched) {
-      if (command === 'discard_draft' || command === 'rollback') {
-        // The store's config in the editor, as the view shown has it; a notice about a newer
-        // revision is moot.
-        receive(now);
-        setNewer(null);
-      } else if (answerShown) receive(now);
-      else {
-        // The editor's config is the store's draft (saved, or saved and applied); kept as it is.
-        setLocalDirty(false);
-        edited.current = false;
-      }
-    } else if (answerShown) {
-      // Kept as with a load (shown already). A revision answering this window's save or apply has
-      // the editor's config, as sent: not newer than it.
-      if (command === 'save_draft' || command === 'apply_settings')
-        editorRevision.current = Math.max(editorRevision.current ?? now.revision, now.revision);
-      else sayNewer(now.revision);
-    }
+      receive(now);
+      // The store's config is in the editor now: a notice about a newer revision is moot.
+      if (command === 'discard_draft' || command === 'rollback') setNewer(null);
+      // A save or apply leaves a notice standing (review C5), but not one the overtaking view
+      // raised over the edits this write saved: there are none left to keep.
+      else if (!answerShown)
+        setNewer((n) => (n !== null && !n.saved && n.revision <= now.revision ? null : n));
+    } else if (command === 'save_draft' || command === 'apply_settings') {
+      // The revision answering this window's save or apply has the editor's config, as sent: not
+      // newer than it. A view of the revision applied, installed first, said it was; in order, it
+      // would not have.
+      editorRevision.current = Math.max(editorRevision.current ?? s.revision, s.revision);
+      if (command === 'apply_settings')
+        setNewer((n) => (n !== null && !n.saved && n.revision === s.revision ? null : n));
+    } else if (answerShown) sayNewer(s.revision);
   };
   const write = async (command: StoreWrite, args?: Record<string, unknown>) => {
     setWriting((n) => n + 1);
@@ -365,22 +387,29 @@ export default function App() {
         // Not save_draft's: its config is not the editor's yet (see `reconciled`).
         if (command !== 'save_draft') reconcileTo(s.revision);
       }
-      conclude(command, view !== null, !unsaved && edits.current === sent);
+      if (command === 'rollback' || command === 'apply_settings') {
+        made.current.set(s.revision, command);
+        // A view of this revision, installed before this answer, said it came from elsewhere.
+        setNewer((n) => (n !== null && n.revision === s.revision ? { ...n, by: command } : n));
+      }
       if (command === 'save_draft') {
         // Active revision newer than the editor's config: the save replaced the draft of a revision
         // this window never took in. Said until acknowledged, as is a save over a notice standing,
         // whether or not the answer is shown. A save that ran before the notice's revision was
         // published did not overwrite it: that publish replaced the save.
+        const over = { revision: s.revision, saved: true, by: madeBy(s.revision) };
         setNewer((n) =>
           n !== null
             ? s.revision >= n.revision
-              ? { revision: s.revision, saved: true }
+              ? over
               : n
             : base !== null && s.revision > base
-              ? { revision: s.revision, saved: true }
+              ? over
               : null,
         );
       }
+      // After the notice about the save: the editor may take in the view that overtook it.
+      conclude(command, s, view !== null, !unsaved && edits.current === sent);
       return s;
     } finally {
       // In the same step as the answer, so no render sees the write done without its answer.
@@ -854,9 +883,12 @@ export default function App() {
       {newer !== null && (
         // Not blocking: the editor stays usable, and nothing changes until the user picks one.
         <div className="alert notice" role="status">
+          {newer.by === null
+            ? `配置已在后台更新为 v${newer.revision}`
+            : `配置已更新为 v${newer.revision}（${MADE_BY[newer.by]}）`}
           {newer.saved
-            ? `配置已在后台更新为 v${newer.revision}，保存已用编辑器中的配置覆盖了它的草稿。`
-            : `配置已在后台更新为 v${newer.revision}。编辑器中未保存的修改仍然保留，保存时会以它们覆盖草稿。`}
+            ? '，保存已用编辑器中的配置覆盖了它的草稿。'
+            : '。编辑器中未保存的修改仍然保留，保存时会以它们覆盖草稿。'}
           <button
             onClick={() => {
               editorRevision.current = Math.max(editorRevision.current ?? 0, newer.revision);

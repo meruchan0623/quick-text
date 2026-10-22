@@ -1902,7 +1902,11 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       await answerHeld(mounted, hold, 0);
       expect(separators(container)).toBe(' |');
       expect(revisionText(container)).toContain('当前生效 v3');
-      expect(notices(container)).toContain('配置已在后台更新为 v3。编辑器中未保存的修改仍然保留');
+      // This window made v3: not said to come from 「后台」.
+      expect(notices(container)).toContain(
+        '配置已更新为 v3（恢复上一个版本）。编辑器中未保存的修改仍然保留',
+      );
+      expect(notices(container)).not.toContain('后台');
       await click(mounted, '放弃修改，载入新配置');
       expect(separators(container)).toBe(before);
       expect(notices(container)).toBe('');
@@ -1933,6 +1937,164 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       await focusLoad(mounted);
       expect(notices(container)).toBe('');
       expect(separators(container)).toBe(' |');
+    });
+
+    it('names 恢复上一个版本 in the notice a load raised before its dropped answer came', async () => {
+      const hold = holdAnswers('rollback');
+      const mounted = await mountReady(hold);
+      const { container } = mounted;
+      await click(mounted, '文本指令参数设置');
+      await publish(mounted, ',');
+      await waitFor(mounted, () => {
+        expect(separators(container)).toBe(',');
+      });
+      // The load shows v3 over the later edit, before the answer says this window made it.
+      await dropAnswer(mounted, hold, ROLLBACK, () =>
+        type(mounted, field(container, '词分隔符'), ' |'),
+      );
+      expect(separators(container)).toBe(' |');
+      expect(notices(container)).toContain(
+        '配置已更新为 v3（恢复上一个版本）。编辑器中未保存的修改仍然保留',
+      );
+      expect(notices(container)).not.toContain('后台');
+      // Saving over it names it the same way.
+      await saveSettings(mounted);
+      expect(notices(container)).toContain(
+        '配置已更新为 v3（恢复上一个版本），保存已用编辑器中的配置覆盖了它的草稿',
+      );
+      expect(notices(container)).not.toContain('后台');
+    });
+
+    it('says nothing newer of the revision 应用设置 made when its answer is dropped', async () => {
+      const hold = holdAnswers('apply_settings');
+      const mounted = await mountReady(hold);
+      const { backend, container } = mounted;
+      await click(mounted, '文本指令参数设置');
+      await type(mounted, field(container, '词分隔符'), ' ;');
+      hold.arm();
+      await click(mounted, '应用设置');
+      await waitFor(mounted, () => {
+        expect(hold.held[0]?.read).toBe(true);
+      });
+      await type(mounted, field(container, '词分隔符'), ' |');
+      await focusLoad(mounted);
+      await answerHeld(mounted, hold, 0);
+      expect(backend.active.globals.word_separators).toBe(' ;');
+      expect(revisionText(container)).toContain('当前生效 v2');
+      // As had the answer come first: the later edit kept, over v2, which is this window's own.
+      expect(separators(container)).toBe(' |');
+      expect(revisionText(container)).toContain('草稿待应用');
+      expect(notices(container)).toBe('');
+      await focusLoad(mounted);
+      expect(notices(container)).toBe('');
+      expect(separators(container)).toBe(' |');
+    });
+
+    /** 总开关 as its checkbox shows it. */
+    const enabled = (container: HTMLElement) => checkbox(container, '启用文本指令')?.checked;
+    /** What the last save_draft sent for 总开关. */
+    const sentEnabled = (backend: MockBackend) =>
+      (callsOf(backend, 'save_draft').at(-1)?.args.config as { enabled: boolean } | undefined)
+        ?.enabled;
+
+    /**
+     * Over an unsaved edit of the word separators, 总开关 saves a config the editor does not show:
+     * the edit, and the switch turned. Its answer is held; returns the switch as it was.
+     */
+    async function toggleHeld(mounted: Mounted, hold: LoadHold) {
+      const { container } = mounted;
+      await click(mounted, '文本指令参数设置');
+      await type(mounted, field(container, '词分隔符'), ' ;');
+      await click(mounted, '文本指令管理');
+      const before = enabled(container);
+      hold.arm();
+      await mounted.act(() => {
+        checkbox(container, '启用文本指令')?.click();
+      });
+      await waitFor(mounted, () => {
+        expect(hold.held[0]?.read).toBe(true);
+      });
+      return before;
+    }
+
+    it('puts what 总开关 saved in the editor when its answer is dropped for a later load', async () => {
+      const hold = holdAnswers('save_draft');
+      const mounted = await mountReady(hold);
+      const { backend, container } = mounted;
+      const before = await toggleHeld(mounted, hold);
+      // The load shows the store as the save left it; the editor, with its unsaved edit, keeps its
+      // config.
+      await focusLoad(mounted);
+      expect(enabled(container)).toBe(before);
+      await answerHeld(mounted, hold, 0);
+      expect(enabled(container)).toBe(!before);
+      expect(notices(container)).toBe('');
+      // Nothing unsaved: 导出 does not save first.
+      await click(mounted, '导出');
+      await waitFor(mounted, () => {
+        expect(callsOf(backend, 'export_config')).toHaveLength(1);
+      });
+      await settle(mounted);
+      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+      await click(mounted, '文本指令参数设置');
+      expect(separators(container)).toBe(' ;');
+      // A save from the editor keeps what 总开关 saved.
+      await saveSettings(mounted);
+      expect(sentEnabled(backend)).toBe(!before);
+      expect(sentSeparators(backend)).toBe(' ;');
+    });
+
+    it('keeps edits made after 总开关 saved when its answer is dropped for a later load', async () => {
+      const hold = holdAnswers('save_draft');
+      const mounted = await mountReady(hold);
+      const { container } = mounted;
+      await toggleHeld(mounted, hold);
+      await click(mounted, '文本指令参数设置');
+      await type(mounted, field(container, '词分隔符'), ' |');
+      await focusLoad(mounted);
+      await answerHeld(mounted, hold, 0);
+      expect(separators(container)).toBe(' |');
+      expect(revisionText(container)).toContain('草稿待应用');
+      // Still unsaved: a revision published elsewhere does not replace it.
+      await publish(mounted, ',');
+      await waitFor(mounted, () => {
+        expect(notices(container)).toContain('配置已在后台更新为 v2。编辑器中未保存的修改仍然保留');
+      });
+      expect(separators(container)).toBe(' |');
+    });
+
+    it('takes in what was published after a save ran when its answer is dropped', async () => {
+      const hold = holdAnswers('save_draft');
+      const mounted = await mountReady(hold);
+      const { backend, container } = mounted;
+      // Another window publishes v2 just before the save runs, and v3 after.
+      const handle = backend.handle.bind(backend);
+      let published = false;
+      backend.handle = (...[command, args]: Parameters<MockBackend['handle']>) => {
+        if (command === 'save_draft' && !published) {
+          published = true;
+          backend.publishExternally((config) => {
+            config.globals.word_separators = ',';
+          });
+        }
+        return handle(command, args);
+      };
+      await click(mounted, '文本指令参数设置');
+      await type(mounted, field(container, '词分隔符'), ' ;');
+      hold.arm();
+      await click(mounted, '保存参数草稿');
+      await waitFor(mounted, () => {
+        expect(hold.held[0]?.read).toBe(true);
+      });
+      await publish(mounted, '|');
+      // Shown over the edit being saved, so said newer.
+      await focusLoad(mounted);
+      expect(notices(container)).toContain('配置已在后台更新为 v3');
+      await answerHeld(mounted, hold, 0);
+      // As had the answer come first: the save over v2 said, then v3 taken in, which makes both moot.
+      expect(separators(container)).toBe('|');
+      expect(revisionText(container)).toContain('当前生效 v3');
+      expect(notices(container)).toBe('');
     });
   });
 });
