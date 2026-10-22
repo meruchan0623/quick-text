@@ -1,4 +1,4 @@
-import { completeRules, isReadableRule } from './lib/rules';
+import { completeRules, hasUnsafeNumber, isReadableRule } from './lib/rules';
 import { DEFAULT_TERMINATORS } from './lib/terminators';
 export type Data = Record<string, any>;
 export interface Config extends Data {
@@ -33,6 +33,15 @@ export function completeConfig<T extends Config>(config: T): T {
   const rules = completeRules(config.rules);
   return rules === config.rules ? config : { ...config, rules };
 }
+/**
+ * Whether the config outside `rules` (its own keys and the globals', known or of a newer version)
+ * holds a number past the IPC number contract (docs/ipc-contract-0.4.md §6), which saving may
+ * rewrite. Rules are left out: such a rule is unreadable and the list says so.
+ */
+export const settingsHaveUnsafeNumber = (config: Config): boolean =>
+  hasUnsafeNumber(
+    Object.entries(config).flatMap(([key, value]) => (key === 'rules' ? [] : [value])),
+  );
 export interface State extends Data {
   draft: Config;
   active: Config;

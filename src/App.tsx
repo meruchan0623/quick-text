@@ -13,6 +13,7 @@ import {
   keys,
   newRule,
   Rule,
+  settingsHaveUnsafeNumber,
   State,
 } from './model';
 import ActionEditor from './ActionEditor';
@@ -346,6 +347,8 @@ export default function App() {
     ...editingDiagnostics.rule,
     ...editingDiagnostics.other.filter((d) => d.severity !== 'warning'),
   ];
+  // Kept in place on save. Their numbers are within the IPC number contract (a rule holding one
+  // past it is unreadable and never reaches the editor), so their values stay the same.
   const editingExtraKeys = editing ? unknownRuleKeys(editing) : [];
   const mutate = async (fn: (rs: Rule[]) => Rule[]) =>
     run(
@@ -703,6 +706,12 @@ export default function App() {
         <section className="settings">
           <h2>文本指令参数设置</h2>
           <p className="muted">以下选项与指令草稿一并发布，单条指令可覆盖触发字符。</p>
+          {/* IPC number contract (docs/ipc-contract-0.4.md §6); saving is not blocked. */}
+          {settingsHaveUnsafeNumber(config) && (
+            <p className="unsafe-number-note">
+              配置中含超出可安全保存范围的数值，保存时可能被改写。
+            </p>
+          )}
           <Field label="默认触发字符">
             <EndKeys
               platform={platform}
@@ -914,7 +923,7 @@ export default function App() {
                 )}
                 {editingExtraKeys.length > 0 && (
                   <p className="muted extra-keys">
-                    含有本版本不认识的字段（{editingExtraKeys.join('、')}），保存时会原样保留。
+                    含有本版本不认识的字段（{editingExtraKeys.join('、')}），保存时会保留。
                   </p>
                 )}
                 <h3>什么时候执行</h3>

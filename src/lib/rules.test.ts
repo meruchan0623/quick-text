@@ -231,6 +231,51 @@ describe('tolerant reading (B-43)', () => {
       ]);
     });
 
+    // Every kind of place a number can sit in a rule, as JSON text with $N for the number: readable
+    // with a safe number, unreadable and flagged with one past the contract.
+    const ruleText = (rest: string) => `{"id":"r","match":{"kind":"literal","value":";r"},${rest}}`;
+    const stepText = (step: string) =>
+      ruleText(`"action":{"type":"steps","plan":{"steps":[${step}]}}`);
+    const places: [string, string][] = [
+      [
+        'a known integer field (step span.line)',
+        stepText('{"operation":{"type":"delay","ms":1},"span":{"line":$N,"column":1,"length":0}}'),
+      ],
+      ['a known integer field (step delay.ms)', stepText('{"operation":{"type":"delay","ms":$N}}')],
+      [
+        'a known float field (step mouse_move.x)',
+        stepText('{"operation":{"type":"mouse_move","x":$N,"y":0}}'),
+      ],
+      [
+        'action reusable.parameters',
+        ruleText('"action":{"type":"reusable","action_id":"a","parameters":{"count":$N}}'),
+      ],
+      [
+        'step reusable.parameters',
+        stepText('{"operation":{"type":"reusable","action_id":"a","parameters":{"count":$N}}}'),
+      ],
+      [
+        'deep in step reusable.parameters',
+        stepText(
+          '{"operation":{"type":"reusable","action_id":"a","parameters":{"o":{"l":[1,{"n":$N}]}}}}',
+        ),
+      ],
+      ['a rule-level key of a newer version', ruleText('"future_rule_field":$N')],
+      [
+        'deep in a rule-level key of a newer version',
+        ruleText('"future_rule_field":{"a":[{"b":[$N]}]}'),
+      ],
+    ];
+
+    it.each(places)('makes a rule unreadable with a number past it in %s', (_, text) => {
+      expect(isReadableRule(JSON.parse(text.replace('$N', '9007199254740991')))).toBe(true);
+      const rules = JSON.parse(`[${text.replace('$N', '9007199254740993')}]`) as unknown[];
+      expect(isReadableRule(rules[0])).toBe(false);
+      expect(unreadableEntries(rules)).toEqual([{ index: 0, id: 'r', unsafeNumber: true }]);
+      // Left as it is, like any unreadable entry: no serde defaults filled in.
+      expect(completeRules(rules)[0]).toBe(rules[0]);
+    });
+
     it('writes an unreadable entry with only safe numbers back as the JSON it came from', () => {
       const parsed = JSON.parse(`[${readableText},${hugeText},${safeText}]`) as unknown[];
       const [a] = parsed.filter(isReadableRule);

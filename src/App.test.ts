@@ -682,7 +682,7 @@ describe('tolerant reading (B-43)', () => {
     const before = structuredClone(backend.draft);
     await click(mounted, '编辑');
     expect(container.querySelector('.extra-keys')?.textContent).toBe(
-      '含有本版本不认识的字段（future_rule_field），保存时会原样保留。',
+      '含有本版本不认识的字段（future_rule_field），保存时会保留。',
     );
     await type(mounted, field(container, '说明'), '新说明');
     await clickIn(mounted, dialog(container, '编辑文本指令'), '保存');
@@ -807,12 +807,18 @@ describe('tolerant reading (B-43)', () => {
     // form JSON.stringify writes, so the text itself can be compared.
     const safeText =
       '{"id":"safe-raw","match":42,"future_kind":{"counts":[9007199254740991,-9007199254740991,2.5],"note":null}}';
+    // A rule the editor could open but for the number in a form-editable reusable parameter: it
+    // would show the rounded value as the real one, so it is listed read-only too.
+    const parameterText =
+      '{"id":"huge-parameter","match":{"kind":"literal","value":";hp"},' +
+      '"action":{"type":"reusable","action_id":"a","parameters":{"count":9007199254740993}}}';
     const mounted = await mount({}, (backend) => {
-      backend.draft.rules.splice(1, 0, ...(JSON.parse(`[${hugeText},${safeText}]`) as unknown[]));
+      const raw = JSON.parse(`[${hugeText},${safeText},${parameterText}]`) as unknown[];
+      backend.draft.rules.splice(1, 0, ...raw);
     });
     const { backend, container } = mounted;
     await waitFor(mounted, () => {
-      expect(container.querySelectorAll('tbody tr.unreadable-row')).toHaveLength(2);
+      expect(container.querySelectorAll('tbody tr.unreadable-row')).toHaveLength(3);
     });
     const row = (id: string) =>
       [...container.querySelectorAll('tbody tr.unreadable-row')].find(
@@ -822,6 +828,10 @@ describe('tolerant reading (B-43)', () => {
       '含超出可安全保存范围的数值，保存其他内容时该数值可能被改写。',
     );
     expect(row('huge-number')?.textContent).not.toMatch(/保存时不会改动它/);
+    expect(row('huge-parameter')?.querySelector('.unreadable-reason')?.textContent).toBe(
+      '含超出可安全保存范围的数值，保存其他内容时该数值可能被改写。',
+    );
+    expect(row('huge-parameter')?.querySelector('input, button')).toBeNull();
     expect(row('safe-raw')?.querySelector('.unreadable-reason')).toBeNull();
     expect(row('safe-raw')?.textContent).toMatch(/保存时不会改动它/);
 
@@ -841,8 +851,56 @@ describe('tolerant reading (B-43)', () => {
     // The safe entry goes out as the JSON it came in as.
     expect(saved[2]).toEqual(JSON.parse(safeText));
     expect(JSON.stringify(saved[2])).toBe(safeText);
-    // The flagged one goes out with the value JSON.parse rounded it to, as the list says.
+    // The flagged ones go out with the value JSON.parse rounded them to, as the list says.
     expect(JSON.stringify(saved[1])).toBe(hugeText.replace('9007199254740993', '9007199254740992'));
+    expect(JSON.stringify(saved[3])).toBe(
+      parameterText.replace('9007199254740993', '9007199254740992'),
+    );
+  });
+
+  // Config- and globals-level keys of a newer version: the config stays readable; the settings
+  // page says a number in it may be rewritten. JSON text again, as the IPC carries it.
+  describe.each(['config', 'globals'] as const)('an unknown key of the %s', (level) => {
+    const text = (n: string) => `{"future_big":{"ids":[1,${n}],"note":null}}`;
+    async function mountWith(n: string): Promise<Mounted> {
+      const mounted = await mount({}, (backend) => {
+        Object.assign(
+          level === 'config' ? backend.draft : backend.draft.globals,
+          JSON.parse(text(n)),
+        );
+      });
+      await waitFor(mounted, () => {
+        expect(mounted.container.querySelectorAll('tbody tr')).toHaveLength(3);
+      });
+      await click(mounted, '文本指令参数设置');
+      return mounted;
+    }
+    async function saveSettings(mounted: Mounted): Promise<string> {
+      await click(mounted, '保存参数草稿');
+      await waitFor(mounted, () => {
+        expect(callsOf(mounted.backend, 'save_draft')).toHaveLength(1);
+      });
+      expect(mounted.container.querySelector('.alert.error')).toBeNull();
+      const saved = lastSaved(mounted.backend);
+      return JSON.stringify({
+        future_big: (level === 'config' ? saved : saved.globals).future_big,
+      });
+    }
+
+    it('holding a number past the IPC contract: the settings page says so; saving goes through', async () => {
+      const mounted = await mountWith('9007199254740993');
+      expect(mounted.container.querySelector('.unsafe-number-note')?.textContent).toBe(
+        '配置中含超出可安全保存范围的数值，保存时可能被改写。',
+      );
+      // Out with the value JSON.parse rounded it to, as the note says.
+      expect(await saveSettings(mounted)).toBe(text('9007199254740992'));
+    });
+
+    it('holding only safe numbers: no note; it goes out as the JSON it came in as', async () => {
+      const mounted = await mountWith('9007199254740991');
+      expect(mounted.container.querySelector('.unsafe-number-note')).toBeNull();
+      expect(await saveSettings(mounted)).toBe(text('9007199254740991'));
+    });
   });
 
   it('reads absent fields as their serde defaults and edits such a rule', async () => {

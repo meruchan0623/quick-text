@@ -37,7 +37,30 @@ const text = (value: unknown): string => (typeof value === 'string' ? value : ''
 // object) and unknown fields as extra keys. The UI lists such an entry read-only and writes every
 // entry and key back in place, as the value it received: within the IPC number contract
 // (docs/ipc-contract-0.4.md §6) the value stays the same. An integer past it was already rounded
-// when the IPC JSON was parsed; `hasUnsafeNumber` finds such an entry so the list can say so.
+// when the IPC JSON was parsed, so an entry holding one anywhere is unreadable, and the list says
+// why (`UnreadableEntry.unsafeNumber`).
+
+/**
+ * Whether a number anywhere in `value` is past ±(2^53−1), the IPC number contract
+ * (docs/ipc-contract-0.4.md §6). JSON parsing rounds an integer past it to the nearest double, so
+ * the value written back may not be the one in the file. Every original past 2^53−1 parses to at
+ * least 2^53 (or to Infinity), so the check misses none; it also flags a value that happens to
+ * round-trip, such as 2^53 itself or 1e300.
+ */
+export function hasUnsafeNumber(value: unknown): boolean {
+  const pending: unknown[] = [value];
+  while (pending.length > 0) {
+    const item = pending.pop();
+    if (typeof item === 'number') {
+      if (Math.abs(item) > Number.MAX_SAFE_INTEGER) return true;
+    } else if (Array.isArray(item)) {
+      for (const child of item) pending.push(child);
+    } else if (isRecord(item)) {
+      for (const child of Object.values(item)) pending.push(child);
+    }
+  }
+  return false;
+}
 
 /**
  * The top-level fields of a readable rule. `isReadableRule` checks every nested field too (see
@@ -62,9 +85,13 @@ export interface ReadableRule {
 /**
  * Whether a `rules` entry is a rule the UI can show and edit, or a raw unreadable entry. Every
  * nested field is checked against the Rust type, per action, step and key type; an unknown type,
- * or an unknown key below the rule itself, makes the entry unreadable.
+ * or an unknown key below the rule itself, makes the entry unreadable. So does a number past the
+ * IPC number contract anywhere in it: in a known field, in `reusable.parameters` (of an action or
+ * a step), in a rule-level key of a newer version, at any depth. The editor would otherwise take
+ * the rounded value for the real one; unreadable, the list says why instead.
  */
-export const isReadableRule = (entry: unknown): entry is ReadableRule => isRuleShape(entry);
+export const isReadableRule = (entry: unknown): entry is ReadableRule =>
+  isRuleShape(entry) && !hasUnsafeNumber(entry);
 
 /**
  * `rules` with the serde default of every absent field of every readable rule filled in, at every
@@ -80,28 +107,6 @@ export function completeRules(rules: unknown[]): unknown[] {
 export function unreadableId(entry: unknown): string | null {
   const id = record(entry).id;
   return typeof id === 'string' && id !== '' ? id : null;
-}
-
-/**
- * Whether a number anywhere in `value` is past ±(2^53−1), the IPC number contract
- * (docs/ipc-contract-0.4.md §6). JSON parsing rounds an integer past it to the nearest double, so
- * the value written back may not be the one in the file. Every original past 2^53−1 parses to at
- * least 2^53 (or to Infinity), so the check misses none; it also flags a value that happens to
- * round-trip, such as 2^53 itself or 1e300.
- */
-export function hasUnsafeNumber(value: unknown): boolean {
-  const pending: unknown[] = [value];
-  while (pending.length > 0) {
-    const item = pending.pop();
-    if (typeof item === 'number') {
-      if (Math.abs(item) > Number.MAX_SAFE_INTEGER) return true;
-    } else if (Array.isArray(item)) {
-      for (const child of item) pending.push(child);
-    } else if (isRecord(item)) {
-      for (const child of Object.values(item)) pending.push(child);
-    }
-  }
-  return false;
 }
 
 export interface UnreadableEntry {

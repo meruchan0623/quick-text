@@ -16,7 +16,9 @@
 //   A field without one must be there. `null` is only valid for an `Option`.
 // - Numbers. Integers are checked against their Rust type (u16, u32, i32, u64/usize) and floats must
 //   be finite. A u64 past 2^53−1 is outside the IPC number contract and not readable: it was
-//   already rounded when the IPC JSON was parsed, and the list flags the entry (`hasUnsafeNumber`).
+//   already rounded when the IPC JSON was parsed. `isReadableRule` (./rules.ts) goes further: a
+//   number past the contract anywhere in an entry, `serde_json::Value` fields and rule-level keys
+//   included, makes it unreadable, and the list says why.
 
 /** A runtime type check for one JSON value. */
 export type Guard = (value: unknown) => boolean;
