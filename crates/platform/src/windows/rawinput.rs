@@ -474,8 +474,8 @@ static DROPPED_BUSY_SINK: ArcSwapOption<DroppedBusySink> = ArcSwapOption::const_
 /// The sink is called synchronously on the input consumer thread, the one
 /// that drains the RawInput lane, once per report. It must not block (the
 /// runtime hands each report to a bounded queue); matching waits for it.
-/// A rule is reported at most once per busy period, however often it is
-/// typed.
+/// A rule retyped within one stamp is reported once; after any reset of the
+/// busy shadow (a new busy period, a broken prefix) it is reported again.
 #[allow(dead_code, reason = "S-19: the runtime installs the sink at merge")]
 pub(crate) fn set_dropped_busy_sink(sink: Box<dyn Fn(DroppedBusy) + Send + Sync>) {
     DROPPED_BUSY_SINK.store(Some(Arc::new(sink)));
@@ -514,32 +514,37 @@ pub(super) fn clear_dropped_busy_sink() {
 /// breaks it too. Acceptance mode's injected keys advance only the
 /// generation and do not break it (test harness only).
 ///
-/// A busy period lasts until a key is captured while not busy; that key
-/// discards the shadow and its reports. Two busy periods with no such key
-/// between them would count as one, but they cannot meet: busy is set only
-/// when the consumer hands the executor a candidate, completed by a key
-/// captured while not busy that came through here first. Acceptance mode,
-/// whose trigger keys come from the hook, is the exception (test harness
-/// only).
+/// Whenever the shadow is reset it is reset whole, its reports included:
+/// on a key captured while not busy (the busy period ended), a change of
+/// stamp or loss count, a key that cannot become an event, a configuration
+/// change. Reports are kept only so that one rule retyped within one stamp
+/// does not flood the sink.
+///
+/// Busy is set when the consumer hands the executor a candidate, and also
+/// by src-tauri's `execute_action` for actions started from the UI, so the
+/// invariant that keeps two busy periods apart is: between them there is
+/// either a key captured while not busy or a change of stamp. A candidate
+/// is completed by a key captured while not busy that came through here
+/// first; an action started from the UI by mouse or focus alone follows a
+/// click or a focus change, which advances the caret or focus epoch, so the
+/// first key of its period finds a new stamp. Acceptance mode, whose
+/// trigger keys come from the hook, is the exception (test harness only).
 #[derive(Default)]
 pub(super) struct Shadow {
     text: String,
-    /// The stamp of the last key folded in; `None` once the prefix broke.
+    /// The stamp of the last key folded in; `None` once the shadow reset.
     stamp: Option<Stamp>,
     /// The lane loss count of the last key folded in.
     lost: u64,
-    /// The rules already reported in this busy period.
+    /// The rules already reported since the shadow last reset.
     reported: Vec<String>,
 }
 impl Shadow {
-    /// The next key starts a new word.
-    fn break_prefix(&mut self) {
+    /// The prefix broke or the busy period ended: the next key starts a
+    /// new word, and its rule may be reported again.
+    fn reset(&mut self) {
         self.text.clear();
         self.stamp = None;
-    }
-    /// The busy period is over: nothing of it is kept.
-    fn end_period(&mut self) {
-        self.break_prefix();
         self.reported.clear();
     }
 }
@@ -557,12 +562,12 @@ pub(super) fn shadow_match(
         return None;
     }
     if !record.busy {
-        shadow.end_period();
+        shadow.reset();
         return None;
     }
     let Some(event) = event.filter(|_| !record.paused && !shared.paused.load(Ordering::SeqCst))
     else {
-        shadow.break_prefix();
+        shadow.reset();
         return None;
     };
     let terminator = terminator_of(&event.kind);
@@ -571,7 +576,7 @@ pub(super) fn shadow_match(
     let contiguous = shadow.stamp.as_ref() == Some(&event.stamp) && shadow.lost == record.lost;
     let previous = (terminator.is_some() && contiguous).then(|| shadow.text.clone());
     if !contiguous {
-        shadow.text.clear();
+        shadow.reset();
     }
     shadow.stamp = Some(event.stamp.clone());
     shadow.lost = record.lost;
@@ -589,7 +594,7 @@ pub(super) fn shadow_match(
         return None;
     };
     if compiler.config.revision != event.stamp.revision {
-        shadow.text.clear();
+        shadow.reset();
         return None;
     }
     let foreground_context = ForegroundContext {

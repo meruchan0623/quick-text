@@ -3167,7 +3167,7 @@ impl ForegroundProbe for LiveCaret {
 }
 
 /// S-19: an abbreviation typed while an action runs reaches the sink once
-/// per busy period, as its rule id and process, and never becomes a
+/// while its stamp holds, as its rule id and process, and never becomes a
 /// candidate.
 #[test]
 fn a_rule_typed_while_busy_is_reported_once_and_never_executed() {
@@ -3184,7 +3184,7 @@ fn a_rule_typed_while_busy_is_reported_once_and_never_executed() {
     assert!(rig.enter("qzx").is_empty(), "no candidate while busy");
     assert_eq!(busy_drops("s19-once"), [dropped_in_app("s19-once")]);
     assert!(rig.enter("qzx").is_empty());
-    assert_eq!(busy_drops("s19-once").len(), 1, "once per busy period");
+    assert_eq!(busy_drops("s19-once").len(), 1, "once within one stamp");
     // A key captured while idle ends the period; in the next one the rule
     // is reported again, here with RawInput lagging behind the hook.
     rig.busy(false);
@@ -3206,6 +3206,45 @@ fn a_rule_typed_while_busy_is_reported_once_and_never_executed() {
     assert!(busy_drops("s19-word").is_empty());
     assert!(rig.enter(" ").is_empty());
     assert_eq!(busy_drops("s19-word"), [dropped_in_app("s19-word")]);
+}
+
+/// S-19: two busy periods with no key captured while idle between them are
+/// still two. src-tauri's `execute_action` sets busy too, for an action
+/// started from the UI, after a click or a focus change and not a key; the
+/// new stamp resets the shadow, so a rule typed in each period is reported
+/// in each. Within one stamp a retyped rule is still reported once.
+#[test]
+fn a_rule_is_reported_in_each_busy_period_split_by_a_click_or_a_focus_change() {
+    let _serial = serial();
+    collect_busy_drops();
+    let probe = MockForeground::new(window());
+    let mut rig = BusyRig::new("s19-ui", "qzx", TriggerMode::Immediate, probe.clone(), 64);
+    rig.busy(true);
+    assert!(rig.enter("qzx").is_empty());
+    assert!(rig.enter("qzx").is_empty());
+    assert_eq!(busy_drops("s19-ui").len(), 1, "once within one stamp");
+    // The action ends with no key typed; a click starts the next from the
+    // UI. The hooks advance the production probe's caret epoch on a click
+    // (LiveCaret); this probe mirrors it.
+    rig.busy(false);
+    handle_mouse(&rig.hooks, &rig.shared, mouse(WM_LBUTTONDOWN, 5, 5));
+    handle_mouse(&rig.hooks, &rig.shared, mouse(WM_LBUTTONUP, 5, 5));
+    probe.update_input_context(|context| context.caret_epoch += 1);
+    rig.busy(true);
+    assert!(rig.enter("qzx").is_empty());
+    assert!(rig.enter("qzx").is_empty());
+    assert_eq!(busy_drops("s19-ui").len(), 2, "again after a click");
+    // Or a focus change does.
+    rig.busy(false);
+    probe.update_input_context(|context| context.focus_epoch += 1);
+    rig.busy(true);
+    assert!(rig.enter("qzx").is_empty());
+    assert!(rig.enter("qzx").is_empty());
+    assert_eq!(
+        busy_drops("s19-ui"),
+        vec![dropped_in_app("s19-ui"); 3],
+        "again after a focus change"
+    );
 }
 
 /// S-19: keys typed while busy never reach the matcher's buffer, so
