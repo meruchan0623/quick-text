@@ -234,15 +234,79 @@ function Get-LockedRegistryCrates {
     return @($result)
 }
 
+# The distributed npm packages as registry tarballs: one entry per package file (name, version, the tarball URL and
+# the integrity of package-lock.json, and the file name the tarball has inside the archive: npm/tarballs/<FileName>).
+# Needs only package-lock.json. The archive generator and Assert-DependencySourcesZip both derive from this, so they agree.
+function Get-NpmLockPackageName {
+    param([Parameter(Mandatory = $true)][string]$Key, [Parameter(Mandatory = $true)]$Entry)
+    if ($Entry.ContainsKey('name') -and $Entry['name']) { return [string]$Entry['name'] }
+    return $Key.Substring($Key.LastIndexOf('node_modules/', [StringComparison]::Ordinal) + 'node_modules/'.Length)
+}
+
+function Get-DistributedNpmTarballs {
+    param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+    $byFile = [ordered]@{}
+    foreach ($item in (Get-DistributedNpmLockEntries -ProjectRoot $ProjectRoot)) {
+        $entry = $item.Entry
+        $name = Get-NpmLockPackageName -Key $item.Key -Entry $entry
+        $version = [string]$entry['version']
+        $resolved = if ($entry.ContainsKey('resolved')) { [string]$entry['resolved'] } else { '' }
+        $integrity = if ($entry.ContainsKey('integrity')) { [string]$entry['integrity'] } else { '' }
+        if (-not $resolved -or -not $integrity) { throw "package-lock.json: $($item.Key) has no resolved URL or integrity, so its tarball cannot be bound to the registry" }
+        $fileName = ($name -replace '/', '__') + "-$version.tgz"
+        if ($byFile.Contains($fileName)) {
+            if ($byFile[$fileName].Integrity -ne $integrity) { throw "package-lock.json: $name $version appears with two different integrity values" }
+            continue
+        }
+        $byFile[$fileName] = [pscustomobject]@{ Name = $name; Version = $version; Resolved = $resolved; Integrity = $integrity; FileName = $fileName }
+    }
+    return @($byFile.Values | Sort-Object FileName)
+}
+
+# The line npm/PACKAGES.txt has for a tarball: name, version, resolved URL, integrity (package-lock.json) and the tarball's path.
+function Get-NpmPackagesLine {
+    param([Parameter(Mandatory = $true)]$Tarball)
+    return "$($Tarball.Name) $($Tarball.Version) | $($Tarball.Resolved) | $($Tarball.Integrity) | tarballs/$($Tarball.FileName)"
+}
+
+# True when the stream has the npm `integrity` value (Subresource Integrity: "sha512-<base64>", possibly several
+# values; the strongest of sha512, sha384, sha256 counts). Throws for a value it cannot check.
+function Test-NpmIntegrity {
+    param([Parameter(Mandatory = $true)][string]$Integrity, [Parameter(Mandatory = $true)][IO.Stream]$Stream)
+    $tokens = @($Integrity -split '\s+' | Where-Object { $_ })
+    $chosen = $null
+    foreach ($algorithm in @('sha512', 'sha384', 'sha256')) {
+        $chosen = $tokens | Where-Object { $_.StartsWith("$algorithm-", [StringComparison]::Ordinal) } | Select-Object -First 1
+        if ($chosen) { break }
+    }
+    if (-not $chosen) { throw "Unsupported npm integrity value '$Integrity' (need sha512, sha384 or sha256)" }
+    $algorithm, $expected = $chosen.Split('-', 2)
+    $expected = ($expected -split '\?')[0]
+    if ($algorithm -eq 'sha512') { $hash = [Security.Cryptography.SHA512]::HashData($Stream) }
+    elseif ($algorithm -eq 'sha384') { $hash = [Security.Cryptography.SHA384]::HashData($Stream) }
+    else { $hash = [Security.Cryptography.SHA256]::HashData($Stream) }
+    return [Convert]::ToBase64String($hash) -ceq $expected
+}
+
 # Hard gate for every path that can produce something distributable (package-portable.ps1, package-artifacts.ps1,
 # scripts/check-bundle-preconditions.ps1 for `tauri build`): a binary must never go out without its dependency
 # sources (GPL-3.0-or-later; the dependency code is compiled or bundled into it). Throws unless the archive is
 #   - named for this version and a readable ZIP with the layout scripts/package-dependency-sources.ps1 writes,
 #   - built from THIS tree's Cargo.lock and package-lock.json (hashes in SOURCE-DEPS-MANIFEST.txt),
-#   - complete: exactly the crates of Cargo.lock are vendored, each one's .cargo-checksum.json carries the checksum
-#     of Cargo.lock and the hash of its own Cargo.toml (so a truncated or edited entry is noticed), and every
-#     distributed npm package is present at the version and with the PACKAGES.txt line the lock file asks for.
-# Returns Path, Sha256, Crates and NpmPackages. Reads the archive only; it needs neither cargo nor node_modules nor a network.
+#   - complete, including the payload and not only the metadata:
+#       Rust: exactly the crates of Cargo.lock are vendored; each crate's .cargo-checksum.json carries the checksum of
+#             Cargo.lock, and EVERY file it lists (sources, build.rs, Cargo.toml, licenses, ...) is in the archive with
+#             the listed SHA-256, so a deleted or altered source file is noticed;
+#       npm:  every distributed package of package-lock.json is in the archive as the original registry tarball, and
+#             the tarball's hash equals the `integrity` of package-lock.json (not a value the archive declares itself),
+#             so the payload is bound to the upstream package.
+# Threat model: it stops an incomplete, stale or mismatched archive from being shipped by accident (a truncated copy,
+# an archive of another commit, files lost on the way). It does not defend against somebody who deliberately edits
+# the files AND the .cargo-checksum.json that sits next to them: the `package` checksum there is the hash of the
+# original .crate file, which `cargo vendor` unpacked and discarded, so it can only be compared with Cargo.lock, not
+# recomputed from the files. The archive is made by scripts/package-dependency-sources.ps1 on the release machine.
+# Returns Path, Sha256, Crates, RustFiles and NpmPackages. Reads the archive only; it needs neither cargo nor
+# node_modules nor a network.
 function Assert-DependencySourcesZip {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -257,7 +321,8 @@ function Assert-DependencySourcesZip {
     try { $archive = [IO.Compression.ZipFile]::OpenRead($Path) } catch { throw "$label is not a readable ZIP file: $Path ($($_.Exception.Message))" }
     try {
         $stage = "Quicker-Text-$Version-Source-deps"
-        $entries = @{}
+        # Case-sensitive: file names inside a crate may differ only by case (PowerShell's @{} would merge them).
+        $entries = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
         foreach ($entry in $archive.Entries) { $entries[$entry.FullName] = $entry }
         foreach ($required in @('README-OFFLINE-BUILD.md', 'cargo-config.toml', 'SOURCE-DEPS-MANIFEST.txt', 'npm/PACKAGES.txt')) {
             if (-not $entries.ContainsKey("$stage/$required")) { throw "$label lacks $required" }
@@ -285,41 +350,72 @@ function Assert-DependencySourcesZip {
         if ($vendoredCount -ne $crates.Count) { throw "$label holds $vendoredCount vendored crates but Cargo.lock lists $($crates.Count)" }
         $declaredCrates = [regex]::Match($manifest, '(?m)^crates vendored: (\d+) ')
         if (-not $declaredCrates.Success -or [int]$declaredCrates.Groups[1].Value -ne $crates.Count) { throw "$label manifest does not declare the $($crates.Count) crates of Cargo.lock" }
+        # Every file the crate's .cargo-checksum.json lists must be in the archive with the listed SHA-256. The hash is
+        # computed straight from the ZIP entry stream (no extraction, no process per file).
+        $rustFiles = 0
         foreach ($crate in $crates) {
             $directory = "$vendorPrefix$($crate.Name)-$($crate.Version)"
-            $toml = $entries["$directory/Cargo.toml"]
-            $sums = $entries["$directory/.cargo-checksum.json"]
-            if (-not $toml -or -not $sums) { throw "$label lacks the source of crate $($crate.Name) $($crate.Version)" }
-            $sumText = Read-ZipEntryText -Entry $sums
-            $package = [regex]::Match($sumText, '"package":"([0-9a-f]{64})"')
-            if (-not $package.Success -or $package.Groups[1].Value -ne $crate.Checksum) { throw "$label`: crate $($crate.Name) $($crate.Version) does not match the checksum in Cargo.lock" }
-            $own = [regex]::Match($sumText, '"Cargo\.toml":"([0-9a-f]{64})"')
-            if (-not $own.Success -or $own.Groups[1].Value -ne (Get-ZipEntrySha256 -Entry $toml)) { throw "$label`: Cargo.toml of crate $($crate.Name) $($crate.Version) differs from its checksum file (damaged or edited)" }
+            $sums = $null
+            if (-not $entries.TryGetValue("$directory/.cargo-checksum.json", [ref]$sums) -or -not $entries.ContainsKey("$directory/Cargo.toml")) {
+                throw "$label lacks the source of crate $($crate.Name) $($crate.Version)"
+            }
+            $document = $null
+            try { $document = [Text.Json.JsonDocument]::Parse((Read-ZipEntryText -Entry $sums)) } catch { throw "$label`: .cargo-checksum.json of crate $($crate.Name) $($crate.Version) is not valid JSON" }
+            try {
+                $package = $null
+                $fileTable = $null
+                foreach ($property in $document.RootElement.EnumerateObject()) {
+                    if ($property.Name -ceq 'package') { $package = $property.Value.GetString() }
+                    elseif ($property.Name -ceq 'files') { $fileTable = $property.Value }
+                }
+                if (-not $package -or $package -ne $crate.Checksum) { throw "$label`: crate $($crate.Name) $($crate.Version) does not match the checksum in Cargo.lock" }
+                if ($null -eq $fileTable -or $fileTable.ValueKind -ne [Text.Json.JsonValueKind]::Object) { throw "$label`: .cargo-checksum.json of crate $($crate.Name) $($crate.Version) has no file table" }
+                $listsCargoToml = $false
+                foreach ($listed in $fileTable.EnumerateObject()) {
+                    $zipEntry = $null
+                    if (-not $entries.TryGetValue("$directory/$($listed.Name)", [ref]$zipEntry)) {
+                        throw "$label`: crate $($crate.Name) $($crate.Version) lacks $($listed.Name) (listed in its .cargo-checksum.json; the source is incomplete)"
+                    }
+                    $stream = $zipEntry.Open()
+                    try { $actual = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)) } finally { $stream.Dispose() }
+                    if (-not [string]::Equals($actual, $listed.Value.GetString(), [StringComparison]::OrdinalIgnoreCase)) {
+                        throw "$label`: $($listed.Name) of crate $($crate.Name) $($crate.Version) differs from its .cargo-checksum.json (damaged or edited)"
+                    }
+                    if ($listed.Name -ceq 'Cargo.toml') { $listsCargoToml = $true }
+                    $rustFiles++
+                }
+                if (-not $listsCargoToml) { throw "$label`: .cargo-checksum.json of crate $($crate.Name) $($crate.Version) does not list Cargo.toml" }
+            } finally { $document.Dispose() }
         }
 
-        # npm: every distributed package of package-lock.json is present, at the locked version, and listed.
-        $npmItems = @(Get-DistributedNpmLockEntries -ProjectRoot $ProjectRoot)
-        if ($npmItems.Count -lt 1) { throw 'package-lock.json lists no distributed npm packages' }
+        # npm: every distributed package of package-lock.json is in the archive as the registry tarball, and the
+        # tarball has the integrity that package-lock.json (this tree, not the archive) asks for.
+        $tarballs = @(Get-DistributedNpmTarballs -ProjectRoot $ProjectRoot)
+        if ($tarballs.Count -lt 1) { throw 'package-lock.json lists no distributed npm packages' }
         $declaredNpm = [regex]::Match($manifest, '(?m)^npm packages: (\d+)\s*$')
-        if (-not $declaredNpm.Success -or [int]$declaredNpm.Groups[1].Value -ne $npmItems.Count) { throw "$label manifest does not declare the $($npmItems.Count) npm packages of package-lock.json" }
-        $listed = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        if (-not $declaredNpm.Success -or [int]$declaredNpm.Groups[1].Value -ne $tarballs.Count) { throw "$label manifest does not declare the $($tarballs.Count) npm packages of package-lock.json" }
+        $listedLines = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         foreach ($line in ((Read-ZipEntryText -Entry $entries["$stage/npm/PACKAGES.txt"]) -split "\r?\n")) {
-            if ($line -and -not $line.StartsWith('#', [StringComparison]::Ordinal)) { [void]$listed.Add($line) }
+            if ($line -and -not $line.StartsWith('#', [StringComparison]::Ordinal)) { [void]$listedLines.Add($line) }
         }
-        if ($listed.Count -ne $npmItems.Count) { throw "$label`: npm/PACKAGES.txt lists $($listed.Count) packages but package-lock.json distributes $($npmItems.Count)" }
-        foreach ($item in $npmItems) {
-            $packageJson = $entries["$stage/npm/$($item.Key)/package.json"]
-            if (-not $packageJson) { throw "$label lacks npm package $($item.Key)" }
-            $json = Read-ZipEntryText -Entry $packageJson | ConvertFrom-Json -AsHashtable
-            if ([string]$json['version'] -ne [string]$item.Entry['version']) { throw "$label holds $($item.Key) $($json['version']) but package-lock.json has $($item.Entry['version'])" }
-            $expectedLine = "$($json['name']) $($item.Entry['version']) | $([string]$item.Entry['resolved']) | $([string]$item.Entry['integrity'])"
-            if (-not $listed.Contains($expectedLine)) { throw "$label`: npm/PACKAGES.txt has no line for $($item.Key) (expected '$expectedLine')" }
+        if ($listedLines.Count -ne $tarballs.Count) { throw "$label`: npm/PACKAGES.txt lists $($listedLines.Count) packages but package-lock.json distributes $($tarballs.Count)" }
+        foreach ($tarball in $tarballs) {
+            $expectedLine = Get-NpmPackagesLine -Tarball $tarball
+            if (-not $listedLines.Contains($expectedLine)) { throw "$label`: npm/PACKAGES.txt has no line for $($tarball.Name) $($tarball.Version) (expected '$expectedLine')" }
+            $zipEntry = $null
+            if (-not $entries.TryGetValue("$stage/npm/tarballs/$($tarball.FileName)", [ref]$zipEntry)) {
+                throw "$label lacks the npm tarball of $($tarball.Name) $($tarball.Version) (npm/tarballs/$($tarball.FileName))"
+            }
+            $stream = $zipEntry.Open()
+            try { $intact = Test-NpmIntegrity -Integrity $tarball.Integrity -Stream $stream } finally { $stream.Dispose() }
+            if (-not $intact) { throw "$label`: npm tarball of $($tarball.Name) $($tarball.Version) does not match the integrity in package-lock.json (damaged, edited or another build)" }
         }
     } finally { $archive.Dispose() }
     return [pscustomobject]@{
         Path        = $Path
         Sha256      = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
         Crates      = $crates.Count
-        NpmPackages = $npmItems.Count
+        RustFiles   = $rustFiles
+        NpmPackages = $tarballs.Count
     }
 }

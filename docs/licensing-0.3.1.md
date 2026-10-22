@@ -31,7 +31,7 @@ Quicker Text 0.3.1 的整个项目，包括自研代码和静态纳入的 espans
 2. 单独发布的源码包 `Quicker-Text-0.3.1-Source.zip`【待核实：0.3.1 是否单独发布；发布位置；SHA256 `……`】。0.3.1 若没有单独发布源码包，把绿色包内 `source/` 目录另行打成 ZIP 放到发布页面即可，不需要重新构建。
 3. 版本库快照：提交 `b359598`（`chore: 0.3.1 baseline`，2026-10-22）的源码树。它与已发布包的差别应当只有 `LICENSE`、`README.md`、`THIRD_PARTY_NOTICES.md` 以及 `package.json` 的 `license` 字段，这几处在 2026-10-22 已改为 GPL-3.0-or-later 口径【待核实：把已发布包的 `source/` 与该提交逐文件比较，记录差异】。版本库目前没有 `v0.3.1` 标签；比较完成后建议在该提交上补打标签，让「0.3.1 的源码」有固定的指向。
 
-依赖的源码：0.3.1 的 `source/` 没有复制 crates.io 与 npm 的依赖，它们的确切版本和校验和由 `Cargo.lock` 与 `package-lock.json` 固定。GPL 的对应源码包括编进二进制文件的这些依赖，所以不能只靠锁文件：要为 0.3.1 补发依赖源码包 `Quicker-Text-0.3.1-Source-deps.zip`，与上面的源码一起构成完整的对应源码。生成方法：把 `b359598` 的快照解到新目录，运行 `npm ci`、`cargo fetch --locked`，再用当前仓库的 `scripts/package-dependency-sources.ps1 -ProjectRoot <快照目录> -OutputDirectory <新目录>`（步骤见发布清单第 3 节）。【待核实：包生成并上传到 0.3.1 的发布页面之前，本文不声称依赖源码已经提供；上传后在这里写上位置和 SHA256】
+依赖的源码：0.3.1 的 `source/` 没有复制 crates.io 与 npm 的依赖，它们的确切版本和校验和由 `Cargo.lock` 与 `package-lock.json` 固定。GPL 的对应源码包括编进二进制文件的这些依赖，所以不能只靠锁文件：要为 0.3.1 补发依赖源码包 `Quicker-Text-0.3.1-Source-deps.zip`，与上面的源码一起构成完整的对应源码。生成方法：把 `b359598` 的快照解到新目录，运行 `cargo fetch --locked`（生成声明文件时还要 `npm ci`；依赖源码包的 npm 部分直接取注册表的原始 tarball，不需要 `node_modules`），再用当前仓库的 `scripts/package-dependency-sources.ps1 -ProjectRoot <快照目录> -OutputDirectory <新目录>`（步骤见发布清单第 3 节）。【待核实：包生成并上传到 0.3.1 的发布页面之前，本文不声称依赖源码已经提供；上传后在这里写上位置和 SHA256】
 
 ## 从源码重建 0.3.1
 
@@ -47,7 +47,7 @@ cargo build -p quicker-text --release
 
 得到 `target\release\quicker-text.exe`。重新生成绿色包：0.3.1 的快照自带的 `./scripts/package-portable.ps1 -OutputDirectory <新目录>`（输出目录必须是新目录，脚本不会覆盖已有交付包）。0.4.0 起仓库里的这个脚本更严：`-DependencySourcesZip <Source-deps.zip>` 必填，并要求用 `scripts/generate-third-party-licenses.ps1` 生成的声明文件；依赖源码包经过校验后放在绿色包旁边，缺少或不符时不产出任何文件（命令见 README「许可与绿色包构建」）。更详细的步骤见 `docs/build-verification.md`。
 
-注册中心上取不到依赖时，用 `Quicker-Text-0.3.1-Source-deps.zip`（补发之后）：与上面的源码解到同一个目录，按其中的 `README-OFFLINE-BUILD.md` 把 `cargo-vendor` 目录和 `cargo-config.toml` 接到工程上，Rust 部分用 `cargo build -p quicker-text --release --locked --offline` 完全离线构建。前端的运行时依赖在 `npm/node_modules`；TypeScript、React 插件、Tauri CLI 这些构建工具不属于程序本身，不在包内，仍需 `npm ci` 从 npm 获取。
+注册中心上取不到依赖时，用 `Quicker-Text-0.3.1-Source-deps.zip`（补发之后）：与上面的源码解到同一个目录，按其中的 `README-OFFLINE-BUILD.md` 把 `cargo-vendor` 目录和 `cargo-config.toml` 接到工程上，Rust 部分用 `cargo build -p quicker-text --release --locked --offline` 完全离线构建。前端的运行时依赖在 `npm/tarballs`，是 npm 注册表的原始 tarball（`.tgz`，其 sha512 就是 `package-lock.json` 的 `integrity`，用 `tar -xzf` 解开）；TypeScript、React 插件、Tauri CLI 这些构建工具不属于程序本身，不在包内，仍需 `npm ci` 从 npm 获取，`npm ci` 会按同样的 `integrity` 校验。
 
 不承诺重建的 exe 与已发布的 exe 逐字节相同：编译器版本、构建路径和依赖下载时间都会影响结果。承诺的是：源码、依赖源码、构建脚本和依赖版本清单足以重新构建出功能相同的程序。
 

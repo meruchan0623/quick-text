@@ -24,7 +24,7 @@
 | 构建没有改依赖锁文件 | `git diff --exit-code -- Cargo.lock package-lock.json` | 发布的依赖版本就是仓库里固定的版本 |
 | PDB 与 exe 中没有故障注入函数 | `scripts/check-binary-strings.ps1`，对归档的 PDB 与 `quicker-text.exe` | 不含 `debug_inject_fault`；同一次扫描要求 PDB 含 `quicker_platform`、exe 含 `com.quickertext.desktop`，空文件或编码不对的文件通不过 |
 | 第三方版权与许可证文字 | `scripts/generate-third-party-licenses.ps1`（`notices` 任务在 PR 里也会跑 `-CheckOnly`） | 为实际分发的每个 Rust crate 和 npm 包收集版权与许可证原文，生成 `THIRD-PARTY-LICENSES.txt`；任何一个包找不到许可证文字就失败，不写文件（S-28） |
-| 依赖源码包（先于安装包构建） | `scripts/package-dependency-sources.ps1` | 生成 `Quicker-Text-<版本>-Source-deps.zip`：`cargo vendor --locked` 的全部 crate、会进入前端产物的 npm 生产依赖、离线重建说明；检查实际分发的每个 crate 都在、数量与 `Cargo.lock` 一致、只靠这些源码 cargo 能离线解析工作区（S-28、B-51） |
+| 依赖源码包（先于安装包构建） | `scripts/package-dependency-sources.ps1` | 生成 `Quicker-Text-<版本>-Source-deps.zip`：`cargo vendor --locked` 的全部 crate、会进入前端产物的 npm 生产依赖（用 `npm pack` 取的注册表原始 tarball，放在 `npm/tarballs/`，每个都按 `package-lock.json` 的 sha512 `integrity` 校验）、离线重建说明；检查实际分发的每个 crate 都在、数量与 `Cargo.lock` 一致、只靠这些源码 cargo 能离线解析工作区；写完后用门槛函数把成品再验一遍，不通过就删掉这个包（S-28、B-51）。不需要先 `npm ci` |
 | 安装包构建的门槛 | `src-tauri/tauri.conf.json` 的 `build.beforeBundleCommand`，即 `scripts/check-bundle-preconditions.ps1` | Tauri 在编译完成、写安装包之前运行它。声明文件是占位文件、没有设置 `QT_DEPENDENCY_SOURCES_ZIP`、依赖源码包与本树锁文件不符或不完整，或平台不是 Windows x64，都使打包失败，不产出安装包（见下面「产出可分发二进制的路径」） |
 | 安装包带着生成的声明文件 | `release` 工作流「Installer bundles the generated notice file」 | 构建后 `src-tauri/resources` 与 `target/release` 里的 `THIRD-PARTY-LICENSES.txt` 都是刚生成的那份（哈希相同），不是占位文件；另用 7-Zip 列出安装包内容，列不出只给警告（见第 2 节人工核对） |
 | 打包 | `scripts/package-artifacts.ps1` | 安装包、exe、GPL 全文、第三方声明、`THIRD-PARTY-LICENSES.txt`、说明文档、`Source.zip`、`Source-deps.zip`、`SHA256SUMS`。`-DependencySourcesZip` 必填，并按本树的锁文件逐项校验；缺少、损坏、过期或不完整的依赖源码包，或者声明文件是占位文件、不是用本树的锁文件生成的，直接失败且不留输出：没有对应源码的完整版本不能发布 |
@@ -34,7 +34,9 @@ PDB 检查的做法写在 `scripts/check-binary-strings.ps1` 的头部注释里�
 
 ### 产出可分发二进制的路径（S-28 硬门槛）
 
-原则：任何能产出可分发二进制的路径，在依赖源码缺失时必须失败，不能只给警告。下表是仓库里所有这样的路径；新增脚本或工作流步骤能产出安装包、更新包或 ZIP 时，先把它加进来并接上同样的门槛。门槛的检查逻辑只有一份：`scripts/third-party-set.ps1` 里的 `Assert-DependencySourcesZip`（文件名与版本；清单里的 `Cargo.lock`、`package-lock.json` 哈希与本树一致；每个 crate 在包里且 `.cargo-checksum.json` 与 `Cargo.lock` 的校验和相符；npm 包在包里且版本与锁文件相同；任何不符都抛错）和 `Assert-ThirdPartyLicensesFile`（声明文件不是占位文件，且由本树的锁文件生成）。
+原则：任何能产出可分发二进制的路径，在依赖源码缺失时必须失败，不能只给警告。下表是仓库里所有这样的路径；新增脚本或工作流步骤能产出安装包、更新包或 ZIP 时，先把它加进来并接上同样的门槛。门槛的检查逻辑只有一份：`scripts/third-party-set.ps1` 里的 `Assert-DependencySourcesZip`（文件名与版本；清单里的 `Cargo.lock`、`package-lock.json` 哈希与本树一致；每个 crate 在包里，其 `.cargo-checksum.json` 的 `package` 与 `Cargo.lock` 的校验和相符，并且该文件列出的每一个文件，包括源码、`build.rs`、`Cargo.toml`，都在包里且 SHA256 与列出的一致；每个 npm 包都以注册表原始 tarball 的形式在 `npm/tarballs/` 里，tarball 的 sha512 等于 `package-lock.json` 的 `integrity`；任何不符都抛错）和 `Assert-ThirdPartyLicensesFile`（声明文件不是占位文件，且由本树的锁文件生成）。在当前的 559 个 crate、28312 个文件、5 个 npm tarball 上，一次检查约 3 到 8 秒。
+
+这个检查的防护范围：防止不小心发出不完整、过期或不匹配的依赖源码包（复制到一半的文件、另一个提交生成的包、丢了源码文件或 `build.rs`、字节被改动）。它不防有人同时改文件和 `.cargo-checksum.json`：`cargo vendor` 解包之后不留原始 `.crate`，`.cargo-checksum.json` 里的 `package` 只能与 `Cargo.lock` 的校验和比对，不能从包里的文件重新算出；这个包由发布机上的 `scripts/package-dependency-sources.ps1` 生成，不是不受信任的输入。npm 部分比这更强：tarball 直接与锁文件里的 `integrity` 比，绑定到上游发布的那个文件。
 
 | 路径 | 门槛 |
 | --- | --- |
@@ -69,19 +71,19 @@ PDB 检查的做法写在 `scripts/check-binary-strings.ps1` 的头部注释里�
 GPL-3.0-or-later 第 1 节的「对应源码」包括编进二进制文件的第三方代码，第 6 条（d）要求同等的获取途径。所以每个发布必须同时提供两个源码包，缺一不可，不存在「只给锁文件、已知并接受」的选项（注册中心将来下架某个版本，旧版本就取不到了）：
 
 - `Quicker-Text-<版本>-Source.zip`：工作区代码、`vendor/espanso-win32`、锁文件、构建和打包脚本。
-- `Quicker-Text-<版本>-Source-deps.zip`：`cargo vendor --locked` 的全部 crate、会打进前端产物的 npm 生产依赖、`README-OFFLINE-BUILD.md`（离线重建步骤）。两个包合在一起才是完整对应源码，发布说明里也这样写。
+- `Quicker-Text-<版本>-Source-deps.zip`：`cargo vendor --locked` 的全部 crate、会打进前端产物的 npm 生产依赖（注册表原始 tarball，`npm/tarballs/*.tgz`）、`README-OFFLINE-BUILD.md`（离线重建步骤）。两个包合在一起才是完整对应源码，发布说明里也这样写。
 
-由 `release` 工作流生成并作为前置条件检查：依赖源码包缺失、命名不对、与本树锁文件不符、里面缺 crate 或 npm 包，安装包构建和打包步骤都会失败。绿色包同理：`package-portable.ps1` 的 `-DependencySourcesZip` 必填，依赖源码包作为附属文件放在绿色包 ZIP 旁边（不放进 ZIP，约 100 MB 对约 5 MB 的下载太大，与安装包发布时两个源码包并列的方式一致），发布时两个文件一起上传。
+由 `release` 工作流生成并作为前置条件检查：依赖源码包缺失、命名不对、与本树锁文件不符、里面缺 crate 或 npm 包，或者 crate 缺了 `.cargo-checksum.json` 列出的文件（源码、`build.rs`）、文件内容被改过、npm tarball 与锁文件的 `integrity` 不符，安装包构建和打包步骤都会失败。绿色包同理：`package-portable.ps1` 的 `-DependencySourcesZip` 必填，依赖源码包作为附属文件放在绿色包 ZIP 旁边（不放进 ZIP，约 100 MB 对约 5 MB 的下载太大，与安装包发布时两个源码包并列的方式一致），发布时两个文件一起上传。
 
 - [ ] 发布附件里有 `Source-deps.zip`，`SHA256SUMS` 里有它的哈希，发布说明写着两个包合在一起是完整对应源码。
-- [ ] 抽查 `Source-deps.zip`（约 100 MB，解压后近 800 MB）：`SOURCE-DEPS-MANIFEST.txt` 里的 `Cargo.lock` 与 `package-lock.json` 哈希与本版相同；按 `README-OFFLINE-BUILD.md` 在断网的机器上把两个包解到同一目录，`cargo metadata --offline --locked` 能通过（脚本在打包时已验证过一次，这里用另一台机器再做一次）。
+- [ ] 抽查 `Source-deps.zip`（约 100 MB，解压后近 800 MB）：`SOURCE-DEPS-MANIFEST.txt` 里的 `Cargo.lock` 与 `package-lock.json` 哈希与本版相同；按 `README-OFFLINE-BUILD.md` 在断网的机器上把两个包解到同一目录，`cargo metadata --offline --locked` 能通过（脚本在打包时已验证过一次，这里用另一台机器再做一次）。门槛只能挡住意外（防护范围见上面「产出可分发二进制的路径」一节开头），这次抽查是第二道：在发布机以外的机器上打开 `npm/tarballs/`，任选一个 `.tgz` 用 `tar -xzf` 解开，确认 `package/` 里有实现文件，不是空壳。
 - [ ] 依赖增长到接近 GitHub 单个附件的上限（2 GiB）时，改用多个 ZIP 分卷并更新发布说明的写法，不要因此退回只提供锁文件。
 
 ## 3. 0.3.1 补发许可证说明
 
 0.3.1 已经发出，包内是旧的 MIT `LICENSE` 加 GPL 第三方声明，见 [0.3.1 许可证说明](licensing-0.3.1.md)。首次发布 0.4.0 之前完成：
 
-- [ ] 补发 0.3.1 的依赖源码包和第三方许可证文字。两个脚本都有 `-ProjectRoot` 参数，可以对 0.3.1 的版本库快照（`b359598`）运行：`git archive b359598` 解到一个新目录，在里面 `npm ci`、`cargo fetch --locked`，再运行 `pwsh scripts/generate-third-party-licenses.ps1 -ProjectRoot <该目录> -OutputFile <文件>` 和 `pwsh scripts/package-dependency-sources.ps1 -ProjectRoot <该目录> -OutputDirectory <新目录>`。用当前仓库的脚本即可，不要往 0.3.1 的快照里加东西。2026-10-22 对 `b359598` 的快照试过两个脚本：声明文件覆盖 286 个 crate 加 5 个 npm 包，没有缺许可证文字的包；依赖源码包含 513 个 crate（其中 286 个实际分发）和 5 个 npm 包，约 104 MB，离线解析通过。两个文件随 0.3.1 的发布页面一起提供。
+- [ ] 补发 0.3.1 的依赖源码包和第三方许可证文字。两个脚本都有 `-ProjectRoot` 参数，可以对 0.3.1 的版本库快照（`b359598`）运行：`git archive b359598` 解到一个新目录，在里面 `npm ci`（生成声明文件要用 `node_modules`；依赖源码包本身不需要，它的 npm 部分直接取注册表的 tarball）、`cargo fetch --locked`，再运行 `pwsh scripts/generate-third-party-licenses.ps1 -ProjectRoot <该目录> -OutputFile <文件>` 和 `pwsh scripts/package-dependency-sources.ps1 -ProjectRoot <该目录> -OutputDirectory <新目录>`。用当前仓库的脚本即可，不要往 0.3.1 的快照里加东西。2026-10-22 对 `b359598` 的快照试过两个脚本：声明文件覆盖 286 个 crate 加 5 个 npm 包，没有缺许可证文字的包；依赖源码包含 513 个 crate（其中 286 个实际分发）和 5 个 npm 包，约 104 MB，离线解析通过。两个文件随 0.3.1 的发布页面一起提供。
 
 - [ ] 对照已发布的 0.3.1 文件，核实 `docs/licensing-0.3.1.md` 里所有【待核实】项，并删去标记。
 - [ ] 把已发布 ZIP 的 `source/` 与版本库提交 `b359598` 逐文件比较，记录差异（预期只有 `LICENSE`、`README.md`、`THIRD_PARTY_NOTICES.md`、`package.json` 的 `license`）。

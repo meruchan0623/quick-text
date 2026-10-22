@@ -8,16 +8,23 @@
 #                        proc macros and crates for other platforms included; cargo needs the complete set
 #                        to resolve offline)
 #   cargo-config.toml    source replacement for an offline cargo build
-#   npm/node_modules/    the production npm packages bundled into the frontend, plus the build tool whose
-#                        code the bundle embeds (scripts/third-party-set.ps1), copied from node_modules
-#   npm/PACKAGES.txt     name, version, resolved URL and integrity from package-lock.json
+#   npm/tarballs/        the production npm packages bundled into the frontend, plus the build tool whose
+#                        code the bundle embeds (scripts/third-party-set.ps1), as the ORIGINAL registry tarballs
+#                        (`npm pack <resolved URL>`), each checked against the sha512 `integrity` of package-lock.json
+#   npm/PACKAGES.txt     name, version, resolved URL, integrity and tarball file, from package-lock.json
 #   SOURCE-DEPS-MANIFEST.txt, README-OFFLINE-BUILD.md
 #
-# Prerequisites: `npm ci` was run in the project root (node_modules is the source of the npm packages;
-# npm has verified their integrity against package-lock.json), cargo and network access for `cargo vendor`.
+# Prerequisites: cargo and network access for `cargo vendor`; npm and the registry (or an npm cache that has the
+# packages) for `npm pack`. Neither `npm ci` nor node_modules is needed: the tarballs come from the registry and
+# are bound to package-lock.json, not copied from an install.
 # Gates: fails when a distributed crate is not vendored, when the vendored crate count differs from
-# Cargo.lock, when cargo cannot resolve the workspace offline from the vendored sources alone, or when an
-# npm package is missing. Output must be a new file; nothing is overwritten. Size: several hundred MB.
+# Cargo.lock, when cargo cannot resolve the workspace offline from the vendored sources alone, when an npm
+# tarball does not have the integrity of package-lock.json, and finally when the finished archive does not pass
+# Assert-DependencySourcesZip (scripts/third-party-set.ps1: every file of every vendored crate is in the archive
+# with the hash its .cargo-checksum.json lists; every npm tarball has its locked integrity). That check is
+# the same one package-portable.ps1, package-artifacts.ps1 and the pre-bundle hook apply. It is aimed at an
+# incomplete, stale or mismatched archive, not at someone who edits the files and the checksum file together.
+# Output must be a new file; nothing is overwritten. Size: several hundred MB.
 #
 #   pwsh scripts/package-dependency-sources.ps1 -OutputDirectory <dir>
 #   -ProjectRoot <other checkout>    # e.g. the 0.3.1 tree, to publish its dependency sources afterwards
@@ -93,19 +100,36 @@ directory = "cargo-vendor"
     Write-Output "Rust: $($vendored.Count) crates vendored; $($cargoDistributed.Count) distributed crates present; offline resolution OK"
 
     # --- npm ----------------------------------------------------------------------------------
-    $npmPackages = @(Get-DistributedNpmPackages -ProjectRoot $ProjectRoot)
-    if ($npmPackages.Count -eq 0) { throw 'No npm packages found; the frontend bundle always contains at least React' }
+    # The original registry tarballs, one per package file. `npm pack <tarball URL>` hands out the tarball as the
+    # registry serves it (npm cache first, registry otherwise); it is accepted only when its hash is the integrity
+    # that package-lock.json records, so the archive holds exactly what `npm ci` installs and is bound to upstream.
+    $tarballs = @(Get-DistributedNpmTarballs -ProjectRoot $ProjectRoot)
+    if ($tarballs.Count -eq 0) { throw 'No npm packages found; the frontend bundle always contains at least React' }
     $npmRoot = Join-Path $stage 'npm'
+    $tarballDir = Join-Path $npmRoot 'tarballs'
+    New-Item -ItemType Directory -Path $tarballDir -Force | Out-Null
+    $npmExe = if ($IsWindows) { 'npm.cmd' } else { 'npm' }
     $lines = [Collections.Generic.List[string]]::new()
-    $lines.Add('# name version | resolved | integrity (package-lock.json)')
-    foreach ($package in $npmPackages) {
-        $target = Join-Path $npmRoot ($package.LockKey -replace '/', [IO.Path]::DirectorySeparatorChar)
-        New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
-        Copy-Item -LiteralPath $package.Directory -Destination $target -Recurse -Force
-        $lines.Add("$($package.Name) $($package.Version) | $($package.Source) | $($package.Integrity)")
+    $lines.Add('# name version | resolved | integrity (package-lock.json) | tarball in this archive')
+    foreach ($tarball in $tarballs) {
+        $packDir = Join-Path $work ('npm-pack-' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $packDir | Out-Null
+        Push-Location $packDir
+        try {
+            $null = (& $npmExe pack $tarball.Resolved --pack-destination $packDir --prefer-offline --ignore-scripts --json) | Out-String
+            if ($LASTEXITCODE -ne 0) { throw "npm pack failed for $($tarball.Name) $($tarball.Version) (exit code $LASTEXITCODE): $($tarball.Resolved)" }
+        } finally { Pop-Location }
+        $packed = @(Get-ChildItem -LiteralPath $packDir -File)
+        if ($packed.Count -ne 1) { throw "npm pack of $($tarball.Name) $($tarball.Version) produced $($packed.Count) files instead of one tarball" }
+        $stream = [IO.File]::OpenRead($packed[0].FullName)
+        try { $intact = Test-NpmIntegrity -Integrity $tarball.Integrity -Stream $stream } finally { $stream.Dispose() }
+        if (-not $intact) { throw "npm tarball of $($tarball.Name) $($tarball.Version) does not match the integrity in package-lock.json ($($tarball.Resolved))" }
+        Move-Item -LiteralPath $packed[0].FullName -Destination (Join-Path $tarballDir $tarball.FileName)
+        Remove-Item -LiteralPath $packDir -Recurse -Force
+        $lines.Add((Get-NpmPackagesLine -Tarball $tarball))
     }
     Set-Content -LiteralPath (Join-Path $npmRoot 'PACKAGES.txt') -Value $lines -Encoding utf8NoBOM
-    Write-Output "npm: $($npmPackages.Count) packages ($((@($npmPackages | ForEach-Object { $_.Name })) -join ', '))"
+    Write-Output "npm: $($tarballs.Count) registry tarballs, integrity verified ($((@($tarballs | ForEach-Object { $_.Name })) -join ', '))"
 
     # --- manifest and instructions ------------------------------------------------------------
     $commit = ''
@@ -117,7 +141,7 @@ directory = "cargo-vendor"
         "Cargo.lock SHA-256: $(Get-ThirdPartyLockfileSha256 -Path (Join-Path $ProjectRoot 'Cargo.lock'))",
         "package-lock.json SHA-256: $(Get-ThirdPartyLockfileSha256 -Path (Join-Path $ProjectRoot 'package-lock.json'))",
         "crates vendored: $($vendored.Count) (distributed to the Windows x64 release: $($cargoDistributed.Count))",
-        "npm packages: $($npmPackages.Count)",
+        "npm packages: $($tarballs.Count)",
         "cargo: $(& $tool 'cargo' '-V')",
         "rustc: $(& $tool 'rustc' '-V')",
         "node: $(& $tool 'node' '-v')",
@@ -141,8 +165,8 @@ release binaries (GPL-3.0-or-later). The licenses of these packages are listed i
 | --- | --- |
 | `cargo-vendor/` | every crate in `Cargo.lock` (`cargo vendor --locked --versioned-dirs`): {{CRATES}} crates, including build scripts, proc macros and crates for other platforms |
 | `cargo-config.toml` | cargo source replacement for an offline build |
-| `npm/node_modules/` | the production npm packages bundled into the frontend, plus `vite` (its preload polyfill is embedded in the bundle) |
-| `npm/PACKAGES.txt` | npm name, version, resolved URL and integrity from `package-lock.json` |
+| `npm/tarballs/` | the production npm packages bundled into the frontend, plus `vite` (its preload polyfill is embedded in the bundle), as the original registry tarballs (`.tgz`); each one has the sha512 `integrity` that `package-lock.json` records |
+| `npm/PACKAGES.txt` | npm name, version, resolved URL, integrity and tarball file from `package-lock.json` |
 | `SOURCE-DEPS-MANIFEST.txt` | commit, lock file hashes and tool versions this archive was made with |
 
 ## Rebuild from these sources / 重建步骤
@@ -152,13 +176,14 @@ Needs Rust (MSVC toolchain), the MSVC C++ build tools with the Windows SDK, Node
 1. Unpack `Quicker-Text-{{VERSION}}-Source.zip` into an empty directory (`<src>`).
 2. Unpack this archive, copy its `cargo-vendor` directory to `<src>\cargo-vendor` and `cargo-config.toml` to
    `<src>\.cargo\config.toml` (create the `.cargo` directory). `<src>\Cargo.lock` stays unchanged.
-3. Frontend (`npm`): the production packages are in `npm\node_modules`, plus `vite` because its preload
-   polyfill is embedded in the bundle. The other build tools listed under `devDependencies` (TypeScript, the
-   React plugin, the Tauri CLI) are not part of the product and are not in this archive; `npm ci` fetches
-   them from the npm registry and verifies every package against the `integrity` values in
-   `package-lock.json`. After `npm ci`, the folders in `node_modules` that also exist here have identical
-   content and can be replaced by the folders from this archive to build against them.
-   Then run `npm run build`.
+3. Frontend (`npm`): `npm\tarballs` holds the original registry tarballs (`.tgz`) of the production packages,
+   plus `vite` because its preload polyfill is embedded in the bundle. Every file is byte-identical to what npm
+   downloads: its SHA-512 hash is the `integrity` value of `package-lock.json`, and `npm\PACKAGES.txt` lists
+   name, version, URL, integrity and file of each one. `tar -xzf <file>` unpacks one (the package files are in
+   the `package` folder it creates). The other build tools listed under `devDependencies` (TypeScript, the
+   React plugin, the Tauri CLI) are not part of the product and are not in this archive. Run `npm ci`: it
+   fetches the packages from the npm registry and verifies every one against the same `integrity` values, so
+   the production packages it installs have the same content as the tarballs here. Then run `npm run build`.
 4. Rust, offline: `cargo build -p quicker-text --release --locked --offline`. Cargo resolves everything from
    `cargo-vendor`; no registry access is needed.
 5. Notices: `pwsh scripts/generate-third-party-licenses.ps1` regenerates `THIRD-PARTY-LICENSES.txt` from the
@@ -191,6 +216,14 @@ The exact build steps used by the release workflow are in `.github/workflows/rel
     foreach ($required in @("$stageName/README-OFFLINE-BUILD.md", "$stageName/cargo-config.toml", "$stageName/SOURCE-DEPS-MANIFEST.txt", "$stageName/npm/PACKAGES.txt")) {
         if ($names -notcontains $required) { throw "ZIP lacks $required" }
     }
+    # The finished file must pass the gate that package-portable.ps1, package-artifacts.ps1 and the pre-bundle hook
+    # apply to it. An archive that fails is removed (it is the file this run just created), so it cannot be picked up.
+    $checkTimer = [Diagnostics.Stopwatch]::StartNew()
+    try { $verified = Assert-DependencySourcesZip -Path $zipPath -ProjectRoot $ProjectRoot -Version $version } catch {
+        Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+        throw "The archive that was just written fails its own check and was removed: $($_.Exception.Message)"
+    }
+    Write-Output "Archive check OK: $($verified.Crates) crates ($($verified.RustFiles) files hash-checked against .cargo-checksum.json), $($verified.NpmPackages) npm tarballs matching package-lock.json integrity ($([Math]::Round($checkTimer.Elapsed.TotalSeconds, 1)) s)"
     $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
     $megabytes = [Math]::Round((Get-Item -LiteralPath $zipPath).Length / 1MB, 1)
     Write-Output "Wrote $zipPath ($megabytes MB, $actual files, SHA-256 $hash)"

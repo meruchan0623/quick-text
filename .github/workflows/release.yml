@@ -21,9 +21,11 @@
 #        when one has no license text; the file replaces the committed placeholder in
 #        src-tauri/resources, which tauri.conf.json bundles into the installer
 #     5. dependency sources (S-28): scripts/package-dependency-sources.ps1 builds
-#        Source-deps.zip (cargo vendor --locked plus the production npm packages; offline
-#        resolution is verified). Source.zip and Source-deps.zip together are the complete
-#        corresponding source, so no binary is produced without it (next step, step 8)
+#        Source-deps.zip (cargo vendor --locked plus the registry tarballs of the production npm
+#        packages; offline resolution is verified, every vendored file is hash-checked against its
+#        .cargo-checksum.json and every tarball against the package-lock.json integrity).
+#        Source.zip and Source-deps.zip together are the complete corresponding source, so no
+#        binary is produced without it (next step, step 8)
 #     6. the NSIS installer (tauri build, release profile). Tauri runs
 #        scripts/check-bundle-preconditions.ps1 before it bundles (build.beforeBundleCommand):
 #        no installer unless the bundled notice file is the generated one and
@@ -155,8 +157,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Third-party notice generation failed' }
           Copy-Item -LiteralPath $notices -Destination src-tauri/resources/THIRD-PARTY-LICENSES.txt -Force
 
-      # cargo vendor needs the network; the script verifies the result (every distributed crate
-      # vendored, count equals Cargo.lock, offline resolution from the vendored sources alone).
+      # cargo vendor and npm pack need the network; the script verifies the result (every distributed crate
+      # vendored, count equals Cargo.lock, offline resolution from the vendored sources alone, every file
+      # of every crate and every npm tarball present and matching its checksum or the lock file integrity).
       # Built before the installer: the installer build is gated on it (next step).
       - name: Dependency sources (Source-deps.zip, S-28)
         run: pwsh -NoProfile -File scripts/package-dependency-sources.ps1 -OutputDirectory "$env:RUNNER_TEMP/deps"
