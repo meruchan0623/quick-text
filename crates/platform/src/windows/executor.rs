@@ -24,19 +24,24 @@
 //!   plan B-01 (5) suggested that, but it contradicts no-regression #2
 //!   ("paste never degrades to typing"), and the coordinator ruled for #2.
 //!   Key output runs as usual.
-use super::actions::{current_stage, execute_with_proof, set_stage, Ports, Stage};
+use super::actions::{
+    begin_trace, current_stage, execute_with_proof, set_stage, stage_marks, Ports, Stage,
+    StageMarks,
+};
 use super::clipboard::WinClipboard;
 use super::foreground::WinForeground;
-use super::inject::WinInjector;
+use super::inject::{WinInjector, SENT_EFFECT};
 use super::keystate::physical;
 use super::*;
 use crate::fault::{self, FaultPoint};
-use crate::health::{Component, ReasonCode};
+use crate::health::{Component, Outcome, ReasonCode, StageTimings, TriggerKind};
+use crate::history::Record;
+use crate::runtime::Runtime;
 use crate::supervisor::{ExecutorControl, Status};
 use crate::traits::{ClipboardBackend, Clock, Injector, SystemClock};
 use arc_swap::ArcSwapOption;
 use parking_lot::{Mutex as PlMutex, MutexGuard as PlMutexGuard};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{PoisonError, Weak};
 use std::thread::JoinHandle;
@@ -79,6 +84,223 @@ pub(super) type Runner = Arc<dyn Fn(&Candidate, &TaskScope) -> RunReport + Send 
 
 struct Job {
     candidate: Candidate,
+    task: Task,
+}
+
+/// What the history needs to know about a queued run: identifiers only
+/// (rule id, trigger kind, executable name), never the rule body or the
+/// abbreviation.
+#[derive(Clone)]
+struct Task {
+    rule_id: String,
+    trigger: TriggerKind,
+    process: Option<String>,
+    queued_at: Instant,
+}
+
+impl Task {
+    fn of(candidate: &Candidate, queued_at: Instant) -> Self {
+        Self {
+            rule_id: candidate.rule.id.clone(),
+            trigger: match candidate.rule.trigger_mode {
+                TriggerMode::Immediate => TriggerKind::Immediate,
+                TriggerMode::Terminator => TriggerKind::Terminator,
+            },
+            process: Some(candidate.focus.process.clone()).filter(|name| !name.is_empty()),
+            queued_at,
+        }
+    }
+
+    fn record(&self, verdict: Verdict, timings: StageTimings) -> Record {
+        Record {
+            process: self.process.clone(),
+            completed_steps: verdict.completed_steps,
+            side_effects: verdict.side_effects,
+            timings,
+            ..Record::new(
+                self.rule_id.clone(),
+                self.trigger,
+                verdict.outcome,
+                verdict.reason,
+            )
+        }
+    }
+}
+
+/// History verdict of one run (B-35).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Verdict {
+    pub(super) outcome: Outcome,
+    pub(super) reason: ReasonCode,
+    pub(super) completed_steps: usize,
+    pub(super) side_effects: bool,
+}
+
+impl Verdict {
+    fn new(outcome: Outcome, reason: ReasonCode, side_effects: bool) -> Self {
+        Self {
+            outcome,
+            reason,
+            completed_steps: 0,
+            side_effects,
+        }
+    }
+}
+
+/// Reason codes recognised in run messages. The action pipeline reports
+/// failures as text; these fragments are the stable parts of those texts
+/// (inject.rs, clipboard.rs, protection.rs and the guards in actions.rs).
+const REASONS: &[(&str, ReasonCode)] = &[
+    ("SendInput accepted", ReasonCode::InjectPartial),
+    ("Executor task was fenced", ReasonCode::ExecutorTimeout),
+    ("Executor task panicked", ReasonCode::ExecutorPanic),
+    ("Execution timeout", ReasonCode::ExecutorTimeout),
+    ("Clipboard is still held", ReasonCode::ClipboardBusy),
+    ("Clipboard is busy", ReasonCode::ClipboardBusy),
+    ("changed externally", ReasonCode::ClipboardChanged),
+    ("cannot be safely", ReasonCode::ClipboardFormatSkipped),
+    (
+        "unsupported handle format",
+        ReasonCode::ClipboardFormatSkipped,
+    ),
+    ("Cancelled", ReasonCode::Cancelled),
+    ("Engine paused", ReasonCode::Paused),
+    (
+        "Foreground window/process changed",
+        ReasonCode::FocusChanged,
+    ),
+    ("next target is not foreground", ReasonCode::FocusChanged),
+    ("changed its declared target", ReasonCode::FocusChanged),
+    ("User input changed", ReasonCode::StaleInput),
+    (
+        "Focus, caret, layout or configuration changed",
+        ReasonCode::StaleInput,
+    ),
+    ("modifier is held", ReasonCode::ModifierHeld),
+    ("physically held", ReasonCode::ModifierHeld),
+    ("Physical mouse button", ReasonCode::ModifierHeld),
+    ("blocked", ReasonCode::ProtectedControl),
+];
+
+/// Reason for a run that stopped with `message` while in `stage`.
+fn reason_for(message: &str, stage: Stage) -> ReasonCode {
+    match stage {
+        Stage::Idle | Stage::Preflight => ReasonCode::PreflightFailed,
+        Stage::Resolve => ReasonCode::ResolveFailed,
+        _ => REASONS
+            .iter()
+            .find(|(fragment, _)| message.contains(fragment))
+            .map_or(ReasonCode::Internal, |(_, reason)| *reason),
+    }
+}
+
+/// Engine-side failures stay `Failed` even when nothing reached the screen;
+/// refusals (guards, preflight, clipboard safety) are `Skipped` then.
+fn failed_or_skipped(reason: ReasonCode, side_effects: bool) -> Outcome {
+    let engine_failure = matches!(
+        reason,
+        ReasonCode::InjectPartial
+            | ReasonCode::ClipboardBusy
+            | ReasonCode::ExecutorPanic
+            | ReasonCode::ExecutorTimeout
+            | ReasonCode::Internal
+    );
+    if side_effects || engine_failure {
+        Outcome::Failed
+    } else {
+        Outcome::Skipped
+    }
+}
+
+/// The real outcome of a finished run (fixes "automatic status is always
+/// unknown"). A completed plan is `Succeeded`: every event was accepted by
+/// the system. The UI-facing `ExecutionResult.status` keeps saying
+/// `unknown`, because consumption by the target is still not verified.
+/// `stage` is where the run stopped; `sent` whether any input or clipboard
+/// effect happened (used when the run returned an error).
+pub(super) fn classify(
+    result: &Result<ExecutionResult, String>,
+    stage: Stage,
+    sent: bool,
+) -> Verdict {
+    match result {
+        Ok(run) => {
+            let (outcome, reason) = match run.status.as_str() {
+                "cancelled" => (Outcome::Cancelled, ReasonCode::Cancelled),
+                "failed" => {
+                    let reason = reason_for(&run.message, stage);
+                    (failed_or_skipped(reason, run.side_effects), reason)
+                }
+                _ => (Outcome::Succeeded, ReasonCode::Ok),
+            };
+            Verdict {
+                outcome,
+                reason,
+                completed_steps: run.completed_steps,
+                side_effects: run.side_effects,
+            }
+        }
+        Err(message) => {
+            let reason = reason_for(message, stage);
+            let outcome = match reason {
+                ReasonCode::Cancelled => Outcome::Cancelled,
+                _ => failed_or_skipped(reason, sent),
+            };
+            Verdict::new(outcome, reason, sent)
+        }
+    }
+}
+
+fn micros(from: Instant, to: Instant) -> Option<u64> {
+    Some(u64::try_from(to.saturating_duration_since(from).as_micros()).unwrap_or(u64::MAX))
+}
+
+/// Per-stage durations from the stage entry times of one run. A stage ends
+/// where the first of `until` was entered, or at `end` when the run stopped
+/// inside it. Erase and restore are absent when the run had none.
+pub(super) fn stage_timings(
+    queued: Option<Instant>,
+    started: Instant,
+    end: Instant,
+    marks: &StageMarks,
+) -> StageTimings {
+    let span = |stage: Stage, until: &[Stage]| {
+        let from = marks[stage as usize]?;
+        let to = until
+            .iter()
+            .find_map(|next| marks[*next as usize])
+            .unwrap_or(end);
+        micros(from, to)
+    };
+    StageTimings {
+        queue_us: queued.and_then(|queued| micros(queued, started)),
+        resolve_us: span(Stage::Resolve, &[Stage::Preflight]),
+        erase_us: span(
+            Stage::Erase,
+            &[Stage::Output, Stage::Cleanup, Stage::Restore, Stage::Done],
+        ),
+        output_us: span(Stage::Output, &[Stage::Restore, Stage::Done]),
+        restore_us: span(Stage::Restore, &[Stage::Done]),
+        total_us: micros(queued.unwrap_or(started), end),
+    }
+}
+
+/// Records one manual run (`execute`, no rule) in the process history.
+pub(super) fn record_manual(
+    process: &str,
+    result: &Result<ExecutionResult, String>,
+    started: Instant,
+) {
+    let end = SystemClock.now();
+    let verdict = classify(result, current_stage(), SENT_EFFECT.with(Cell::get));
+    let task = Task {
+        rule_id: String::new(),
+        trigger: TriggerKind::Manual,
+        process: Some(process.to_owned()).filter(|name| !name.is_empty()),
+        queued_at: started,
+    };
+    crate::runtime::current()
+        .record(task.record(verdict, stage_timings(None, started, end, &stage_marks())));
 }
 
 #[derive(Default)]
@@ -89,9 +311,13 @@ struct Worker {
     retired: Vec<JoinHandle<()>>,
 }
 
-#[derive(Clone)]
+/// The task on the worker. Whoever takes it out of `ExecutorCore::running`
+/// (the worker when the run ends, or the fence) writes its history entry,
+/// so each run is recorded exactly once.
 struct Running {
     epoch: u64,
+    task: Task,
+    started_at: Instant,
 }
 
 /// Keys (and mouse buttons, by their VK) that this program pressed and has
@@ -180,6 +406,11 @@ pub(super) struct ExecutorCore {
     clipboard_holder: AtomicU64,
     /// Why the executor is down until the next rebuild.
     fault: PlMutex<Option<ReasonCode>>,
+    /// Execution history (B-35); production uses `runtime::current()`.
+    runtime: Arc<Runtime>,
+    /// The running task got at least one event accepted (for the history
+    /// entry the fence writes on its behalf).
+    task_sent: AtomicBool,
 }
 
 impl ExecutorCore {
@@ -189,6 +420,7 @@ impl ExecutorCore {
         runner: Runner,
         release: Arc<dyn Injector>,
         budget: Duration,
+        runtime: Arc<Runtime>,
     ) -> Arc<Self> {
         let origin = clock.now();
         Arc::new_cyclic(|me| Self {
@@ -198,6 +430,8 @@ impl ExecutorCore {
             runner,
             release,
             budget,
+            runtime,
+            task_sent: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
             held: Box::new(AtomicHeldKeys::default()),
             origin,
@@ -233,17 +467,27 @@ impl ExecutorCore {
     }
 
     /// Queues a candidate; false when it was dropped (busy or no worker).
+    /// A dropped trigger is recorded too: `dropped_busy` while another
+    /// action runs, `skipped` while the executor waits for its rebuild.
     pub(super) fn enqueue(&self, candidate: Candidate) -> bool {
+        let task = Task::of(&candidate, self.clock.now());
         if self
             .shared
             .busy
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
+            self.runtime.record(task.record(
+                Verdict::new(Outcome::DroppedBusy, ReasonCode::DroppedBusy, false),
+                StageTimings::default(),
+            ));
             return false;
         }
         self.shared.cancel.store(false, Ordering::SeqCst);
-        let job = Job { candidate };
+        let job = Job {
+            candidate,
+            task: task.clone(),
+        };
         let worker = self.worker.lock();
         let queued = match worker.sender.as_ref() {
             Some(sender) => sender.try_send(job).is_ok(),
@@ -252,6 +496,11 @@ impl ExecutorCore {
         drop(worker);
         if !queued {
             self.shared.busy.store(false, Ordering::SeqCst);
+            let reason = self.fault.lock().unwrap_or(ReasonCode::EngineDown);
+            self.runtime.record(task.record(
+                Verdict::new(Outcome::Skipped, reason, false),
+                StageTimings::default(),
+            ));
         }
         queued
     }
@@ -317,10 +566,24 @@ impl ExecutorCore {
         }
         *self.fault.lock() = Some(ReasonCode::ExecutorTimeout);
         self.worker.lock().sender = None;
-        self.running.lock().take();
+        let running = self.running.lock().take();
         let released = self.release_held();
         let send_lock_busy = send.is_none();
         drop(send);
+        if let Some(running) = running {
+            // The stalled thread will never record this run itself. A send
+            // still in flight (send lock held) may have reached the target.
+            let now = self.clock.now();
+            let sent = self.task_sent.load(Ordering::SeqCst) || released > 0 || send_lock_busy;
+            self.runtime.record(running.task.record(
+                Verdict::new(Outcome::Failed, ReasonCode::ExecutorTimeout, sent),
+                StageTimings {
+                    queue_us: micros(running.task.queued_at, running.started_at),
+                    total_us: micros(running.task.queued_at, now),
+                    ..StageTimings::default()
+                },
+            ));
+        }
         self.shared.busy.store(false, Ordering::SeqCst);
         tracing::warn!(
             event = "executor.fenced",
@@ -334,10 +597,10 @@ impl ExecutorCore {
 
     /// Fences the running task when it made no progress within the budget.
     fn fence_if_stalled(&self, now: Instant) {
-        let Some(running) = self.running.lock().clone() else {
+        let Some(epoch) = self.running.lock().as_ref().map(|running| running.epoch) else {
             return;
         };
-        if running.epoch != self.epoch() {
+        if epoch != self.epoch() {
             return;
         }
         let stalled = now.saturating_duration_since(self.last_beat());
@@ -347,7 +610,7 @@ impl ExecutorCore {
                 stalled_ms = stalled.as_millis() as u64,
                 budget_ms = self.budget.as_millis() as u64
             );
-            self.fence(running.epoch);
+            self.fence(epoch);
         }
     }
 
@@ -453,8 +716,14 @@ impl ExecutorCore {
     }
 
     fn run(self: &Arc<Self>, job: Job, epoch: u64) {
-        let candidate = job.candidate;
-        *self.running.lock() = Some(Running { epoch });
+        let Job { candidate, task } = job;
+        let started = self.clock.now();
+        self.task_sent.store(false, Ordering::SeqCst);
+        *self.running.lock() = Some(Running {
+            epoch,
+            task,
+            started_at: started,
+        });
         self.beat();
         let guard = BusyGuard { core: self, epoch };
         let scope = Arc::new(TaskScope {
@@ -462,13 +731,19 @@ impl ExecutorCore {
             epoch,
         });
         let installed = ScopeLease::install(Arc::clone(&scope));
-        set_stage(Stage::Resolve);
+        begin_trace();
+        set_stage(Stage::Resolve, started);
         let outcome = catch_unwind(AssertUnwindSafe(|| (self.runner)(&candidate, &scope)));
         drop(installed);
+        let end = self.clock.now();
         let current = self.epoch() == epoch;
+        let stage = current_stage();
+        let sent = SENT_EFFECT.with(Cell::get) || self.task_sent.load(Ordering::SeqCst);
+        let mut panicked = false;
         let result = match outcome {
             Ok(report) => report.result,
             Err(payload) => {
+                panicked = true;
                 let kind = if payload.is::<&'static str>() {
                     "str"
                 } else if payload.is::<String>() {
@@ -489,7 +764,32 @@ impl ExecutorCore {
                 Err("Executor task panicked; stopped".into())
             }
         };
-        if current {
+        // Record exactly once: whoever takes `running` owns the history entry.
+        // A fenced task finds it gone (the fence recorded ExecutorTimeout).
+        let running = {
+            let mut slot = self.running.lock();
+            if slot.as_ref().is_some_and(|r| r.epoch == epoch) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        let owned = running.is_some();
+        if let Some(running) = running {
+            let verdict = if panicked {
+                Verdict::new(Outcome::Failed, ReasonCode::ExecutorPanic, sent)
+            } else {
+                classify(&result, stage, sent)
+            };
+            let timings = stage_timings(
+                Some(running.task.queued_at),
+                running.started_at,
+                end,
+                &stage_marks(),
+            );
+            self.runtime.record(running.task.record(verdict, timings));
+        }
+        if owned && self.epoch() == epoch {
             let id = format!("{}:{}", candidate.rule.id, candidate.generation);
             let last = match result {
                 Ok(mut completed) => {
@@ -656,6 +956,10 @@ impl<I: Injector> Fenced<'_, I> {
             core.held.mark_down(*key);
         }
         let accepted = send();
+        if accepted > 0 {
+            // Side effects of a run the fence may have to record.
+            core.task_sent.store(true, Ordering::SeqCst);
+        }
         settle(accepted);
         accepted
     }
@@ -887,6 +1191,7 @@ pub(crate) fn start_executor(shared: Arc<Shared>) {
         Arc::new(run_on_windows),
         Arc::new(WinInjector),
         STALL_BUDGET,
+        crate::runtime::current(),
     );
     if let Err(error) = core.respawn() {
         tracing::error!(event = "executor.start_failed", %error);

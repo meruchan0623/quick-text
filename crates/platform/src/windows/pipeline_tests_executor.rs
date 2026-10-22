@@ -1,7 +1,8 @@
 //! L2 tests for the executor service (B-01, S-01) on mock ports and a fake
 //! clock: panic isolation, the epoch fence on a stalled task, held-key
 //! release, the clipboard ruling and supervisor recovery. Faults come from
-//! the `fault-injection` points (`ExecutorPanic`, `ExecutorHang`).
+//! the `fault-injection` points (`ExecutorPanic`, `ExecutorHang`). Also the
+//! history wiring (B-35): one entry per run with its real outcome.
 #![cfg_attr(
     not(feature = "fault-injection"),
     allow(
@@ -10,13 +11,18 @@
         reason = "helpers of the fault-injection tests"
     )
 )]
-use super::actions::Ports;
-use super::executor::{run_candidate, Candidate, ExecutorCore, Runner, TaskScope, STALL_BUDGET};
+use super::actions::{Ports, Stage, StageMarks};
+use super::executor::{
+    classify, run_candidate, stage_timings, Candidate, ExecutorCore, Runner, TaskScope,
+    STALL_BUDGET,
+};
 use super::pipeline_tests::SERIAL;
 use super::rawinput::{detect_candidate, Buffer, Event, Kind};
 use super::*;
 use crate::fault;
-use crate::health::{Component, ComponentHealth, HealthState, ReasonCode};
+use crate::health::{
+    Component, ComponentHealth, HealthState, HistoryEntry, Outcome, ReasonCode, TriggerKind,
+};
 use crate::mock::{FakeClock, InjectCall, MockClipboard, MockForeground, MockInjector};
 use crate::runtime::Runtime;
 use crate::supervisor::{ExecutorControl, InputSources, Status, Supervisor, BACKOFF};
@@ -157,6 +163,7 @@ struct ExecRig {
     generation: u64,
     injector: Arc<MockInjector>,
     foreground: MockForeground,
+    clipboard: MockClipboard,
     clock: Arc<FakeClock>,
     core: Arc<ExecutorCore>,
     runtime: Arc<Runtime>,
@@ -179,15 +186,16 @@ impl ExecRig {
         let foreground = MockForeground::new(MockForeground::window(FOCUS, APP));
         let clock = Arc::new(FakeClock::new());
         let clipboard = MockClipboard::new(7, vec![(13, utf16("original"))]);
+        let runtime = Arc::new(Runtime::new(clock.clone()));
         let core = ExecutorCore::new(
             Arc::clone(&shared),
             clock.clone(),
             mock_runner(&injector, &foreground, &clock, &clipboard),
             injector.clone(),
             STALL_BUDGET,
+            Arc::clone(&runtime),
         );
         core.respawn().expect("worker starts");
-        let runtime = Arc::new(Runtime::new(clock.clone()));
         let supervisor = Supervisor::new(
             clock.clone(),
             Arc::clone(&runtime),
@@ -200,6 +208,7 @@ impl ExecRig {
             generation: 0,
             injector,
             foreground,
+            clipboard,
             clock,
             core,
             runtime,
@@ -212,6 +221,13 @@ impl ExecRig {
     }
     fn state(&self) -> HealthState {
         self.runtime.health().state
+    }
+    fn history(&self) -> Vec<HistoryEntry> {
+        self.runtime.list_history(None)
+    }
+    /// The newest history entry.
+    fn last_entry(&self) -> HistoryEntry {
+        self.history().pop().expect("a history entry")
     }
     fn component(&self, component: Component) -> Option<(HealthState, Option<ReasonCode>)> {
         self.runtime
@@ -232,12 +248,17 @@ impl ExecRig {
     /// Types `abbreviation` key by key (as the RawInput callback would) and
     /// hands the match to the executor; false when it was dropped.
     fn trigger(&mut self, abbreviation: &str) -> bool {
-        self.buffer = Buffer::default();
         *self
             .shared
             .last
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = None;
+        let candidate = self.detect(abbreviation);
+        self.core.enqueue(candidate)
+    }
+    /// Types `abbreviation` key by key; the match (not yet queued).
+    fn detect(&mut self, abbreviation: &str) -> Candidate {
+        self.buffer = Buffer::default();
         let mut candidate = None;
         for ch in abbreviation.chars() {
             self.generation += 1;
@@ -254,8 +275,7 @@ impl ExecRig {
             };
             candidate = detect_candidate(&self.shared, &mut self.buffer, event, &self.foreground);
         }
-        self.core
-            .enqueue(candidate.expect("abbreviation matches its rule"))
+        candidate.expect("abbreviation matches its rule")
     }
     fn wait_idle(&self) {
         wait_until("the executor to go idle", || {
@@ -408,6 +428,12 @@ fn s01_panic_is_isolated_and_the_executor_keeps_serving() {
 
     let failed = rig.run("btw");
     assert_eq!(failed.status, "failed");
+    let entry = rig.last_entry();
+    assert_eq!(
+        (entry.outcome, entry.reason),
+        (Outcome::Failed, ReasonCode::ExecutorPanic)
+    );
+    assert!(entry.side_effects);
     // The panic skipped the plan's own cleanup: the busy guard released A.
     assert_eq!(
         rig.injector.calls().last(),
@@ -445,6 +471,11 @@ fn s01_panic_is_isolated_and_the_executor_keeps_serving() {
         assert_eq!(result.completed_steps, 4);
     }
     assert_eq!(rig.injector.typed(), BODY.repeat(12));
+    let history = rig.history();
+    assert_eq!(history.len(), 12, "one entry per run");
+    assert!(history[1..]
+        .iter()
+        .all(|entry| (entry.outcome, entry.reason) == (Outcome::Succeeded, ReasonCode::Ok)));
 }
 
 /// A task stuck inside a send exceeds the budget: the supervisor bumps the
@@ -472,6 +503,14 @@ fn hung_task_is_fenced_and_a_new_worker_takes_over() {
     rig.clock.advance(Duration::from_secs(2));
     rig.supervisor.tick();
     assert_eq!(rig.core.epoch(), epoch + 1);
+    // The fence records the stalled run on its behalf.
+    let entry = rig.last_entry();
+    assert_eq!(
+        (entry.outcome, entry.reason),
+        (Outcome::Failed, ReasonCode::ExecutorTimeout)
+    );
+    assert_eq!(entry.rule_id, "rule-btw");
+    assert!(entry.side_effects);
     let fenced = rig.injector.calls();
     assert_eq!(
         fenced.last(),
@@ -497,9 +536,12 @@ fn hung_task_is_fenced_and_a_new_worker_takes_over() {
         fenced,
         "the woken thread sent nothing"
     );
+    assert_eq!(rig.history().len(), 1, "the woken thread recorded nothing");
     rig.injector.on_call(|_| {});
     let result = rig.run("btw");
     assert_eq!(result.status, "unknown", "{}", result.message);
+    assert_eq!(rig.history().len(), 2);
+    assert_eq!(rig.last_entry().outcome, Outcome::Succeeded);
 }
 
 /// B-01 (5), ruled for no-regression #2: while a fenced task still holds
@@ -531,6 +573,12 @@ fn clipboard_held_by_a_stalled_task_refuses_paste_without_typing() {
     assert_eq!(refused.status, "failed");
     assert!(refused.message.contains("no typing fallback"));
     assert_eq!(rig.injector.calls().len(), sent, "no erase, no typing");
+    let entry = rig.last_entry();
+    assert_eq!(
+        (entry.outcome, entry.reason),
+        (Outcome::Failed, ReasonCode::ClipboardBusy)
+    );
+    assert!(!entry.side_effects);
     let typed = rig.run("kw");
     assert_eq!(typed.status, "unknown", "{}", typed.message);
     assert_eq!(rig.injector.typed(), TYPED);
@@ -582,4 +630,265 @@ fn task_fenced_mid_plan_stops_before_the_next_input() {
         rig.executor_status(),
         Status::Down(ReasonCode::ExecutorTimeout)
     ));
+    // Recorded once, by the fence; the stopped thread adds nothing.
+    let history = rig.history();
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        (history[0].outcome, history[0].reason),
+        (Outcome::Failed, ReasonCode::ExecutorTimeout)
+    );
+    assert!(history[0].side_effects, "a send was in flight");
+}
+
+/// Opens a gate when dropped, so a worker held inside a send never outlives
+/// a failing test.
+struct Gate(Arc<AtomicBool>);
+impl Drop for Gate {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// B-35: a match that reaches the executor while another action runs is
+/// dropped and recorded as `dropped_busy`, with identifiers only; the
+/// running action records its own entry.
+#[test]
+fn trigger_dropped_while_busy_is_recorded() {
+    let mut rig = ExecRig::new(vec![
+        text_rule("btw", OutputMethod::Keys, BODY),
+        text_rule("kw", OutputMethod::Keys, TYPED),
+    ]);
+    // Matched just before the executor turned busy (the dispatcher race).
+    let late = rig.detect("kw");
+    let entered = Arc::new(AtomicBool::new(false));
+    let gate = Gate(Arc::new(AtomicBool::new(false)));
+    let (inside, open) = (Arc::clone(&entered), Arc::clone(&gate.0));
+    rig.injector.on_call(move |_| {
+        if !inside.swap(true, Ordering::SeqCst) {
+            while !open.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    });
+    assert!(rig.trigger("btw"));
+    wait_until("the worker's first send", || entered.load(Ordering::SeqCst));
+    assert!(!rig.core.enqueue(late), "dropped while busy");
+    let dropped = rig.last_entry();
+    assert_eq!(
+        (dropped.outcome, dropped.reason),
+        (Outcome::DroppedBusy, ReasonCode::DroppedBusy)
+    );
+    assert_eq!(dropped.rule_id, "rule-kw");
+    assert_eq!(dropped.trigger, TriggerKind::Immediate);
+    assert_eq!(dropped.process.as_deref(), Some(APP));
+    assert!(!dropped.side_effects);
+
+    drop(gate);
+    rig.wait_idle();
+    let history = rig.history();
+    assert_eq!(history.len(), 2, "one entry per trigger");
+    assert_eq!(history[1].rule_id, "rule-btw");
+    assert_eq!(history[1].outcome, Outcome::Succeeded);
+}
+
+/// B-35: automatic runs record their real outcome (no longer always
+/// "unknown") with per-stage timings.
+#[test]
+fn automatic_runs_record_their_real_outcome_and_stage_timings() {
+    let mut rig = ExecRig::new(vec![
+        text_rule("btw", OutputMethod::Keys, BODY),
+        text_rule("pst", OutputMethod::Paste, BODY),
+    ]);
+    let typed = rig.run("btw");
+    assert_eq!(typed.status, "unknown", "the UI status stays unverified");
+    let entry = rig.last_entry();
+    assert_eq!(
+        (entry.outcome, entry.reason),
+        (Outcome::Succeeded, ReasonCode::Ok)
+    );
+    assert_eq!(entry.rule_id, "rule-btw");
+    assert_eq!(entry.trigger, TriggerKind::Immediate);
+    assert_eq!(entry.process.as_deref(), Some(APP));
+    assert_eq!(entry.completed_steps, typed.completed_steps);
+    assert!(entry.side_effects);
+    let timings = entry.timings;
+    for (stage, value) in [
+        ("queue", timings.queue_us),
+        ("resolve", timings.resolve_us),
+        ("erase", timings.erase_us),
+        ("output", timings.output_us),
+        ("total", timings.total_us),
+    ] {
+        assert!(value.is_some(), "{stage} timing missing");
+    }
+    assert_eq!(timings.restore_us, None, "no clipboard lease");
+
+    assert_eq!(rig.run("pst").status, "unknown");
+    let pasted = rig.last_entry();
+    assert_eq!(pasted.outcome, Outcome::Succeeded);
+    assert!(pasted.timings.restore_us.is_some());
+
+    // Fail-stop: the first typed character is cut short after the erase.
+    rig.injector.short_count(rig.injector.calls().len() + 3, 1);
+    assert_eq!(rig.run("btw").status, "failed");
+    let partial = rig.last_entry();
+    assert_eq!(
+        (partial.outcome, partial.reason),
+        (Outcome::Failed, ReasonCode::InjectPartial)
+    );
+    assert!(partial.side_effects);
+
+    // A clipboard that cannot be restored: refused before any input.
+    let sent = rig.injector.calls().len();
+    rig.clipboard.take_over(9, vec![(2, vec![1])]);
+    assert_eq!(rig.run("pst").status, "failed");
+    let refused = rig.last_entry();
+    assert_eq!(
+        (refused.outcome, refused.reason),
+        (Outcome::Skipped, ReasonCode::ClipboardFormatSkipped)
+    );
+    assert!(!refused.side_effects);
+    assert_eq!(rig.injector.calls().len(), sent);
+    assert_eq!(rig.history().len(), 4);
+}
+
+/// B-35: history rows carry identifiers only. Sentinel body, abbreviations
+/// and clipboard text never reach them, whatever the outcome.
+#[test]
+fn history_never_contains_the_body_or_the_abbreviation() {
+    let mut keys = text_rule("zqv", OutputMethod::Keys, BODY);
+    keys.id = "rule-keys".into();
+    let mut paste = text_rule("zqp", OutputMethod::Paste, BODY);
+    paste.id = "rule-paste".into();
+    let mut rig = ExecRig::new(vec![keys, paste]);
+    rig.run("zqv");
+    rig.run("zqp");
+    rig.injector.short_count(rig.injector.calls().len() + 3, 1);
+    rig.run("zqv");
+    let late = rig.detect("zqp");
+    rig.shared.busy.store(true, Ordering::SeqCst);
+    assert!(!rig.core.enqueue(late));
+    rig.shared.busy.store(false, Ordering::SeqCst);
+
+    let history = rig.history();
+    assert_eq!(history.len(), 4);
+    let json = serde_json::to_string(&history).unwrap();
+    assert!(json.contains("rule-keys") && json.contains("rule-paste"));
+    for secret in [BODY, "zqv", "zqp", "original"] {
+        assert!(!json.contains(secret), "{secret} reached the history");
+    }
+}
+
+/// Outcome mapping of the real path: refusals with nothing sent are
+/// skipped, engine failures failed, completed plans succeeded; the stage
+/// decides resolve and preflight failures.
+#[test]
+fn verdicts_follow_the_real_path() {
+    let run = |status: &str, message: &str, sent: bool| -> Result<ExecutionResult, String> {
+        Ok(ExecutionResult {
+            id: String::new(),
+            status: status.into(),
+            message: message.into(),
+            completed_steps: 0,
+            side_effects: sent,
+        })
+    };
+    let verdict = |result: Result<ExecutionResult, String>, stage: Stage, sent: bool| {
+        let verdict = classify(&result, stage, sent);
+        (verdict.outcome, verdict.reason)
+    };
+    let failed = |message: &str| Err::<ExecutionResult, String>(message.into());
+    let cases = [
+        (
+            verdict(run("unknown", "Input was sent", true), Stage::Done, true),
+            (Outcome::Succeeded, ReasonCode::Ok),
+        ),
+        (
+            verdict(run("cancelled", "Cancelled", true), Stage::Done, true),
+            (Outcome::Cancelled, ReasonCode::Cancelled),
+        ),
+        (
+            verdict(
+                run("failed", "Password controls are blocked", false),
+                Stage::Erase,
+                false,
+            ),
+            (Outcome::Skipped, ReasonCode::ProtectedControl),
+        ),
+        (
+            verdict(
+                run("failed", "Password controls are blocked", true),
+                Stage::Erase,
+                true,
+            ),
+            (Outcome::Failed, ReasonCode::ProtectedControl),
+        ),
+        (
+            verdict(failed("no such snippet"), Stage::Resolve, false),
+            (Outcome::Skipped, ReasonCode::ResolveFailed),
+        ),
+        (
+            verdict(failed("Replay speed"), Stage::Preflight, false),
+            (Outcome::Skipped, ReasonCode::PreflightFailed),
+        ),
+        (
+            verdict(
+                failed("Foreground window/process changed; stopped safely"),
+                Stage::Guard,
+                false,
+            ),
+            (Outcome::Skipped, ReasonCode::FocusChanged),
+        ),
+        (
+            verdict(failed("Engine paused; input stopped"), Stage::Guard, false),
+            (Outcome::Skipped, ReasonCode::Paused),
+        ),
+        (
+            verdict(failed("Clipboard is busy"), Stage::Clipboard, false),
+            (Outcome::Failed, ReasonCode::ClipboardBusy),
+        ),
+        (
+            verdict(failed("Cancelled"), Stage::Output, true),
+            (Outcome::Cancelled, ReasonCode::Cancelled),
+        ),
+        (
+            verdict(failed("unexpected"), Stage::Output, false),
+            (Outcome::Failed, ReasonCode::Internal),
+        ),
+    ];
+    for (index, (got, want)) in cases.into_iter().enumerate() {
+        assert_eq!(got, want, "case {index}");
+    }
+}
+
+/// Stage timings in microseconds from the stage entry marks: a stage ends
+/// where the next measured one starts; absent stages stay `None`.
+#[test]
+fn stage_timings_measure_each_stage_in_microseconds() {
+    let origin = Instant::now();
+    let at = |ms| origin + Duration::from_millis(ms);
+    let mut marks = StageMarks::default();
+    marks[Stage::Resolve as usize] = Some(at(1));
+    marks[Stage::Preflight as usize] = Some(at(3));
+    marks[Stage::Erase as usize] = Some(at(4));
+    marks[Stage::Output as usize] = Some(at(6));
+    marks[Stage::Cleanup as usize] = Some(at(9));
+    marks[Stage::Done as usize] = Some(at(10));
+    let timings = stage_timings(Some(origin), at(1), at(11), &marks);
+    assert_eq!(timings.queue_us, Some(1_000));
+    assert_eq!(timings.resolve_us, Some(2_000));
+    assert_eq!(timings.erase_us, Some(2_000));
+    assert_eq!(timings.output_us, Some(4_000));
+    assert_eq!(timings.restore_us, None);
+    assert_eq!(timings.total_us, Some(11_000));
+
+    // Stopped inside the erase: it ends at the run's end, no output.
+    let mut stopped = StageMarks::default();
+    stopped[Stage::Resolve as usize] = Some(at(1));
+    stopped[Stage::Erase as usize] = Some(at(2));
+    let timings = stage_timings(None, at(1), at(5), &stopped);
+    assert_eq!(timings.queue_us, None);
+    assert_eq!(timings.erase_us, Some(3_000));
+    assert_eq!(timings.output_us, None);
+    assert_eq!(timings.total_us, Some(4_000));
 }

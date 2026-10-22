@@ -15,9 +15,14 @@ use crate::traits::{ClipboardBackend, Clock, ForegroundProbe, Injector, SystemCl
 thread_local! {
     static AUTOMATIC_EXECUTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static STAGE: std::cell::Cell<Stage> = const { std::cell::Cell::new(Stage::Idle) };
+    static STAGE_AT: std::cell::Cell<StageMarks> = const { std::cell::Cell::new([None; STAGES]) };
 }
+const STAGES: usize = 10;
+/// When the run on this thread entered each [`Stage`] (indexed by stage).
+pub(super) type StageMarks = [Option<Instant>; STAGES];
 /// Where the run on this thread currently is. Logged (location only, never
-/// content) when an executor task panics.
+/// content) when an executor task panics; the entry times give the history
+/// its stage timings (B-35).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Stage {
     Idle,
@@ -47,11 +52,26 @@ impl Stage {
         }
     }
 }
-pub(super) fn set_stage(stage: Stage) {
+/// Enters `stage` at `at` (the run's own clock).
+pub(super) fn set_stage(stage: Stage, at: Instant) {
     STAGE.with(|current| current.set(stage));
+    STAGE_AT.with(|marks| {
+        let mut entered = marks.get();
+        entered[stage as usize] = Some(at);
+        marks.set(entered);
+    });
 }
 pub(super) fn current_stage() -> Stage {
     STAGE.with(std::cell::Cell::get)
+}
+/// Starts a new trace on this thread (no stage entered, nothing sent yet).
+pub(super) fn begin_trace() {
+    STAGE.with(|current| current.set(Stage::Idle));
+    STAGE_AT.with(|marks| marks.set([None; STAGES]));
+    SENT_EFFECT.with(|flag| flag.set(false));
+}
+pub(super) fn stage_marks() -> StageMarks {
+    STAGE_AT.with(std::cell::Cell::get)
 }
 fn open(target: &str, args: &[String], cwd: &Option<String>) -> Result<(), String> {
     if args.is_empty() {
@@ -253,10 +273,17 @@ pub fn execute(
     terminator: Option<String>,
     speed: f64,
 ) -> Result<ExecutionResult, String> {
-    if erase != 0 {
-        return Err("Automatic erasure requires observed text proof".into());
-    }
-    execute_inner(s, plan, target, generation, None, terminator, speed)
+    // Manual run (no rule): recorded in the history too (B-35).
+    let started = SystemClock.now();
+    begin_trace();
+    let process = target.process.clone();
+    let result = if erase != 0 {
+        Err("Automatic erasure requires observed text proof".into())
+    } else {
+        execute_inner(s, plan, target, generation, None, terminator, speed)
+    };
+    super::executor::record_manual(&process, &result, started);
+    result
 }
 pub(super) fn execute_inner(
     s: Arc<Shared>,
@@ -324,12 +351,12 @@ where
     let erasure = proof.as_ref().map(rawinput::Proof::erasure);
     SENT_EFFECT.with(|flag| flag.set(false));
     let _fence_lease = FenceLease::install(proof);
-    set_stage(Stage::Preflight);
+    set_stage(Stage::Preflight, clock.now());
     if !speed.is_finite() || speed <= 0.0 {
         return Err("Replay speed must be positive and finite".into());
     }
     preflight(&plan)?;
-    set_stage(Stage::Guard);
+    set_stage(Stage::Guard, clock.now());
     // A shifted or AltGr trigger can match before the modifier is released.
     // Wait for release while keeping every cancellation and focus check active.
     if erasure.is_some() {
@@ -343,7 +370,7 @@ where
     }
     guarded(probe, s, &target, generation)?;
     // All potentially failing source/format checks happen before trigger deletion.
-    set_stage(Stage::Clipboard);
+    set_stage(Stage::Clipboard, clock.now());
     let mut clipboard = acquire_clipboard(&plan, || ClipboardLease::new((ports.clipboard)()?))?;
     let mut payloads = std::collections::BTreeMap::new();
     if let Some(lease) = clipboard.as_ref() {
@@ -357,8 +384,8 @@ where
     if let Some(lease) = clipboard.as_ref() {
         lease.verify_current()?;
     }
-    set_stage(Stage::Erase);
     if let Some(erasure) = &erasure {
+        set_stage(Stage::Erase, clock.now());
         let erased = erase(injector, clock, erasure, || {
             guarded(probe, s, &target, generation)
         });
@@ -372,7 +399,7 @@ where
             });
         }
     }
-    set_stage(Stage::Output);
+    set_stage(Stage::Output, clock.now());
     let mut owned = BTreeSet::new();
     let mut owned_mouse = vec![];
     let mut completed = 0;
@@ -547,7 +574,7 @@ where
             }
         }
     }
-    set_stage(Stage::Cleanup);
+    set_stage(Stage::Cleanup, clock.now());
     for v in owned {
         if !physical(v) {
             if let Err(error) = key(injector, v, true) {
@@ -579,13 +606,13 @@ where
             }
         }
     }
-    set_stage(Stage::Restore);
     if let Some(mut lease) = clipboard {
+        set_stage(Stage::Restore, clock.now());
         if let Err(e) = lease.restore() {
             failure = Some(format!("Clipboard restore failed after input: {e}"));
         }
     }
-    set_stage(Stage::Done);
+    set_stage(Stage::Done, clock.now());
     let result = ExecutionResult {
         id: format!("run-{}", s.generation.load(Ordering::SeqCst)),
         status: if failure.as_deref() == Some("Cancelled") {
