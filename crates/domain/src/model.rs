@@ -1,6 +1,12 @@
+use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
+/// Schema version this build writes.
 pub const SCHEMA_VERSION: u32 = 1;
+/// Highest schema version this build reads; `version` must be in `1..=SUPPORTED_SCHEMA_VERSION`
+/// (B-43). Anything higher was written by a newer release and is never overwritten.
+pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 pub const MAX_STEPS: usize = 10000;
 pub const MAX_DELAY_MS: u64 = 3_600_000;
 fn version() -> u32 {
@@ -9,22 +15,49 @@ fn version() -> u32 {
 fn yes() -> bool {
     true
 }
+/// Terminator keys that older configurations may contain but the Windows input path
+/// never delivers (B-12 / S-12). Existing values are kept as configured; readers only
+/// warn with [`diagnostic_code::TERMINATOR_UNSUPPORTED`].
+pub const UNSUPPORTED_TERMINATORS: [&str; 2] = ["tab", "enter"];
+/// Stable diagnostic codes that hosts match on instead of message text.
+pub mod diagnostic_code {
+    /// `version` is above [`crate::SUPPORTED_SCHEMA_VERSION`]: open read-only, never overwrite.
+    pub const SCHEMA_NEWER: &str = "schema_newer";
+    /// `version` is not a supported schema version (for example 0).
+    pub const SCHEMA_VERSION: &str = "schema_version";
+    /// Stored configuration is not UTF-8 JSON, its root is not an object, or `rules` is not
+    /// an array: nothing can be read from it.
+    pub const CONFIG_MALFORMED: &str = "config_malformed";
+    /// A top-level or global field had the wrong type and fell back to its default.
+    pub const FIELD_RESET: &str = "field_reset";
+    /// A rule entry could not be read; it is kept verbatim and disabled at runtime.
+    pub const RULE_UNREADABLE: &str = "rule_unreadable";
+    /// The configuration still uses `tab` / `enter` terminators (B-12).
+    pub const TERMINATOR_UNSUPPORTED: &str = "terminator_unsupported";
+}
 fn default_terminators() -> Vec<String> {
-    ["space", "tab", "enter", "semicolon"]
-        .map(str::to_string)
-        .to_vec()
+    // New configurations only offer the keys every runtime delivers (B-12).
+    ["space", "semicolon"].map(str::to_string).to_vec()
 }
 fn default_separators() -> String {
     " \t\r\n".into()
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+/// Serialized as the 0.3.1 object (`version`, `revision`, `enabled`, `globals`, `rules`) plus
+/// `extra`; `unreadable_rules` go back into `rules` and never add a key (B-43). Deserializing
+/// keeps unknown fields and unreadable rule entries but rejects wrongly typed known fields;
+/// stored files go through [`crate::read_stored_config`], which also resets those.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub version: u32,
     pub revision: u64,
     pub enabled: bool,
     pub globals: GlobalSettings,
+    /// Rules this build understands; the only ones that compile and match.
     pub rules: Vec<Rule>,
+    /// `rules` entries this build could not read, kept verbatim (B-43).
+    pub unreadable_rules: Vec<UnreadableRule>,
+    /// Top-level fields this build does not know, written back unchanged (B-43).
+    pub extra: Map<String, Value>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -34,16 +67,178 @@ impl Default for Config {
             enabled: true,
             globals: GlobalSettings::default(),
             rules: vec![],
+            unreadable_rules: vec![],
+            extra: Map::new(),
         }
     }
 }
+/// Keys of the serialized [`Config`] object; `extra` never shadows them.
+pub(crate) const CONFIG_FIELDS: [&str; 5] = ["version", "revision", "enabled", "globals", "rules"];
+/// A `rules` entry this build could not read (an unknown action type, a wrongly typed field).
+/// It never compiles, so it stays off at runtime, and it is written back verbatim (B-43).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnreadableRule {
+    /// Position in the serialized `rules` array. When the list has since become shorter the
+    /// entry is written after the last rule.
+    pub index: usize,
+    /// The entry exactly as read.
+    pub raw: Value,
+}
+impl UnreadableRule {
+    /// The entry's `id`, when it has a string one.
+    pub fn id(&self) -> Option<&str> {
+        self.raw.get("id")?.as_str()
+    }
+    /// Top-level fields of the entry that do not read as their rule field. Names only, so
+    /// they can be logged without rule content; empty when the entry is not an object.
+    pub fn unreadable_fields(&self) -> Vec<String> {
+        let Some(fields) = self.raw.as_object() else {
+            return vec![];
+        };
+        fields
+            .iter()
+            .filter(|(key, value)| {
+                let single = Value::Object(Map::from_iter([((*key).clone(), (*value).clone())]));
+                Rule::deserialize(&single).is_err()
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+}
+pub(crate) enum RuleEntry<'a> {
+    Readable(&'a Rule),
+    Unreadable(&'a UnreadableRule),
+}
+impl Config {
+    /// The serialized `rules` array: readable rules in order, each unreadable entry at its
+    /// recorded index (entries past the end follow the last rule, in index order).
+    pub(crate) fn rule_entries(&self) -> Vec<RuleEntry<'_>> {
+        let mut unreadable: Vec<_> = self.unreadable_rules.iter().collect();
+        unreadable.sort_by_key(|entry| entry.index);
+        let mut unreadable = unreadable.into_iter().peekable();
+        let mut readable = self.rules.iter();
+        let mut entries = Vec::with_capacity(self.rules.len() + self.unreadable_rules.len());
+        loop {
+            let position = entries.len();
+            if let Some(entry) = unreadable.next_if(|entry| entry.index <= position) {
+                entries.push(RuleEntry::Unreadable(entry));
+            } else if let Some(rule) = readable.next() {
+                entries.push(RuleEntry::Readable(rule));
+            } else if let Some(entry) = unreadable.next() {
+                entries.push(RuleEntry::Unreadable(entry));
+            } else {
+                return entries;
+            }
+        }
+    }
+    /// Index of each of `rules` in the serialized `rules` array, for diagnostic paths that
+    /// must point at the entry an editor shows.
+    pub(crate) fn rule_positions(&self) -> Vec<usize> {
+        self.rule_entries()
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| matches!(entry, RuleEntry::Readable(_)))
+            .map(|(position, _)| position)
+            .collect()
+    }
+}
+struct RuleEntries<'a>(&'a Config);
+impl Serialize for RuleEntries<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let entries = self.0.rule_entries();
+        let mut seq = serializer.serialize_seq(Some(entries.len()))?;
+        for entry in entries {
+            match entry {
+                RuleEntry::Readable(rule) => seq.serialize_element(rule)?,
+                RuleEntry::Unreadable(entry) => seq.serialize_element(&entry.raw)?,
+            }
+        }
+        seq.end()
+    }
+}
+impl Serialize for Config {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let extra: Vec<_> = self
+            .extra
+            .iter()
+            .filter(|(key, _)| !CONFIG_FIELDS.contains(&key.as_str()))
+            .collect();
+        let mut map = serializer.serialize_map(Some(CONFIG_FIELDS.len() + extra.len()))?;
+        map.serialize_entry("version", &self.version)?;
+        map.serialize_entry("revision", &self.revision)?;
+        map.serialize_entry("enabled", &self.enabled)?;
+        map.serialize_entry("globals", &self.globals)?;
+        map.serialize_entry("rules", &RuleEntries(self))?;
+        for (key, value) in extra {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
+}
+impl<'de> Deserialize<'de> for Config {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        crate::stored::config_from_value(value, crate::stored::Mode::Strict, &mut vec![])
+            .map_err(serde::de::Error::custom)
+    }
+}
+impl Config {
+    /// Locations that still use [`UNSUPPORTED_TERMINATORS`]: the global setting and the
+    /// overrides of terminator-mode rules (immediate rules never consult terminators).
+    fn unsupported_terminator_uses(&self) -> impl Iterator<Item = (String, &[String])> {
+        let globals = std::iter::once((
+            "globals.terminators".to_string(),
+            self.globals.terminators.as_slice(),
+        ));
+        let rules = self
+            .rules
+            .iter()
+            .zip(self.rule_positions())
+            .filter_map(|(rule, index)| {
+                let keys = &rule.terminator.as_ref()?.keys;
+                (rule.trigger_mode == TriggerMode::Terminator)
+                    .then(|| (format!("rules[{index}].terminator.keys"), keys.as_slice()))
+            });
+        globals.chain(rules).filter(|(_, keys)| {
+            keys.iter()
+                .any(|k| UNSUPPORTED_TERMINATORS.contains(&k.as_str()))
+        })
+    }
+    /// Distinct legacy terminator keys still in use, in [`UNSUPPORTED_TERMINATORS`] order
+    /// (the `keys` of the `terminator_unsupported` startup problem).
+    pub fn unsupported_terminators(&self) -> Vec<String> {
+        let used: Vec<_> = self.unsupported_terminator_uses().collect();
+        UNSUPPORTED_TERMINATORS
+            .iter()
+            .filter(|key| used.iter().any(|(_, keys)| keys.iter().any(|k| k == *key)))
+            .map(|key| key.to_string())
+            .collect()
+    }
+    /// One warning per location that uses a legacy terminator. The keys stay configured
+    /// and compile unchanged; only the warning is new (B-12).
+    pub fn terminator_diagnostics(&self) -> Vec<Diagnostic> {
+        self.unsupported_terminator_uses()
+            .map(|(path, _)| {
+                Diagnostic::warning(
+                    diagnostic_code::TERMINATOR_UNSUPPORTED,
+                    "Tab and Enter terminators are not delivered on Windows; the setting is kept unchanged",
+                    SourceSpan::default(),
+                )
+                .at(path)
+            })
+            .collect()
+    }
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct GlobalSettings {
     pub terminators: Vec<String>,
     pub word_separators: String,
     pub blacklist: Vec<String>,
     pub ime_erasure: ImeErasure,
+    /// Fields this build does not know, written back unchanged (B-43).
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 impl Default for GlobalSettings {
     fn default() -> Self {
@@ -52,11 +247,13 @@ impl Default for GlobalSettings {
             word_separators: default_separators(),
             blacklist: vec![],
             ime_erasure: ImeErasure::Escape,
+            extra: Map::new(),
         }
     }
 }
+/// Unknown fields of a rule are kept in `extra` (B-43); nested values stay strict, so an
+/// entry with an unknown action type or nested field is kept whole as an [`UnreadableRule`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(default, deny_unknown_fields)]
 pub struct Rule {
     pub id: String,
     pub enabled: bool,
@@ -72,9 +269,12 @@ pub struct Rule {
     pub action: Action,
     pub parameter: ParameterSource,
     pub notification: Notification,
+    /// Fields this build does not know, written back unchanged (B-43).
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 #[derive(Deserialize)]
-#[serde(remote = "Rule", default, deny_unknown_fields)]
+#[serde(remote = "Rule", default)]
 struct RuleFields {
     pub id: String,
     pub enabled: bool,
@@ -90,6 +290,8 @@ struct RuleFields {
     pub action: Action,
     pub parameter: ParameterSource,
     pub notification: Notification,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 impl Default for RuleFields {
     fn default() -> Self {
@@ -107,14 +309,15 @@ impl Default for RuleFields {
             action: rule.action,
             parameter: rule.parameter,
             notification: rule.notification,
+            extra: rule.extra,
         }
     }
 }
 // Accept the removed field only while reading legacy configuration. It is never
-// retained in the rule model or serialized back into active configuration.
+// retained in the rule model (not even in `extra`) or serialized back into active configuration.
 impl<'de> Deserialize<'de> for Rule {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let mut value = serde_json::Value::deserialize(deserializer)?;
+        let mut value = Value::deserialize(deserializer)?;
         if let Some(fields) = value.as_object_mut() {
             fields.remove("scope");
         }
@@ -136,6 +339,7 @@ impl Default for Rule {
             action: Action::None,
             parameter: ParameterSource::DefaultMatch,
             notification: Notification::default(),
+            extra: Map::new(),
         }
     }
 }
@@ -432,6 +636,12 @@ impl Diagnostic {
             path: String::new(),
             span,
             severity: Severity::Error,
+        }
+    }
+    pub fn warning(code: &str, message: impl Into<String>, span: SourceSpan) -> Self {
+        Self {
+            severity: Severity::Warning,
+            ..Self::error(code, message, span)
         }
     }
     pub fn at(mut self, path: impl Into<String>) -> Self {

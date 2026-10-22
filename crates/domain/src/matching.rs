@@ -1,6 +1,7 @@
 use crate::*;
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 #[derive(Debug, Clone)]
 pub struct CompiledRule {
@@ -8,6 +9,53 @@ pub struct CompiledRule {
     regex: Option<Regex>,
     literal: Option<Regex>,
     order: usize,
+}
+impl CompiledRule {
+    /// Position of the rule in the configured list.
+    pub fn order(&self) -> usize {
+        self.order
+    }
+    pub fn priority(&self) -> MatchPriority {
+        MatchPriority::of(&self.rule, self.order)
+    }
+}
+/// S-17 priority between rules that match the same input; the smallest value wins.
+///
+/// Three tiers, as in Quicker 2.3.1: literal triggers before regex triggers; within a kind,
+/// the longer configured trigger (literal text or regex source, in characters) first;
+/// then the earlier rule in the list. `order` is unique per rule, so this is a total order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MatchPriority {
+    pub regex: bool,
+    pub length: usize,
+    pub order: usize,
+}
+impl MatchPriority {
+    pub fn of(rule: &Rule, order: usize) -> Self {
+        Self {
+            regex: rule.match_spec.kind == MatchKind::Regex,
+            length: rule.match_spec.value.chars().count(),
+            order,
+        }
+    }
+    /// Same kind and same configured length: only the list order separates the two rules,
+    /// which is the conflict reported through `MatchResult::tied_rule_ids`.
+    pub fn ties_with(&self, other: &Self) -> bool {
+        self.regex == other.regex && self.length == other.length
+    }
+}
+impl Ord for MatchPriority {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.regex
+            .cmp(&other.regex)
+            .then(other.length.cmp(&self.length))
+            .then(self.order.cmp(&other.order))
+    }
+}
+impl PartialOrd for MatchPriority {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 #[derive(Debug, Clone)]
 pub struct CompiledConfig {
@@ -23,6 +71,10 @@ pub struct MatchResult {
     pub parameter: Option<String>,
     pub consume_terminator: bool,
     pub revision: u64,
+    /// Other rules that matched in the same priority tier and lost only on list order
+    /// (S-17), in list order. The runtime records these as a conflict for the health page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tied_rule_ids: Vec<String>,
 }
 fn diag(code: &str, message: impl Into<String>, path: &str) -> Diagnostic {
     Diagnostic::error(code, message, SourceSpan::default()).at(path)
@@ -114,7 +166,7 @@ impl CompiledConfig {
         {
             return None;
         }
-        let mut matches: Vec<(usize, usize, MatchResult)> = vec![];
+        let mut matches: Vec<(MatchPriority, MatchResult)> = vec![];
         for compiled in &self.rules {
             let rule = &compiled.rule;
             match rule.trigger_mode {
@@ -156,8 +208,7 @@ impl CompiledConfig {
                 };
                 let erase_chars = full.as_str().chars().count();
                 matches.push((
-                    erase_chars,
-                    compiled.order,
+                    compiled.priority(),
                     MatchResult {
                         rule_id: rule.id.clone(),
                         matched: full.as_str().into(),
@@ -170,144 +221,35 @@ impl CompiledConfig {
                             .map(|t| t.consume)
                             .unwrap_or(true),
                         revision: self.config.revision,
+                        tied_rule_ids: vec![],
                     },
                 ));
             }
         }
-        matches.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        matches.into_iter().next().map(|(_, _, r)| r)
+        matches.sort_by_key(|(priority, _)| *priority);
+        let mut ranked = matches.into_iter();
+        let (best, mut result) = ranked.next()?;
+        result.tied_rule_ids = ranked
+            .take_while(|(priority, _)| priority.ties_with(&best))
+            .map(|(_, r)| r.rule_id)
+            .collect();
+        Some(result)
     }
     pub fn rule(&self, id: &str) -> Option<&Rule> {
         self.rules.iter().find(|r| r.rule.id == id).map(|r| &r.rule)
     }
 }
 pub fn compile_config(config: &Config) -> Result<CompiledConfig, Vec<Diagnostic>> {
-    let mut errors = vec![];
+    let mut errors = config_errors(config);
     let mut rules = vec![];
     let mut ids = BTreeSet::new();
-    if config.version != SCHEMA_VERSION {
-        errors.push(diag(
-            "schema_version",
-            "Unsupported configuration version",
-            "version",
-        ));
-    }
-    if config.globals.terminators.iter().any(|t| t.is_empty()) {
-        errors.push(diag(
-            "terminator",
-            "Empty terminator is invalid",
-            "globals.terminators",
-        ));
-    }
-    for (order, rule) in config.rules.iter().enumerate() {
-        let base = format!("rules[{order}]");
-        if rule.id.trim().is_empty() || !ids.insert(rule.id.clone()) {
-            errors.push(diag(
-                "rule_id",
-                "Rule ID must be nonempty and unique",
-                &format!("{base}.id"),
-            ));
+    let positions = config.rule_positions();
+    for (order, (rule, position)) in config.rules.iter().zip(positions).enumerate() {
+        match compile_rule(rule, order, position, &mut ids) {
+            Ok(Some(compiled)) => rules.push(compiled),
+            Ok(None) => {}
+            Err(rule_errors) => errors.extend(rule_errors),
         }
-        if !rule.enabled {
-            continue;
-        }
-        if rule.match_spec.value.is_empty() {
-            errors.push(diag(
-                "match_empty",
-                "Trigger must not be empty",
-                &format!("{base}.match.value"),
-            ));
-            continue;
-        }
-        if rule.match_spec.value.len() > 8192 {
-            errors.push(diag(
-                "match_limit",
-                "Trigger exceeds 8192 bytes",
-                &format!("{base}.match.value"),
-            ));
-            continue;
-        }
-        if rule.trigger_mode == TriggerMode::Immediate && rule.match_spec.kind == MatchKind::Regex {
-            errors.push(diag(
-                "immediate_regex",
-                "Immediate mode requires a literal trigger",
-                &format!("{base}.trigger_mode"),
-            ));
-        }
-        if rule
-            .terminator
-            .as_ref()
-            .is_some_and(|t| t.keys.is_empty() || t.keys.iter().any(String::is_empty))
-        {
-            errors.push(diag(
-                "terminator",
-                "Override requires nonempty terminators; use null to inherit",
-                &format!("{base}.terminator"),
-            ));
-        }
-        let pattern = match rule.match_spec.kind {
-            MatchKind::Literal => format!("{}$", regex::escape(&rule.match_spec.value)),
-            MatchKind::Regex => format!("(?:{})$", rule.match_spec.value),
-        };
-        let re = match RegexBuilder::new(&pattern)
-            .case_insensitive(rule.ignore_case)
-            .size_limit(1_048_576)
-            .build()
-        {
-            Ok(re) => re,
-            Err(_) => {
-                errors.push(diag("regex_unsupported","Invalid/unsupported Rust regex; .NET lookaround and backreferences need rewriting",&format!("{base}.match.value")));
-                continue;
-            }
-        };
-        if re.is_match("") {
-            errors.push(diag(
-                "empty_match",
-                "Regex must not match an empty input",
-                &format!("{base}.match.value"),
-            ));
-        }
-        match &rule.parameter {
-            ParameterSource::FirstCapture if re.captures_len() < 2 => errors.push(diag(
-                "capture_missing",
-                "First capture requires regex group 1",
-                &format!("{base}.parameter"),
-            )),
-            ParameterSource::CaptureTemplate { template } => match capture_indices(template) {
-                Ok(indices) => {
-                    if indices.iter().any(|i| *i >= re.captures_len()) {
-                        errors.push(diag(
-                            "capture_missing",
-                            "Template references a nonexistent capture",
-                            &format!("{base}.parameter"),
-                        ));
-                    }
-                }
-                Err(m) => errors.push(diag("capture_template", m, &format!("{base}.parameter"))),
-            },
-            _ => {}
-        }
-        for mut d in validate_action(&rule.action) {
-            d.path = format!(
-                "{base}.action{}",
-                if d.path.is_empty() {
-                    String::new()
-                } else {
-                    format!(".{}", d.path)
-                }
-            );
-            errors.push(d);
-        }
-        let (regex, literal) = match rule.match_spec.kind {
-            MatchKind::Regex => (Some(re), None),
-            MatchKind::Literal => (None, Some(re)),
-        };
-        rules.push(CompiledRule {
-            rule: rule.clone(),
-            regex,
-            literal,
-            order,
-        });
     }
     if !errors.is_empty() {
         return Err(errors);
@@ -316,6 +258,210 @@ pub fn compile_config(config: &Config) -> Result<CompiledConfig, Vec<Diagnostic>
         config: config.clone(),
         rules,
     })
+}
+/// Result of [`compile_config_lenient`].
+#[derive(Debug, Clone)]
+pub struct LenientCompile {
+    /// The whole configuration with every rule that compiled.
+    pub compiled: CompiledConfig,
+    /// IDs of enabled rules that did not compile and stay off at runtime, in list order.
+    /// Together with [`Config::unreadable_rules`] these are the `rules_skipped` problem.
+    pub skipped_rule_ids: Vec<String>,
+    /// Why: the diagnostics [`compile_config`] reports for those rules (and for disabled
+    /// rules with an empty or duplicate ID, which are off anyway).
+    pub diagnostics: Vec<Diagnostic>,
+}
+/// Compiles rule by rule for loading stored configuration (B-43, `load_or_fallback`): a rule
+/// that does not compile is only switched off at runtime. Errors that concern the whole
+/// configuration (version, global terminators) still fail.
+pub fn compile_config_lenient(config: &Config) -> Result<LenientCompile, Vec<Diagnostic>> {
+    let errors = config_errors(config);
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    let mut rules = vec![];
+    let mut skipped_rule_ids = vec![];
+    let mut diagnostics = vec![];
+    let mut ids = BTreeSet::new();
+    let positions = config.rule_positions();
+    for (order, (rule, position)) in config.rules.iter().zip(positions).enumerate() {
+        match compile_rule(rule, order, position, &mut ids) {
+            Ok(Some(compiled)) => rules.push(compiled),
+            Ok(None) => {}
+            Err(rule_errors) => {
+                if rule.enabled {
+                    skipped_rule_ids.push(rule.id.clone());
+                }
+                diagnostics.extend(rule_errors);
+            }
+        }
+    }
+    Ok(LenientCompile {
+        compiled: CompiledConfig {
+            config: config.clone(),
+            rules,
+        },
+        skipped_rule_ids,
+        diagnostics,
+    })
+}
+/// Errors that concern the whole configuration rather than one rule.
+fn config_errors(config: &Config) -> Vec<Diagnostic> {
+    let mut errors = vec![];
+    if !(1..=SUPPORTED_SCHEMA_VERSION).contains(&config.version) {
+        // B-43: a newer schema has its own code so hosts can open it read-only.
+        errors.push(if config.version > SUPPORTED_SCHEMA_VERSION {
+            diag(
+                diagnostic_code::SCHEMA_NEWER,
+                "Configuration was written by a newer release",
+                "version",
+            )
+        } else {
+            diag(
+                diagnostic_code::SCHEMA_VERSION,
+                "Unsupported configuration version",
+                "version",
+            )
+        });
+    }
+    if config.globals.terminators.iter().any(|t| t.is_empty()) {
+        errors.push(diag(
+            "terminator",
+            "Empty terminator is invalid",
+            "globals.terminators",
+        ));
+    }
+    errors
+}
+/// Compiles one rule; `Ok(None)` for a disabled rule, of which only the ID is checked.
+/// `order` is the rule's index in `Config::rules`; `position` its index in the serialized
+/// `rules` array (which also holds unreadable entries), used in diagnostic paths.
+fn compile_rule(
+    rule: &Rule,
+    order: usize,
+    position: usize,
+    ids: &mut BTreeSet<String>,
+) -> Result<Option<CompiledRule>, Vec<Diagnostic>> {
+    let base = format!("rules[{position}]");
+    let mut errors = vec![];
+    if rule.id.trim().is_empty() || !ids.insert(rule.id.clone()) {
+        errors.push(diag(
+            "rule_id",
+            "Rule ID must be nonempty and unique",
+            &format!("{base}.id"),
+        ));
+    }
+    if !rule.enabled {
+        return if errors.is_empty() {
+            Ok(None)
+        } else {
+            Err(errors)
+        };
+    }
+    if rule.match_spec.value.is_empty() {
+        errors.push(diag(
+            "match_empty",
+            "Trigger must not be empty",
+            &format!("{base}.match.value"),
+        ));
+        return Err(errors);
+    }
+    if rule.match_spec.value.len() > 8192 {
+        errors.push(diag(
+            "match_limit",
+            "Trigger exceeds 8192 bytes",
+            &format!("{base}.match.value"),
+        ));
+        return Err(errors);
+    }
+    if rule.trigger_mode == TriggerMode::Immediate && rule.match_spec.kind == MatchKind::Regex {
+        errors.push(diag(
+            "immediate_regex",
+            "Immediate mode requires a literal trigger",
+            &format!("{base}.trigger_mode"),
+        ));
+    }
+    if rule
+        .terminator
+        .as_ref()
+        .is_some_and(|t| t.keys.is_empty() || t.keys.iter().any(String::is_empty))
+    {
+        errors.push(diag(
+            "terminator",
+            "Override requires nonempty terminators; use null to inherit",
+            &format!("{base}.terminator"),
+        ));
+    }
+    let pattern = match rule.match_spec.kind {
+        MatchKind::Literal => format!("{}$", regex::escape(&rule.match_spec.value)),
+        MatchKind::Regex => format!("(?:{})$", rule.match_spec.value),
+    };
+    let re = match RegexBuilder::new(&pattern)
+        .case_insensitive(rule.ignore_case)
+        .size_limit(1_048_576)
+        .build()
+    {
+        Ok(re) => re,
+        Err(_) => {
+            errors.push(diag(
+                "regex_unsupported",
+                "Invalid/unsupported Rust regex; .NET lookaround and backreferences need rewriting",
+                &format!("{base}.match.value"),
+            ));
+            return Err(errors);
+        }
+    };
+    if re.is_match("") {
+        errors.push(diag(
+            "empty_match",
+            "Regex must not match an empty input",
+            &format!("{base}.match.value"),
+        ));
+    }
+    match &rule.parameter {
+        ParameterSource::FirstCapture if re.captures_len() < 2 => errors.push(diag(
+            "capture_missing",
+            "First capture requires regex group 1",
+            &format!("{base}.parameter"),
+        )),
+        ParameterSource::CaptureTemplate { template } => match capture_indices(template) {
+            Ok(indices) => {
+                if indices.iter().any(|i| *i >= re.captures_len()) {
+                    errors.push(diag(
+                        "capture_missing",
+                        "Template references a nonexistent capture",
+                        &format!("{base}.parameter"),
+                    ));
+                }
+            }
+            Err(m) => errors.push(diag("capture_template", m, &format!("{base}.parameter"))),
+        },
+        _ => {}
+    }
+    for mut d in validate_action(&rule.action) {
+        d.path = format!(
+            "{base}.action{}",
+            if d.path.is_empty() {
+                String::new()
+            } else {
+                format!(".{}", d.path)
+            }
+        );
+        errors.push(d);
+    }
+    let (regex, literal) = match rule.match_spec.kind {
+        MatchKind::Regex => (Some(re), None),
+        MatchKind::Literal => (None, Some(re)),
+    };
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    Ok(Some(CompiledRule {
+        rule: rule.clone(),
+        regex,
+        literal,
+        order,
+    }))
 }
 pub fn validate_action(action: &Action) -> Vec<Diagnostic> {
     let mut errors = vec![];
