@@ -111,6 +111,12 @@ impl<'de> Deserialize<'de> for ClipboardPrefs {
 }
 
 impl ClipboardPrefs {
+    /// Runs inside serde, so inside every load of prefs.json
+    /// ([`load_unlocked`]) with [`PREFS_FILE`] already held by whoever
+    /// loads. It needs no lock of its own and takes none: it only checks the
+    /// value it is given and logs (`store.prefs_invalid`), and never reads,
+    /// moves or writes the file. A replaced value reaches the file only
+    /// through a later save, which takes the lock.
     fn from_value(value: Value) -> Self {
         let mut fields = match value {
             Value::Object(fields) => fields,
@@ -204,8 +210,22 @@ fn invalid(field: &'static str, found: &Value, problem: &'static str) {
 /// Startup, before the engine starts (one call in `main.rs` setup): hands
 /// `app.clipboard` to the platform as the options of every clipboard lease
 /// (B-08). Prefs that cannot be read leave the defaults, logged.
+///
+/// The read is a full load, which may quarantine a damaged file, so it holds
+/// [`PREFS_FILE`] like every load (review A6-3). The options are handed to
+/// the platform only after that lock is released: `set_lease_options` takes
+/// the platform's own lock, and nothing is taken while [`PREFS_FILE`] is
+/// held.
 pub fn apply_clipboard_prefs(dir: &Path) {
-    let clipboard = match load_prefs(dir) {
+    set_lease_options(clipboard_prefs_then(dir, || {}).lease_options());
+}
+
+/// `app.clipboard` as [`apply_clipboard_prefs`] reads it, through
+/// [`load_prefs_then`] (so under [`PREFS_FILE`], with `after_read` run in
+/// the gap between reading the bytes and acting on them: tests). The
+/// fallback is logged after the lock is released.
+fn clipboard_prefs_then(dir: &Path, after_read: impl FnOnce()) -> ClipboardPrefs {
+    match load_prefs_then(dir, after_read) {
         Ok(prefs) => prefs.app.clipboard,
         Err(e) => {
             tracing::warn!(
@@ -216,8 +236,7 @@ pub fn apply_clipboard_prefs(dir: &Path) {
             );
             ClipboardPrefs::default()
         }
-    };
-    set_lease_options(clipboard.lease_options());
+    }
 }
 
 /// Reads `prefs.json` leniently. A missing file gives defaults; a file that
@@ -917,6 +936,62 @@ mod tests {
         assert!(writer.join().unwrap().unwrap());
         assert!(!writer_ran_in_the_gap);
         assert!(auto_listen_on_start(&dir), "the writer's change is kept");
+        let files = quarantined(&dir);
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(fs::read(&files[0]).unwrap(), damaged);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The same barrier for the P5-B reader, the startup read of
+    /// `app.clipboard` ([`apply_clipboard_prefs`], through
+    /// `clipboard_prefs_then` so the process-wide lease options stay
+    /// untouched): it has just read a damaged prefs.json when a writer
+    /// arrives. The writer waits for the read, so the read takes the
+    /// defaults and quarantines only the damaged bytes, and the writer's
+    /// change (clipboard policy included) ends up in prefs.json. Without the
+    /// shared lock the writer would quarantine and replace the file in the
+    /// gap, and the read would then move the writer's file aside.
+    #[test]
+    fn a_writer_never_lands_between_a_damaged_clipboard_read_and_its_quarantine() {
+        use std::sync::{mpsc, Arc, Barrier};
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let damaged =
+            b"{\"app\": {\"clipboard\": {\"restore_policy\": \"text_only\", \"restore_del";
+        fs::write(dir.join(FILE), damaged).unwrap();
+        let read = Arc::new(Barrier::new(2));
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer = {
+            let dir = dir.clone();
+            let read = Arc::clone(&read);
+            std::thread::spawn(move || {
+                read.wait();
+                let result = update_prefs(&dir, |prefs| {
+                    prefs.app.clipboard.restore_policy = RestorePolicy::Full;
+                    prefs.app.auto_listen_on_start = true;
+                    true
+                });
+                let _ = done_tx.send(());
+                result
+            })
+        };
+        let mut writer_ran_in_the_gap = false;
+        let clipboard = clipboard_prefs_then(&dir, || {
+            read.wait();
+            // Every chance for the writer to run now; it can only finish
+            // here if it does not wait for this read.
+            writer_ran_in_the_gap = done_rx.recv_timeout(Duration::from_millis(300)).is_ok();
+        });
+        assert_eq!(clipboard, ClipboardPrefs::default());
+        assert!(writer.join().unwrap().unwrap());
+        assert!(!writer_ran_in_the_gap);
+        let kept = load_prefs(&dir).unwrap();
+        assert_eq!(
+            kept.app.clipboard.restore_policy,
+            RestorePolicy::Full,
+            "the writer's change is kept"
+        );
+        assert!(kept.app.auto_listen_on_start);
         let files = quarantined(&dir);
         assert_eq!(files.len(), 1, "{files:?}");
         assert_eq!(fs::read(&files[0]).unwrap(), damaged);
