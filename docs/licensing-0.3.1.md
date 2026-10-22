@@ -45,7 +45,7 @@ npm run build
 cargo build -p quicker-text --release
 ```
 
-得到 `target\release\quicker-text.exe`。重新生成绿色包：`./scripts/package-portable.ps1 -OutputDirectory <新目录>`（输出目录必须是新目录，脚本不会覆盖已有交付包）。更详细的步骤见 `docs/build-verification.md`。
+得到 `target\release\quicker-text.exe`。重新生成绿色包：0.3.1 的快照自带的 `./scripts/package-portable.ps1 -OutputDirectory <新目录>`（输出目录必须是新目录，脚本不会覆盖已有交付包）。0.4.0 起仓库里的这个脚本更严：`-DependencySourcesZip <Source-deps.zip>` 必填，并要求用 `scripts/generate-third-party-licenses.ps1` 生成的声明文件；依赖源码包经过校验后放在绿色包旁边，缺少或不符时不产出任何文件（命令见 README「许可与绿色包构建」）。更详细的步骤见 `docs/build-verification.md`。
 
 注册中心上取不到依赖时，用 `Quicker-Text-0.3.1-Source-deps.zip`（补发之后）：与上面的源码解到同一个目录，按其中的 `README-OFFLINE-BUILD.md` 把 `cargo-vendor` 目录和 `cargo-config.toml` 接到工程上，Rust 部分用 `cargo build -p quicker-text --release --locked --offline` 完全离线构建。前端的运行时依赖在 `npm/node_modules`；TypeScript、React 插件、Tauri CLI 这些构建工具不属于程序本身，不在包内，仍需 `npm ci` 从 npm 获取。
 

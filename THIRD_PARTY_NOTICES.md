@@ -42,7 +42,11 @@ version in `scripts/third-party-license-clarifications.json` and marked `clarifi
 
 The source of these packages is published with every release as
 `Quicker-Text-<version>-Source-deps.zip` (`cargo vendor --locked` output plus the npm
-production packages, with offline build instructions). Exact versions and checksums are also
+production packages, with offline build instructions); the portable package carries it as a
+companion file next to the ZIP, named and hashed in the ZIP's `DEPENDENCY-SOURCES.txt`. The
+build and packaging scripts (installer build, release package, portable package) fail when
+the archive is missing or does not match the lock files, so no binary is produced without
+it. Exact versions and checksums are also
 pinned in `Cargo.lock` and `package-lock.json`. `src-tauri/resources/THIRD-PARTY-LICENSES.txt`
 in the repository is only a placeholder that keeps the bundle configuration valid; the
 release workflow replaces it for the installer build and restores it afterwards.

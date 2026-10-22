@@ -164,7 +164,12 @@ Needs Rust (MSVC toolchain), the MSVC C++ build tools with the Windows SDK, Node
 5. Notices: `pwsh scripts/generate-third-party-licenses.ps1` regenerates `THIRD-PARTY-LICENSES.txt` from the
    licenses in `cargo-vendor` (through the cargo configuration of step 2) and in `node_modules`.
    Run it before step 6 so that the installer bundles the file.
-6. Installer: `npm run tauri -- build --bundles nsis` (the Tauri CLI downloads the NSIS toolchain itself).
+6. Installer: `pwsh scripts/build-windows.ps1 -DependencySourcesZip <this archive>` runs `npm ci`, the Rust tests,
+   the notice generation of step 5 and the installer build (the Tauri CLI downloads the NSIS toolchain
+   itself). A plain `npm run tauri -- build` that bundles an installer is refused by
+   `scripts/check-bundle-preconditions.ps1` unless the environment variable `QT_DEPENDENCY_SOURCES_ZIP` names
+   this archive and the notices of step 5 are in place; an executable for local use only (not an installer)
+   is `npm run tauri -- build --no-bundle`.
 
 The exact build steps used by the release workflow are in `.github/workflows/release.yml` and
 `docs/release-checklist.md` inside `Quicker-Text-{{VERSION}}-Source.zip`.
