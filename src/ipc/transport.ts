@@ -10,6 +10,7 @@
 // Vitest swaps the transport with setTransport(), or drives the Tauri transport through mockIPC.
 import { invoke as tauriInvoke } from '@tauri-apps/api/core';
 import { listen as tauriListen } from '@tauri-apps/api/event';
+import { UnsendableArgsError, unsendablePath } from './sendable';
 
 export type Unlisten = () => void;
 export type CommandArgs = Record<string, unknown>;
@@ -79,7 +80,13 @@ export function setTransport(next: Transport | null): void {
   pending = null;
 }
 
+/**
+ * Every command goes through here. Arguments holding a number JSON cannot carry (NaN, ±Infinity,
+ * or the editor's invalid-number marker) are refused before anything is sent; see ./sendable.
+ */
 export async function invoke<T>(command: string, args?: CommandArgs): Promise<T> {
+  const path = args === undefined ? null : unsendablePath(args);
+  if (path !== null) throw new UnsendableArgsError(command, path);
   return (await transport()).invoke<T>(command, args);
 }
 

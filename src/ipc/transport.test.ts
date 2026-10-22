@@ -4,6 +4,7 @@
 // the environment.
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { invalidNumber } from '../lib/numberFields';
 import { errorText } from './errors';
 
 type TransportModule = typeof import('./transport');
@@ -60,6 +61,37 @@ describe('production build', () => {
     const transport = await freshTransport({ dev: false, mock: '1' });
     expect(transport.usesMock).toBe(false);
     await expect(transport.invoke('load_state')).resolves.toEqual({ from: 'tauri' });
+  });
+});
+
+describe('the last check before sending', () => {
+  it('sends nothing whose arguments hold NaN, ±Infinity or an invalid-number marker', async () => {
+    const sent: string[] = [];
+    mockIPC((command) => {
+      sent.push(command);
+      return null;
+    });
+    const transport = await freshTransport({ dev: false });
+    const marker = invalidNumber('3600001');
+    const refused: [string, Record<string, unknown>, string][] = [
+      ['execute_action', { action: { type: 'reusable', parameters: { n: marker } } }, 'action'],
+      ['test_rule', { rule: { action: { plan: { steps: [{ ms: NaN }] } } } }, 'rule'],
+      ['save_draft', { config: { rules: [{ speed: Infinity }] } }, 'config'],
+    ];
+    for (const [command, args, at] of refused) {
+      const error: unknown = await transport.invoke(command, args).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).name).toBe('UnsendableArgsError');
+      expect(errorText(error)).toContain(`（${at}.`);
+      expect(errorText(error)).toContain('已停止发送；已填写的内容会保留。');
+      await expect(transport.call(command, args)).rejects.toThrow('已停止发送');
+    }
+    expect(sent).toEqual([]);
+
+    await transport.invoke('execute_action', {
+      action: { type: 'reusable', parameters: { n: 1 } },
+    });
+    expect(sent).toEqual(['execute_action']);
   });
 });
 

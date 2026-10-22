@@ -2,9 +2,13 @@ import { describe, expect, it } from 'vitest';
 import {
   actionDiagnostics,
   actionNumberProblems,
+  invalidNumber,
+  isInvalidNumber,
+  numberText,
   parseNumber,
   rangeError,
   rangeText,
+  readNumber,
   ruleEditDiagnostics,
 } from './numberFields';
 import { MAX_DELAY_MS, ranges } from './ruleShape';
@@ -79,6 +83,69 @@ describe('parseNumber', () => {
     expect(parseNumber('0.01', ranges.replaySpeed)).toBe(0.01);
     expect(parseNumber('0', ranges.replaySpeed)).toBeNull();
     expect(parseNumber('-1', ranges.replaySpeed)).toBeNull();
+  });
+});
+
+describe('the invalid-number marker', () => {
+  it('holds the text typed where the number goes, and the field shows it again', () => {
+    expect(readNumber(' 12 ', ranges.delayMs)).toBe(12);
+    const marker = readNumber('3600001', ranges.delayMs);
+    expect(isInvalidNumber(marker)).toBe(true);
+    expect(numberText(marker)).toBe('3600001');
+    expect(numberText(readNumber('', ranges.delayMs))).toBe('');
+    expect(numberText(readNumber('#3', ranges.delayMs))).toBe('#3');
+    expect(numberText(0)).toBe('0');
+    expect(numberText(NaN)).toBe('');
+    expect(numberText(undefined)).toBe('');
+  });
+
+  it('survives the editor history (structuredClone), and nothing from JSON looks like one', () => {
+    const marker = invalidNumber('9007199254740993');
+    const copied: unknown = structuredClone({ ms: marker });
+    expect(copied).toEqual({ ms: marker });
+    expect(isInvalidNumber((copied as { ms: unknown }).ms)).toBe(true);
+    // JSON has no NaN: what the backend sends, or a JSON copy, is never taken for a marker.
+    expect(isInvalidNumber(JSON.parse(JSON.stringify(marker)))).toBe(false);
+    expect(isInvalidNumber({ invalidNumber: '1', nan: null })).toBe(false);
+    expect(isInvalidNumber({ invalidNumber: 1, nan: NaN })).toBe(false);
+  });
+
+  it('blocks saving and testing wherever it stands, with a path to it', () => {
+    const marker = invalidNumber('abc');
+    const action = steps(
+      { type: 'delay', ms: marker },
+      { type: 'key_press', key: { type: 'windows_code', code: invalidNumber('300') } },
+    );
+    expect(ruleEditDiagnostics(rule(action), 0).map((d) => [d.code, d.path])).toEqual([
+      ['number_range', 'rules[0].action.plan.steps[0].operation.ms'],
+      ['number_range', 'rules[0].action.plan.steps[1].operation.key.code'],
+    ]);
+    // A reusable parameter: Rust takes any JSON value there, so only the check stops it.
+    const reusable = { type: 'reusable', action_id: 'x', parameters: { n: marker } };
+    expect(ruleEditDiagnostics(rule(reusable), 3).map((d) => [d.code, d.path])).toEqual([
+      ['number_range', 'rules[3].action.parameters.n'],
+    ]);
+    expect(actionDiagnostics(reusable).map((d) => d.path)).toEqual(['parameters.n']);
+    const operation = steps({ type: 'reusable', action_id: 'x', parameters: { n: marker } });
+    expect(actionDiagnostics(operation).map((d) => d.path)).toEqual([
+      'plan.steps[0].operation.parameters.n',
+    ]);
+    // Deeper in an operation's JSON parameters, past the number checks: the last check finds it.
+    for (const deep of [marker, NaN]) {
+      const nested = steps({ type: 'reusable', action_id: 'x', parameters: { list: [1, deep] } });
+      expect(ruleEditDiagnostics(rule(nested), 0)).toEqual([
+        {
+          code: 'not_savable',
+          message: '含有无法识别的内容，请检查后再试。',
+          path: 'rules[0].action.plan.steps[0].operation.parameters.list[1]',
+          span: { line: 0, column: 0, length: 0 },
+          severity: 'error',
+        },
+      ]);
+      expect(actionDiagnostics(nested).map((d) => d.path)).toEqual([
+        'plan.steps[0].operation.parameters.list[1]',
+      ]);
+    }
   });
 });
 

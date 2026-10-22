@@ -988,13 +988,17 @@ describe('number fields of the editor', () => {
     parameter: { type: 'default_match' },
     notification: { enabled: false, message: '' },
   });
-  const steps = (operation: Record<string, unknown>) => ({
+  const steps = (...operations: Record<string, unknown>[]) => ({
     type: 'steps',
     plan: {
       version: 1,
       dialect: 'structured',
       source: null,
-      steps: [{ operation, span: { line: 0, column: 0, length: 0 }, target: { type: 'locked' } }],
+      steps: operations.map((operation) => ({
+        operation,
+        span: { line: 0, column: 0, length: 0 },
+        target: { type: 'locked' },
+      })),
     },
   });
   const EDITOR = '编辑文本指令';
@@ -1054,6 +1058,25 @@ describe('number fields of the editor', () => {
     expect(callsOf(backend, 'save_draft')).toHaveLength(0);
   }
 
+  /** No call reached the backend with the editor's invalid-number marker in it. */
+  function expectNoMarkerSent(backend: MockBackend): void {
+    expect(JSON.stringify(backend.calls)).not.toContain('invalidNumber');
+  }
+
+  /** Select step `index` (from 0) in the step list. */
+  async function openStep(mounted: Mounted, index: number): Promise<void> {
+    const steps = dialog(mounted.container, EDITOR)?.querySelectorAll('ol.steps > li > button');
+    const target = steps?.[index];
+    if (!(target instanceof HTMLButtonElement)) throw new Error(`no step ${String(index + 1)}`);
+    await mounted.act(() => {
+      target.click();
+    });
+  }
+
+  /** The heading of the step form: 「步骤 2 · 等待」. */
+  const stepHeading = (mounted: Mounted) =>
+    dialog(mounted.container, EDITOR)?.querySelector('.step-form h4')?.textContent;
+
   /** 保存 goes through; the action of the rule saved last. */
   async function save(mounted: Mounted): Promise<unknown> {
     await clickIn(mounted, dialog(mounted.container, EDITOR), '保存');
@@ -1094,6 +1117,7 @@ describe('number fields of the editor', () => {
     const listed = `操作设置 · 参数「param1」的值应为 ${JSON_RANGE}。`;
     await expectSaveRefused(mounted, listed);
     expect(backend.draft.rules).toHaveLength(3);
+    expectNoMarkerSent(backend);
     // Still editable: the largest safe integer goes through as typed.
     expectInvalid(input(editor, '参数值'), '9007199254740993', `请输入 ${JSON_RANGE}。`);
     await type(mounted, input(editor, '参数值'), '9007199254740991');
@@ -1124,6 +1148,7 @@ describe('number fields of the editor', () => {
     await mounted.act(() => new Promise((resolve) => setTimeout(resolve, 20)));
     expect(dialog(container, '用哪段文字检查？')).toBeNull();
     expect(callsOf(backend, 'test_rule')).toHaveLength(0);
+    expectNoMarkerSent(backend);
 
     // The rule is not turned read-only: it can be fixed and saved, and is listed as editable.
     await type(mounted, input(editor, '参数值'), '-12');
@@ -1180,6 +1205,75 @@ describe('number fields of the editor', () => {
     await type(mounted, name, '#13');
     expect(await save(mounted)).toEqual(
       steps({ type: 'key_press', key: { type: 'windows_code', code: 13 } }),
+    );
+  });
+
+  // Codex round 5: the text is part of the rule being edited, not of the field's component, which
+  // is mounted anew for each step.
+  it('keeps invalid number text across switching steps, reordering them and undo', async () => {
+    const delay = { type: 'delay', ms: 100 };
+    const text = { type: 'text', text: 'hi', method: 'keys' };
+    const mounted = await editFirst(rule(';a-steps', steps(delay, text)));
+    const { backend, container } = mounted;
+    const editor = dialog(container, EDITOR);
+    const label = '等待时间（毫秒）';
+    const error = '请输入 0 到 3600000 之间的整数。';
+    await type(mounted, input(editor, label), '3600001');
+    expectInvalid(input(editor, label), '3600001', error);
+
+    await openStep(mounted, 1);
+    expect(editor?.querySelector(`input[aria-label="${label}"]`)).toBeNull();
+    await openStep(mounted, 0);
+    expectInvalid(input(editor, label), '3600001', error);
+
+    await clickIn(mounted, editor, '下移');
+    expect(stepHeading(mounted)).toBe('步骤 2 · 等待');
+    expectInvalid(input(editor, label), '3600001', error);
+    expect(editor?.querySelectorAll('ol.steps small')[1]?.textContent).toBe('3600001');
+    await expectSaveRefused(mounted, '步骤 2 · 等待时间（毫秒）应为 0 到 3600000 之间的整数。');
+
+    // Undo takes back the move first, then the edit: the last valid value, without the error.
+    await clickIn(mounted, editor, '撤销');
+    expect(stepHeading(mounted)).toBe('步骤 1 · 等待');
+    expectInvalid(input(editor, label), '3600001', error);
+    await clickIn(mounted, editor, '撤销');
+    expect(input(editor, label).value).toBe('100');
+    expect(input(editor, label).getAttribute('aria-invalid')).toBeNull();
+    expect(editor?.querySelector('.number-error')).toBeNull();
+    expectNoMarkerSent(backend);
+  });
+
+  it('keeps an invalid key code (#300) across switching steps, reordering them and undo', async () => {
+    const press = { type: 'key_press', key: { type: 'named', name: 'Enter' } };
+    const delay = { type: 'delay', ms: 100 };
+    const mounted = await editFirst(rule(';a-keys', steps(press, delay)));
+    const { backend, container } = mounted;
+    const editor = dialog(container, EDITOR);
+    const error = '以 # 开头表示 Windows 键码，请输入 1 到 255 之间的整数。';
+    await type(mounted, input(editor, '按键名称'), '#300');
+
+    await openStep(mounted, 1);
+    expect(editor?.querySelector('input[aria-label="按键名称"]')).toBeNull();
+    await openStep(mounted, 0);
+    expectInvalid(input(editor, '按键名称'), '#300', error);
+
+    await clickIn(mounted, editor, '下移');
+    expect(stepHeading(mounted)).toBe('步骤 2 · 按一下键');
+    expectInvalid(input(editor, '按键名称'), '#300', error);
+    await expectSaveRefused(mounted, '步骤 2 · 键码应为 1 到 255 之间的整数。');
+
+    await clickIn(mounted, editor, '撤销');
+    expectInvalid(input(editor, '按键名称'), '#300', error);
+    await clickIn(mounted, editor, '撤销');
+    expect(input(editor, '按键名称').value).toBe('Enter');
+    expect(input(editor, '按键名称').getAttribute('aria-invalid')).toBeNull();
+    expectNoMarkerSent(backend);
+
+    // Fixed after all that, it saves as typed.
+    await type(mounted, input(editor, '按键名称'), '#013');
+    expect(input(editor, '按键名称').value).toBe('#013');
+    expect(await save(mounted)).toEqual(
+      steps({ type: 'key_press', key: { type: 'windows_code', code: 13 } }, delay),
     );
   });
 });

@@ -1,14 +1,42 @@
-// The editor's number contract (Codex round 4): the editor never produces a number the backend
-// cannot read, or one past the IPC number contract (docs/ipc-contract-0.4.md §6), or one Rust's
-// validation refuses. Each number field checks its raw text against the `ranges` entry of its Rust
-// type (./ruleShape.ts, the table the shape check uses too) before converting it. Text that is not
-// such a number stays in the field with an inline error, and the rule holds NaN there: a marker
-// that blocks saving and testing, never sent (JSON would turn it into null, and `null` is a valid
-// `serde_json::Value`). Keeping the last valid value instead would save a number the user did not
-// mean. Every path that writes the edited rule or sends the edited action runs the same checks
-// first (`ruleEditDiagnostics`, `actionDiagnostics`).
+// The editor's number contract (Codex rounds 4 and 5): the editor never produces a number the
+// backend cannot read, or one past the IPC number contract (docs/ipc-contract-0.4.md §6), or one
+// Rust's validation refuses. Each number field checks its raw text against the `ranges` entry of
+// its Rust type (./ruleShape.ts, the table the shape check uses too) before converting it.
+//
+// Text that is not such a number is kept, as typed, in the edited rule itself: an InvalidNumber
+// marker stands where the number goes. The rule is the editor's state, so the text survives
+// whatever the field's component does not (switching steps, reordering them, undo), and the field
+// shows it again with its inline error. Keeping the last valid value instead would save a number
+// the user did not mean.
+//
+// The marker never leaves the editor. Every path that writes the edited rule or sends the edited
+// action runs the checks below first (`ruleEditDiagnostics`, `actionDiagnostics`), which refuse it
+// with a message at the field. The marker also carries a NaN, so the transport's last check
+// (../ipc/sendable.ts) refuses any command still holding one: JSON would turn it into an object,
+// and an object is a valid `serde_json::Value` (a reusable parameter, for one).
+import { unsendablePath } from '../ipc/sendable';
 import { hasUnsafeNumber, isReadableRule } from './rules';
 import { inRange, isAction, isRecord, ranges, type NumberRange } from './ruleShape';
+
+declare const invalidBrand: unique symbol;
+
+/** Number text that is no number in its field's range, kept as typed where the number goes. */
+export interface InvalidNumber {
+  readonly invalidNumber: string;
+  /**
+   * Always NaN. It makes the marker unsendable (../ipc/sendable.ts), and it tells the marker apart
+   * from anything the backend sends: JSON has no NaN. structuredClone (the editor's history) keeps
+   * it.
+   */
+  readonly nan: number;
+  readonly [invalidBrand]: true;
+}
+
+export const invalidNumber = (text: string): InvalidNumber =>
+  ({ invalidNumber: text, nan: NaN }) as InvalidNumber;
+
+export const isInvalidNumber = (value: unknown): value is InvalidNumber =>
+  isRecord(value) && typeof value.invalidNumber === 'string' && Number.isNaN(value.nan);
 
 const INTEGER = /^[+-]?\d+$/;
 const DECIMAL = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i;
@@ -23,6 +51,16 @@ export function parseNumber(text: string, range: NumberRange): number | null {
   if (!(range.integer ? INTEGER : DECIMAL).test(trimmed)) return null;
   const value = Number(trimmed);
   return inRange(range, value) ? value : null;
+}
+
+/** What a number field stores for `text`: its number in `range`, or the text itself, marked. */
+export const readNumber = (text: string, range: NumberRange): number | InvalidNumber =>
+  parseNumber(text, range) ?? invalidNumber(text);
+
+/** The text a number field shows for a stored `value`: the marked text, or the number. */
+export function numberText(value: unknown): string {
+  if (isInvalidNumber(value)) return value.invalidNumber;
+  return typeof value === 'number' && Number.isFinite(value) ? String(value) : '';
 }
 
 /** `range` in words: 「0 到 3600000 之间的整数」, 「大于 0 的数字」. */
@@ -73,7 +111,7 @@ function keysProblems(keys: unknown, path: string, out: NumberProblem[]): void {
 function parameterProblems(parameters: unknown, path: string, out: NumberProblem[]): void {
   if (!isRecord(parameters)) return;
   for (const [name, value] of Object.entries(parameters))
-    if (typeof value === 'number')
+    if (typeof value === 'number' || isInvalidNumber(value))
       check(value, ranges.json, join(path, name), `参数「${name}」的值`, out);
 }
 
@@ -160,15 +198,22 @@ const toDiagnostic = ({ path, label, range }: NumberProblem): EditDiagnostic =>
 /** For a value the specific checks miss: the backend could not read it as the editor means it. */
 const NOT_SAVABLE = '含有无法识别的内容，请检查后再试。';
 
+/** Where `value` holds a number JSON cannot carry. A marker is named by its own path. */
+const unsendableAt = (value: unknown, root: string): string | null =>
+  unsendablePath(value, root)?.replace(/\.nan$/, '') ?? null;
+
 /**
  * Why the edited rule, at position `index` of the config, cannot be saved or tested as it is:
- * number fields holding no number in their range, or else a shape the backend would not read as
- * the editor means it (`isReadableRule`). Empty when it can.
+ * number fields holding no number in their range; else an invalid-number marker or other number
+ * JSON cannot carry anywhere else in it; else a shape the backend would not read as the editor
+ * means it (`isReadableRule`). Empty when it can.
  */
 export function ruleEditDiagnostics(rule: unknown, index: number): EditDiagnostic[] {
   const base = `rules[${String(index)}]`;
   const found = actionNumberProblems(isRecord(rule) ? rule.action : undefined, `${base}.action`);
   if (found.length > 0) return found.map(toDiagnostic);
+  const unsendable = unsendableAt(rule, base);
+  if (unsendable !== null) return [diagnostic('not_savable', NOT_SAVABLE, unsendable)];
   return isReadableRule(rule) ? [] : [diagnostic('not_savable', NOT_SAVABLE, base)];
 }
 
@@ -176,6 +221,8 @@ export function ruleEditDiagnostics(rule: unknown, index: number): EditDiagnosti
 export function actionDiagnostics(action: unknown): EditDiagnostic[] {
   const found = actionNumberProblems(action);
   if (found.length > 0) return found.map(toDiagnostic);
+  const unsendable = unsendableAt(action, '');
+  if (unsendable !== null) return [diagnostic('not_savable', NOT_SAVABLE, unsendable)];
   return isAction(action) && !hasUnsafeNumber(action)
     ? []
     : [diagnostic('not_savable', NOT_SAVABLE, '')];

@@ -3,7 +3,14 @@ import { call } from './ipc/transport';
 import { diagnosticText, parseCommandError } from './ipc/errors';
 import { actionChoice, actionLabel, actionOptions, clone, Data, Rule } from './model';
 import { moveItem, withoutKey } from './lib/list';
-import { actionDiagnostics, parseNumber, rangeError } from './lib/numberFields';
+import {
+  actionDiagnostics,
+  isInvalidNumber,
+  numberText,
+  rangeError,
+  readNumber,
+  type InvalidNumber,
+} from './lib/numberFields';
 import { inRange, ranges } from './lib/ruleShape';
 import { LinesInput } from './LinesInput';
 import { NumberField } from './NumberField';
@@ -17,25 +24,26 @@ type Props = {
   run: (f: () => Promise<any>, s?: string) => Promise<any>;
   show: (d: { title: string; data: any }) => void;
 };
+/** A value of the reusable-action form; invalid number text is kept as a marker. */
+type ParameterValue = string | number | boolean | null | InvalidNumber;
 // 「#13」 is a Windows key code. Its text is checked against the code's range (1..=255) before it
-// is converted; NaN marks text that is not such a code, which the editor refuses to save or send
-// (src/lib/numberFields.ts), so it never writes a code past u16 that the backend cannot read.
+// is converted. Text that is not such a code is kept in the rule as an InvalidNumber marker, which
+// the editor refuses to save or send (src/lib/numberFields.ts), so it never writes a code past u16
+// that the backend cannot read, and the text typed survives switching steps.
 const key = (name: string) =>
   name === '$primary'
     ? { type: 'platform_primary' }
     : name.startsWith('#')
-      ? { type: 'windows_code', code: parseNumber(name.slice(1), ranges.windowsKeyCode) ?? NaN }
+      ? { type: 'windows_code', code: readNumber(name.slice(1), ranges.windowsKeyCode) }
       : { type: 'named', name };
-const keyValue = (k: Data) =>
+const keyValue = (k: Data): string =>
   k.type === 'platform_primary'
     ? '$primary'
     : k.type === 'windows_code'
-      ? Number.isNaN(k.code)
-        ? '#'
-        : `#${k.code}`
+      ? `#${numberText(k.code)}`
       : k.name;
-const sameKey = (x: Data, y: Data) =>
-  x.type === y.type && Object.is(x.code, y.code) && x.name === y.name;
+const invalidKey = (k: Data) =>
+  k.type === 'windows_code' && !inRange(ranges.windowsKeyCode, k.code);
 const namedKeys = [
   'Ctrl',
   'Shift',
@@ -212,10 +220,11 @@ function defaultAction(t: string): Data {
   }
 }
 function KeySelect({ value, onChange }: { value: Data; onChange: (k: Data) => void }) {
-  // As in NumberField: the text typed stays while it still stands for `value`.
+  // As in NumberField: the text typed stays while it still stands for `value` (「#013」); invalid
+  // code text comes back from the rule itself.
   const errorId = useId();
   const [typed, setTyped] = useState<string | null>(null);
-  const invalid = value.type === 'windows_code' && !inRange(ranges.windowsKeyCode, value.code);
+  const invalid = invalidKey(value);
   return (
     <>
       <input
@@ -223,7 +232,7 @@ function KeySelect({ value, onChange }: { value: Data; onChange: (k: Data) => vo
         aria-invalid={invalid || undefined}
         aria-describedby={invalid ? errorId : undefined}
         list="keynames"
-        value={typed !== null && sameKey(key(typed), value) ? typed : keyValue(value)}
+        value={typed !== null && keyValue(key(typed)) === keyValue(value) ? typed : keyValue(value)}
         onChange={(e) => {
           setTyped(e.target.value);
           onChange(key(e.target.value));
@@ -383,10 +392,10 @@ export default function ActionEditor({
     [bText, setBText] = useState(''),
     [bKey, setBKey] = useState('Enter'),
     [bGroup, setBGroup] = useState<Data[]>([]),
-    [repeat, setRepeat] = useState(1),
+    [repeat, setRepeat] = useState<number | InvalidNumber>(1),
     [mods, setMods] = useState<string[]>([]),
     [recording, setRecording] = useState(false),
-    [eventDelay, setEventDelay] = useState(0);
+    [eventDelay, setEventDelay] = useState<number | InvalidNumber>(0);
   const dragged = useRef<number | null>(null);
   const edit = (patch: Data) => onChange({ ...a, ...patch });
   const steps: Data[] = a.plan?.steps ?? [];
@@ -417,6 +426,8 @@ export default function ActionEditor({
   };
   const addStep = () => {
     if (command === 'sendkeys') {
+      // The button is disabled then too; this keeps a marker out of the text sent to parse.
+      if (!inRange(ranges.repeat, repeat)) return;
       void run(async () => {
         const sequence =
           mods.map((m) => (m === 'Ctrl' ? '^' : m === 'Shift' ? '+' : '%')).join('') +
@@ -436,12 +447,15 @@ export default function ActionEditor({
       return;
     }
     const cmd = a.type === 'replay' ? replayMap[command] || 'moveto' : command;
+    // As above: the button is disabled while the delay is invalid, and no marker gets past here.
+    if (a.type === 'replay' && !inRange(ranges.delayMs, eventDelay)) return;
+    const delay = inRange(ranges.delayMs, eventDelay) ? eventDelay : 0;
     updateSteps([
       ...steps,
-      ...(a.type === 'replay' && eventDelay > 0
+      ...(a.type === 'replay' && delay > 0
         ? [
             {
-              operation: { type: 'delay', ms: eventDelay },
+              operation: { type: 'delay', ms: delay },
               span: { line: steps.length + 1, column: 1, length: 0 },
               target: { type: 'locked' },
             },
@@ -734,7 +748,7 @@ export default function ActionEditor({
                           mods
                             .map((m) => (m === 'Ctrl' ? '^' : m === 'Shift' ? '+' : '%'))
                             .join('') +
-                          `{${bKey} ${repeat}}`,
+                          `{${bKey} ${numberText(repeat)}}`,
                       },
                     })
                   }
@@ -746,13 +760,13 @@ export default function ActionEditor({
                 <h4>按住 Ctrl、Shift 或 Alt，再依次按多个键</h4>
                 <Shortcut platform={platform} value={bGroup} onChange={setBGroup} />
                 <button
-                  disabled={!bGroup.length}
+                  disabled={!bGroup.length || bGroup.some(invalidKey)}
                   onClick={() => {
                     const prefix = mods
                       .map((m) => (m === 'Ctrl' ? '^' : m === 'Shift' ? '+' : '%'))
                       .join('');
                     const groupSource =
-                      prefix + '(' + bGroup.map((k) => `{${String(keyValue(k))}}`).join('') + ')';
+                      prefix + '(' + bGroup.map((k) => `{${keyValue(k)}}`).join('') + ')';
                     edit({
                       source: { type: 'inline', value: String(a.source.value) + groupSource },
                     });
@@ -920,81 +934,82 @@ export default function ActionEditor({
               <small>
                 名称要与另一条指令需要的名称一致；内容可以是文字、数字、“是或否”，也可以留空。
               </small>
-              {Object.entries<string | number | boolean | null>(a.parameters ?? {}).map(
-                ([name, value], i) => (
-                  <div className="inline" key={i}>
-                    <input
-                      aria-label="参数名称"
-                      value={name}
-                      onChange={(e) => {
-                        const p = withoutKey(a.parameters ?? {}, name);
-                        p[e.target.value] = value;
-                        edit({ parameters: p });
-                      }}
-                    />
+              {Object.entries<ParameterValue>(a.parameters ?? {}).map(([name, value], i) => (
+                <div className="inline" key={i}>
+                  <input
+                    aria-label="参数名称"
+                    value={name}
+                    onChange={(e) => {
+                      const p = withoutKey(a.parameters ?? {}, name);
+                      p[e.target.value] = value;
+                      edit({ parameters: p });
+                    }}
+                  />
+                  <select
+                    aria-label="参数类型"
+                    value={
+                      value === null ? 'null' : isInvalidNumber(value) ? 'number' : typeof value
+                    }
+                    onChange={(e) =>
+                      edit({
+                        parameters: {
+                          ...a.parameters,
+                          [name]:
+                            e.target.value === 'boolean'
+                              ? true
+                              : e.target.value === 'number'
+                                ? 0
+                                : e.target.value === 'null'
+                                  ? null
+                                  : '',
+                        },
+                      })
+                    }
+                  >
+                    <option value="string">文字</option>
+                    <option value="number">数字</option>
+                    <option value="boolean">是或否</option>
+                    <option value="null">空值</option>
+                  </select>
+                  {typeof value === 'boolean' ? (
                     <select
-                      aria-label="参数类型"
-                      value={value === null ? 'null' : typeof value}
+                      aria-label="选择是或否"
+                      value={String(value)}
                       onChange={(e) =>
                         edit({
-                          parameters: {
-                            ...a.parameters,
-                            [name]:
-                              e.target.value === 'boolean'
-                                ? true
-                                : e.target.value === 'number'
-                                  ? 0
-                                  : e.target.value === 'null'
-                                    ? null
-                                    : '',
-                          },
+                          parameters: { ...a.parameters, [name]: e.target.value === 'true' },
                         })
                       }
                     >
-                      <option value="string">文字</option>
-                      <option value="number">数字</option>
-                      <option value="boolean">是或否</option>
-                      <option value="null">空值</option>
+                      <option value="true">是</option>
+                      <option value="false">否</option>
                     </select>
-                    {typeof value === 'boolean' ? (
-                      <select
-                        aria-label="选择是或否"
-                        value={String(value)}
-                        onChange={(e) =>
-                          edit({
-                            parameters: { ...a.parameters, [name]: e.target.value === 'true' },
-                          })
-                        }
-                      >
-                        <option value="true">是</option>
-                        <option value="false">否</option>
-                      </select>
-                    ) : typeof value === 'number' ? (
-                      // Any JSON number within the IPC number contract (Rust takes a JSON value).
-                      <NumberField
-                        aria-label="参数值"
-                        range={ranges.json}
-                        value={value}
-                        onChange={(n) => edit({ parameters: { ...a.parameters, [name]: n } })}
-                      />
-                    ) : (
-                      <input
-                        aria-label="参数值"
-                        disabled={value === null}
-                        value={value === null ? '' : value}
-                        onChange={(e) =>
-                          edit({ parameters: { ...a.parameters, [name]: e.target.value } })
-                        }
-                      />
-                    )}
-                    <button
-                      onClick={() => edit({ parameters: withoutKey(a.parameters ?? {}, name) })}
-                    >
-                      删除
-                    </button>
-                  </div>
-                ),
-              )}
+                  ) : typeof value === 'number' || isInvalidNumber(value) ? (
+                    // Any JSON number within the IPC number contract (Rust takes a JSON value).
+                    // Invalid text is kept as a marker, which saving and testing refuse.
+                    <NumberField
+                      aria-label="参数值"
+                      range={ranges.json}
+                      value={value}
+                      onChange={(n) => edit({ parameters: { ...a.parameters, [name]: n } })}
+                    />
+                  ) : (
+                    <input
+                      aria-label="参数值"
+                      disabled={value === null}
+                      value={value === null ? '' : value}
+                      onChange={(e) =>
+                        edit({ parameters: { ...a.parameters, [name]: e.target.value } })
+                      }
+                    />
+                  )}
+                  <button
+                    onClick={() => edit({ parameters: withoutKey(a.parameters ?? {}, name) })}
+                  >
+                    删除
+                  </button>
+                </div>
+              ))}
               <button
                 onClick={() =>
                   edit({
@@ -1031,7 +1046,6 @@ export default function ActionEditor({
                 <NumberField
                   className="number"
                   range={ranges.replaySpeed}
-                  step={0.1}
                   value={a.speed}
                   onChange={(n) => edit({ speed: n })}
                 />
@@ -1192,7 +1206,9 @@ export default function ActionEditor({
                         {stepLabel(s.operation)}
                         <small>
                           {s.operation.text ||
-                            s.operation.ms ||
+                            (isInvalidNumber(s.operation.ms)
+                              ? s.operation.ms.invalidNumber
+                              : s.operation.ms) ||
                             s.operation.key?.name ||
                             (
                               {
