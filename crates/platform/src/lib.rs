@@ -205,3 +205,6 @@ pub fn stop_recording(shared: &Arc<Shared>) -> Result<ActionPlan, String> {
 pub mod history;
 pub mod runtime;
 pub mod supervisor;
+
+/// The app's clipboard lease options, set at startup from prefs (B-08).
+pub mod clipboard_options;

@@ -2,6 +2,7 @@
 //! writes and verified restore, plus the Windows adapter.
 use super::inject::mark_external_effect;
 use super::*;
+use crate::clipboard_options::lease_options;
 use crate::fault::{self, FaultPoint};
 use crate::health::{Component, ComponentHealth, HealthState, ReasonCode};
 use crate::traits::{ClipboardBackend, ClipboardRead, FormatRead, LeaseOptions, RestorePolicy};
@@ -1372,9 +1373,10 @@ impl<C: ClipboardBackend> ClipboardLease<C> {
         self.written = Some(self.verify_owned()?);
         Ok(())
     }
-    /// [`ClipboardLease::open`] with the default options.
+    /// [`ClipboardLease::open`] with the app's options (`prefs.json`
+    /// `app.clipboard`, set at startup; [`lease_options`]).
     pub(super) fn new(backend: C) -> Result<Self, LeaseError> {
-        Self::open(backend, LeaseOptions::default())
+        Self::open(backend, lease_options())
     }
     /// Backs up the clipboard under `options` (B-08), then verifies the
     /// backup in a second section so a copy racing it is detected. Every
@@ -2326,6 +2328,10 @@ mod tests {
         let options = LeaseOptions::default();
         assert_eq!(options.policy, RestorePolicy::BestEffort);
         assert_eq!(options.restore_delay, Duration::from_millis(300));
+        // `new` opens with the app's options; no unit test sets them (they
+        // are process-wide), so they are still the defaults here. Setting
+        // them is tested in tests/clipboard_options.rs, its own process.
+        assert_eq!(lease_options(), options);
         let lease = ClipboardLease::new(MockClipboard::new(7, text("original"))).unwrap();
         assert_eq!(lease.restore_delay(), Duration::from_millis(300));
         assert!(lease.skipped_formats().is_empty());

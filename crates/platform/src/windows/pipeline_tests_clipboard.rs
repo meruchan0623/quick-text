@@ -2,8 +2,9 @@
 //! lease over `MockClipboard` holding handle formats, oversized formats, a
 //! busy clipboard, a hung owner, delay-rendered data that is slow or never
 //! arrives, unreadable data and external changes. The pipeline leases with
-//! `LeaseOptions::default()` (BestEffort); the other policies are exercised
-//! on the lease directly until preferences select one.
+//! the app's options (`clipboard_options`, set from prefs at startup), which
+//! unit tests never set: `LeaseOptions::default()` (BestEffort). The other
+//! policies are exercised on the lease directly.
 use super::*;
 use crate::health::{HealthState, ReasonCode};
 use crate::traits::{LeaseOptions, RestorePolicy, DEFAULT_RESTORE_DELAY};

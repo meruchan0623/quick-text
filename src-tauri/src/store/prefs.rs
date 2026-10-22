@@ -8,12 +8,17 @@
 
 use super::atomic::atomic_json;
 use crate::error::{file_label, CommandError, IoOp};
-use serde::{Deserialize, Serialize};
+use quicker_platform::{
+    clipboard_options::set_lease_options,
+    traits::{LeaseOptions, RestorePolicy, DEFAULT_RESTORE_DELAY},
+};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use std::{
     fs, io,
+    ops::RangeInclusive,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const FILE: &str = "prefs.json";
@@ -47,6 +52,8 @@ pub struct AppPrefs {
     pub auto_listen_on_start: bool,
     /// Temporary log level, in effect until `until_ms` (§7 logging).
     pub log_level: Option<LogLevelOverride>,
+    /// How a paste restores the clipboard (B-08).
+    pub clipboard: ClipboardPrefs,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -59,6 +66,152 @@ pub struct LogLevelOverride {
     /// Fields this version does not know, kept and written back unchanged.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// Bounds of `app.clipboard.restore_delay_ms` (plan §6 settings table).
+pub const RESTORE_DELAY_MS: RangeInclusive<u64> = 100..=2000;
+const DEFAULT_RESTORE_DELAY_MS: u64 = DEFAULT_RESTORE_DELAY.as_millis() as u64;
+
+/// `app.clipboard` (B-08), the lease options of every paste; set at startup
+/// by [`apply_clipboard_prefs`]. No command or settings page edits it in 0.4.
+///
+/// Read field by field: a missing, mistyped, unknown or out-of-range value
+/// takes its default and is logged (`store.prefs_invalid`), and never makes
+/// the whole file count as damaged. A replaced value is written back as its
+/// default the next time prefs are saved.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ClipboardPrefs {
+    /// `"full"`, `"best_effort"` (default) or `"text_only"`.
+    pub restore_policy: RestorePolicy,
+    /// Wait between the paste chord and the restore, within
+    /// [`RESTORE_DELAY_MS`]; 300 by default.
+    pub restore_delay_ms: u64,
+    /// Fields this version does not know, kept and written back unchanged.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl Default for ClipboardPrefs {
+    fn default() -> Self {
+        Self {
+            restore_policy: RestorePolicy::default(),
+            restore_delay_ms: DEFAULT_RESTORE_DELAY_MS,
+            extra: Map::new(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ClipboardPrefs {
+    /// Fails only where the JSON itself is invalid, which damages the file
+    /// anyway; every value is checked by [`ClipboardPrefs::from_value`].
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Value::deserialize(deserializer).map(Self::from_value)
+    }
+}
+
+impl ClipboardPrefs {
+    fn from_value(value: Value) -> Self {
+        let mut fields = match value {
+            Value::Object(fields) => fields,
+            other => {
+                invalid("app.clipboard", &other, "not_an_object");
+                return Self::default();
+            }
+        };
+        let restore_policy = match fields.remove("restore_policy") {
+            None => RestorePolicy::default(),
+            Some(value) => RestorePolicy::deserialize(&value).unwrap_or_else(|_| {
+                let problem = match value {
+                    Value::String(_) => "unknown_value",
+                    _ => "wrong_type",
+                };
+                invalid("app.clipboard.restore_policy", &value, problem);
+                RestorePolicy::default()
+            }),
+        };
+        let restore_delay_ms = match fields.remove("restore_delay_ms") {
+            None => DEFAULT_RESTORE_DELAY_MS,
+            Some(Value::Number(ms)) => match ms.as_u64() {
+                Some(ms) if RESTORE_DELAY_MS.contains(&ms) => ms,
+                _ => {
+                    tracing::warn!(
+                        event = "store.prefs_invalid",
+                        file = FILE,
+                        field = "app.clipboard.restore_delay_ms",
+                        problem = "out_of_range",
+                        value = %ms,
+                        min = *RESTORE_DELAY_MS.start(),
+                        max = *RESTORE_DELAY_MS.end(),
+                        "invalid preference replaced by its default"
+                    );
+                    DEFAULT_RESTORE_DELAY_MS
+                }
+            },
+            Some(other) => {
+                invalid("app.clipboard.restore_delay_ms", &other, "wrong_type");
+                DEFAULT_RESTORE_DELAY_MS
+            }
+        };
+        Self {
+            restore_policy,
+            restore_delay_ms,
+            extra: fields,
+        }
+    }
+
+    /// The platform's lease options. A delay outside [`RESTORE_DELAY_MS`]
+    /// (only possible when set in code, never when read) takes the default.
+    pub fn lease_options(&self) -> LeaseOptions {
+        let ms = if RESTORE_DELAY_MS.contains(&self.restore_delay_ms) {
+            self.restore_delay_ms
+        } else {
+            DEFAULT_RESTORE_DELAY_MS
+        };
+        LeaseOptions {
+            policy: self.restore_policy,
+            restore_delay: Duration::from_millis(ms),
+        }
+    }
+}
+
+/// Logs a replaced value by its JSON type only: a string value is never
+/// echoed.
+fn invalid(field: &'static str, found: &Value, problem: &'static str) {
+    let found = match found {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    };
+    tracing::warn!(
+        event = "store.prefs_invalid",
+        file = FILE,
+        field,
+        problem,
+        found,
+        "invalid preference replaced by its default"
+    );
+}
+
+/// Startup, before the engine starts (one call in `main.rs` setup): hands
+/// `app.clipboard` to the platform as the options of every clipboard lease
+/// (B-08). Prefs that cannot be read leave the defaults, logged.
+pub fn apply_clipboard_prefs(dir: &Path) {
+    let clipboard = match load_prefs(dir) {
+        Ok(prefs) => prefs.app.clipboard,
+        Err(e) => {
+            tracing::warn!(
+                event = "store.prefs_unavailable",
+                file = FILE,
+                error = %e,
+                "prefs unavailable; clipboard restore uses the defaults"
+            );
+            ClipboardPrefs::default()
+        }
+    };
+    set_lease_options(clipboard.lease_options());
 }
 
 /// Reads `prefs.json` leniently. A missing file gives defaults; a file that
@@ -230,6 +383,7 @@ mod tests {
             "app": {
                 "auto_listen_on_start": false,
                 "log_level": null,
+                "clipboard": {"restore_policy": "best_effort", "restore_delay_ms": 300},
                 "hotkey": "Ctrl+Alt+Q",
                 "stats": {"enabled": true}
             },
@@ -383,6 +537,217 @@ mod tests {
             file_label(&second).unwrap(),
             "prefs.corrupt-20261022-102133-1.json"
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn with_clipboard(dir: &Path, clipboard: Value) {
+        let file = json!({
+            "app": {"auto_listen_on_start": true, "clipboard": clipboard},
+            "ui": {"theme": "dark"}
+        });
+        fs::write(dir.join(FILE), serde_json::to_vec(&file).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn clipboard_prefs_default_to_best_effort_after_300_ms() {
+        let clipboard = Prefs::default().app.clipboard;
+        assert_eq!(clipboard.restore_policy, RestorePolicy::BestEffort);
+        assert_eq!(clipboard.restore_delay_ms, 300);
+        assert_eq!(clipboard.lease_options(), LeaseOptions::default());
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(FILE),
+            br#"{"app": {"auto_listen_on_start": true}}"#,
+        )
+        .unwrap();
+        assert_eq!(load_prefs(&dir).unwrap().app.clipboard, clipboard);
+        with_clipboard(&dir, json!({}));
+        assert_eq!(load_prefs(&dir).unwrap().app.clipboard, clipboard);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn clipboard_prefs_are_read_and_written_back() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        for (name, policy, ms) in [
+            ("full", RestorePolicy::Full, 100),
+            ("best_effort", RestorePolicy::BestEffort, 750),
+            ("text_only", RestorePolicy::TextOnly, 2000),
+        ] {
+            let section = json!({
+                "restore_policy": name,
+                "restore_delay_ms": ms,
+                "office_formats": {"keep": [true, null]}
+            });
+            with_clipboard(&dir, section.clone());
+            let prefs = load_prefs(&dir).unwrap();
+            let clipboard = &prefs.app.clipboard;
+            assert_eq!(
+                (clipboard.restore_policy, clipboard.restore_delay_ms),
+                (policy, ms)
+            );
+            assert_eq!(
+                clipboard.lease_options(),
+                LeaseOptions {
+                    policy,
+                    restore_delay: Duration::from_millis(ms),
+                }
+            );
+            save_prefs(&dir, &prefs).unwrap();
+            let written: Value =
+                serde_json::from_slice(&fs::read(dir.join(FILE)).unwrap()).unwrap();
+            assert_eq!(written["app"]["clipboard"], section, "{name}");
+        }
+        assert!(quarantined(&dir).is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A bad clipboard value takes its default and is logged, by field and
+    /// JSON type only; the rest of the file still loads and nothing is
+    /// quarantined.
+    #[test]
+    fn invalid_clipboard_values_take_their_defaults_and_are_logged() {
+        use crate::diagnostics::logging::{
+            test_support::{read_logs, scoped},
+            DEFAULT_LEVEL,
+        };
+        const SECRET: &str = "QT-SENTINEL-not-a-policy";
+        let (policy, delay) = (
+            "app.clipboard.restore_policy",
+            "app.clipboard.restore_delay_ms",
+        );
+        let cases = [
+            (
+                json!({"restore_policy": SECRET, "restore_delay_ms": 500}),
+                (RestorePolicy::BestEffort, 500),
+                (policy, "unknown_value"),
+            ),
+            (
+                json!({"restore_policy": "Full", "restore_delay_ms": 500}),
+                (RestorePolicy::BestEffort, 500),
+                (policy, "unknown_value"),
+            ),
+            (
+                json!({"restore_policy": 2, "restore_delay_ms": 500}),
+                (RestorePolicy::BestEffort, 500),
+                (policy, "wrong_type"),
+            ),
+            (
+                json!({"restore_policy": "text_only", "restore_delay_ms": 99}),
+                (RestorePolicy::TextOnly, 300),
+                (delay, "out_of_range"),
+            ),
+            (
+                json!({"restore_policy": "full", "restore_delay_ms": 2001}),
+                (RestorePolicy::Full, 300),
+                (delay, "out_of_range"),
+            ),
+            (
+                json!({"restore_delay_ms": -1}),
+                (RestorePolicy::BestEffort, 300),
+                (delay, "out_of_range"),
+            ),
+            (
+                json!({"restore_delay_ms": 300.5}),
+                (RestorePolicy::BestEffort, 300),
+                (delay, "out_of_range"),
+            ),
+            (
+                json!({"restore_policy": "text_only", "restore_delay_ms": "300"}),
+                (RestorePolicy::TextOnly, 300),
+                (delay, "wrong_type"),
+            ),
+            (
+                json!({"restore_delay_ms": null}),
+                (RestorePolicy::BestEffort, 300),
+                (delay, "wrong_type"),
+            ),
+            (
+                json!(SECRET),
+                (RestorePolicy::BestEffort, 300),
+                ("app.clipboard", "not_an_object"),
+            ),
+            (
+                json!(["full", 500]),
+                (RestorePolicy::BestEffort, 300),
+                ("app.clipboard", "not_an_object"),
+            ),
+            (
+                Value::Null,
+                (RestorePolicy::BestEffort, 300),
+                ("app.clipboard", "not_an_object"),
+            ),
+        ];
+        for (section, (expected_policy, expected_ms), (field, problem)) in cases {
+            let dir = temp_dir();
+            fs::create_dir_all(&dir).unwrap();
+            with_clipboard(&dir, section.clone());
+            let logs = dir.join("logs");
+            let built = scoped(&logs, DEFAULT_LEVEL);
+            let prefs = tracing::subscriber::with_default(built.subscriber, || load_prefs(&dir))
+                .unwrap_or_else(|e| panic!("{section}: {e}"));
+            drop(built.guard);
+            let clipboard = &prefs.app.clipboard;
+            assert_eq!(
+                (clipboard.restore_policy, clipboard.restore_delay_ms),
+                (expected_policy, expected_ms),
+                "{section}"
+            );
+            assert!(prefs.app.auto_listen_on_start, "{section}");
+            assert_eq!(prefs.ui, json!({"theme": "dark"}), "{section}");
+            assert!(dir.join(FILE).exists(), "{section}");
+            assert!(quarantined(&dir).is_empty(), "{section}");
+            let log = read_logs(&logs);
+            let line = log
+                .lines()
+                .find(|line| line.contains("event=\"store.prefs_invalid\""))
+                .unwrap_or_else(|| panic!("{section}: no log line in\n{log}"));
+            assert!(line.contains(&format!("field=\"{field}\"")), "{line}");
+            assert!(line.contains(&format!("problem=\"{problem}\"")), "{line}");
+            assert!(!log.contains(SECRET), "{line}");
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// The startup call sets the platform's lease options (process-wide; no
+    /// other test in this crate opens a lease or reads them).
+    #[test]
+    fn startup_hands_the_clipboard_prefs_to_the_platform() {
+        use quicker_platform::clipboard_options::lease_options;
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        with_clipboard(
+            &dir,
+            json!({"restore_policy": "text_only", "restore_delay_ms": 1500}),
+        );
+        apply_clipboard_prefs(&dir);
+        let text_only = LeaseOptions {
+            policy: RestorePolicy::TextOnly,
+            restore_delay: Duration::from_millis(1500),
+        };
+        assert_eq!(lease_options(), text_only);
+        // Unreadable prefs: the defaults, and the file is left alone.
+        fs::remove_file(dir.join(FILE)).unwrap();
+        fs::create_dir_all(dir.join(FILE)).unwrap();
+        apply_clipboard_prefs(&dir);
+        assert_eq!(lease_options(), LeaseOptions::default());
+        assert!(dir.join(FILE).is_dir());
+        fs::remove_dir_all(dir.join(FILE)).unwrap();
+        with_clipboard(&dir, json!({"restore_policy": "full"}));
+        apply_clipboard_prefs(&dir);
+        assert_eq!(
+            lease_options(),
+            LeaseOptions {
+                policy: RestorePolicy::Full,
+                ..LeaseOptions::default()
+            }
+        );
+        // No file: the defaults.
+        fs::remove_file(dir.join(FILE)).unwrap();
+        apply_clipboard_prefs(&dir);
+        assert_eq!(lease_options(), LeaseOptions::default());
         fs::remove_dir_all(dir).unwrap();
     }
 }

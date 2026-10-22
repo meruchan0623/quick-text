@@ -58,6 +58,7 @@ fn main() {
                 Arc::new(quicker_platform::traits::SystemClock),
                 Arc::new(diagnostics::logging::apply_level),
             ));
+            store::prefs::apply_clipboard_prefs(&dir);
             let store = store::Store::load(dir);
             let engine = store.engine.clone();
             app.manage(Managed::new(store));

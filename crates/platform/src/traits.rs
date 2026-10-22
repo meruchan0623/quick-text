@@ -191,8 +191,9 @@ pub enum RestorePolicy {
 /// (espanso v2.4.1 uses the same; 0.3 waited a fixed 150 ms).
 pub const DEFAULT_RESTORE_DELAY: Duration = Duration::from_millis(300);
 
-/// Clipboard lease configuration. Preferences do not set it yet, so every
-/// lease uses `Default`: BestEffort and [`DEFAULT_RESTORE_DELAY`].
+/// Clipboard lease configuration. Leases use the app's options
+/// (`crate::clipboard_options`, set at startup from prefs); `Default` until
+/// then: BestEffort and [`DEFAULT_RESTORE_DELAY`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LeaseOptions {
     pub policy: RestorePolicy,
