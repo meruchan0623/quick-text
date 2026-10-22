@@ -37,7 +37,9 @@
 //! | `app.panic` | error | a panic; thread, location, redacted message, crash file name |
 //! | `command.internal` | error | `CommandError::Internal`; `trace_id` and the original error |
 //! | `command.io` | warn | `CommandError::Io`; operation, file name, OS error |
+//! | `diagnostics.export` | info | a bundle was written; redaction, entry count, `elapsed_ms` |
 //! | `engine.unavailable` | warn | the platform refused to start or resume |
+//! | `frontend.error` | warn | `log_frontend_error`; message, source, stack (8 KiB in total) |
 //! | `log.file_unavailable` | error | log files could not be opened; stderr only |
 //! | `log.level_set` | info | `set_log_level`; level and `until_ms` |
 //! | `log.level_restored` | info | a saved temporary level was re-applied at startup |
@@ -47,6 +49,7 @@
 //! | `log.expiry_thread_failed` | error | the expiry thread did not start |
 //! | `store.quarantine` | warn | a damaged file was renamed aside |
 //! | `store.quarantine_failed` | error | the rename failed; the file stays in place |
+//! | `ui.metric` | info / debug | `report_metric`; whitelisted name and value (first paint at info, event lag at debug) |
 //!
 //! # Privacy
 //!

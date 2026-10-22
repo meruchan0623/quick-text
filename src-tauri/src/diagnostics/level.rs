@@ -196,7 +196,6 @@ impl LogLevelControl {
         Self { shared, thread }
     }
 
-    #[allow(dead_code)] // Read by export_diagnostics (next commit).
     pub fn current(&self) -> LevelState {
         self.shared.state.lock().current
     }

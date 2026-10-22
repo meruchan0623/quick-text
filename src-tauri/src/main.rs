@@ -8,7 +8,7 @@ mod events;
 mod store;
 mod tray;
 
-use app_state::Managed;
+use app_state::{DataDir, Managed};
 use quicker_platform::ExecutionResult;
 use std::{path::PathBuf, sync::Arc};
 use tauri::Manager;
@@ -47,6 +47,7 @@ fn main() {
                 debug_build = cfg!(debug_assertions),
                 "Quicker Text starting"
             );
+            app.manage(DataDir(dir.clone()));
             app.manage(diagnostics::level::LogLevelControl::start(
                 dir.clone(),
                 Arc::new(quicker_platform::traits::SystemClock),
@@ -103,7 +104,12 @@ fn main() {
             commands::system::get_cursor,
             commands::system::capture_selection,
             commands::system::exit_app,
-            commands::diagnostics::set_log_level
+            commands::diagnostics::set_log_level,
+            commands::diagnostics::export_diagnostics,
+            commands::diagnostics::open_log_dir,
+            commands::diagnostics::open_data_dir,
+            commands::diagnostics::log_frontend_error,
+            commands::diagnostics::report_metric
         ])
         .build(tauri::generate_context!())
         .expect("Quicker Text startup failed")
