@@ -14,6 +14,7 @@ use std::{path::PathBuf, sync::Arc};
 use tauri::Manager;
 
 fn main() {
+    diagnostics::panic::install();
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(w) = app.get_webview_window("main") {
@@ -39,6 +40,7 @@ fn main() {
             // Logging comes first so the store and every command can log
             // (`CommandError::internal` trace ids must be findable).
             diagnostics::logging::init(&dir);
+            diagnostics::panic::set_crash_dir(dir.clone());
             tracing::info!(
                 event = "app.start",
                 version = env!("CARGO_PKG_VERSION"),
