@@ -745,6 +745,42 @@ fn trigger_dropped_while_busy_is_recorded() {
     assert_eq!(history[1].outcome, Outcome::Succeeded);
 }
 
+/// S-19 wiring: the busy shadow's reports (P1b's sink) land in the same
+/// history as the executor's own busy drops: `dropped_busy`, the rule's
+/// automatic trigger, identifiers only, and nothing runs.
+#[test]
+fn busy_shadow_reports_are_recorded_as_dropped_busy() {
+    let mut terminated = text_rule("trm", OutputMethod::Keys, BODY);
+    terminated.trigger_mode = TriggerMode::Terminator;
+    let rig = ExecRig::new(vec![text_rule("kw", OutputMethod::Keys, TYPED), terminated]);
+    let sink = rig.core.dropped_busy_sink();
+    sink(DroppedBusy {
+        rule_id: "rule-kw".into(),
+        process: APP.into(),
+    });
+    sink(DroppedBusy {
+        rule_id: "rule-trm".into(),
+        process: String::new(),
+    });
+    let history = rig.history();
+    assert_eq!(history.len(), 2, "one entry per report");
+    for (entry, rule, trigger, process) in [
+        (&history[0], "rule-kw", TriggerKind::Immediate, Some(APP)),
+        (&history[1], "rule-trm", TriggerKind::Terminator, None),
+    ] {
+        assert_eq!(
+            (entry.outcome, entry.reason),
+            (Outcome::DroppedBusy, ReasonCode::DroppedBusy)
+        );
+        assert_eq!(entry.rule_id, rule);
+        assert_eq!(entry.trigger, trigger);
+        assert_eq!(entry.process.as_deref(), process);
+        assert_eq!(entry.completed_steps, 0);
+        assert!(!entry.side_effects);
+    }
+    assert!(rig.injector.calls().is_empty(), "nothing runs");
+}
+
 /// B-35: automatic runs record their real outcome (no longer always
 /// "unknown") with per-stage timings.
 #[test]

@@ -891,6 +891,49 @@ impl ExecutorCore {
         false
     }
 
+    /// The busy shadow's report sink (S-19, `set_dropped_busy_sink`): each
+    /// rule the user typed while an action ran becomes a `dropped_busy`
+    /// history entry, like a candidate [`enqueue`](Self::enqueue) drops
+    /// busy. It runs on the input consumer thread and must not block: it
+    /// takes no executor lock, only the configuration lock (as matching
+    /// does) and the runtime's history path.
+    pub(super) fn dropped_busy_sink(&self) -> Box<dyn Fn(DroppedBusy) + Send + Sync> {
+        let me = self.me.clone();
+        Box::new(move |dropped| {
+            if let Some(core) = me.upgrade() {
+                core.record_dropped_busy(dropped);
+            }
+        })
+    }
+
+    fn record_dropped_busy(&self, dropped: DroppedBusy) {
+        // The shadow drops only automatic triggers: the rule's own trigger
+        // mode. It just matched, so the rule is in the configuration unless
+        // a reload removed it since; it then reads as immediate.
+        let mode = self
+            .shared
+            .compiled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .config
+            .rules
+            .iter()
+            .find(|rule| rule.id == dropped.rule_id)
+            .map(|rule| rule.trigger_mode);
+        let task = Task {
+            trigger: match mode {
+                Some(TriggerMode::Terminator) => TriggerKind::Terminator,
+                _ => TriggerKind::Immediate,
+            },
+            process: Some(dropped.process).filter(|name| !name.is_empty()),
+            rule_id: dropped.rule_id,
+            queued_at: self.clock.now(),
+        };
+        let verdict = Verdict::new(Outcome::DroppedBusy, ReasonCode::DroppedBusy, false);
+        self.runtime
+            .record(task.record(verdict, StageTimings::default()));
+    }
+
     /// [`ExecutorControl::rebuild`]: makes the executor serve again. Uses
     /// only the executor's own locks, so it is safe without the
     /// supervisor's machine lock and concurrently with `probe` and
@@ -1955,6 +1998,8 @@ pub(crate) fn start_executor(shared: Arc<Shared>) {
     if let Err(error) = core.rebuild() {
         tracing::error!(event = "executor.start_failed", %error);
     }
+    // S-19: rules typed while an action runs reach the history from now on.
+    set_dropped_busy_sink(core.dropped_busy_sink());
     EXECUTOR.store(Some(core));
 }
 

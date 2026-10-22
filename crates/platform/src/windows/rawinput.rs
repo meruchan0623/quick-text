@@ -453,10 +453,6 @@ fn eligible(target: &Foreground, stamp: &Stamp, probe: &impl ForegroundProbe) ->
 /// A rule the user typed while an action was running, which the matcher
 /// dropped because it was busy (S-19). Identifiers only: never the
 /// abbreviation, the typed keys or any other text.
-#[allow(
-    dead_code,
-    reason = "S-19: read by the sink the runtime installs at merge"
-)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DroppedBusy {
     /// The id of the matched rule.
@@ -476,7 +472,7 @@ static DROPPED_BUSY_SINK: ArcSwapOption<DroppedBusySink> = ArcSwapOption::const_
 /// runtime hands each report to a bounded queue); matching waits for it.
 /// A rule retyped within one stamp is reported once; after any reset of the
 /// busy shadow (a new busy period, a broken prefix) it is reported again.
-#[allow(dead_code, reason = "S-19: the runtime installs the sink at merge")]
+/// Production: `start_executor` installs the executor's history sink.
 pub(crate) fn set_dropped_busy_sink(sink: Box<dyn Fn(DroppedBusy) + Send + Sync>) {
     DROPPED_BUSY_SINK.store(Some(Arc::new(sink)));
 }
