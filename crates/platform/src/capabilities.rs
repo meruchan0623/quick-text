@@ -70,11 +70,6 @@ pub fn capabilities_for(components: &[ComponentHealth]) -> Vec<Capability> {
     table(readiness(), components)
 }
 
-/// Capabilities of this build from adapter readiness alone.
-pub fn capabilities() -> Vec<Capability> {
-    capabilities_for(&[])
-}
-
 /// What the platform adapter offers right now, before component health.
 #[allow(
     dead_code,

@@ -164,7 +164,7 @@ pub use no_executor::*;
 
 mod capabilities;
 pub use capabilities::{
-    capabilities, capabilities_for, Capability, CapabilityReason, CapabilityStatus, PlatformReason,
+    capabilities_for, Capability, CapabilityReason, CapabilityStatus, PlatformReason,
 };
 /// Starts a recording session. Pausing detection for its duration is the
 /// caller's job, through the runtime's `PauseReasons::RECORDING` (the shell
