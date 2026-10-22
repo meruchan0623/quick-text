@@ -521,6 +521,12 @@ describe('tolerant reading (B-43)', () => {
       null,
       null,
     ]);
+    // Read-only only says this UI cannot edit them; the backend may still run them, so no row
+    // claims they are not in effect (only a backend rule_unreadable diagnostic may say that).
+    expect(rows.map((r) => r.querySelector('.muted')?.textContent)).toEqual(
+      rows.map(() => '这条规则含有当前界面无法编辑的内容，只能查看；已保留在配置中。'),
+    );
+    expect(rows.every((r) => !/生效/.test(r.textContent))).toBe(true);
     // Nothing to select, edit or delete on them.
     expect(rows.every((r) => !r.querySelector('input, button'))).toBe(true);
     expect(container.querySelector('.batch span')?.textContent).toBe(
@@ -827,13 +833,19 @@ describe('tolerant reading (B-43)', () => {
     expect(row('huge-number')?.querySelector('.unreadable-reason')?.textContent).toBe(
       '含超出可安全保存范围的数值，保存其他内容时该数值可能被改写。',
     );
-    expect(row('huge-number')?.textContent).not.toMatch(/保存时不会改动它/);
     expect(row('huge-parameter')?.querySelector('.unreadable-reason')?.textContent).toBe(
       '含超出可安全保存范围的数值，保存其他内容时该数值可能被改写。',
     );
     expect(row('huge-parameter')?.querySelector('input, button')).toBeNull();
     expect(row('safe-raw')?.querySelector('.unreadable-reason')).toBeNull();
-    expect(row('safe-raw')?.textContent).toMatch(/保存时不会改动它/);
+    // Every row says the same thing otherwise: no claim that the entry is or is not in effect,
+    // and none that it is kept byte for byte.
+    for (const id of ['huge-number', 'huge-parameter', 'safe-raw']) {
+      expect(row(id)?.querySelector('.muted')?.textContent).toBe(
+        '这条规则含有当前界面无法编辑的内容，只能查看；已保留在配置中。',
+      );
+      expect(row(id)?.textContent).not.toMatch(/生效|原样|不会改动/);
+    }
 
     // An unrelated save goes through.
     const toggle = container.querySelector<HTMLInputElement>('input[aria-label="停用 ;s2"]');
