@@ -79,84 +79,17 @@ static COUNTING: CountingAlloc = CountingAlloc;
 fn allocations<R>(body: impl FnOnce() -> R) -> (R, usize) {
     ALLOCATIONS.with(|count| count.set(0));
     TRACKING.with(|tracking| tracking.set(true));
-    let value = body();
+    // The executor tests' process-wide event recording allocates; keep this
+    // thread out of it while counting.
+    let value = capture::unrecorded(body);
     TRACKING.with(|tracking| tracking.set(false));
     (value, ALLOCATIONS.with(Cell::get))
 }
 
-/// Captures `tracing` events as " field=value" lines.
-///
-/// One process-wide subscriber, installed once and never replaced, routes
-/// each event to a buffer of the thread that emitted it. A per-test
-/// `with_default` subscriber raced with tracing-core's shared callsite
-/// interest and max-level caches: another test thread installing or
-/// dropping its own subscriber could rebuild them mid-test, and an event
-/// was occasionally dropped before it reached the capture (an empty
-/// capture in `a_resync_waits_for_our_injections_to_settle`, seen once).
-/// With a single global subscriber whose interest is always on, those
-/// caches never change.
-mod capture {
-    use std::cell::RefCell;
-    use std::fmt::{Debug, Write};
-    use std::sync::Once;
-    use tracing::field::{Field, Visit};
-    use tracing::subscriber::Interest;
-    use tracing::{span, Event, Metadata, Subscriber};
+// Captures `tracing` events as " field=value" lines: the one process-wide
+// subscriber of the test binary, shared with the executor tests.
+use super::trace_capture as capture;
 
-    thread_local! {
-        /// This thread's capture buffer; `None` when it is not capturing.
-        static LINES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
-    }
-    static INSTALL: Once = Once::new();
-
-    struct Line(String);
-    impl Visit for Line {
-        fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
-            let _ = write!(self.0, " {}={:?}", field.name(), value);
-        }
-    }
-    struct Router;
-    impl Subscriber for Router {
-        fn register_callsite(&self, _: &'static Metadata<'static>) -> Interest {
-            Interest::always()
-        }
-        fn enabled(&self, _: &Metadata<'_>) -> bool {
-            true
-        }
-        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
-            span::Id::from_u64(1)
-        }
-        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
-        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
-        fn event(&self, event: &Event<'_>) {
-            // Threads that are not capturing (the hook path under the
-            // allocation counter among them) return before formatting.
-            let _ = LINES.try_with(|lines| {
-                let Ok(mut lines) = lines.try_borrow_mut() else {
-                    return;
-                };
-                if let Some(lines) = lines.as_mut() {
-                    let mut line = Line(event.metadata().level().to_string());
-                    event.record(&mut line);
-                    lines.push(line.0);
-                }
-            });
-        }
-        fn enter(&self, _: &span::Id) {}
-        fn exit(&self, _: &span::Id) {}
-    }
-    /// Runs `body` capturing the events this thread emits.
-    pub(super) fn logs<R>(body: impl FnOnce() -> R) -> (R, Vec<String>) {
-        INSTALL.call_once(|| {
-            tracing::subscriber::set_global_default(Router)
-                .expect("no other global tracing subscriber in the test binary");
-        });
-        let outer = LINES.with(|lines| lines.replace(Some(Vec::new())));
-        let value = body();
-        let captured = LINES.with(|lines| lines.replace(outer)).unwrap_or_default();
-        (value, captured)
-    }
-}
 fn count_of(lines: &[String], needle: &str) -> usize {
     lines.iter().filter(|line| line.contains(needle)).count()
 }

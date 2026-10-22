@@ -16,6 +16,64 @@ use super::{
 use crate::traits::{ClipboardBackend, Clock, ForegroundProbe, Injector, SystemClock};
 thread_local! {
     static AUTOMATIC_EXECUTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STAGE: std::cell::Cell<Stage> = const { std::cell::Cell::new(Stage::Idle) };
+    static STAGE_AT: std::cell::Cell<StageMarks> = const { std::cell::Cell::new([None; STAGES]) };
+}
+const STAGES: usize = 10;
+/// When the run on this thread entered each [`Stage`] (indexed by stage).
+pub(super) type StageMarks = [Option<Instant>; STAGES];
+/// Where the run on this thread currently is. Logged (location only, never
+/// content) when an executor task panics; the entry times give the history
+/// its stage timings (B-35).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Stage {
+    Idle,
+    Resolve,
+    Preflight,
+    Guard,
+    Clipboard,
+    Erase,
+    Output,
+    Cleanup,
+    Restore,
+    Done,
+}
+impl Stage {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Stage::Idle => "idle",
+            Stage::Resolve => "resolve",
+            Stage::Preflight => "preflight",
+            Stage::Guard => "guard",
+            Stage::Clipboard => "clipboard",
+            Stage::Erase => "erase",
+            Stage::Output => "output",
+            Stage::Cleanup => "cleanup",
+            Stage::Restore => "restore",
+            Stage::Done => "done",
+        }
+    }
+}
+/// Enters `stage` at `at` (the run's own clock).
+pub(super) fn set_stage(stage: Stage, at: Instant) {
+    STAGE.with(|current| current.set(stage));
+    STAGE_AT.with(|marks| {
+        let mut entered = marks.get();
+        entered[stage as usize] = Some(at);
+        marks.set(entered);
+    });
+}
+pub(super) fn current_stage() -> Stage {
+    STAGE.with(std::cell::Cell::get)
+}
+/// Starts a new trace on this thread (no stage entered, nothing sent yet).
+pub(super) fn begin_trace() {
+    STAGE.with(|current| current.set(Stage::Idle));
+    STAGE_AT.with(|marks| marks.set([None; STAGES]));
+    SENT_EFFECT.with(|flag| flag.set(false));
+}
+pub(super) fn stage_marks() -> StageMarks {
+    STAGE_AT.with(std::cell::Cell::get)
 }
 fn open(target: &str, args: &[String], cwd: &Option<String>) -> Result<(), String> {
     if args.is_empty() {
@@ -163,6 +221,9 @@ fn guarded_context(
     target: &Foreground,
     generation: u64,
 ) -> Result<(), String> {
+    // B-01: a task fenced by the supervisor stops here, before any further
+    // input, clipboard write or launch (also records task progress).
+    super::executor::checkpoint()?;
     if pause_blocks_execution(
         s.paused.load(Ordering::SeqCst),
         AUTOMATIC_EXECUTION.with(|automatic| automatic.get()),
@@ -214,10 +275,17 @@ pub fn execute(
     terminator: Option<String>,
     speed: f64,
 ) -> Result<ExecutionResult, String> {
-    if erase != 0 {
-        return Err("Automatic erasure requires observed text proof".into());
-    }
-    execute_inner(s, plan, target, generation, None, terminator, speed)
+    // Manual run (no rule): recorded in the history too (B-35).
+    let started = SystemClock.now();
+    begin_trace();
+    let process = target.process.clone();
+    let result = if erase != 0 {
+        Err("Automatic erasure requires observed text proof".into())
+    } else {
+        execute_inner(s, plan, target, generation, None, terminator, speed)
+    };
+    super::executor::record_manual(&process, &result, started);
+    result
 }
 pub(super) fn execute_inner(
     s: Arc<Shared>,
@@ -230,7 +298,8 @@ pub(super) fn execute_inner(
 ) -> Result<ExecutionResult, String> {
     execute_with_proof(
         &Ports {
-            injector: &WinInjector,
+            // Manual output takes the executor's send lock too (S1).
+            injector: &super::executor::serialized(&WinInjector),
             foreground: &WinForeground,
             clock: &SystemClock,
             clipboard: WinClipboard::new,
@@ -285,10 +354,12 @@ where
     let erasure = proof.as_ref().map(rawinput::Proof::erasure);
     SENT_EFFECT.with(|flag| flag.set(false));
     let _fence_lease = FenceLease::install(proof);
+    set_stage(Stage::Preflight, clock.now());
     if !speed.is_finite() || speed <= 0.0 {
         return Err("Replay speed must be positive and finite".into());
     }
     preflight(&plan)?;
+    set_stage(Stage::Guard, clock.now());
     // A shifted or AltGr trigger can match before the modifier is released.
     // Wait for release while keeping every cancellation and focus check active.
     if erasure.is_some() {
@@ -302,6 +373,7 @@ where
     }
     guarded(probe, s, &target, generation)?;
     // All potentially failing source/format checks happen before trigger deletion.
+    set_stage(Stage::Clipboard, clock.now());
     let mut clipboard = acquire_clipboard(&plan, || ClipboardLease::new((ports.clipboard)()?))?;
     let mut payloads = std::collections::BTreeMap::new();
     if let Some(lease) = clipboard.as_ref() {
@@ -342,6 +414,7 @@ where
         }
     }
     if let Some(erasure) = &erasure {
+        set_stage(Stage::Erase, clock.now());
         let erased = erase(injector, clock, erasure, || {
             guarded(probe, s, &target, generation)
         });
@@ -355,6 +428,7 @@ where
             });
         }
     }
+    set_stage(Stage::Output, clock.now());
     let mut owned = BTreeSet::new();
     let mut owned_mouse = vec![];
     let mut completed = 0;
@@ -529,6 +603,7 @@ where
             }
         }
     }
+    set_stage(Stage::Cleanup, clock.now());
     for v in owned {
         if !physical(v) {
             if let Err(error) = key(injector, v, true) {
@@ -561,10 +636,12 @@ where
         }
     }
     if let Some(mut lease) = clipboard {
+        set_stage(Stage::Restore, clock.now());
         if let Err(e) = lease.restore() {
             failure = Some(format!("Clipboard restore failed after input: {e}"));
         }
     }
+    set_stage(Stage::Done, clock.now());
     let result = ExecutionResult {
         id: format!("run-{}", s.generation.load(Ordering::SeqCst)),
         status: if failure.as_deref() == Some("Cancelled") {
@@ -580,7 +657,13 @@ where
         completed_steps: completed,
         side_effects: SENT_EFFECT.with(|flag| flag.get()) || completed > 0,
     };
-    *s.last.lock().unwrap() = Some(result.clone());
+    // An executor task publishes its result itself, from its busy guard and
+    // only while it still owns the run (B-01); manual runs publish here.
+    if !super::executor::in_task() {
+        *s.last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.clone());
+    }
     Ok(result)
 }
 
