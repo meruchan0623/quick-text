@@ -44,6 +44,7 @@ async function mount(
   const { createRoot } = await import('react-dom/client');
   const { MockBackend, createMockTransport } = await import('./ipc/mock');
   const { setTransport } = await import('./ipc/transport');
+  const { runtimeSync } = await import('./ipc/events');
   const { default: App } = await import('./App');
   const backend = new MockBackend({ rules: 3, ...options });
   setup?.(backend);
@@ -63,6 +64,9 @@ async function mount(
     await act(() => {
       root.unmount();
     });
+    // The app-wide RuntimeSync of this module graph lives as long as the app; end it with this one,
+    // or a later window focus event would make it call a reset transport (the preview mock).
+    runtimeSync().dispose();
     container.remove();
     setTransport(null);
   });
@@ -611,6 +615,135 @@ describe('启动时自动开始监听 (S-09)', () => {
     // The rest of the page still works.
     await click(mounted, '文本指令管理');
     expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
+  });
+
+  /** Let React and the mock's pending promises settle. */
+  const settle = (mounted: Mounted) =>
+    mounted.act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+
+  /**
+   * Once attached, the first load_state sent after `arm()` reads the state at once, as the backend
+   * would, but answers only on `release()`: a reload overtaken by a command's answer (review C2).
+   */
+  function holdLoad() {
+    let armed = false;
+    let read = false;
+    let answered = false;
+    let release: () => void = () => undefined;
+    const released = new Promise<void>((resolve) => {
+      release = () => {
+        resolve();
+      };
+    });
+    return {
+      attach: (backend: MockBackend) => {
+        const handle = backend.handle.bind(backend);
+        backend.handle = async (...[command, args]: Parameters<MockBackend['handle']>) => {
+          if (command !== 'load_state' || !armed) return handle(command, args);
+          armed = false;
+          const answer = await handle(command, args);
+          read = true;
+          await released;
+          answered = true;
+          return answer;
+        };
+      },
+      arm: () => {
+        armed = true;
+      },
+      read: () => read,
+      answered: () => answered,
+      release: () => {
+        release();
+      },
+    };
+  }
+
+  /** Reload on focus with load_state held, toggle the setting meanwhile, then let the load answer. */
+  async function overtakeReload(mounted: Mounted, hold: ReturnType<typeof holdLoad>) {
+    const { container } = mounted;
+    hold.arm();
+    await mounted.act(() => {
+      window.dispatchEvent(new Event('focus'));
+    });
+    await waitFor(mounted, () => {
+      expect(hold.read()).toBe(true);
+    });
+    await toggle(mounted);
+    await waitFor(mounted, () => {
+      expect(checkbox(container, AUTO_LISTEN)?.checked).toBe(false);
+    });
+    hold.release();
+    await waitFor(mounted, () => {
+      expect(hold.answered()).toBe(true);
+    });
+    await settle(mounted);
+  }
+
+  it('keeps set_auto_listen’s answer over a load_state read before it (review C2)', async () => {
+    const hold = holdLoad();
+    const mounted = await openSettings({}, (backend) => {
+      backend.autoListen = true;
+      hold.attach(backend);
+    });
+    await overtakeReload(mounted, hold);
+    const { backend, container } = mounted;
+    expect(checkbox(container, AUTO_LISTEN)?.checked).toBe(false);
+    expect(callsOf(backend, 'set_auto_listen').map((c) => c.args)).toEqual([{ enabled: false }]);
+    expect(backend.autoListen).toBe(false);
+    // The overtaken answer was dropped and load_state asked again; that answer read the new value.
+    expect(callsOf(backend, 'load_state')).toHaveLength(3);
+    expect(container.querySelector('.alert.error')).toBeNull();
+  });
+
+  it('keeps unsaved settings edits when the reload asked again answers (review C2)', async () => {
+    const hold = holdLoad();
+    const mounted = await openSettings({}, (backend) => {
+      backend.autoListen = true;
+      hold.attach(backend);
+    });
+    const { container } = mounted;
+    await type(mounted, field(container, '词分隔符'), ' ;');
+    await overtakeReload(mounted, hold);
+    expect(checkbox(container, AUTO_LISTEN)?.checked).toBe(false);
+    expect(callsOf(mounted.backend, 'load_state')).toHaveLength(3);
+    // An answer to load_state never replaces the editor's unsaved values.
+    expect(field(container, '词分隔符').value).toBe(' ;');
+  });
+
+  it('shows what the backend answered, not what was asked (review C2)', async () => {
+    const mounted = await openSettings({}, (backend) => {
+      const handle = backend.handle.bind(backend);
+      // A backend that could not turn either setting on answers with the value it kept.
+      backend.handle = async (...[command, args]: Parameters<MockBackend['handle']>) => {
+        const answer = await handle(command, args);
+        if (command === 'set_auto_listen') backend.autoListen = false;
+        if (command === 'set_autostart') backend.autostart = false;
+        return command === 'set_auto_listen' || command === 'set_autostart' ? false : answer;
+      };
+    });
+    const { backend, container } = mounted;
+    expect(checkbox(container, AUTO_LISTEN)?.checked).toBe(false);
+    await toggle(mounted);
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'set_auto_listen')).toHaveLength(1);
+    });
+    await settle(mounted);
+    expect(callsOf(backend, 'set_auto_listen')[0]?.args).toEqual({ enabled: true });
+    expect(checkbox(container, AUTO_LISTEN)?.checked).toBe(false);
+
+    const autostart = checkbox(container, '登录后自动启动');
+    expect(autostart?.checked).toBe(false);
+    await mounted.act(() => {
+      autostart?.click();
+    });
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'set_autostart')).toHaveLength(1);
+    });
+    await settle(mounted);
+    expect(callsOf(backend, 'set_autostart')[0]?.args).toEqual({ enabled: true });
+    expect(checkbox(container, '登录后自动启动')?.checked).toBe(false);
+    expect(container.querySelector('.alert.error')).toBeNull();
   });
 });
 

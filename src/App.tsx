@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type SetStateAction } from 'react';
 import { call } from './ipc/transport';
 import {
   errorText as describe,
@@ -47,6 +47,8 @@ import { ruleEditDiagnostics } from './lib/numberFields';
 
 // `null` from describe() means the user cancelled: show nothing.
 const errorText = (e: unknown) => describe(e) ?? '';
+// How many times one load_state is asked for while commands keep overtaking it (review C2).
+const LOAD_ATTEMPTS = 3;
 function Field({
   label,
   children,
@@ -206,6 +208,36 @@ export default function App() {
     setLocalDirty(false);
     edited.current = false;
   };
+  // Review C2: counts the times state was set from a command's answer (set_paused, set_autostart,
+  // set_auto_listen, save_draft, discard_draft, rollback, apply_settings). A load_state sent before
+  // the latest of them may have been read before that change; applying it would undo the change.
+  const answers = useRef(0);
+  const receiveAnswer = (s: State) => {
+    answers.current += 1;
+    receive(s);
+  };
+  const patchState = (update: SetStateAction<State | null>) => {
+    answers.current += 1;
+    setState(update);
+  };
+  /**
+   * load_state into `apply`. An answer overtaken by a command's answer is not applied but asked for
+   * again, at most LOAD_ATTEMPTS times in all: the fields only load_state carries would otherwise
+   * stay stale until the next focus, and 「刷新状态」 would report a refresh that did not happen. A
+   * load sent after a command answered reads that command's change, so the next answer applies.
+   * The check and `apply` run in one step after the answer arrives, with nothing in between.
+   */
+  const loadInto = async (apply: (s: State) => void) => {
+    for (let attempt = 0; attempt < LOAD_ATTEMPTS; attempt++) {
+      const generation = answers.current;
+      const s = await call<State>('load_state');
+      if (generation === answers.current) {
+        apply(s);
+        return;
+      }
+    }
+    // Overtaken every time: keep what the commands answered.
+  };
   const run = async (fn: () => Promise<any>, success?: string) => {
     setBusy(true);
     setError('');
@@ -221,20 +253,18 @@ export default function App() {
     }
   };
   useEffect(() => {
-    call<State>('load_state')
-      .then((s) => {
-        receive(s);
-        setMessage('已连接 · 保存写入草稿，应用设置后生效');
-      })
-      .catch((e: unknown) => setError(errorText(e)));
+    loadInto((s) => {
+      receive(s);
+      setMessage('已连接 · 保存写入草稿，应用设置后生效');
+    }).catch((e: unknown) => setError(errorText(e)));
   }, []);
   // The legacy load_state fields (target observation, capabilities, draft flags) have no event:
   // reload them when the window regains focus and on 「刷新状态」. Unsaved local edits are kept.
-  const reload = async () => {
-    const s = await call<State>('load_state');
-    if (edited.current) setState(s);
-    else receive(s);
-  };
+  const reload = () =>
+    loadInto((s) => {
+      if (edited.current) setState(s);
+      else receive(s);
+    });
   const reloadRef = useRef(reload);
   useEffect(() => {
     reloadRef.current = reload;
@@ -262,7 +292,7 @@ export default function App() {
     run(async () => {
       const manual = live ? live.manualPause : !!state?.paused;
       // set_paused only toggles the manual reason; the unsaved draft in the editor stays untouched.
-      setState(await call<State>('set_paused', { paused: !manual }));
+      patchState(await call<State>('set_paused', { paused: !manual }));
     });
   const exportDiagnostics = () =>
     run(async () => {
@@ -294,7 +324,7 @@ export default function App() {
     run(async () => {
       try {
         const value = await call<boolean>('set_auto_listen', { enabled });
-        setState((s) => (s ? { ...s, auto_listen_on_start: value } : s));
+        patchState((s) => (s ? { ...s, auto_listen_on_start: value } : s));
       } catch (e) {
         // A backend that reports the setting but lacks the command: say so once, then disable.
         if (isMissingCommand(e)) setAutoListenMissing(true);
@@ -327,7 +357,7 @@ export default function App() {
   };
   const save = async (c = config) => {
     const s = await call<State>('save_draft', { config: c });
-    receive(s);
+    receiveAnswer(s);
     return s;
   };
   const selectedSet = new Set(selected);
@@ -832,8 +862,10 @@ export default function App() {
                 onChange={(e) =>
                   run(async () => {
                     const enabled = e.target.checked;
-                    await call('set_autostart', { enabled });
-                    setState((s) => (s ? { ...s, autostart: enabled } : s));
+                    // Show what the backend set (Rust returns the resulting value), not the request.
+                    const value = await call<unknown>('set_autostart', { enabled });
+                    const autostart = typeof value === 'boolean' ? value : enabled;
+                    patchState((s) => (s ? { ...s, autostart } : s));
                   })
                 }
               />
@@ -892,7 +924,7 @@ export default function App() {
             <button
               onClick={async () => {
                 if (await confirmAction({ title: '放弃全部未应用草稿？', confirm: '放弃草稿' }))
-                  void run(async () => receive(await call<State>('discard_draft')));
+                  void run(async () => receiveAnswer(await call<State>('discard_draft')));
               }}
             >
               放弃未应用草稿
@@ -900,7 +932,7 @@ export default function App() {
             <button
               onClick={async () => {
                 if (await confirmAction({ title: '回滚到上一个生效版本？', confirm: '回滚' }))
-                  void run(async () => receive(await call<State>('rollback')));
+                  void run(async () => receiveAnswer(await call<State>('rollback')));
               }}
             >
               恢复上一个版本
@@ -953,7 +985,7 @@ export default function App() {
           onClick={() =>
             run(async () => {
               if (localDirty) await save();
-              receive(await call<State>('apply_settings'));
+              receiveAnswer(await call<State>('apply_settings'));
             }, '设置已应用，生效版本已更新')
           }
         >
