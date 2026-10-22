@@ -100,6 +100,10 @@ impl Subscription {
 /// happens when it is full). Health and State do not use it.
 const EVENT_QUEUE_CAPACITY: usize = 1024;
 
+/// Most `Execution` events the event thread delivers in one round before it
+/// goes back to the latest Health/State.
+const EXECUTION_BATCH: usize = 64;
+
 /// The latest published Health and State. Every change bumps `version` in
 /// the same critical section that changes the values, and the event thread
 /// copies all three at once, so the Health and State it delivers always
@@ -256,10 +260,13 @@ impl Runtime {
     ///   listener blocks) may be merged away and never delivered. A value
     ///   whose callback panicked counts as not delivered to that subscriber
     ///   and is offered again on a later wake-up.
-    /// - `Execution` events are delivered in queue order. If a listener
-    ///   blocks, at most `EVENT_QUEUE_CAPACITY` (1024) of them wait; beyond
-    ///   that they are dropped and counted (one `runtime.events_dropped`
-    ///   warning per backlog). Read the history to catch up.
+    /// - `Execution` events are delivered in queue order, in batches of at
+    ///   most `EXECUTION_BATCH` (64) with a Health/State check between
+    ///   batches, so a stream of executions never delays the latest Health
+    ///   and State by more than one batch. If a listener blocks, at most
+    ///   `EVENT_QUEUE_CAPACITY` (1024) of them wait; beyond that they are
+    ///   dropped and counted (one `runtime.events_dropped` warning per
+    ///   backlog). Read the history to catch up.
     /// - There is no ordering between `Execution` and `Health`/`State`.
     ///
     /// Emitters never wait on listeners, and a blocked listener holds at
@@ -550,7 +557,10 @@ impl Runtime {
 /// subscriber list (once, so a Health and its State go to the same
 /// subscribers), and brings every listed subscriber up to date, Health
 /// before State (see [`Subscription::catch_up`]); then it drains the
-/// `Execution` queue and reports drops. The wake-up token is consumed
+/// `Execution` queue, at most [`EXECUTION_BATCH`] entries, and reports
+/// drops. If that left entries queued, the next round starts at once
+/// instead of waiting for a wake-up, so a steady stream of executions
+/// cannot hold back the latest Health/State. The wake-up token is consumed
 /// before `latest` is read, so a change made after that read (or a
 /// subscriber added after the list was taken, whose `subscribe` sends a
 /// token) is picked up by the next round. Each `Execution` goes to the
@@ -563,20 +573,35 @@ fn run_event_thread(
     outbox: &Outbox,
     listeners: &RwLock<Vec<Arc<Subscription>>>,
 ) {
-    while wake.recv().is_ok() {
+    let mut backlog = false;
+    loop {
+        if backlog {
+            // Take a pending wake-up (if any) before reading `latest`.
+            if matches!(wake.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
+                return;
+            }
+        } else if wake.recv().is_err() {
+            return;
+        }
         let latest = outbox.latest.lock().clone();
         // Bound first: no listener runs with the list locked.
         let subscribers = listeners.read().clone();
         for subscriber in &subscribers {
             subscriber.catch_up(&latest);
         }
-        while let Ok(entry) = executions.try_recv() {
+        let mut drained = 0;
+        while drained < EXECUTION_BATCH {
+            let Ok(entry) = executions.try_recv() else {
+                break;
+            };
+            drained += 1;
             let event = EngineEvent::Execution(entry);
             let subscribers = listeners.read().clone();
             for subscriber in &subscribers {
                 subscriber.call(event.clone());
             }
         }
+        backlog = drained == EXECUTION_BATCH;
         let dropped = outbox.dropped.swap(0, Ordering::Relaxed);
         if dropped > 0 {
             tracing::warn!(
@@ -1284,6 +1309,60 @@ mod tests {
         assert_eq!(entries(&sink), [late]);
         assert_eq!(healths(&sink), [final_health]);
         assert_eq!(states(&sink), [final_state]);
+    }
+
+    /// Every Execution callback records another execution, so the queue is
+    /// never empty. A Health published meanwhile still goes out while that
+    /// stream keeps running.
+    #[test]
+    fn a_stream_of_executions_does_not_hold_back_health() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        let (runtime, _) = runtime();
+        let final_health = numbered(HealthState::Degraded, 9);
+        let seen = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let delivered = Arc::new(AtomicBool::new(false));
+        {
+            let producer = Arc::downgrade(&runtime);
+            let seen = Arc::clone(&seen);
+            let stop = Arc::clone(&stop);
+            let delivered = Arc::clone(&delivered);
+            let final_health = final_health.clone();
+            runtime.subscribe(Box::new(move |event| match event {
+                EngineEvent::Execution(_) => {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if let Some(runtime) = producer.upgrade() {
+                        runtime.record(execution("refill"));
+                    }
+                }
+                EngineEvent::Health(health) if health == final_health => {
+                    delivered.store(true, Ordering::SeqCst);
+                }
+                _ => {}
+            }));
+        }
+        runtime.record(execution("first"));
+        wait_until("a running stream", || {
+            seen.load(Ordering::SeqCst) > 4 * EXECUTION_BATCH
+        });
+        runtime.publish_health(final_health);
+        wait_until("the final health while the stream runs", || {
+            delivered.load(Ordering::SeqCst)
+        });
+        let at_delivery = seen.load(Ordering::SeqCst);
+        wait_until("the stream still running", || {
+            seen.load(Ordering::SeqCst) > at_delivery + EXECUTION_BATCH
+        });
+        stop.store(true, Ordering::SeqCst);
+        let stopped = seen.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            seen.load(Ordering::SeqCst) <= stopped + 1,
+            "producer stopped"
+        );
     }
 
     #[test]
