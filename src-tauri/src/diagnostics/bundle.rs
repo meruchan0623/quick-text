@@ -904,6 +904,98 @@ mod tests {
         );
     }
 
+    /// S-08 privacy test, store half: phrase content goes through every store
+    /// path that logs (save, publish, rollback, a rejected save, an internal
+    /// error, prefs quarantine, a log level change) with the most verbose
+    /// level on a real log file. Neither the log nor a Summary bundle of the
+    /// same data directory may contain it. The "100 executions" half needs
+    /// the executor (P1a).
+    #[test]
+    fn phrase_content_never_reaches_the_log_or_the_summary_bundle() {
+        use crate::diagnostics::{
+            level::LogLevelControl,
+            logging::test_support::{read_logs, scoped},
+        };
+        use crate::store::{prefs::load_prefs, Store};
+        use std::sync::Arc;
+        use tracing::level_filters::LevelFilter;
+
+        let dir = temp_dir();
+        let built = scoped(&log_dir(&dir), LevelFilter::TRACE);
+        tracing::subscriber::with_default(built.subscriber, || {
+            tracing::info!(event = "test.start", "privacy test");
+            let mut store = Store::load(dir.clone()).unwrap();
+            let mut config = sentinel_config();
+            config.rules[0].enabled = true;
+            config.rules[0].notification.enabled = true;
+            config.rules[0].notification.message = format!("notify-{SENTINEL}");
+            config.rules[1].match_spec.value = format!("literal-{SENTINEL}");
+            config.rules[1].match_spec.kind = MatchKind::Literal;
+            store.save(config.clone()).unwrap();
+            store.publish(config.clone()).unwrap();
+            config.rules[0].description = format!("edited-{SENTINEL}");
+            store.save(config.clone()).unwrap();
+            store.publish(config.clone()).unwrap();
+            store.rollback_previous().unwrap();
+            let mut invalid = config.clone();
+            invalid.rules[1].match_spec = MatchSpec {
+                kind: MatchKind::Regex,
+                value: format!("({SENTINEL}"),
+            };
+            assert!(store.save(invalid).is_err());
+            store.active.revision = u64::MAX;
+            assert!(store.publish(config).is_err());
+
+            fs::write(dir.join("prefs.json"), format!("{{\"app\": {SENTINEL}")).unwrap();
+            assert!(load_prefs(&dir).is_ok());
+            let control = LogLevelControl::start(
+                dir.clone(),
+                Arc::new(quicker_platform::traits::SystemClock),
+                Arc::new(|_| {}),
+            );
+            control.set(LogLevel::Debug, Some(1.0)).unwrap();
+            drop(control);
+        });
+        drop(built.guard);
+
+        let log = read_logs(&log_dir(&dir));
+        for expected in [
+            "test.start",
+            "command.internal",
+            "store.quarantine",
+            "log.level_set",
+        ] {
+            assert!(
+                log.contains(expected),
+                "{expected} missing from the log:\n{log}"
+            );
+        }
+        assert!(
+            !log.contains(SENTINEL),
+            "the log leaks the sentinel:\n{log}"
+        );
+        // The data directory does hold the sentinel (configuration,
+        // revisions, the quarantined prefs), so the bundle has to filter.
+        assert!(fs::read_to_string(dir.join("active.json"))
+            .unwrap()
+            .contains(SENTINEL));
+
+        // The log file is dated by the real clock.
+        let mut now = snapshot(&[]);
+        now.now = SystemTime::now();
+        let (cursor, _) =
+            build_bundle(&dir, Redaction::Summary, Cursor::new(Vec::new()), &now).unwrap();
+        let files = unzip(cursor.into_inner());
+        assert!(files.keys().any(|name| name.starts_with("logs/")));
+        for (name, text) in &files {
+            assert!(
+                !text.contains(SENTINEL),
+                "{name} leaks the sentinel:\n{text}"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     /// S-08: export < 5 s. A week of 2 MiB logs stands in for verbose days.
     #[test]
     fn a_week_of_logs_is_bundled_well_inside_the_budget() {
