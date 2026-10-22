@@ -149,6 +149,20 @@ fn submitted(
             }
         }
     } else {
+        // Accepted residual risk: this thread can be preempted between
+        // SendInput returning and the loop below, while the hook already
+        // handles the user's physical key-up of a key we just pressed.
+        // `released_elsewhere` then finds no bit to clear, and the bit set
+        // here outlives the key. This thread cannot tell the two orders
+        // apart (the hook runs asynchronously to SendInput's return), so it
+        // sets the bit anyway. Wrongly not setting it leaves a press of ours
+        // unprotected: a resync imports it as physical, `release_owned`
+        // skips it and the key stays down. Wrongly setting it only hides
+        // the key from resync until its next key-up that is not ours, which
+        // `released_elsewhere` always clears. Visible harm needs all of: a
+        // batch ending with the key down (partial acceptance or a KeyDown
+        // step), a failed cleanup release, the key-up inside this window,
+        // and a later physical press the hooks miss.
         for &(v, up) in sequence.iter().take(accepted as usize) {
             if up {
                 injecting.released(v);

@@ -300,6 +300,17 @@ impl OwnInput {
     /// left-side key state. When a bit was cleared it advances `seq`, so a
     /// resync sampling at the same time is discarded and retried. Atomics
     /// only: this runs in the hook callbacks.
+    ///
+    /// Every key-up and button-up without our MARK (physical, or injected by
+    /// another program) reaches this before any other filtering in the
+    /// hooks, and the bit is cleared whichever thread set it. Accepted
+    /// residual risk: the injecting thread notes a press of ours only after
+    /// SendInput returns (`inject::submitted`), so the user's key-up of that
+    /// key can be handled here first; the late bit then hides the key from
+    /// resync until its next key-up that is not ours clears it. Setting the
+    /// bit is the safer mistake: a press of ours left unset would be
+    /// imported by a resync as physical and skipped by `release_owned`, and
+    /// the key would stay down.
     pub(super) fn released_elsewhere(&self, vk: u16) {
         let ended = match vk {
             VK_CONTROL | VK_LCONTROL => [VK_CONTROL, VK_LCONTROL],
