@@ -87,7 +87,7 @@ impl CommandError {
     /// Logs `err` under a fresh trace id; the frontend receives only the id.
     pub fn internal(err: impl Display) -> Self {
         let trace_id = uuid::Uuid::new_v4().to_string();
-        tracing::error!(trace_id = %trace_id, error = %err, "command failed");
+        tracing::error!(event = "command.internal", trace_id = %trace_id, error = %err, "command failed");
         Self::Internal { trace_id }
     }
     pub fn validation(diagnostics: Vec<Diagnostic>) -> Self {
@@ -97,7 +97,7 @@ impl CommandError {
     /// (B-03), a platform that refuses to start or resume counts as `Failed`;
     /// the platform's reason goes to the log.
     pub fn engine_unavailable(reason: impl Display) -> Self {
-        tracing::warn!(reason = %reason, "engine unavailable");
+        tracing::warn!(event = "engine.unavailable", reason = %reason, "engine unavailable");
         Self::EngineUnavailable {
             health: HealthState::Failed,
         }
@@ -115,7 +115,7 @@ impl CommandError {
     /// full paths into the user profile); the OS error text goes to the log.
     pub fn io(op: IoOp, path: Option<&Path>, err: &std::io::Error) -> Self {
         let path = path.and_then(file_label);
-        tracing::warn!(?op, path = ?path, error = %err, "command io failed");
+        tracing::warn!(event = "command.io", ?op, path = ?path, error = %err, "command io failed");
         Self::Io {
             op,
             path,

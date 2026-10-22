@@ -2,17 +2,19 @@
 mod app_state;
 mod autostart;
 mod commands;
+mod diagnostics;
 mod error;
 mod events;
 mod store;
 mod tray;
 
-use app_state::Managed;
+use app_state::{DataDir, Managed};
 use quicker_platform::ExecutionResult;
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 use tauri::Manager;
 
 fn main() {
+    diagnostics::panic::install();
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(w) = app.get_webview_window("main") {
@@ -35,6 +37,25 @@ fn main() {
                 Some(dir) => dir,
                 None => app.path().app_data_dir()?,
             };
+            // Logging comes first so the store and every command can log
+            // (`CommandError::internal` trace ids must be findable).
+            diagnostics::logging::init(&dir);
+            diagnostics::panic::set_crash_dir(dir.clone());
+            tracing::info!(
+                event = "app.start",
+                version = env!("CARGO_PKG_VERSION"),
+                debug_build = cfg!(debug_assertions),
+                "Quicker Text starting"
+            );
+            app.manage(DataDir(dir.clone()));
+            app.manage(commands::diagnostics::BundledAssets::embedded(
+                &app.asset_resolver(),
+            ));
+            app.manage(diagnostics::level::LogLevelControl::start(
+                dir.clone(),
+                Arc::new(quicker_platform::traits::SystemClock),
+                Arc::new(diagnostics::logging::apply_level),
+            ));
             let store = store::Store::load(dir).map_err(std::io::Error::other)?;
             let engine = store.engine.clone();
             app.manage(Managed::new(store));
@@ -85,8 +106,20 @@ fn main() {
             commands::rules::preview_image,
             commands::system::get_cursor,
             commands::system::capture_selection,
-            commands::system::exit_app
+            commands::system::exit_app,
+            commands::diagnostics::set_log_level,
+            commands::diagnostics::export_diagnostics,
+            commands::diagnostics::open_log_dir,
+            commands::diagnostics::open_data_dir,
+            commands::diagnostics::log_frontend_error,
+            commands::diagnostics::report_metric
         ])
-        .run(tauri::generate_context!())
-        .expect("Quicker Text startup failed");
+        .build(tauri::generate_context!())
+        .expect("Quicker Text startup failed")
+        .run(|_, event| {
+            if let tauri::RunEvent::Exit = event {
+                tracing::info!(event = "app.exit", "Quicker Text exiting");
+                diagnostics::logging::flush();
+            }
+        });
 }

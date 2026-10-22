@@ -3,9 +3,10 @@
 mod atomic;
 mod load;
 mod metadata;
-mod prefs;
+pub mod prefs;
 mod revisions;
 
+pub use atomic::replace_file;
 pub use metadata::merge_import_metadata;
 
 use crate::error::CommandError;

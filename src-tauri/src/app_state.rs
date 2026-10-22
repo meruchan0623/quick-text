@@ -3,11 +3,15 @@ use crate::{autostart, store::Store};
 use quicker_domain::Config;
 use quicker_platform::ExecutionResult;
 use serde::Serialize;
-use std::sync::atomic::Ordering;
+use std::{path::PathBuf, sync::atomic::Ordering};
 
 /// The store lock is `parking_lot` so a panic while it is held cannot poison
 /// it for every later command (B-01).
 pub type Managed = parking_lot::Mutex<Store>;
+
+/// The resolved data directory, for the diagnostics commands that read or
+/// open it without the store lock.
+pub struct DataDir(pub PathBuf);
 
 #[derive(Clone, Serialize)]
 pub struct AppState {
