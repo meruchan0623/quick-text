@@ -396,6 +396,16 @@ footer {
   border: 1px solid currentColor;
   border-radius: 4px;
 }
+.alert.notice {
+  background: #eef6fc;
+  color: #1f4e70;
+  border-bottom: 1px solid #c5ddef;
+}
+.alert.notice button {
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  margin-left: 6px;
+}
 .settings {
   padding: 25px 34px;
   background: white;

@@ -266,6 +266,12 @@ export class MockBackend {
   #seq = 0;
   #historySeq = 0;
   readonly #handlers = new Map<string, Set<(payload: unknown) => void>>();
+  /** What the last store-state said (or the start); store-state is sent only on a change. */
+  #store: { revision: number; safeMode: SafeModeReason | null };
+  /** The config import_config last previewed (as JSON), until the next save_draft. */
+  #pendingImport: string | null = null;
+  /** In safe mode, the draft is a committed import: apply_settings may publish it. */
+  #safeImport = false;
 
   constructor(options: MockOptions = {}) {
     this.options = {
@@ -305,6 +311,7 @@ export class MockBackend {
       (this.safeMode
         ? [{ kind: 'safe_mode', severity: 'error', args: { reason: this.safeMode } }]
         : []);
+    this.#store = { revision: this.active.revision, safeMode: this.safeMode };
   }
 
   // ---- events ----
@@ -369,6 +376,33 @@ export class MockBackend {
     return entry;
   }
 
+  /**
+   * A revision published from outside this window (another instance, say): the draft is replaced
+   * by it, as after apply_settings. `edit` changes the published config.
+   */
+  publishExternally(edit?: (config: MockConfig) => void): void {
+    const next = { ...clone(this.draft), revision: this.active.revision + 1 };
+    edit?.(next);
+    this.previous.push(this.active);
+    this.active = next;
+    this.draft = clone(next);
+    this.#emitStore();
+  }
+
+  /**
+   * Safe mode ends without a command, as when the backend's SafeMode(Locked) retry succeeds: the
+   * store is read again (at `revision`, when given), the safe_mode pause and problem go, and the
+   * changes are pushed. A problem going is never pushed (contract §3).
+   */
+  endSafeMode(revision?: number): void {
+    if (revision !== undefined && revision !== this.active.revision) {
+      this.active = { ...clone(this.active), revision };
+      this.draft = clone(this.active);
+    }
+    this.#leaveSafeMode();
+    this.#emitStore();
+  }
+
   // ---- commands ----
 
   async handle(command: string, args: CommandArgs = {}): Promise<unknown> {
@@ -384,7 +418,11 @@ export class MockBackend {
     const handler = (legacy ? this.#legacyCommands : this.#commands)[command];
     // eslint-disable-next-line @typescript-eslint/only-throw-error -- Tauri rejects with a plain string
     if (!handler) throw notFound(command);
-    return handler(args);
+    const answer = handler(args);
+    // A command that changed the revision or safe mode pushes store-state before it answers, so the
+    // event may reach the window first (apply_settings, rollback).
+    this.#emitStore();
+    return answer;
   }
 
   /** Reject like the backend: CommandError in 0.4, plain string in legacy mode. */
@@ -401,27 +439,36 @@ export class MockBackend {
   readonly #shared: Record<string, (args: CommandArgs) => unknown> = {
     load_state: () => this.#state(),
     save_draft: (args) => {
-      this.#guardSafeMode();
       const config = clone(args.config as MockConfig);
+      // In safe mode only the previewed import may be committed, and only where importing is the
+      // way out (src-tauri store/mod.rs).
+      const importing = this.#pendingImport === JSON.stringify(config);
+      if (!(importing && (this.safeMode === 'crash_loop' || this.safeMode === 'no_valid_config')))
+        this.#guardSafeMode();
       if (!this.options.legacy) {
         const errors = validate(config).filter((d) => d.severity === 'error');
         if (errors.length > 0)
           this.#fail({ code: 'validation', detail: { diagnostics: errors } }, '');
       }
       this.draft = config;
+      this.#pendingImport = null;
+      this.#safeImport = this.safeMode !== null;
       return this.#state();
     },
     apply_settings: () => {
-      this.#guardSafeMode();
+      // In safe mode only the committed import may be published; that ends safe mode.
+      if (!this.#safeImport) this.#guardSafeMode();
       const errors = validate(this.draft).filter((d) => d.severity === 'error');
       if (errors.length > 0)
         this.#fail({ code: 'validation', detail: { diagnostics: errors } }, JSON.stringify(errors));
       this.previous.push(this.active);
       this.active = { ...clone(this.draft), revision: this.active.revision + 1 };
       this.draft = clone(this.active);
+      if (this.safeMode) this.#leaveSafeMode();
       return this.#state();
     },
     discard_draft: () => {
+      this.#guardSafeMode();
       this.draft = clone(this.active);
       return this.#state();
     },
@@ -517,6 +564,7 @@ export class MockBackend {
       const config = clone(this.draft);
       if (args.strategy === 'replace') config.rules = incoming;
       else for (const rule of incoming) config.rules.push(rule);
+      this.#pendingImport = JSON.stringify(config);
       return {
         config,
         report: [`2 条合成示例规则；策略：${String(args.strategy)}`, '0 conflicts'],
@@ -697,6 +745,28 @@ export class MockBackend {
 
   #emitState(): void {
     this.emit('engine-state', clone(this.engine));
+  }
+
+  /**
+   * Safe mode ends (store set_safe_mode(None)): its pause reason and problem go. The engine is not
+   * resumed by it; it stays paused (manually) until the user resumes listening.
+   */
+  #leaveSafeMode(): void {
+    if (!this.safeMode) return;
+    this.safeMode = null;
+    this.#safeImport = false;
+    this.problems = this.problems.filter((p) => p.kind !== 'safe_mode');
+    this.#togglePause('safe_mode', false);
+    if (!this.engine.paused_reasons.includes('manual')) this.#togglePause('manual', true);
+    this.#emitState();
+  }
+
+  /** Push store-state when the revision or safe mode differs from the last push. */
+  #emitStore(): void {
+    const store = { revision: this.active.revision, safeMode: this.safeMode };
+    if (store.revision === this.#store.revision && store.safeMode === this.#store.safeMode) return;
+    this.#store = store;
+    this.emit('store-state', { revision: store.revision, safe_mode: store.safeMode });
   }
 
   #appendHistory(partial: Partial<HistoryEntry>): HistoryEntry {

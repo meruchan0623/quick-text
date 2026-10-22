@@ -27,6 +27,7 @@ import RuntimeStatus from './RuntimeStatus';
 import { useAsk } from './Ask';
 import { Modal } from './Modal';
 import { runtimeSync, useRuntime } from './ipc/events';
+import type { SafeModeReason } from './ipc/types';
 import { liveStatus } from './status';
 import { BannerStack, HealthCard, HistoryList } from './StatusArea';
 import { LinesInput } from './LinesInput';
@@ -52,6 +53,8 @@ const LOAD_ATTEMPTS = 3;
 const OVERTAKEN = '读取期间状态一再变化，读到的内容已过时';
 const REFRESH_OVERTAKEN = `${OVERTAKEN}，这次没有刷新。请再点一次「刷新状态」。`;
 const NOT_READY = '还没有读取到当前配置，暂时不能修改指令和设置。';
+/** Commands that write the store and answer with the whole state. */
+type StoreWrite = 'save_draft' | 'apply_settings' | 'discard_draft' | 'rollback';
 function Field({
   label,
   children,
@@ -201,6 +204,10 @@ export default function App() {
       setEditing({ ...editing, trigger_mode: value, ...(cache ?? {}) });
     }
   };
+  // The revision of the state the editor's config was taken from, and a newer one that arrived
+  // while the editor held unsaved edits (shown as a notice until the user decides).
+  const editorRevision = useRef<number | null>(null);
+  const [newerRevision, setNewerRevision] = useState<number | null>(null);
   const receive = (s: State) => {
     setState(s);
     // A rule field with a serde default may be absent; the editor reads it filled in, as Rust does.
@@ -210,6 +217,8 @@ export default function App() {
     setSelected((current) => pruneSelection(current, draft.rules));
     setLocalDirty(false);
     edited.current = false;
+    editorRevision.current = s.revision;
+    setNewerRevision(null);
   };
   // Review C2: counts the times state was set from a command's answer (set_paused, set_autostart,
   // set_auto_listen, save_draft, discard_draft, rollback, apply_settings). A load_state sent before
@@ -223,6 +232,20 @@ export default function App() {
     answers.current += 1;
     setState(update);
   };
+  // This window's writes of the store in flight. The store-state a write causes may arrive before
+  // its answer; the answer carries the new revision, so no reload is needed for it (see below).
+  const [writing, setWriting] = useState(0);
+  const write = async (command: StoreWrite, args?: Record<string, unknown>) => {
+    setWriting((n) => n + 1);
+    try {
+      const s = await call<State>(command, args);
+      receiveAnswer(s);
+      return s;
+    } finally {
+      // In the same step as the answer, so no render sees the write done without its answer.
+      setWriting((n) => n - 1);
+    }
+  };
   // Until the first load_state snapshot is applied, `config` is emptyConfig, not the user's: a write
   // would replace their draft or settings with it. Every write is disabled until then (`ready`) and
   // refused again by its handler (`requireReady`, read from the ref, which is never behind).
@@ -233,12 +256,26 @@ export default function App() {
   const requireReady = () => {
     if (!loaded.current) throw new Error(NOT_READY);
   };
+  // Safe mode as soon as it is known: the runtime view follows store-state; until its first
+  // snapshot, or from a backend without one, load_state's field stands in.
+  const safeMode: SafeModeReason | null =
+    runtime.status === 'ready' ? runtime.safeMode : (state?.safe_mode ?? null);
+  // The writes safe mode refuses (ipc-contract §4: all but importing) are disabled with it, and
+  // enabled again when it ends. Import, confirming the import and 应用设置 stay, as committing and
+  // publishing an import is the way out of CrashLoop and NoValidConfig; so does 导出 (allowed in
+  // CrashLoop). The backend decides: the handlers do not check safe mode, and a write made before
+  // the event arrives is refused there with the reason.
+  const editable = ready && safeMode === null;
   /** Apply a load_state snapshot; the first one initializes the editor and unlocks the writes. */
   const applySnapshot = (s: State) => {
     if (loaded.current) {
-      // Unsaved local edits are kept.
-      if (edited.current) setState(s);
-      else receive(s);
+      if (!edited.current) receive(s);
+      else {
+        // Unsaved local edits are kept, never replaced by a load. When the store moved on under
+        // them, say so; the user loads the new config or keeps editing (and saving overwrites).
+        setState(s);
+        if (s.revision !== editorRevision.current) setNewerRevision(s.revision);
+      }
       return;
     }
     receive(s);
@@ -317,6 +354,23 @@ export default function App() {
     window.addEventListener('focus', onFocus);
     return () => window.removeEventListener('focus', onFocus);
   }, []);
+  // store-state moved the revision (runtime.revision): a change this window did not make (another
+  // window, a background Locked retry) is read with load_state. Each new revision is looked at
+  // once, when the first load has applied and no write of this window is in flight: a write's
+  // answer carries the revision it made, so its own store-state then matches and nothing is read.
+  // A backend without store-state moves runtime.revision only with a snapshot.
+  const storeRevision = runtime.revision;
+  const loadedRevision = state?.revision;
+  const seenRevision = useRef<number | null>(null);
+  useEffect(() => {
+    if (!ready || writing > 0 || storeRevision === null) return;
+    if (seenRevision.current === storeRevision) return;
+    seenRevision.current = storeRevision;
+    if (loadedRevision === storeRevision) return;
+    reloadRef.current().catch(() => {
+      // As on focus: the last known state stays; 「刷新状态」 reports errors.
+    });
+  }, [ready, writing, storeRevision, loadedRevision]);
   const refresh = () =>
     run(async () => {
       const applied = await reload();
@@ -402,9 +456,7 @@ export default function App() {
   const save = async (c = config) => {
     // Every path that submits the config ends here (rules, settings, 总开关, import, export, apply).
     requireReady();
-    const s = await call<State>('save_draft', { config: c });
-    receiveAnswer(s);
-    return s;
+    return write('save_draft', { config: c });
   };
   const selectedSet = new Set(selected);
   // Rules the UI can show and edit. Any other entry (one the backend could not read, B-43, or one
@@ -576,6 +628,23 @@ export default function App() {
           </button>
         </div>
       )}
+      {newerRevision !== null && (
+        // Not blocking: the editor stays usable, and nothing changes until the user picks one.
+        <div className="alert notice" role="status">
+          {`配置已在后台更新为 v${newerRevision}。编辑器中未保存的修改仍然保留，保存时会以它们覆盖草稿。`}
+          <button
+            onClick={() => {
+              editorRevision.current = newerRevision;
+              setNewerRevision(null);
+            }}
+          >
+            保留我的修改
+          </button>
+          <button disabled={busy || !state} onClick={() => state && receive(state)}>
+            放弃修改，载入新配置
+          </button>
+        </div>
+      )}
       {error && (
         <div className="alert error" role="alert">
           {error}
@@ -591,7 +660,7 @@ export default function App() {
               <input
                 type="checkbox"
                 checked={config.enabled}
-                disabled={!ready}
+                disabled={!editable}
                 onChange={(e) =>
                   run(() => save({ ...config, enabled: e.target.checked }), '总开关已保存到草稿')
                 }
@@ -612,7 +681,7 @@ export default function App() {
             </label>
             <button
               className="primary"
-              disabled={!ready}
+              disabled={!editable}
               onClick={() => openEditor(newRule(platform))}
             >
               ＋ 添加指令
@@ -632,7 +701,7 @@ export default function App() {
               {selected.length} 条
             </span>
             <button
-              disabled={!ready || !selected.length}
+              disabled={!editable || !selected.length}
               onClick={() =>
                 mutate((rs) => rs.map((r) => (selectedSet.has(r.id) ? { ...r, enabled: true } : r)))
               }
@@ -640,7 +709,7 @@ export default function App() {
               启用
             </button>
             <button
-              disabled={!ready || !selected.length}
+              disabled={!editable || !selected.length}
               onClick={() =>
                 mutate((rs) =>
                   rs.map((r) => (selectedSet.has(r.id) ? { ...r, enabled: false } : r)),
@@ -650,7 +719,7 @@ export default function App() {
               停用
             </button>
             <button
-              disabled={!ready || !selected.length}
+              disabled={!editable || !selected.length}
               onClick={async () => {
                 const g = await askValue({
                   title: `把所选 ${selected.length} 条指令移到哪个分组？`,
@@ -666,7 +735,7 @@ export default function App() {
               移至分组
             </button>
             <button
-              disabled={!ready || !selected.length}
+              disabled={!editable || !selected.length}
               onClick={async () => {
                 if (
                   await confirmAction({
@@ -757,6 +826,7 @@ export default function App() {
                         aria-label={`停用 ${r.match.value}`}
                         type="checkbox"
                         checked={!r.enabled}
+                        disabled={!editable}
                         onChange={(e) =>
                           mutate((rs) =>
                             rs.map((x) =>
@@ -769,6 +839,7 @@ export default function App() {
                     <td className="row-tools">
                       <button onClick={() => openEditor(clone(r))}>编辑</button>
                       <button
+                        disabled={!editable}
                         onClick={async () => {
                           if (
                             await confirmAction({
@@ -814,7 +885,9 @@ export default function App() {
                 <div aria-hidden="true">⌨</div>
                 <strong>{search ? '没有匹配的指令' : '建立你的第一条文本指令'}</strong>
                 <p>设置缩写、触发条件和操作，保存后应用设置。</p>
-                <button onClick={() => openEditor(newRule(platform))}>添加指令</button>
+                <button disabled={!editable} onClick={() => openEditor(newRule(platform))}>
+                  添加指令
+                </button>
               </div>
             )}
           </div>
@@ -846,7 +919,7 @@ export default function App() {
           )}
           {/* Edits here only become a write on 「保存参数草稿」, but made before the config is read
               they would be edits of emptyConfig, dropped by the first snapshot. */}
-          <fieldset className="settings-fields" disabled={!ready}>
+          <fieldset className="settings-fields" disabled={!editable}>
             <Field label="默认触发字符">
               <EndKeys
                 platform={platform}
@@ -909,7 +982,7 @@ export default function App() {
             </Field>
           </fieldset>
           <button
-            disabled={!ready}
+            disabled={!editable}
             onClick={() =>
               run(async () => {
                 requireReady();
@@ -936,7 +1009,7 @@ export default function App() {
               <input
                 type="checkbox"
                 checked={!!state?.autostart}
-                disabled={!ready}
+                disabled={!editable}
                 onChange={(e) =>
                   run(async () => {
                     requireReady();
@@ -961,7 +1034,7 @@ export default function App() {
                 <input
                   type="checkbox"
                   checked={autoListen}
-                  disabled={!ready || autoListenMissing}
+                  disabled={!editable || autoListenMissing}
                   onChange={(e) => setAutoListen(e.target.checked)}
                 />
                 启动时自动开始监听
@@ -970,7 +1043,7 @@ export default function App() {
           </div>
           <button
             className="primary"
-            disabled={!ready}
+            disabled={!editable}
             onClick={() => run(() => save(), '参数已保存到草稿')}
           >
             保存参数草稿
@@ -1005,24 +1078,24 @@ export default function App() {
           <div className="inline">
             <button onClick={refresh}>刷新状态</button>
             <button
-              disabled={!ready}
+              disabled={!editable}
               onClick={async () => {
                 if (await confirmAction({ title: '放弃全部未应用草稿？', confirm: '放弃草稿' }))
                   void run(async () => {
                     requireReady();
-                    receiveAnswer(await call<State>('discard_draft'));
+                    await write('discard_draft');
                   });
               }}
             >
               放弃未应用草稿
             </button>
             <button
-              disabled={!ready}
+              disabled={!editable}
               onClick={async () => {
                 if (await confirmAction({ title: '回滚到上一个生效版本？', confirm: '回滚' }))
                   void run(async () => {
                     requireReady();
-                    receiveAnswer(await call<State>('rollback'));
+                    await write('rollback');
                   });
               }}
             >
@@ -1077,7 +1150,7 @@ export default function App() {
             run(async () => {
               requireReady();
               if (localDirty) await save();
-              receiveAnswer(await call<State>('apply_settings'));
+              await write('apply_settings');
             }, '设置已应用，生效版本已更新')
           }
         >
@@ -1381,7 +1454,7 @@ export default function App() {
             <div className="modal-footer">
               <span>保存后还需点击主窗口的“应用设置”，指令才会生效</span>
               <button onClick={() => void closeEditor()}>取消</button>
-              <button disabled={busy} className="primary" onClick={commitEdit}>
+              <button disabled={busy || !editable} className="primary" onClick={commitEdit}>
                 保存
               </button>
             </div>

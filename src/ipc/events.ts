@@ -1,6 +1,8 @@
-// Runtime events (B-44, S-19): the four broadcast events replace polling. Every payload carries the
+// Runtime events (B-44, S-19): the broadcast events replace polling. Every payload carries the
 // global `seq`; stale and duplicate events are dropped, and a gap or the window regaining focus
-// realigns everything with one `get_runtime_snapshot` (docs/ipc-contract-0.4.md §3).
+// realigns everything with one `get_runtime_snapshot` (docs/ipc-contract-0.4.md §3). `store-state`
+// (store revision and safe mode) is newer than the other four; a backend without it never sends it,
+// and the view then learns both from snapshots only.
 //
 // The view is always a snapshot plus the events after it without a hole. The seq it reflects (the
 // ledger's high-water mark) only moves forward: a snapshot older than the mark is discarded, and an
@@ -133,6 +135,11 @@ function mergeProblems(current: StartupProblem[], incoming: StartupProblem[]): S
   return added.length > 0 ? [...current, ...added] : current;
 }
 
+const withoutSafeMode = (problems: StartupProblem[]) =>
+  problems.some((p) => p.kind === 'safe_mode')
+    ? problems.filter((p) => p.kind !== 'safe_mode')
+    : problems;
+
 function mergeHistory(current: HistoryRow[], incoming: HistoryRow[]): HistoryRow[] {
   if (incoming.length === 0) return current;
   const bySeq = new Map(current.map((row) => [row.entry.seq, row]));
@@ -168,6 +175,8 @@ export class RuntimeSync {
   #attempt = 0;
   /** History is known without holes up to this seq; `list_history` continues from here. */
   #historySeq: number | null = null;
+  /** Counts the startup_problems re-reads after safe mode ended; only the latest applies. */
+  #problemsRequest = 0;
 
   constructor(io: RuntimeIo, focusTarget: EventTarget | null = null, schedule: Schedule = later) {
     this.#io = io;
@@ -298,8 +307,18 @@ export class RuntimeSync {
       // Called after the snapshot, so the list covers everything up to at least its history_seq.
       this.#noteHistorySeq([...history.value.map((e) => e.seq), snapshot.history_seq]);
     }
+    // Safe mode ended since the view last knew (a missed store-state, or a backend without it):
+    // the list read now replaces the old one, as on store-state; otherwise it is merged in.
+    const left = this.#view.safeMode !== null && snapshot.safe_mode === null;
+    if (left) {
+      this.#problemsRequest += 1; // an older re-read in flight must not undo this one
+      view = { ...view, problems: withoutSafeMode(view.problems) };
+    }
     if (problems.status === 'fulfilled')
-      view = { ...view, problems: mergeProblems(view.problems, problems.value) };
+      view = {
+        ...view,
+        problems: left ? problems.value : mergeProblems(view.problems, problems.value),
+      };
     // (Disposed meanwhile: nobody listens any more, nothing is held and no retry is scheduled.)
     this.#set(view);
     this.#settle(true);
@@ -400,7 +419,40 @@ export class RuntimeSync {
         });
         return;
       }
+      case 'store-state': {
+        const { revision, safe_mode } = event.payload;
+        const left = view.safeMode !== null && safe_mode === null;
+        this.#set({
+          ...view,
+          seq: event.payload.seq,
+          revision,
+          safeMode: safe_mode,
+          // Its own problem goes with safe mode at once; the others are read again below.
+          problems: left ? withoutSafeMode(view.problems) : view.problems,
+        });
+        if (left) void this.#rereadProblems();
+        return;
+      }
     }
+  }
+
+  /**
+   * Safe mode ended. The backend drops problems without an event (§3), its safe_mode problem at
+   * least, so read the list again and take it as it is now. Problems pushed while the request was
+   * out are kept; of two overlapping requests only the later one applies.
+   */
+  async #rereadProblems(): Promise<void> {
+    const request = ++this.#problemsRequest;
+    const before = new Set(this.#view.problems.map(problemKey));
+    let current: StartupProblem[];
+    try {
+      current = await this.#io.invoke<StartupProblem[]>('startup_problems');
+    } catch {
+      return; // The list stays as it is; the next snapshot merges in what it reads.
+    }
+    if (this.#disposed || request !== this.#problemsRequest) return;
+    const pushed = this.#view.problems.filter((p) => !before.has(problemKey(p)));
+    this.#set({ ...this.#view, problems: mergeProblems(current, pushed) });
   }
 
   #set(view: RuntimeView): void {

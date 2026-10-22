@@ -126,12 +126,23 @@ export interface ExecutionResultEvent {
 export interface StartupProblemEvent extends StartupProblem {
   seq: number;
 }
+/**
+ * Sent whenever the store revision or safe mode changes, whoever caused it (this window's own
+ * save/rollback/import too, or a background Locked retry that succeeded). Not rate limited, never
+ * repeated for unchanged values. An older backend never sends it.
+ */
+export interface StoreStateEvent {
+  seq: number;
+  revision: number;
+  safe_mode: SafeModeReason | null;
+}
 
 export interface EventPayloads {
   'engine-health': EngineHealthEvent;
   'engine-state': EngineStateEvent;
   'execution-result': ExecutionResultEvent;
   'startup-problem': StartupProblemEvent;
+  'store-state': StoreStateEvent;
 }
 export type EventName = keyof EventPayloads;
 export const EVENT_NAMES: readonly EventName[] = [
@@ -139,6 +150,7 @@ export const EVENT_NAMES: readonly EventName[] = [
   'engine-state',
   'execution-result',
   'startup-problem',
+  'store-state',
 ];
 
 // ---- 0.4 commands (§5) ----

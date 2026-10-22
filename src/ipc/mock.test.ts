@@ -269,6 +269,51 @@ describe('mock backend commands', () => {
     expect(error).toEqual({ code: 'safe_mode', detail: { reason: 'locked' } });
   });
 
+  it('pushes store-state when the revision or safe mode changes, and only then', async () => {
+    const backend = new MockBackend({ rules: 0 });
+    use(backend);
+    const pushed: unknown[] = [];
+    backend.on('store-state', (payload) => pushed.push(payload));
+    const { draft } = await invoke<LegacyState>('load_state');
+    await invoke('save_draft', { config: { ...draft, enabled: false } });
+    await invoke('discard_draft');
+    expect(pushed).toEqual([]); // the draft is not the store's revision
+    await invoke('apply_settings');
+    const applied = backend.seq;
+    await invoke('rollback');
+    backend.publishExternally();
+    expect(pushed).toEqual([
+      { seq: applied, revision: 2, safe_mode: null },
+      { seq: applied + 1, revision: 3, safe_mode: null },
+      { seq: applied + 2, revision: 4, safe_mode: null },
+    ]);
+
+    // In crash_loop a refused write pushes nothing; committing and applying an import ends it.
+    const crashed = new MockBackend({ rules: 0, safeMode: 'crash_loop' });
+    use(crashed);
+    const states: unknown[] = [];
+    crashed.on('store-state', (payload) => states.push(payload));
+    expect(await invoke('rollback').catch((e: unknown) => e)).toMatchObject({ code: 'safe_mode' });
+    const preview = await invoke<{ config: MockConfig }>('import_config', {
+      path: 'mock://import.json',
+      strategy: 'replace',
+    });
+    await invoke('save_draft', { config: preview.config });
+    expect(states).toEqual([]);
+    await invoke('apply_settings');
+    expect(states).toEqual([{ seq: crashed.seq, revision: 2, safe_mode: null }]);
+    expect(crashed.problems).toEqual([]);
+    expect(crashed.engine.paused_reasons).toEqual(['manual']);
+
+    // The backend's Locked retry succeeding: pushed once, not again for the same values.
+    const locked = new MockBackend({ rules: 0, safeMode: 'locked' });
+    const retried: unknown[] = [];
+    locked.on('store-state', (payload) => retried.push(payload));
+    locked.endSafeMode(5);
+    locked.endSafeMode();
+    expect(retried).toEqual([{ seq: locked.seq, revision: 5, safe_mode: null }]);
+  });
+
   it('returns null when a dialog is cancelled', async () => {
     use(new MockBackend({ rules: 0, dialog: 'cancel' }));
     expect(await invoke('export_config')).toBeNull();

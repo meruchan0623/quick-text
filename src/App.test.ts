@@ -643,9 +643,19 @@ describe('启动时自动开始监听 (S-09)', () => {
     expect(container.querySelector('.alert.error')).toBeNull();
   });
 
-  it('keeps the old value and says why when safe mode refuses', async () => {
+  it('is disabled in safe mode, which refuses it', async () => {
     const mounted = await openSettings({ safeMode: 'crash_loop' });
+    expect(checkbox(mounted.container, AUTO_LISTEN)?.disabled).toBe(true);
+  });
+
+  it('keeps the old value and says why when safe mode refuses', async () => {
+    // Safe mode began after the window last heard of it: the backend refuses with the reason.
+    const mounted = await openSettings();
     const { backend, container } = mounted;
+    backend.failures.set('set_auto_listen', {
+      code: 'safe_mode',
+      detail: { reason: 'crash_loop' },
+    });
     expect(checkbox(container, AUTO_LISTEN)?.checked).toBe(false);
     await toggle(mounted);
     await waitFor(mounted, () => {
@@ -1006,6 +1016,215 @@ describe('writes wait for the first load_state snapshot (review C2 follow-up)', 
     await overtakeAll(mounted, hold);
     expect(alerts(container)).toBe('');
     expect(statusText(container)).toContain('已连接');
+  });
+});
+
+describe('store revision and safe mode pushed with store-state', () => {
+  const revisionText = (container: HTMLElement) =>
+    container.querySelector('.revision')?.textContent ?? '';
+  const notice = (container: HTMLElement) =>
+    container.querySelector('.alert.notice')?.textContent ?? '';
+
+  /** Mount and wait until the config is read and the runtime view follows the events. */
+  async function mountReady(options: MockOptions = {}): Promise<Mounted> {
+    const mounted = await mount(options);
+    await waitFor(mounted, () => {
+      expect(statusText(mounted.container)).toContain('已连接');
+      expect(callsOf(mounted.backend, 'startup_problems')).toHaveLength(1);
+    });
+    await settle(mounted);
+    return mounted;
+  }
+
+  it('reads a revision published elsewhere with load_state', async () => {
+    const mounted = await mountReady();
+    const { backend, container } = mounted;
+    expect(revisionText(container)).toContain('当前生效 v1');
+    expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
+    await mounted.act(() => {
+      backend.publishExternally((config) => {
+        config.rules = config.rules.slice(1);
+      });
+    });
+    await waitFor(mounted, () => {
+      expect(revisionText(container)).toContain('当前生效 v2');
+    });
+    expect(container.querySelectorAll('tbody tr')).toHaveLength(2);
+    expect(callsOf(backend, 'load_state')).toHaveLength(2);
+    expect(notice(container)).toBe('');
+    // Pushed, not polled, and continued without a snapshot.
+    expect(callsOf(backend, 'get_runtime_snapshot')).toHaveLength(1);
+  });
+
+  it('reads nothing again for the store-state of its own apply_settings and rollback', async () => {
+    const mounted = await mountReady();
+    const { backend, container } = mounted;
+    await click(mounted, '应用设置');
+    await waitFor(mounted, () => {
+      expect(revisionText(container)).toContain('当前生效 v2');
+    });
+    await click(mounted, '运行状态与恢复');
+    await click(mounted, '恢复上一个版本');
+    await clickIn(mounted, dialog(container, '回滚到上一个生效版本？'), '回滚');
+    await waitFor(mounted, () => {
+      expect(revisionText(container)).toContain('当前生效 v3');
+    });
+    await settle(mounted);
+    // The mock pushes each store-state before the answer, the earliest it can arrive.
+    expect(callsOf(backend, 'apply_settings')).toHaveLength(1);
+    expect(callsOf(backend, 'rollback')).toHaveLength(1);
+    expect(callsOf(backend, 'load_state')).toHaveLength(1);
+    expect(notice(container)).toBe('');
+  });
+
+  it('keeps unsaved settings edits over a revision published elsewhere and says so', async () => {
+    const mounted = await mountReady();
+    const { backend, container } = mounted;
+    await click(mounted, '文本指令参数设置');
+    await type(mounted, field(container, '词分隔符'), ' ;');
+    await mounted.act(() => {
+      backend.publishExternally((config) => {
+        config.globals.word_separators = ',';
+      });
+    });
+    await waitFor(mounted, () => {
+      expect(notice(container)).toContain('配置已在后台更新为 v2');
+    });
+    expect(callsOf(backend, 'load_state')).toHaveLength(2);
+    expect(field(container, '词分隔符').value).toBe(' ;');
+    expect(revisionText(container)).toContain('当前生效 v2');
+    // Keep: the notice goes and the edit stays; saving it overwrites the newer draft.
+    await click(mounted, '保留我的修改');
+    expect(notice(container)).toBe('');
+    expect(field(container, '词分隔符').value).toBe(' ;');
+    await click(mounted, '保存参数草稿');
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+    });
+    const saved = callsOf(backend, 'save_draft')[0]?.args.config as {
+      globals: { word_separators: string };
+    };
+    expect(saved.globals.word_separators).toBe(' ;');
+    // With nothing unsaved, the next revision is loaded straight away.
+    await mounted.act(() => {
+      backend.publishExternally((config) => {
+        config.globals.word_separators = '|';
+      });
+    });
+    await waitFor(mounted, () => {
+      expect(field(container, '词分隔符').value).toBe('|');
+    });
+    expect(notice(container)).toBe('');
+  });
+
+  it('loads the newer revision over unsaved edits only when asked to', async () => {
+    const mounted = await mountReady();
+    const { backend, container } = mounted;
+    await click(mounted, '文本指令参数设置');
+    await type(mounted, field(container, '词分隔符'), ' ;');
+    await mounted.act(() => {
+      backend.publishExternally((config) => {
+        config.globals.word_separators = ',';
+      });
+    });
+    await waitFor(mounted, () => {
+      expect(notice(container)).toContain('配置已在后台更新为 v2');
+    });
+    expect(field(container, '词分隔符').value).toBe(' ;');
+    await click(mounted, '放弃修改，载入新配置');
+    expect(notice(container)).toBe('');
+    expect(field(container, '词分隔符').value).toBe(',');
+    expect(callsOf(backend, 'save_draft')).toHaveLength(0);
+  });
+
+  it('keeps the rule being edited over a revision published elsewhere', async () => {
+    const mounted = await mountReady();
+    const { backend, container } = mounted;
+    await click(mounted, '编辑');
+    await type(mounted, field(container, '说明'), '改过的说明');
+    await mounted.act(() => {
+      backend.publishExternally((config) => {
+        config.enabled = false;
+      });
+    });
+    await waitFor(mounted, () => {
+      expect(revisionText(container)).toContain('当前生效 v2');
+    });
+    expect(callsOf(backend, 'load_state')).toHaveLength(2);
+    expect(dialog(container, '编辑文本指令')).not.toBeNull();
+    expect(field(container, '说明').value).toBe('改过的说明');
+    await clickIn(mounted, dialog(container, '编辑文本指令'), '保存');
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+    });
+    // The edited rule goes into the config read just now.
+    const saved = callsOf(backend, 'save_draft')[0]?.args.config as {
+      enabled: boolean;
+      rules: { description: string }[];
+    };
+    expect(saved.enabled).toBe(false);
+    expect(saved.rules.map((r) => r.description)).toContain('改过的说明');
+  });
+
+  it('disables the writes safe mode refuses and enables them as soon as it ends', async () => {
+    const mounted = await mountReady({ safeMode: 'locked' });
+    const { backend, container } = mounted;
+    const manage = () =>
+      [checkbox(container, '启用文本指令'), button(container, '＋ 添加指令')].map(
+        (entry) => entry?.disabled,
+      );
+    expect(container.querySelector('.banner')?.textContent).toMatch(/已进入安全模式/);
+    expect(manage()).toEqual([true, true]);
+    // Importing, and publishing what was imported, is the way out of crash_loop: never disabled.
+    expect(button(container, '导入')?.disabled).toBe(false);
+    expect(button(container, '应用设置')?.disabled).toBe(false);
+    await click(mounted, '文本指令参数设置');
+    expect(button(container, '保存参数草稿')?.disabled).toBe(true);
+    expect(checkbox(container, '启动时自动开始监听')?.disabled).toBe(true);
+    expect(field(container, '词分隔符').matches(':disabled')).toBe(true);
+    // The backend's Locked retry succeeds: store-state says so, and the page follows at once.
+    await mounted.act(() => {
+      backend.endSafeMode();
+    });
+    expect(container.querySelector('.banner')).toBeNull();
+    expect(button(container, '保存参数草稿')?.disabled).toBe(false);
+    expect(checkbox(container, '启动时自动开始监听')?.disabled).toBe(false);
+    expect(field(container, '词分隔符').matches(':disabled')).toBe(false);
+    await click(mounted, '文本指令管理');
+    expect(manage()).toEqual([false, false]);
+    await settle(mounted);
+    // Same revision: nothing to load. The problems, which go unannounced, are read again.
+    expect(callsOf(backend, 'load_state')).toHaveLength(1);
+    expect(callsOf(backend, 'startup_problems')).toHaveLength(2);
+  });
+
+  it('leaves crash_loop by importing and applying, without reading the state again', async () => {
+    const mounted = await mountReady({ safeMode: 'crash_loop' });
+    const { backend, container } = mounted;
+    await click(mounted, '导入');
+    await waitFor(mounted, () => {
+      expect(dialog(container, '遇到重复的指令时怎么处理？')).not.toBeNull();
+    });
+    await clickIn(mounted, dialog(container, '遇到重复的指令时怎么处理？'), '导入');
+    await waitFor(mounted, () => {
+      expect(button(container, '确认导入草稿')).toBeDefined();
+    });
+    await click(mounted, '确认导入草稿');
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+    });
+    await settle(mounted);
+    expect(container.querySelector('.alert.error')).toBeNull();
+    await click(mounted, '应用设置');
+    await waitFor(mounted, () => {
+      expect(revisionText(container)).toContain('当前生效 v2');
+    });
+    await settle(mounted);
+    expect(container.querySelector('.alert.error')).toBeNull();
+    expect(container.querySelector('.banner')).toBeNull();
+    expect(container.querySelectorAll('tbody tr')).toHaveLength(5);
+    expect(checkbox(container, '启用文本指令')?.disabled).toBe(false);
+    expect(callsOf(backend, 'load_state')).toHaveLength(1);
   });
 });
 
