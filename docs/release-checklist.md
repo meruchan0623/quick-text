@@ -34,9 +34,9 @@ PDB 检查的做法写在 `scripts/check-binary-strings.ps1` 的头部注释里�
 
 ### 产出可分发二进制的路径（S-28 硬门槛）
 
-原则：任何能产出可分发二进制的路径，在依赖源码缺失时必须失败，不能只给警告。下表是仓库里所有这样的路径；新增脚本或工作流步骤能产出安装包、更新包或 ZIP 时，先把它加进来并接上同样的门槛。门槛的检查逻辑只有一份：`scripts/third-party-set.ps1` 里的 `Assert-DependencySourcesZip`（文件名与版本；清单里的 `Cargo.lock`、`package-lock.json` 哈希与本树一致；每个 crate 在包里，其 `.cargo-checksum.json` 的 `package` 与 `Cargo.lock` 的校验和相符，并且该文件列出的每一个文件，包括源码、`build.rs`、`Cargo.toml`，都在包里且 SHA256 与列出的一致；每个 npm 包都以注册表原始 tarball 的形式在 `npm/tarballs/` 里，tarball 的 sha512 等于 `package-lock.json` 的 `integrity`；任何不符都抛错）和 `Assert-ThirdPartyLicensesFile`（声明文件不是占位文件，且由本树的锁文件生成）。在当前的 559 个 crate、28312 个文件、5 个 npm tarball 上，一次检查约 3 到 8 秒。
+原则：任何能产出可分发二进制的路径，在依赖源码缺失时必须失败，不能只给警告。下表是仓库里所有这样的路径；新增脚本或工作流步骤能产出安装包、更新包或 ZIP 时，先把它加进来并接上同样的门槛。门槛的检查逻辑只有一份：`scripts/third-party-set.ps1` 里的 `Assert-DependencySourcesZip`（文件名与版本；在读取或哈希任何条目之前，先对整个 ZIP 的条目名做一次规范性检查，使 Windows 上解压出的文件树与被校验的条目一一对应：条目名不重复，不含仅大小写不同的别名（Windows 上后者会覆盖前者，例如多出一个未被校验的 `CARGO.TOML`），不含反斜杠、冒号、开头的 `/`、空段（`a//b`）、`.` 或 `..` 段、Windows 保留设备名（`CON`、`NUL`、`COM1` 等，带不带扩展名都算）、以点或空格结尾的段，也不含同名的文件与目录，或把文件当目录用；清单里的 `Cargo.lock`、`package-lock.json` 哈希与本树一致；每个 crate 在包里，其 `.cargo-checksum.json` 的 `package` 与 `Cargo.lock` 的校验和相符，并且该文件列出的每一个文件，包括源码、`build.rs`、`Cargo.toml`，都在包里且 SHA256 与列出的一致；每个 npm 包都以注册表原始 tarball 的形式在 `npm/tarballs/` 里，tarball 的 sha512 等于 `package-lock.json` 的 `integrity`；任何不符都抛错）和 `Assert-ThirdPartyLicensesFile`（声明文件不是占位文件，且由本树的锁文件生成）。在当前的 559 个 crate、28312 个文件、5 个 npm tarball 上，一次检查约 3 到 8 秒。
 
-这个检查的防护范围：防止不小心发出不完整、过期或不匹配的依赖源码包（复制到一半的文件、另一个提交生成的包、丢了源码文件或 `build.rs`、字节被改动）。它不防有人同时改文件和 `.cargo-checksum.json`：`cargo vendor` 解包之后不留原始 `.crate`，`.cargo-checksum.json` 里的 `package` 只能与 `Cargo.lock` 的校验和比对，不能从包里的文件重新算出；这个包由发布机上的 `scripts/package-dependency-sources.ps1` 生成，不是不受信任的输入。npm 部分比这更强：tarball 直接与锁文件里的 `integrity` 比，绑定到上游发布的那个文件。
+这个检查的防护范围：防止不小心发出不完整、过期或不匹配的依赖源码包（复制到一半的文件、另一个提交生成的包、丢了源码文件或 `build.rs`、字节被改动、重新打包时多出一个在 Windows 上会覆盖已校验文件的陈旧别名条目）。它不防有人同时改文件和 `.cargo-checksum.json`：`cargo vendor` 解包之后不留原始 `.crate`，`.cargo-checksum.json` 里的 `package` 只能与 `Cargo.lock` 的校验和比对，不能从包里的文件重新算出；这个包由发布机上的 `scripts/package-dependency-sources.ps1` 生成，不是不受信任的输入。npm 部分比这更强：tarball 直接与锁文件里的 `integrity` 比，绑定到上游发布的那个文件。
 
 | 路径 | 门槛 |
 | --- | --- |

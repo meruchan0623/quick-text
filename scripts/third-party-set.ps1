@@ -288,10 +288,103 @@ function Test-NpmIntegrity {
     return [Convert]::ToBase64String($hash) -ceq $expected
 }
 
+# Rejects the whole archive when its entry names are not canonical, before any entry is read or hashed: the tree that
+# unpacking gives must be exactly the set of entries that are verified. The archive is meant to be unpacked on
+# Windows, where the file system is case-insensitive and rewrites or refuses some names: two entries that collide
+# there overwrite one another (an unchecked stale `CARGO.TOML` replaces the verified `Cargo.toml`), and a name that
+# is rewritten (trailing dot or space) or refused (device names, `:`, `\`, `..`) is not the file that was hashed.
+# Rejected:
+#   - exact duplicate names (a later entry silently shadows an earlier one);
+#   - names that collide when case is folded (the later entry overwrites the earlier one), and a directory whose
+#     spelling differs only by case between entries (`SERDE-1.0/x` next to `serde-1.0/y`);
+#   - a directory entry and a file entry with the same name, or a file that is also used as a directory (`a/b` and `a/b/c`);
+#   - names that do not unpack unchanged on Windows: a backslash, colon or another character Windows rejects
+#     (< > " | ? * and control characters), a leading slash, an empty segment (`a//b`), a `.` or `..` segment, a
+#     segment that ends with a space or dot, a reserved device name with or without extension (CON, PRN, AUX, NUL,
+#     COM1-9, LPT1-9). A directory entry's trailing slash is not an empty segment.
+function Assert-ZipEntryNames {
+    param(
+        [Parameter(Mandatory = $true)]$Archive,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+    $names = [string[]]$Archive.Entries.FullName
+    if ($null -eq $names -or $names.Length -eq 0) { return }
+    $slash = [char]'/'
+    # A per-entry PowerShell loop over some 29000 entries takes more than a second, a third of the whole validation, so
+    # the names are handled as text: one string, one name per line, and a few passes of the regex engine and of
+    # HashSet, which do the work in one call each. (A name that contains a line break shifts the lines: see step 2.)
+    $multiline = [Text.RegularExpressions.RegexOptions]::Multiline -bor [Text.RegularExpressions.RegexOptions]::Compiled
+    $text = [string]::Join("`n", $names)
+
+    # 1. Names that do not unpack unchanged on Windows. `^$` is the empty name; the character class leaves out
+    #    the line break itself, which is caught by the line count in step 2.
+    $problem = [regex]::new('^$|[\\:<>"|?*\x00-\x09\x0b-\x1f]|^/|//|(?:^|/)\.{1,2}(?:/|$)|[ .](?:/|$)|(?:^|/)(?:con|prn|aux|nul|com[1-9]|lpt[1-9]) *(?:\.[^/\n]*)?(?:/|$)', $multiline -bor [Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    $found = $problem.Match($text)
+    if ($found.Success) {
+        $from = if ($found.Index -eq 0) { 0 } else { $text.LastIndexOf([char]"`n", $found.Index - 1) + 1 }
+        $to = $text.IndexOf([char]"`n", $found.Index)
+        if ($to -lt 0) { $to = $text.Length }
+        throw "$Label has an entry name that does not unpack unchanged on Windows: '$($text.Substring($from, $to - $from))' (empty, backslash, colon, leading or double slash, '.' or '..' segment, trailing dot or space, reserved device name or a character Windows rejects); rebuild it with scripts/package-dependency-sources.ps1"
+    }
+
+    # 2. The path of every entry: its name without the trailing slash of a directory entry (safe: `//` is rejected).
+    $hasDirectoryEntries = $text.EndsWith($slash) -or $text.Contains("/`n")
+    $pathText = if ($hasDirectoryEntries) { [regex]::Replace($text, '/$', '', $multiline) } else { $text }
+    $paths = $pathText.Split([char]"`n")
+    if ($paths.Length -ne $names.Length) {
+        throw "$Label has an entry name with a line break in it: '$(($names | Where-Object { $_.Contains([char]"`n") } | Select-Object -First 1))'"
+    }
+
+    # 3. Duplicates, and names that are the same path on Windows (case folded, a file next to a directory entry).
+    $folded = [Collections.Generic.HashSet[string]]::new($paths, [StringComparer]::OrdinalIgnoreCase)
+    if ($folded.Count -ne $paths.Length) {
+        # Only to say which: the decision was made above.
+        $first = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+        for ($i = 0; $i -lt $paths.Length; $i++) {
+            if ($first.TryAdd($paths[$i], $names[$i])) { continue }
+            $previous = $first[$paths[$i]]
+            if ([string]::Equals($previous, $names[$i], [StringComparison]::Ordinal)) { throw "$Label has the entry '$previous' more than once" }
+            throw "$Label has entries '$previous' and '$($names[$i])' that are the same path on Windows (they differ only by case or by being a file and a directory); unpacking would let one overwrite the other"
+        }
+    }
+
+    # 4. The directories: those that entries are in, and the directory entries. Each one and each of its ancestors,
+    #    once: one spelling only (`SERDE-1.0/x` next to `serde-1.0/y` is one directory on Windows), and not also a file.
+    $dirs = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $dirEntries = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $parents = [regex]::Matches($pathText, '^.*(?=/[^/\n]*$)', $multiline).Value
+    if ($null -ne $parents) { $dirs.UnionWith([string[]]$parents) }
+    if ($hasDirectoryEntries) {
+        $own = [regex]::Matches($text, '^.*(?=/$)', $multiline).Value
+        if ($null -ne $own) { $dirEntries.UnionWith([string[]]$own); $dirs.UnionWith([string[]]$own) }
+    }
+    # $spelling: case-folded directory path -> the one spelling in use. A directory seen before in the same spelling
+    # has had all its ancestors checked too, so the walk up stops there.
+    $spelling = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($dir in $dirs) {
+        $current = $dir
+        while ($true) {
+            if (-not $spelling.TryAdd($current, $current)) {
+                $known = $spelling[$current]
+                if ([string]::Equals($known, $current, [StringComparison]::Ordinal)) { break }
+                throw "$Label uses the directory '$known' and '$current', which are the same directory on Windows (they differ only by case)"
+            }
+            if ($folded.Contains($current) -and -not $dirEntries.Contains($current)) {
+                throw "$Label has a file named '$current' and also entries below '$current/'; a path cannot be a file and a directory"
+            }
+            $cut = $current.LastIndexOf($slash)
+            if ($cut -lt 0) { break }
+            $current = $current.Substring(0, $cut)
+        }
+    }
+}
+
 # Hard gate for every path that can produce something distributable (package-portable.ps1, package-artifacts.ps1,
 # scripts/check-bundle-preconditions.ps1 for `tauri build`): a binary must never go out without its dependency
 # sources (GPL-3.0-or-later; the dependency code is compiled or bundled into it). Throws unless the archive is
 #   - named for this version and a readable ZIP with the layout scripts/package-dependency-sources.ps1 writes,
+#   - made of canonical entry names, checked first and for the whole archive (Assert-ZipEntryNames): unique, and
+#     unpacking on Windows gives back exactly the entries that are verified (no case aliases, no `\`, `..`, device names),
 #   - built from THIS tree's Cargo.lock and package-lock.json (hashes in SOURCE-DEPS-MANIFEST.txt),
 #   - complete, including the payload and not only the metadata:
 #       Rust: exactly the crates of Cargo.lock are vendored; each crate's .cargo-checksum.json carries the checksum of
@@ -320,8 +413,11 @@ function Assert-DependencySourcesZip {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     try { $archive = [IO.Compression.ZipFile]::OpenRead($Path) } catch { throw "$label is not a readable ZIP file: $Path ($($_.Exception.Message))" }
     try {
+        # Before anything is read or hashed: every check below looks entries up by exact name, so an alias that
+        # unpacks onto a verified file (or a duplicate) would otherwise slip through unchecked.
+        Assert-ZipEntryNames -Archive $archive -Label $label
         $stage = "Quicker-Text-$Version-Source-deps"
-        # Case-sensitive: file names inside a crate may differ only by case (PowerShell's @{} would merge them).
+        # Case-sensitive lookup; after the check above no two entries differ only by case.
         $entries = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
         foreach ($entry in $archive.Entries) { $entries[$entry.FullName] = $entry }
         foreach ($required in @('README-OFFLINE-BUILD.md', 'cargo-config.toml', 'SOURCE-DEPS-MANIFEST.txt', 'npm/PACKAGES.txt')) {
