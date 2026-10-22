@@ -106,19 +106,26 @@
 //!   call a callback, never join a thread, never make a channel send that
 //!   can block, and never wait for `send_lock`. Only bounded leaf locks are
 //!   taken under it (`worker`, `fault`, `shared.last`, and inside
-//!   `Runtime::record` the history ring and the event queue). Two bounded
-//!   non-lock steps also run under it: the rebuild starts the worker
-//!   thread, and `Runtime::record` hands its event to an unbounded queue
-//!   (a send that never blocks), starting the event thread when there is
-//!   none; it never runs a listener inline (listeners run on that thread)
-//!   and never calls back into the executor. The worker's job queue is
-//!   only ever offered with `try_send`.
+//!   `Runtime::record` the history ring, a brief read of the listener list
+//!   and the event queue's lock). Two bounded non-lock steps also run under
+//!   it: the rebuild starts the worker thread, and `Runtime::record` offers
+//!   its event to the event thread's bounded queue with `try_send` (a full
+//!   queue drops and counts it, so the send never blocks), starting the
+//!   event thread when there is none; it never runs a listener inline
+//!   (listeners run on that thread, with no runtime lock held) and never
+//!   calls back into the executor. The worker's job queue is only ever
+//!   offered with `try_send`.
 //! * The supervisor's calls never wait for an executor lock (A2):
 //!   `enforce_budget` and `probe` only `try_lock` `life`, `worker` and
 //!   `fault`. When one is held elsewhere, `probe` returns the status it
 //!   last observed (kept in an atomic) and `enforce_budget` skips the round
 //!   and looks again on the next tick, so a fence comes at most one tick
-//!   (1 s) late, against a [`STALL_BUDGET`] of 10 s.
+//!   (1 s) late, against a [`STALL_BUDGET`] of 10 s. Supervisor-path calls
+//!   (`enforce_budget`, `probe`) never wait on executor locks (`try_lock`
+//!   only); they may take the runtime's leaf locks, which are bounded by
+//!   the runtime's contract (a fence's `retire` records the fenced run
+//!   through `Runtime::record`). `rebuild` is a recovery attempt and may
+//!   block, as said above.
 //! * Stall check (A1): `enforce_budget` decides and fences in one hold of
 //!   `life`. A first look names the suspect run; in the fencing hold, and
 //!   before anything changes, it confirms that the epoch is the same, that
