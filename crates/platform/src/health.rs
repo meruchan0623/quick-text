@@ -55,7 +55,11 @@ impl Component {
     pub fn required(self) -> bool {
         matches!(
             self,
-            Self::Executor | Self::KeyboardHook | Self::MouseHook | Self::RawInput | Self::Supervisor
+            Self::Executor
+                | Self::KeyboardHook
+                | Self::MouseHook
+                | Self::RawInput
+                | Self::Supervisor
         )
     }
 }
@@ -336,14 +340,35 @@ mod tests {
         let none = PauseReasons::empty();
         let manual = PauseReasons::MANUAL;
         let down = PauseReasons::ENGINE_DOWN;
-        assert_eq!(StatusText::resolve(Starting, manual, true), StatusText::Starting);
+        assert_eq!(
+            StatusText::resolve(Starting, manual, true),
+            StatusText::Starting
+        );
         assert_eq!(StatusText::resolve(Failed, down, false), StatusText::Failed);
-        assert_eq!(StatusText::resolve(Recovering, down, true), StatusText::Recovering);
-        assert_eq!(StatusText::resolve(Healthy, manual, true), StatusText::Paused);
-        assert_eq!(StatusText::resolve(Degraded, manual, false), StatusText::Paused);
-        assert_eq!(StatusText::resolve(Healthy, down, true), StatusText::Executing);
-        assert_eq!(StatusText::resolve(Degraded, none, false), StatusText::Degraded);
-        assert_eq!(StatusText::resolve(Healthy, none, false), StatusText::Listening);
+        assert_eq!(
+            StatusText::resolve(Recovering, down, true),
+            StatusText::Recovering
+        );
+        assert_eq!(
+            StatusText::resolve(Healthy, manual, true),
+            StatusText::Paused
+        );
+        assert_eq!(
+            StatusText::resolve(Degraded, manual, false),
+            StatusText::Paused
+        );
+        assert_eq!(
+            StatusText::resolve(Healthy, down, true),
+            StatusText::Executing
+        );
+        assert_eq!(
+            StatusText::resolve(Degraded, none, false),
+            StatusText::Degraded
+        );
+        assert_eq!(
+            StatusText::resolve(Healthy, none, false),
+            StatusText::Listening
+        );
         assert_eq!(
             StatusText::Paused.tooltip(PauseReasons::SAFE_MODE),
             "Quicker Text · 已暂停（安全模式）"
