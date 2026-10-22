@@ -35,6 +35,30 @@ pub struct SubscriptionId(u64);
 
 type Listeners = Arc<RwLock<Vec<(u64, Listener)>>>;
 
+/// Capacity of the queue between emitters and the event thread. Bounded so
+/// a blocked listener cannot grow memory without limit; emitters never wait
+/// on it (see [`Runtime::subscribe`] for what happens when it is full).
+const EVENT_QUEUE_CAPACITY: usize = 1024;
+
+/// What did not fit in the event queue, shared between emitters and the
+/// event thread.
+#[derive(Default)]
+struct Overflow {
+    /// Latest Health/State that could not be queued. While one is parked,
+    /// later events of the same kind replace it instead of being queued, so
+    /// the queue never holds a newer value than the parked one.
+    health: Option<HealthSnapshot>,
+    state: Option<EngineState>,
+    /// Execution events dropped since the event thread last drained.
+    dropped: u64,
+}
+
+#[derive(Default)]
+struct EventQueue {
+    tx: Option<mpsc::SyncSender<EngineEvent>>,
+    overflow: Arc<Mutex<Overflow>>,
+}
+
 #[derive(Default)]
 struct PauseState {
     reasons: PauseReasons,
@@ -44,7 +68,8 @@ struct PauseState {
 }
 
 /// Lock order, for every path that holds more than one of these at a time:
-/// `last_state` → `health` → `pause` → `events`. `process` is only taken
+/// `last_state` → `health` → `pause` → `events` → the event queue's
+/// `Overflow` (the event thread takes only `Overflow`). `process` is only taken
 /// with at most `last_state` held, and `history` alone. Listeners run on the
 /// event thread with none of these held; the process probe never runs with
 /// `health`, `pause` or `events` held.
@@ -53,7 +78,7 @@ pub struct Runtime {
     history: History,
     listeners: Listeners,
     next_listener: AtomicU64,
-    events: Mutex<Option<mpsc::Sender<EngineEvent>>>,
+    events: Mutex<EventQueue>,
     health: Mutex<HealthSnapshot>,
     pause: Mutex<PauseState>,
     last_state: Mutex<Option<EngineState>>,
@@ -68,7 +93,7 @@ impl Runtime {
             history: History::new(),
             listeners: Arc::default(),
             next_listener: AtomicU64::new(1),
-            events: Mutex::new(None),
+            events: Mutex::default(),
             health: Mutex::new(HealthSnapshot::default()),
             pause: Mutex::new(PauseState::default()),
             last_state: Mutex::new(None),
@@ -112,6 +137,21 @@ impl Runtime {
 
     // ---- events -------------------------------------------------------
 
+    /// Registers `listener` for every [`EngineEvent`].
+    ///
+    /// **Contract: a listener must not block** (no waiting on I/O, other
+    /// threads or sleeps). All listeners run one after another on the single
+    /// event thread, so one that blocks holds up every subscriber. Rate
+    /// limiting (P5) belongs outside the listener, e.g. forward events to
+    /// your own channel and throttle there.
+    ///
+    /// If a listener blocks anyway, memory stays bounded: emitters never
+    /// wait, and the queue holds at most `EVENT_QUEUE_CAPACITY` (1024)
+    /// events. When it is full, `Execution` events are dropped and counted
+    /// (one `runtime.events_dropped` warning per backlog), while `Health` and
+    /// `State` are coalesced to their latest value and delivered once the
+    /// backlog drains. Every subscriber therefore eventually sees the latest
+    /// Health and State, and never an older one after a newer one.
     pub fn subscribe(&self, listener: Box<dyn Fn(EngineEvent) + Send + Sync>) -> SubscriptionId {
         let id = self.next_listener.fetch_add(1, Ordering::Relaxed);
         self.listeners.write().push((id, Arc::from(listener)));
@@ -122,32 +162,31 @@ impl Runtime {
         self.listeners.write().retain(|(other, _)| *other != id.0);
     }
 
+    /// Queues `event` for the event thread without blocking, starting the
+    /// thread on first use (or after it exited).
     fn emit(&self, event: EngineEvent) {
         if self.listeners.read().is_empty() {
             return;
         }
-        let mut sender = self.events.lock();
-        let event = match sender.as_ref() {
-            Some(tx) => match tx.send(event) {
-                Ok(()) => return,
-                Err(mpsc::SendError(event)) => event,
+        let mut queue = self.events.lock();
+        let event = match queue.tx.as_ref() {
+            Some(tx) => match offer(tx, &queue.overflow, event) {
+                None => return,
+                Some(event) => event,
             },
             None => event,
         };
-        *sender = None;
-        let (tx, rx) = mpsc::channel::<EngineEvent>();
+        queue.tx = None;
+        let (tx, rx) = mpsc::sync_channel::<EngineEvent>(EVENT_QUEUE_CAPACITY);
         let listeners = Arc::clone(&self.listeners);
+        let overflow = Arc::clone(&queue.overflow);
         let spawned = std::thread::Builder::new()
             .name("qt-engine-events".into())
-            .spawn(move || {
-                for event in rx {
-                    deliver(&listeners, &event);
-                }
-            });
+            .spawn(move || run_event_thread(&rx, &listeners, &overflow));
         match spawned {
             Ok(_) => {
-                let _ = tx.send(event);
-                *sender = Some(tx);
+                let _ = offer(&tx, &queue.overflow, event);
+                queue.tx = Some(tx);
             }
             // Never deliver inline: callers emit while holding state locks
             // that a listener could re-enter. Listeners resynchronise from
@@ -353,6 +392,98 @@ impl Runtime {
     }
 }
 
+/// Hands `event` to the event thread without blocking. A full queue drops
+/// an `Execution` (counted) and parks a `Health`/`State` in `overflow`.
+/// Returns the event back only if the event thread is gone.
+///
+/// Parking and the full check happen under the `overflow` lock, which the
+/// event thread takes before it goes back to waiting on an empty queue. So
+/// a value is only ever parked while the queue is full (or another value of
+/// its kind is already parked), and the event thread always wakes up again
+/// to deliver it.
+fn offer(
+    tx: &mpsc::SyncSender<EngineEvent>,
+    overflow: &Mutex<Overflow>,
+    event: EngineEvent,
+) -> Option<EngineEvent> {
+    let mut overflow = overflow.lock();
+    let event = match event {
+        EngineEvent::Health(health) if overflow.health.is_some() => {
+            overflow.health = Some(health);
+            return None;
+        }
+        EngineEvent::State(state) if overflow.state.is_some() => {
+            overflow.state = Some(state);
+            return None;
+        }
+        event => event,
+    };
+    match tx.try_send(event) {
+        Ok(()) => None,
+        Err(mpsc::TrySendError::Full(event)) => {
+            match event {
+                EngineEvent::Health(health) => overflow.health = Some(health),
+                EngineEvent::State(state) => overflow.state = Some(state),
+                EngineEvent::Execution(_) => overflow.dropped += 1,
+            }
+            None
+        }
+        Err(mpsc::TrySendError::Disconnected(event)) => Some(event),
+    }
+}
+
+/// The event thread: delivers queued events in order; whenever the backlog
+/// is drained, delivers what was coalesced meanwhile before waiting again.
+fn run_event_thread(
+    rx: &mpsc::Receiver<EngineEvent>,
+    listeners: &RwLock<Vec<(u64, Listener)>>,
+    overflow: &Mutex<Overflow>,
+) {
+    loop {
+        let event = match rx.try_recv() {
+            Ok(event) => event,
+            Err(mpsc::TryRecvError::Empty) => {
+                if flush_overflow(listeners, overflow) {
+                    continue;
+                }
+                match rx.recv() {
+                    Ok(event) => event,
+                    Err(mpsc::RecvError) => return,
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => return,
+        };
+        deliver(listeners, &event);
+    }
+}
+
+/// Delivers the parked Health/State (latest values) and reports dropped
+/// executions once. Returns whether anything was parked.
+fn flush_overflow(listeners: &RwLock<Vec<(u64, Listener)>>, overflow: &Mutex<Overflow>) -> bool {
+    let Overflow {
+        health,
+        state,
+        dropped,
+    } = std::mem::take(&mut *overflow.lock());
+    if dropped > 0 {
+        tracing::warn!(
+            event = "runtime.events_dropped",
+            dropped,
+            "event queue was full; execution events dropped"
+        );
+    }
+    let parked = [
+        health.map(EngineEvent::Health),
+        state.map(EngineEvent::State),
+    ];
+    let mut any = false;
+    for event in parked.into_iter().flatten() {
+        deliver(listeners, &event);
+        any = true;
+    }
+    any
+}
+
 fn deliver(listeners: &RwLock<Vec<(u64, Listener)>>, event: &EngineEvent) {
     let targets: Vec<Listener> = listeners
         .read()
@@ -414,7 +545,8 @@ pub fn status_text() -> StatusText {
     current().status_text()
 }
 
-/// Registers an event listener (P5 connects the Tauri EventBus here).
+/// Registers an event listener (P5 connects the Tauri EventBus here). The
+/// listener must not block; see [`Runtime::subscribe`] for the contract.
 pub fn subscribe(listener: Box<dyn Fn(EngineEvent) + Send + Sync>) -> SubscriptionId {
     current().subscribe(listener)
 }
@@ -685,6 +817,150 @@ mod tests {
             })
             .collect();
         assert_eq!(seqs, [1, 2, 3]);
+    }
+
+    /// `record` is the "new history entry" callback: it emits `Execution`
+    /// carrying exactly the entry it returns.
+    #[test]
+    fn record_emits_execution_with_the_returned_entry() {
+        let (runtime, _) = runtime();
+        let events = collect(&runtime);
+        let entry = runtime.record(Record::new(
+            "a",
+            TriggerKind::Terminator,
+            Outcome::Failed,
+            ReasonCode::FocusChanged,
+        ));
+        wait_until("execution event", || !events.lock().is_empty());
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(*events.lock(), vec![EngineEvent::Execution(entry)]);
+    }
+
+    /// A unique snapshot per `n` (carried in `since_ms`), so the order in
+    /// which listeners see them can be checked.
+    fn numbered(state: HealthState, n: usize) -> HealthSnapshot {
+        HealthSnapshot {
+            state,
+            components: vec![crate::health::ComponentHealth {
+                component: crate::health::Component::RawInput,
+                state,
+                reason: None,
+                since_ms: n as i64,
+            }],
+        }
+    }
+
+    /// One listener blocks the event thread while events keep coming: the
+    /// queue stays bounded, executions beyond it are dropped, and once the
+    /// listener returns every subscriber sees the latest Health and State,
+    /// with Health never going backwards.
+    #[test]
+    fn blocked_listener_keeps_queue_bounded_and_coalesces_health_state() {
+        use std::sync::atomic::AtomicBool;
+        let (runtime, _) = runtime();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let blocked_once = AtomicBool::new(false);
+        runtime.subscribe(Box::new(move |_| {
+            if !blocked_once.swap(true, Ordering::SeqCst) {
+                entered_tx.send(()).unwrap();
+                release_rx.lock().recv().unwrap();
+            }
+        }));
+        let events = collect(&runtime);
+        let execution = |rule: &str| {
+            Record::new(
+                rule,
+                TriggerKind::Immediate,
+                Outcome::Succeeded,
+                ReasonCode::Ok,
+            )
+        };
+        runtime.record(execution("first"));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("event thread blocked in the listener");
+
+        let executions = 3 * EVENT_QUEUE_CAPACITY;
+        let states = [
+            HealthState::Healthy,
+            HealthState::Recovering,
+            HealthState::Degraded,
+        ];
+        for i in 0..executions {
+            runtime.record(execution("burst"));
+            if i % 4 == 0 {
+                runtime.publish_health(numbered(states[i % 3], i));
+                runtime.set_pause(PauseReasons::MANUAL, i % 8 == 0);
+            }
+        }
+        let final_health = numbered(HealthState::Degraded, executions + 1);
+        runtime.publish_health(final_health.clone());
+        runtime.set_pause(PauseReasons::TIMED, true);
+        let final_state = runtime.engine_state();
+        assert!(!final_state.listening);
+        release_tx.send(()).unwrap();
+
+        let last_of = |events: &[EngineEvent]| {
+            let health = events.iter().rev().find_map(|event| match event {
+                EngineEvent::Health(health) => Some(health.clone()),
+                _ => None,
+            });
+            let state = events.iter().rev().find_map(|event| match event {
+                EngineEvent::State(state) => Some(state.clone()),
+                _ => None,
+            });
+            (health, state)
+        };
+        wait_until("latest health and state", || {
+            last_of(&events.lock()) == (Some(final_health.clone()), Some(final_state.clone()))
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let events = events.lock().clone();
+        assert_eq!(
+            last_of(&events),
+            (Some(final_health), Some(final_state)),
+            "nothing older arrives after the latest values"
+        );
+        // Bounded: one event in the blocked listener, at most a full queue,
+        // plus the parked Health and State.
+        assert!(
+            events.len() <= 1 + EVENT_QUEUE_CAPACITY + 2,
+            "{} events delivered",
+            events.len()
+        );
+        let delivered_executions = events
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::Execution(_)))
+            .count();
+        assert!(delivered_executions <= 1 + EVENT_QUEUE_CAPACITY);
+        assert!(delivered_executions < 1 + executions, "some were dropped");
+        let health_order: Vec<i64> = events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::Health(health) => Some(health.components[0].since_ms),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            health_order.windows(2).all(|pair| pair[0] < pair[1]),
+            "{health_order:?}"
+        );
+        let seqs: Vec<u64> = events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::Execution(entry) => Some(entry.seq),
+                _ => None,
+            })
+            .collect();
+        assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]));
+
+        // The thread keeps working normally once the backlog is gone.
+        let sink = collect(&runtime);
+        let late = runtime.record(execution("late"));
+        wait_until("late execution", || !sink.lock().is_empty());
+        assert_eq!(*sink.lock(), vec![EngineEvent::Execution(late)]);
     }
 
     #[test]
