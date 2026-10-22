@@ -8,6 +8,7 @@
 // &mock-unreadable=1 (B-43 sample: rules entries the backend could not read, unknown fields).
 // In the preview the backend is also reachable as `globalThis.quickerMock` for manual pokes
 // (e.g. `quickerMock.recordExecution({ outcome: 'dropped_busy' })`).
+import { isReadableRule } from '../lib/rules';
 import type { CommandError } from './errors';
 import type { CommandArgs, Transport, Unlisten } from './transport';
 import type {
@@ -61,19 +62,11 @@ export interface MockConfig {
   [extra: string]: unknown;
 }
 
-/** Whether a `rules` entry deserialises as a rule (the mock's stand-in for serde). */
-export function isMockRule(entry: unknown): entry is MockRule {
-  if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) return false;
-  const rule = entry as Partial<Record<keyof MockRule, unknown>>;
-  const match = rule.match as { value?: unknown } | null | undefined;
-  return (
-    typeof rule.id === 'string' &&
-    typeof rule.enabled === 'boolean' &&
-    typeof match === 'object' &&
-    match !== null &&
-    typeof match.value === 'string'
-  );
-}
+/**
+ * Whether a `rules` entry deserialises as a rule (the mock's stand-in for serde): the same
+ * structural check the UI uses, which mirrors the serde model.
+ */
+export const isMockRule = (entry: unknown): entry is MockRule => isReadableRule(entry);
 
 /**
  * B-43 sample: an unreadable entry with an id between the rules, two without one at the end, and
@@ -128,7 +121,13 @@ export function syntheticRules(count: number): MockRule[] {
     const kind = i % 5;
     const action: Record<string, unknown> =
       kind === 3
-        ? { type: 'hotkey', keys: ['ctrl', 's'] }
+        ? {
+            type: 'hotkey',
+            keys: [
+              { type: 'named', name: 'Ctrl' },
+              { type: 'named', name: 'S' },
+            ],
+          }
         : kind === 4
           ? { type: 'none' }
           : {

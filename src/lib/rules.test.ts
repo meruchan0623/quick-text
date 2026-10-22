@@ -201,6 +201,240 @@ describe('tolerant reading (B-43)', () => {
     expect(replaceReadable(rules, [])).toEqual([raw1, 'not a rule', null]);
   });
 
+  describe('structural check of every nested field', () => {
+    const base = rule('x');
+    const withAction = (action: unknown) => ({ ...base, action });
+    const step = (operation: unknown, target: unknown = { type: 'locked' }) => ({
+      operation,
+      span: { line: 1, column: 1, length: 0 },
+      target,
+    });
+    const plan = (...steps: unknown[]) => ({
+      version: 1,
+      dialect: 'structured',
+      source: null,
+      steps,
+    });
+    const named = (name: string) => ({ type: 'named', name });
+    const text = { type: 'text', method: 'keys', source: { type: 'inline', value: 'hi' } };
+
+    it('accepts every action, step and key type in the shape the backend sends', () => {
+      const valid: unknown[] = [
+        base,
+        { ...base, trigger_mode: 'terminator', terminator: { keys: ['space'], consume: true } },
+        { ...base, match: { kind: 'regex', value: '^a' }, ime_erasure: 'backspace' },
+        { ...base, parameter: { type: 'fixed', value: 'v' } },
+        { ...base, parameter: { type: 'capture_template', template: '{1}' } },
+        { ...base, parameter: { type: 'first_capture' } },
+        { ...base, parameter: { type: 'null' } },
+        withAction(text),
+        withAction({ type: 'text', method: 'paste', source: { type: 'file', path: 'a.txt' } }),
+        withAction({
+          type: 'text',
+          method: 'keys',
+          source: { type: 'file', path: 'a.txt', encoding: 'gbk' },
+        }),
+        withAction({ type: 'html', html: '<b>x</b>', plain_text: 'x' }),
+        withAction({
+          type: 'hotkey',
+          keys: [{ type: 'platform_primary' }, { type: 'windows_code', code: 91 }, named('S')],
+        }),
+        withAction({ type: 'send_keys', source: { type: 'inline', value: '{Enter}' } }),
+        withAction({
+          type: 'send_keys',
+          source: { type: 'inline', value: '' },
+          syntax_variables: ['cliptext'],
+        }),
+        withAction({
+          type: 'steps',
+          plan: plan(
+            step({ type: 'text', text: 'a', method: 'paste' }),
+            step({ type: 'key_down', key: named('Ctrl') }),
+            step({ type: 'key_up', key: named('Ctrl') }),
+            step({ type: 'key_press', key: { type: 'windows_code', code: 13 } }),
+            step({ type: 'hotkey', keys: [named('Ctrl'), named('C')] }),
+            step({ type: 'delay', ms: 100 }),
+            step({ type: 'mouse_move', x: 1, y: 2 }),
+            step({ type: 'mouse_move', x: 1.5, y: -2, relative: true, percent: false }),
+            step({ type: 'mouse_button', button: 'x2', state: 'double_click' }),
+            step({ type: 'wheel', axis: 'horizontal', amount: -3, unit: 'delta' }),
+            step({ type: 'paste_files', paths: ['a', 'b'] }),
+            step({ type: 'paste_image', path: 'a.png' }),
+            step({ type: 'html', html: '', plain_text: '' }),
+            step({ type: 'open', target: 'x', args: [], working_directory: null }),
+            step({ type: 'common', function: 'copy' }),
+            step({ type: 'reusable', action_id: 'a', parameters: { n: 1 } }),
+            step({ type: 'delay', ms: 1 }, { type: 'declared', process: 'notepad.exe' }),
+          ),
+        }),
+        withAction({ type: 'replay', plan: plan(), speed: 1.5 }),
+        withAction({ type: 'open', target: 'x', args: ['-a'], working_directory: 'C:\\' }),
+        withAction({ type: 'open', target: 'x', args: [] }),
+        withAction({ type: 'reusable', action_id: 'a', parameters: { n: 1 } }),
+        withAction({ type: 'reusable', action_id: 'a' }),
+        withAction({ type: 'common', function: 'lock_screen' }),
+        withAction({ type: 'quicker', action_id: 'q', parameter: '' }),
+      ];
+      expect(valid.filter((entry) => !isReadableRule(entry))).toEqual([]);
+    });
+
+    // One malformed value per nested field the list or the editor reads.
+    const malformed: [string, unknown][] = [
+      ['id', { ...base, id: 42 }],
+      ['enabled', { ...base, enabled: 'yes' }],
+      ['group', { ...base, group: null }],
+      ['description', { ...base, description: 1 }],
+      ['ignore_case', { ...base, ignore_case: 'no' }],
+      ['match', { ...base, match: null }],
+      ['match.kind', { ...base, match: { kind: 'glob', value: ';x' } }],
+      ['match.value', { ...base, match: { kind: 'literal', value: 5 } }],
+      ['trigger_mode', { ...base, trigger_mode: 'sometimes' }],
+      ['terminator (missing)', { ...base, terminator: undefined }],
+      ['terminator.keys (number)', { ...base, terminator: { keys: 42, consume: true } }],
+      ['terminator.keys[0]', { ...base, terminator: { keys: [1], consume: true } }],
+      ['terminator.consume', { ...base, terminator: { keys: ['space'] } }],
+      ['ime_erasure (number)', { ...base, ime_erasure: 7 }],
+      ['ime_erasure (unknown)', { ...base, ime_erasure: 'shout' }],
+      ['action', { ...base, action: null }],
+      ['action.type (number)', withAction({ type: 7 })],
+      ['action.type (unknown)', withAction({ type: 'from_the_future' })],
+      ['action.type (prototype key)', withAction({ type: 'constructor' })],
+      ['text.method', withAction({ ...text, method: 'shout' })],
+      ['text.source', withAction({ ...text, source: null })],
+      ['text.source.type', withAction({ ...text, source: { type: 'clipboard' } })],
+      ['text.source.value', withAction({ ...text, source: { type: 'inline', value: 3 } })],
+      ['text.source.path', withAction({ ...text, source: { type: 'file', path: 1 } })],
+      [
+        'text.source.encoding',
+        withAction({ ...text, source: { type: 'file', path: 'a', encoding: 'latin1' } }),
+      ],
+      ['html.html', withAction({ type: 'html', html: 1, plain_text: '' })],
+      ['html.plain_text', withAction({ type: 'html', html: '' })],
+      ['hotkey.keys (string)', withAction({ type: 'hotkey', keys: 'ctrl+s' })],
+      ['hotkey.keys[0] (string)', withAction({ type: 'hotkey', keys: ['ctrl', 's'] })],
+      ['hotkey.keys[0].type', withAction({ type: 'hotkey', keys: [{ type: 'chord' }] })],
+      ['hotkey.keys[0].name', withAction({ type: 'hotkey', keys: [{ type: 'named' }] })],
+      [
+        'hotkey.keys[0].code',
+        withAction({ type: 'hotkey', keys: [{ type: 'windows_code', code: '91' }] }),
+      ],
+      ['send_keys.source', withAction({ type: 'send_keys' })],
+      [
+        'send_keys.syntax_variables',
+        withAction({
+          type: 'send_keys',
+          source: { type: 'inline', value: '' },
+          syntax_variables: 'cliptext',
+        }),
+      ],
+      [
+        'send_keys.syntax_variables[0]',
+        withAction({
+          type: 'send_keys',
+          source: { type: 'inline', value: '' },
+          syntax_variables: [1],
+        }),
+      ],
+      ['steps.plan', withAction({ type: 'steps', plan: null })],
+      ['steps.plan.steps', withAction({ type: 'steps', plan: { steps: 'x' } })],
+      ['steps.plan.steps[0]', withAction({ type: 'steps', plan: plan(null) })],
+      ['step.operation', withAction({ type: 'steps', plan: plan({ target: { type: 'locked' } }) })],
+      [
+        'step.operation.type',
+        withAction({ type: 'steps', plan: plan(step({ type: 'teleport' })) }),
+      ],
+      [
+        'step.target (missing)',
+        withAction({ type: 'steps', plan: plan({ operation: { type: 'delay', ms: 1 } }) }),
+      ],
+      [
+        'step.target.process',
+        withAction({
+          type: 'steps',
+          plan: plan(step({ type: 'delay', ms: 1 }, { type: 'declared' })),
+        }),
+      ],
+      [
+        'step text.text',
+        withAction({ type: 'steps', plan: plan(step({ type: 'text', text: 1, method: 'keys' })) }),
+      ],
+      [
+        'step delay.ms',
+        withAction({ type: 'steps', plan: plan(step({ type: 'delay', ms: '1' })) }),
+      ],
+      [
+        'step key_press.key',
+        withAction({ type: 'steps', plan: plan(step({ type: 'key_press', key: 'Enter' })) }),
+      ],
+      [
+        'step hotkey.keys',
+        withAction({ type: 'steps', plan: plan(step({ type: 'hotkey', keys: [null] })) }),
+      ],
+      [
+        'step mouse_move.x',
+        withAction({ type: 'steps', plan: plan(step({ type: 'mouse_move', x: '1', y: 0 })) }),
+      ],
+      [
+        'step mouse_move.relative',
+        withAction({
+          type: 'steps',
+          plan: plan(step({ type: 'mouse_move', x: 1, y: 0, relative: 'yes' })),
+        }),
+      ],
+      [
+        'step mouse_button.button',
+        withAction({
+          type: 'steps',
+          plan: plan(step({ type: 'mouse_button', button: 'left2', state: 'click' })),
+        }),
+      ],
+      [
+        'step wheel.unit',
+        withAction({
+          type: 'steps',
+          plan: plan(step({ type: 'wheel', axis: 'vertical', amount: 1, unit: 'pixels' })),
+        }),
+      ],
+      [
+        'step paste_files.paths',
+        withAction({ type: 'steps', plan: plan(step({ type: 'paste_files', paths: 'a' })) }),
+      ],
+      [
+        'step paste_image.path',
+        withAction({ type: 'steps', plan: plan(step({ type: 'paste_image' })) }),
+      ],
+      ['replay.speed', withAction({ type: 'replay', plan: plan(), speed: '1' })],
+      ['replay.plan', withAction({ type: 'replay', speed: 1 })],
+      ['open.target', withAction({ type: 'open', target: null, args: [] })],
+      ['open.args (missing)', withAction({ type: 'open', target: 'x' })],
+      ['open.args (string)', withAction({ type: 'open', target: 'x', args: '-a -b' })],
+      [
+        'open.working_directory',
+        withAction({ type: 'open', target: 'x', args: [], working_directory: 3 }),
+      ],
+      ['reusable.action_id', withAction({ type: 'reusable', action_id: 1 })],
+      ['reusable.parameters', withAction({ type: 'reusable', action_id: 'a', parameters: [] })],
+      ['common.function', withAction({ type: 'common', function: null })],
+      ['quicker.parameter', withAction({ type: 'quicker', action_id: 'q' })],
+      ['parameter', { ...base, parameter: null }],
+      ['parameter.type', { ...base, parameter: { type: 'whatever' } }],
+      ['parameter.value', { ...base, parameter: { type: 'fixed', value: 3 } }],
+      ['parameter.template', { ...base, parameter: { type: 'capture_template' } }],
+      ['notification', { ...base, notification: null }],
+      ['notification.enabled', { ...base, notification: { enabled: 'yes', message: '' } }],
+      ['notification.message', { ...base, notification: { enabled: true } }],
+    ];
+
+    it.each(malformed)('treats a malformed %s as unreadable', (_, entry) => {
+      expect(isReadableRule(entry)).toBe(false);
+      // …and writes it back unchanged, in place.
+      const rules = [rule('a'), entry, rule('b')];
+      const next = replaceReadable(rules, [{ ...rule('a'), enabled: false }, rule('b')]);
+      expect(next[1]).toBe(entry);
+      expect(next).toHaveLength(3);
+    });
+  });
+
   it('finds the keys of a newer version', () => {
     expect(unknownRuleKeys(rule('a'))).toEqual([]);
     expect(unknownRuleKeys({ ...rule('a'), word_start_only: true, sensitive: false })).toEqual([

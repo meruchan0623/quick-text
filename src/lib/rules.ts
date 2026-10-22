@@ -1,5 +1,6 @@
 // Pure helpers for the rule list and editor (FE-12). They fix F-04 list items in the 0.4 shell and
 // are meant to be reused by the 0.5 components.
+import { isRecord, isRuleShape } from './ruleShape';
 
 /** Name shown for a rule without a group. */
 export const DEFAULT_GROUP = '默认';
@@ -28,8 +29,6 @@ export function pruneSelection(selected: string[], rules: readonly unknown[]): s
   return selected.every((id) => ids.has(id)) ? selected : selected.filter((id) => ids.has(id));
 }
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
 const record = (value: unknown): Record<string, unknown> => (isRecord(value) ? value : {});
 const text = (value: unknown): string => (typeof value === 'string' ? value : '');
 
@@ -38,38 +37,31 @@ const text = (value: unknown): string => (typeof value === 'string' ? value : ''
 // object) and unknown fields as extra keys. The UI lists such an entry read-only and writes every
 // entry and key back unchanged.
 
-/** The fields the UI reads from a rule; the backend sends all of them for a readable rule. */
+/**
+ * The top-level fields of a readable rule. `isReadableRule` checks every nested field too (see
+ * ./ruleShape.ts); the backend sends all of them for a rule it could read.
+ */
 export interface ReadableRule {
   id: string;
   enabled: boolean;
   group: string;
   description: string;
-  match: { value: string };
-  trigger_mode: string;
-  action: Record<string, unknown>;
-  parameter: Record<string, unknown>;
-  notification: Record<string, unknown>;
+  ignore_case: boolean;
+  match: { kind: 'literal' | 'regex'; value: string };
+  trigger_mode: 'terminator' | 'immediate';
+  terminator: { keys: string[]; consume: boolean } | null;
+  ime_erasure: 'escape' | 'backspace' | null;
+  action: Record<string, unknown> & { type: string };
+  parameter: Record<string, unknown> & { type: string };
+  notification: { enabled: boolean; message: string };
 }
 
-/** Whether a `rules` entry is a rule the UI can show and edit, or a raw unreadable entry. */
-export function isReadableRule(entry: unknown): entry is ReadableRule {
-  if (!isRecord(entry)) return false;
-  const { id, enabled, group, description, match, trigger_mode, action, parameter, notification } =
-    entry;
-  return (
-    typeof id === 'string' &&
-    typeof enabled === 'boolean' &&
-    typeof group === 'string' &&
-    typeof description === 'string' &&
-    isRecord(match) &&
-    typeof match.value === 'string' &&
-    typeof trigger_mode === 'string' &&
-    isRecord(action) &&
-    typeof action.type === 'string' &&
-    isRecord(parameter) &&
-    isRecord(notification)
-  );
-}
+/**
+ * Whether a `rules` entry is a rule the UI can show and edit, or a raw unreadable entry. Every
+ * nested field the list and the editor read is checked, per action, step and key type; an unknown
+ * type makes the entry unreadable.
+ */
+export const isReadableRule = (entry: unknown): entry is ReadableRule => isRuleShape(entry);
 
 /** The id of an unreadable entry, when it has a usable one. */
 export function unreadableId(entry: unknown): string | null {

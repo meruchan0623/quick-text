@@ -572,6 +572,70 @@ describe('tolerant reading (B-43)', () => {
     expect(ids).toEqual(['mock-rule-2', 'mock-unreadable-1', 'mock-rule-3', 'not a rule', null]);
   });
 
+  it('lists entries with a malformed nested field read-only and writes them back unchanged', async () => {
+    const rule = (id: string) => ({
+      id,
+      enabled: true,
+      group: '默认',
+      description: '',
+      ignore_case: false,
+      match: { kind: 'literal', value: `;${id}` },
+      trigger_mode: 'immediate',
+      terminator: null,
+      ime_erasure: null,
+      action: { type: 'none' },
+      parameter: { type: 'default_match' },
+      notification: { enabled: false, message: '' },
+    });
+    // One per nested field the list or the editor reads; each would throw if rendered as a rule.
+    const malformed = [
+      {
+        ...rule('bad-terminator'),
+        trigger_mode: 'terminator',
+        terminator: { keys: 42, consume: true },
+      },
+      { ...rule('bad-match'), match: { kind: 'literal', value: 5 } },
+      { ...rule('bad-ime'), ime_erasure: 7 },
+      { ...rule('bad-text'), action: { type: 'text', method: 'keys', source: null } },
+      { ...rule('bad-hotkey'), action: { type: 'hotkey', keys: 'ctrl+s' } },
+      {
+        ...rule('bad-steps'),
+        action: { type: 'steps', plan: { steps: [{ operation: { type: 'delay', ms: 1 } }] } },
+      },
+      { ...rule('bad-open'), action: { type: 'open', target: 'x', args: 'a b' } },
+      { ...rule('bad-future'), action: { type: 'from_the_future', payload: 1 } },
+      { ...rule('bad-parameter'), parameter: { type: 'fixed', value: 3 } },
+      { ...rule('bad-notification'), notification: null },
+    ];
+    const mounted = await mount({}, (backend) => {
+      backend.draft.rules.splice(1, 0, ...structuredClone(malformed));
+    });
+    const { backend, container } = mounted;
+    await waitFor(mounted, () => {
+      expect(container.querySelectorAll('tbody tr')).toHaveLength(3 + malformed.length);
+    });
+    const rows = [...container.querySelectorAll('tbody tr.unreadable-row')];
+    expect(rows.map((r) => r.querySelector('strong')?.textContent)).toEqual(
+      malformed.map(() => '无法读取的规则'),
+    );
+    expect(rows.map((r) => r.querySelector('.unreadable-id')?.textContent)).toEqual(
+      malformed.map((m) => m.id),
+    );
+    expect(rows.every((r) => !r.querySelector('input, button'))).toBe(true);
+
+    const toggle = container.querySelector<HTMLInputElement>('input[aria-label="停用 ;s2"]');
+    await mounted.act(() => {
+      toggle?.click();
+    });
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+    });
+    const saved = lastSaved(backend).rules;
+    expect(saved).toHaveLength(3 + malformed.length);
+    expect(saved.slice(1, 1 + malformed.length)).toEqual(malformed);
+    expect(saved.at(-2)).toMatchObject({ id: 'mock-rule-2', enabled: false });
+  });
+
   it('keeps unknown keys of the edited rule, the globals and the config', async () => {
     const mounted = await mountSample();
     const { backend, container } = mounted;
