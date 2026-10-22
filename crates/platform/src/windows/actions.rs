@@ -2,7 +2,9 @@
 //! cleanup, terminator and clipboard restore).
 use super::*;
 use super::{
-    clipboard::{acquire_clipboard, clipboard_formats, ClipboardLease, WinClipboard},
+    clipboard::{
+        acquire_clipboard, clipboard_formats, written_before_erase, ClipboardLease, WinClipboard,
+    },
     executor::CandidateProof,
     foreground::WinForeground,
     inject::{
@@ -310,8 +312,34 @@ where
         }
     }
     guarded(probe, s, &target, generation)?;
-    if let Some(lease) = clipboard.as_ref() {
-        lease.verify_current()?;
+    if let Some(lease) = clipboard.as_mut() {
+        // Plan §5.4 principle 4, "resolve first, then delete": a paste no
+        // earlier step can disturb is written and verified, baseline
+        // included, before the trigger is erased, so a refused write leaves
+        // the trigger in place. Its step then only re-verifies. Written but
+        // not erased, the lease's drop restores the clipboard. Without a
+        // trigger to erase, the write stays at its step.
+        let early = written_before_erase(&plan)
+            .filter(|_| erasure.is_some())
+            .and_then(|index| payloads.remove(&index))
+            .map(|mut prepared| {
+                lease.write_prepared(&mut prepared)?;
+                lease.verify_current()?;
+                guarded(probe, s, &target, generation)
+            });
+        match early {
+            Some(Err(message)) => {
+                return Ok(ExecutionResult {
+                    id: "erase".into(),
+                    status: "failed".into(),
+                    message,
+                    completed_steps: 0,
+                    side_effects: SENT_EFFECT.with(|flag| flag.get()),
+                });
+            }
+            Some(Ok(())) => {}
+            None => lease.verify_current()?,
+        }
     }
     if let Some(erasure) = &erasure {
         let erased = erase(injector, clock, erasure, || {

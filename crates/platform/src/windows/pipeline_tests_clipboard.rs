@@ -319,6 +319,71 @@ fn external_change_after_paste_is_never_overwritten() {
 }
 
 #[test]
+fn paste_is_written_before_the_trigger_is_erased() {
+    let mut rig = Rig::new(rule(None, OutputMethod::Paste));
+    let candidate = rig.type_str("btw").unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let (record, clipboard) = (seen.clone(), rig.clipboard.clone());
+    rig.on_first_backspace(move || {
+        *record.lock().unwrap() = Some((clipboard.clears(), clipboard.content()));
+    });
+    let result = rig.execute(&candidate).unwrap();
+    assert_eq!(result.status, "unknown", "{}", result.message);
+    let (clears, during) = seen.lock().unwrap().take().expect("trigger erased");
+    assert_eq!(clears, 1, "written before the first backspace");
+    assert_eq!(during, pasted(&rig.clipboard, EXPANSION));
+    assert_eq!(rig.chords(), 1);
+    // The paste step did not write again: paste write plus restore write.
+    assert_eq!(rig.clipboard.clears(), 2);
+    assert_eq!(rig.clipboard.content(), clip("original"));
+}
+
+#[test]
+fn refused_paste_write_keeps_the_trigger() {
+    for added in [true, false] {
+        let mut rig = Rig::new(rule(None, OutputMethod::Paste));
+        let candidate = rig.type_str("btw").unwrap();
+        if added {
+            // Locks: 0 backup, 1 backup verification, 2 paste write, 3 its
+            // verification. Another application adds a format in between.
+            let script = rig.clipboard.clone();
+            rig.clipboard.on_lock(move |index| {
+                if index == 3 {
+                    script.add_format(0xC0B1, vec![1, 2, 3]);
+                }
+            });
+        } else {
+            rig.clipboard.fail_set(1);
+        }
+        let result = rig.execute(&candidate).unwrap();
+        let name = if added { "added" } else { "write failed" };
+        assert_eq!(result.status, "failed", "{name}");
+        assert_eq!(result.completed_steps, 0, "{name}");
+        assert!(result.side_effects, "{name}: the clipboard was written");
+        assert!(
+            rig.injector.calls().is_empty(),
+            "{name}: no backspace, no paste chord"
+        );
+        if added {
+            assert_eq!(
+                result.message,
+                "Clipboard formats changed externally; clipboard preserved"
+            );
+            // No baseline, and the restore refuses too: the clipboard is
+            // left as it is.
+            let mut expected = pasted(&rig.clipboard, EXPANSION);
+            expected.push((0xC0B1, vec![1, 2, 3]));
+            assert_eq!(rig.clipboard.content(), expected);
+            assert_eq!(rig.clipboard.clears(), 1);
+        } else {
+            assert_eq!(result.message, "Clipboard write failed");
+            assert_eq!(rig.clipboard.content(), clip("original"));
+            assert_eq!(rig.clipboard.clears(), 2);
+        }
+    }
+}
+
+#[test]
 fn open_retry_is_bounded_and_exhaustion_degrades_the_clipboard() {
     let mut rig = Rig::new(rule(None, OutputMethod::Paste));
     rig.clipboard.set_busy(OPEN_ATTEMPTS - 1);
