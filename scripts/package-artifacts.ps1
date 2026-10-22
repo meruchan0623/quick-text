@@ -9,6 +9,10 @@ New-Item -ItemType Directory -Path $output -Force | Out-Null
 $exe = Join-Path $projectRoot 'target\release\quicker-text.exe'
 $installer = Join-Path $projectRoot "target\release\bundle\nsis\Quicker Text_${version}_x64-setup.exe"
 foreach ($file in @($exe, $installer)) { if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing build: $file" } }
+# The read-me-first notes belong to one version: a later release must not ship another version's notes
+# under its own file name (0.4+ writes docs\windows-<version>-notes.md before it is packaged).
+$notes = Join-Path $projectRoot "docs\windows-$version-notes.md"
+if (!(Test-Path -LiteralPath $notes -PathType Leaf)) { throw "Missing release notes: docs\windows-$version-notes.md (write it before packaging)" }
 $deliveries = [ordered]@{
     "Quicker-Text-$version-THIRD-PARTY-NOTICES.md" = Join-Path $projectRoot 'THIRD_PARTY_NOTICES.md'
     "Quicker-Text-$version-GPL-3.0.txt" = Join-Path $projectRoot 'LICENSE'
@@ -19,7 +23,7 @@ $deliveries = [ordered]@{
     "Quicker-Text-$version-浏览器与IME手测.md" = Join-Path $projectRoot 'docs\browser-ime-manual-tests.md'
     "Quicker-Text-$version-验收矩阵.md" = Join-Path $projectRoot 'docs\acceptance.md'
     "Quicker-Text-$version-构建验证记录.md" = Join-Path $projectRoot 'docs\build-verification.md'
-    "Quicker-Text-$version-先读与测试.md" = Join-Path $projectRoot 'docs\windows-0.3.1-notes.md'
+    "Quicker-Text-$version-先读与测试.md" = $notes
     "Quicker-Text-$version-浏览器测试页面.html" = Join-Path $projectRoot 'scripts\fixtures\browser-input.html'
 }
 $zipName = "Quicker-Text-$version-Source.zip"

@@ -1,0 +1,232 @@
+# Release workflow (development plan, section 11 "CI": job `release`; B-52, B-51, S-28).
+#
+# Trigger: push of a tag vMAJOR.MINOR.PATCH. A manual run (workflow_dispatch) does the same
+# build and the same checks as a dry run on the selected branch. Neither publishes anything:
+# the workflow has read-only permissions and only uploads workflow artifacts. The maintainer
+# creates the GitHub Release by hand from them, after the manual items in
+# docs/release-checklist.md.
+#
+#   licenses  (ubuntu)   cargo deny bans/licenses/sources must pass (S-28, B-51); advisories are
+#                        reported but do not block (a new advisory is not a reason to lose a
+#                        build, but the maintainer must read it)
+#   release   (windows)  needs `licenses`
+#     1. tag == package.json == tauri.conf.json == Cargo versions
+#     2. before the build, from the manifests alone:
+#          - no `fault-injection` / `mock` feature is enabled in the release configuration:
+#            `cargo tree -e features` (scripts/check-release-features.ps1, B-52)
+#          - the source allowlist covers every workspace crate (check-source-allowlist.ps1)
+#     3. cargo test --workspace, then the NSIS installer (tauri build, release profile)
+#     4. after the build, from the binaries:
+#          - the PDB is copied to the archive folder and searched for `debug_inject_fault`;
+#            the exe is searched too (scripts/check-binary-strings.ps1, B-52). Method: raw
+#            ASCII and UTF-16LE scan; the PDB of this build must contain `quicker_platform`
+#            (positive control: a scan of an empty or wrong file would find nothing as well)
+#     5. scripts/package-artifacts.ps1 (installer, exe, license text, notices, docs, Source.zip,
+#        SHA256SUMS), then check-source-allowlist.ps1 -Strict on the finished ZIP
+#     6. license / source-acquisition text for the release description
+#     7. upload: package, release notes, and the PDB as a separate artifact
+#
+# The PDB is not part of the package (it is for offline symbolication of crash records and
+# must not ship with the installer). GitHub keeps workflow artifacts for at most 90 days:
+# download the symbols artifact and archive it permanently, per version (see the checklist).
+name: release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  licenses:
+    name: licenses
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo deny (bans, licenses, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses sources
+          arguments: --locked
+
+      - name: cargo deny (advisories, informational)
+        continue-on-error: true
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+          arguments: --locked
+
+  release:
+    name: release
+    needs: licenses
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # The tag name goes through the environment, never into the script text.
+      - name: Versions agree (tag, manifests)
+        id: version
+        env:
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          $arguments = @()
+          if ($env:TAG) { $arguments = @('-Tag', $env:TAG) }
+          pwsh -NoProfile -File scripts/check-release-version.ps1 @arguments
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # --- checks that need no build ----------------------------------------------------
+
+      - name: Scanner self-test (B-52)
+        run: pwsh -NoProfile -File scripts/check-binary-strings.ps1 -SelfTest
+
+      # `cargo tree -e features`: the release configuration of quicker-text must not enable
+      # fault-injection or mock in any crate. Fails too when no crate defines those features
+      # any more (the check would pass vacuously).
+      - name: Release enables no fault-injection / mock (B-52)
+        run: pwsh -NoProfile -File scripts/check-release-features.ps1
+
+      - name: Source allowlist covers all crates (B-51)
+        run: pwsh -NoProfile -File scripts/check-source-allowlist.ps1 -Strict
+
+      - name: Hook-module lints (S-02)
+        run: pwsh -NoProfile -File scripts/check-hook-lints.ps1
+
+      # --- build ------------------------------------------------------------------------
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # tauri::generate_context! needs ../dist at compile time; `tauri build` rebuilds the
+      # real frontend into it afterwards.
+      - name: Create placeholder frontend dist
+        shell: bash
+        run: mkdir -p dist
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Build NSIS installer
+        run: npm run tauri -- build --bundles nsis
+
+      # The build must not have edited the lockfiles it was supposed to follow.
+      - name: Lockfiles unchanged by the build
+        run: git diff --exit-code -- Cargo.lock package-lock.json
+
+      # --- checks on the binaries (B-52) ------------------------------------------------
+
+      - name: Archive PDB
+        id: symbols
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $symbols = Join-Path $env:RUNNER_TEMP 'symbols'
+          New-Item -ItemType Directory -Path $symbols | Out-Null
+          $base = "Quicker-Text-$env:VERSION-Windows-x64"
+          $pdb = 'target/release/quicker_text.pdb'
+          $exe = 'target/release/quicker-text.exe'
+          foreach ($file in @($pdb, $exe)) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing build output: $file" }
+          }
+          Copy-Item -LiteralPath $pdb -Destination (Join-Path $symbols "$base.pdb")
+          @(
+            "version:    $env:VERSION"
+            "ref:        $env:GITHUB_REF_NAME ($env:GITHUB_REF_TYPE)"
+            "commit:     $env:GITHUB_SHA"
+            "rustc:      $(rustc --version)"
+            "exe sha256: $((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant())"
+            "pdb sha256: $((Get-FileHash -LiteralPath $pdb -Algorithm SHA256).Hash.ToLowerInvariant())"
+          ) | Set-Content -LiteralPath (Join-Path $symbols "$base.pdb.txt") -Encoding utf8
+          "path=$symbols" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+          "pdb=$(Join-Path $symbols "$base.pdb")" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+
+      # The forbidden name is looked up in the archived copy. quicker_platform is the positive
+      # control: it is in every PDB of this program, so an empty, truncated or wrongly encoded
+      # file cannot pass.
+      - name: Archived PDB has no debug_inject_fault (B-52)
+        run: pwsh -NoProfile -File scripts/check-binary-strings.ps1 "${{ steps.symbols.outputs.pdb }}" -RequirePresent quicker_platform
+
+      - name: Release exe has no debug_inject_fault (B-52)
+        run: pwsh -NoProfile -File scripts/check-binary-strings.ps1 target/release/quicker-text.exe -RequirePresent com.quickertext.desktop
+
+      # --- package ----------------------------------------------------------------------
+
+      - name: Package (installer, license, notices, Source.zip, SHA256SUMS)
+        run: pwsh -NoProfile -File scripts/package-artifacts.ps1 -OutputDirectory "$env:RUNNER_TEMP/release"
+
+      - name: Source ZIP covers every crate (B-51)
+        run: pwsh -NoProfile -File scripts/check-source-allowlist.ps1 -Strict -Zip "$env:RUNNER_TEMP/release/Quicker-Text-${{ steps.version.outputs.version }}-Source.zip"
+
+      - name: License and source-acquisition text (S-28)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          IS_TAG: ${{ github.ref_type == 'tag' }}
+        run: |
+          $notes = Join-Path $env:RUNNER_TEMP 'release-notes/release-notes.md'
+          $arguments = @{
+            Version       = $env:VERSION
+            SourceZip     = Join-Path $env:RUNNER_TEMP "release/Quicker-Text-$env:VERSION-Source.zip"
+            RepositoryUrl = $env:REPOSITORY_URL
+            Ref           = $env:REF_NAME
+            CommitSha     = $env:GITHUB_SHA
+            OutputFile    = $notes
+          }
+          if ($env:IS_TAG -eq 'true') { $arguments['IsTag'] = $true }
+          ./scripts/write-release-notes.ps1 @arguments
+          Get-Content -LiteralPath $notes -Raw -Encoding utf8 | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          '' | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          '### SHA256SUMS' | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          '```' | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          Get-Content -LiteralPath (Join-Path $env:RUNNER_TEMP "release/Quicker-Text-$env:VERSION-SHA256SUMS.txt") -Encoding utf8 | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          '```' | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+      # --- upload -----------------------------------------------------------------------
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Quicker-Text-${{ steps.version.outputs.version }}-package
+          path: ${{ runner.temp }}/release/*
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload release notes (license and source acquisition)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Quicker-Text-${{ steps.version.outputs.version }}-release-notes
+          path: ${{ runner.temp }}/release-notes/release-notes.md
+          if-no-files-found: error
+          retention-days: 90
+
+      # Separate on purpose: symbols are archived per version, not distributed.
+      - name: Upload PDB (symbols)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Quicker-Text-${{ steps.version.outputs.version }}-symbols
+          path: ${{ steps.symbols.outputs.path }}/*
+          if-no-files-found: error
+          retention-days: 90
