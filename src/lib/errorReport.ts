@@ -8,8 +8,8 @@
 //   it, origin and path included, and the filtering is the backend's. Function names are left out
 //   already here: the backend drops them anyway, and a name can come from data at run time (a
 //   computed property key).
-// - What a production build prints on the console is the class and the component names of React's
-//   component stack, each with `file.js:line:col` of the script it is in.
+// - What a production build prints on the console (errorLog.ts) is the class and the component
+//   names of React's component stack, each with `file.js:line:col` of the script it is in.
 
 /** `log_frontend_error` arguments (docs/ipc-contract-0.4.md §5). */
 export type FrontendErrorReport = {
