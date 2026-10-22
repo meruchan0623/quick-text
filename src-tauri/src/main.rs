@@ -2,6 +2,7 @@
 mod app_state;
 mod autostart;
 mod commands;
+mod diagnostics;
 mod error;
 mod events;
 mod store;
@@ -35,6 +36,15 @@ fn main() {
                 Some(dir) => dir,
                 None => app.path().app_data_dir()?,
             };
+            // Logging comes first so the store and every command can log
+            // (`CommandError::internal` trace ids must be findable).
+            diagnostics::logging::init(&dir);
+            tracing::info!(
+                event = "app.start",
+                version = env!("CARGO_PKG_VERSION"),
+                debug_build = cfg!(debug_assertions),
+                "Quicker Text starting"
+            );
             let store = store::Store::load(dir).map_err(std::io::Error::other)?;
             let engine = store.engine.clone();
             app.manage(Managed::new(store));
@@ -87,6 +97,12 @@ fn main() {
             commands::system::capture_selection,
             commands::system::exit_app
         ])
-        .run(tauri::generate_context!())
-        .expect("Quicker Text startup failed");
+        .build(tauri::generate_context!())
+        .expect("Quicker Text startup failed")
+        .run(|_, event| {
+            if let tauri::RunEvent::Exit = event {
+                tracing::info!(event = "app.exit", "Quicker Text exiting");
+                diagnostics::logging::flush();
+            }
+        });
 }
