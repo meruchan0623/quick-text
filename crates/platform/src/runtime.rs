@@ -175,7 +175,10 @@ struct PauseState {
 /// the outbox's `latest` → `health` → `pause`. `events` is never held
 /// together with any of them, and the event thread takes only `latest`,
 /// just long enough to copy it. `process` is only taken with at most
-/// `latest` held, and `history` alone. Listeners run on the event thread
+/// `latest` held. `history` is taken alone, except in
+/// [`Runtime::record`]: `events` → `history`, then `events` → `listeners`
+/// (read), so the seq order is the queue order (review A8); nothing takes
+/// `events` while holding `history` or `listeners`. Listeners run on the event thread
 /// with none of these held; the process probe never runs with `health` or
 /// `pause` held. Each subscription's `delivered` is taken only by the event
 /// thread, with none of these held. `failed_latch` is written only with
@@ -302,11 +305,16 @@ impl Runtime {
     /// Wakes the event thread without blocking, first queueing `execution`
     /// if given; starts the thread on first use (or after it exited). Never
     /// called with `latest`, `health` or `pause` held.
-    fn post(&self, mut execution: Option<HistoryEntry>) {
+    fn post(&self, execution: Option<HistoryEntry>) {
         if self.listeners.read().is_empty() {
             return;
         }
-        let mut thread = self.events.lock();
+        self.post_locked(&mut self.events.lock(), execution);
+    }
+
+    /// [`Runtime::post`] with `events` already held (as `thread`) and the
+    /// listener check done by the caller.
+    fn post_locked(&self, thread: &mut Option<EventThread>, mut execution: Option<HistoryEntry>) {
         if let Some(running) = thread.as_ref() {
             if running.post(&mut execution, &self.outbox.dropped) {
                 return;
@@ -597,11 +605,20 @@ impl Runtime {
     // ---- history ------------------------------------------------------
 
     /// Appends one execution to the history and emits `Execution`.
+    ///
+    /// Review A8: the seq is assigned and the entry queued under one lock
+    /// (`events`), so concurrent records reach the event thread, and every
+    /// subscriber, in seq order. Queueing never blocks (a bounded
+    /// `try_send`, see [`EventThread::post`]); the history ring and the
+    /// listener list are taken briefly inside it.
     pub fn record(&self, record: Record) -> HistoryEntry {
+        let mut thread = self.events.lock();
         let entry = self
             .history
             .push(record, self.clock.now(), self.clock.wall_ms());
-        self.post(Some(entry.clone()));
+        if !self.listeners.read().is_empty() {
+            self.post_locked(&mut thread, Some(entry.clone()));
+        }
         entry
     }
 
@@ -1124,6 +1141,45 @@ mod tests {
         wait_until("execution event", || !entries(&events.lock()).is_empty());
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(entries(&events.lock()), [entry]);
+    }
+
+    /// Review A8: records from several threads at once reach a subscriber
+    /// (the EventBus is one) in seq order, each once: the seq is assigned
+    /// and the entry queued under one lock. Before, two records could be
+    /// queued in the opposite order to their seqs.
+    #[test]
+    fn concurrent_records_reach_subscribers_in_seq_order() {
+        const THREADS: usize = 8;
+        // 800 in all, below the queue capacity even if nothing drained.
+        const EACH: usize = 100;
+        let (runtime, _) = runtime();
+        let events = collect(&runtime);
+        let start = Arc::new(std::sync::Barrier::new(THREADS));
+        let workers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let runtime = Arc::clone(&runtime);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    for _ in 0..EACH {
+                        runtime.record(execution("a"));
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let total = THREADS * EACH;
+        wait_until("every execution", || entries(&events.lock()).len() == total);
+        let seqs: Vec<u64> = entries(&events.lock()).iter().map(|e| e.seq).collect();
+        let out_of_order = seqs.windows(2).find(|pair| pair[0] >= pair[1]);
+        assert_eq!(
+            out_of_order, None,
+            "seqs reached the subscriber out of order"
+        );
+        assert_eq!(seqs.first(), Some(&1));
+        assert_eq!(seqs.last(), Some(&(total as u64)));
     }
 
     /// A unique snapshot per `n` (carried in `since_ms`), so the order in

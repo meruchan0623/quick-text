@@ -12,6 +12,7 @@ use quicker_platform::{
     },
     Shared,
 };
+use std::collections::BTreeSet;
 use std::sync::{atomic::Ordering, Arc, PoisonError};
 use tauri::{menu::MenuItem, AppHandle, Manager, Wry};
 use tauri_plugin_notification::NotificationExt;
@@ -189,17 +190,35 @@ impl Observer for TrayStatus {
 /// there before the bus sees its entry, and a run the executor fences
 /// (budget timeout) never sets it, while every run has exactly one entry.
 /// Not merged or rate-limited: a burst of failures notifies each one.
+///
+/// Review A8: "each `seq` once" is a bounded set of seen seqs, not "above
+/// the highest seen". The runtime queues entries in seq order, but an
+/// unseen lower seq arriving after a higher one (any reordering on the way)
+/// still notifies, and a redelivered one does not. The set keeps the last
+/// [`NOTICE_WINDOW`] seqs; older ones fold into `floor`, at or below which
+/// every seq counts as taken, so an entry more than that many entries late
+/// is dropped rather than risk a duplicate.
 #[derive(Default)]
 struct HistoryNotices {
-    last_seq: Option<u64>,
+    /// Seqs above `floor` already taken.
+    seen: BTreeSet<u64>,
+    /// Every seq at or below this counts as taken (history seqs start at 1).
+    floor: u64,
 }
+
+/// How many taken seqs [`HistoryNotices`] remembers individually.
+const NOTICE_WINDOW: usize = 256;
 
 impl HistoryNotices {
     fn take(&mut self, entry: &HistoryEntry, engine: &Shared) -> Option<(&'static str, String)> {
-        if self.last_seq.is_some_and(|seen| entry.seq <= seen) {
+        if entry.seq <= self.floor || !self.seen.insert(entry.seq) {
             return None;
         }
-        self.last_seq = Some(entry.seq);
+        if self.seen.len() > NOTICE_WINDOW {
+            if let Some(oldest) = self.seen.pop_first() {
+                self.floor = oldest;
+            }
+        }
         let config = engine.config.lock().unwrap_or_else(PoisonError::into_inner);
         entry_notification(entry, &config.rules)
     }
@@ -444,12 +463,8 @@ mod tests {
         let mut notices = HistoryNotices::default();
         let first = entry(5, "a", Outcome::Failed, ReasonCode::ClipboardBusy);
         assert!(notices.take(&first, &engine).is_some());
-        // Redelivered or older: nothing.
+        // Redelivered: nothing.
         assert_eq!(notices.take(&first, &engine), None);
-        assert_eq!(
-            notices.take(&entry(4, "a", Outcome::Failed, ReasonCode::Ok), &engine),
-            None
-        );
         // The id matches exactly: "ab" is not "a".
         assert_eq!(
             notices
@@ -479,6 +494,49 @@ mod tests {
             notices.take(&entry(10, "gone", Outcome::Failed, ReasonCode::Ok), &engine),
             None
         );
+    }
+
+    /// Review A8: seq 2 reaches the observer before seq 1. Both notify,
+    /// each exactly once.
+    #[test]
+    fn an_unseen_lower_seq_still_notifies_once() {
+        let engine = engine_with(vec![rule("a", true, "")]);
+        let mut notices = HistoryNotices::default();
+        let one = entry(1, "a", Outcome::Failed, ReasonCode::ClipboardBusy);
+        let two = entry(2, "a", Outcome::Succeeded, ReasonCode::Ok);
+        assert_eq!(notices.take(&two, &engine).map(|n| n.0), Some(SENT));
+        assert_eq!(notices.take(&one, &engine).map(|n| n.0), Some(FAILED));
+        assert_eq!(notices.take(&two, &engine), None);
+        assert_eq!(notices.take(&one, &engine), None);
+    }
+
+    /// Review A8: the seen set is bounded. Past the window the oldest seqs
+    /// fold into the floor: still never notified twice, and anything that
+    /// late is dropped; inside the window a gap is still filled.
+    #[test]
+    fn the_seen_window_is_bounded_and_never_notifies_twice() {
+        let engine = engine_with(vec![rule("a", true, "")]);
+        let mut notices = HistoryNotices::default();
+        let window = u64::try_from(NOTICE_WINDOW).unwrap();
+        // Seq 2 is missing; 1 and 3..=window+2 arrive.
+        for seq in std::iter::once(1).chain(3..=window + 2) {
+            let run = entry(seq, "a", Outcome::Failed, ReasonCode::Ok);
+            assert!(notices.take(&run, &engine).is_some(), "seq {seq}");
+        }
+        assert!(notices.seen.len() <= NOTICE_WINDOW);
+        // 1 folded into the floor: a redelivery is still refused.
+        assert_eq!(notices.floor, 1);
+        let one = entry(1, "a", Outcome::Failed, ReasonCode::Ok);
+        assert_eq!(notices.take(&one, &engine), None);
+        // 2 is above the floor and unseen: it notifies, once.
+        let two = entry(2, "a", Outcome::Failed, ReasonCode::Ok);
+        assert!(notices.take(&two, &engine).is_some());
+        assert_eq!(notices.floor, 2);
+        assert_eq!(notices.take(&two, &engine), None);
+        // The newest are still remembered individually.
+        let newest = entry(window + 2, "a", Outcome::Failed, ReasonCode::Ok);
+        assert_eq!(notices.take(&newest, &engine), None);
+        assert!(notices.seen.len() <= NOTICE_WINDOW);
     }
 
     #[test]

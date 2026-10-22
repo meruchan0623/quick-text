@@ -67,8 +67,9 @@ Rust 侧的共享类型在 `crates/platform/src/health.rs`，JSON 形状由其 s
 发送规则（`src-tauri/src/events.rs`）：
 
 - 只有 EventBus 的一个线程发送事件，`seq` 在发送时分配，所以事件按 `seq` 顺序到达。第一条事件的 `seq` 是 1。
+- 引擎分配历史 `seq` 与把条目交给 EventBus 在同一把锁内完成，所以 `execution-result` 所带条目的 `entry.seq` 随事件 `seq` 严格递增（被合并的条目只是不单独出现）。
 - 启动时的初始 Health / State / `revision` / `safe_mode` 都不推送，前端从 `load_state`（或 `get_runtime_snapshot`）取初值。`revision`、`safe_mode` 的初值在启动时（前端能调用命令之前）直接写进 EventBus 的记录作为基线，不占 `seq`；之后每次变化都以更大的 `seq` 推送一条 `store-state`，与基线相同的值不推送。
-- 合并与限速只影响推送；托盘图标的提示、「暂停监听 / 恢复监听」菜单项和执行通知看到每一次变化。Windows 的执行通知在限速之前逐条取历史条目，按条目自己的 `rule_id`、`outcome` 判断（规则开了通知才发），每个历史 `seq` 一次，所以被 `suppressed` 合并的条目、被执行器超时围栏结束的执行也各有通知；macOS 没有执行历史，仍轮询最后一次结果。
+- 合并与限速只影响推送；托盘图标的提示、「暂停监听 / 恢复监听」菜单项和执行通知看到每一次变化。Windows 的执行通知在限速之前逐条取历史条目，按条目自己的 `rule_id`、`outcome` 判断（规则开了通知才发），每个历史 `seq` 一次（记住最近 256 个已通知的 `seq`；比已通知的更小但没见过的 `seq` 照样通知，晚到超过这个窗口的条目不再通知，以免重复），所以被 `suppressed` 合并的条目、被执行器超时围栏结束的执行也各有通知；macOS 没有执行历史，仍轮询最后一次结果。
 - 合并中、尚未发出的值不会出现在任何事件里，也不在 `get_runtime_snapshot` 里，直到它以更大的 `seq` 发出。
 
 类型细节（与 `health.rs` 一致）：
