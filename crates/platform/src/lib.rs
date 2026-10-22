@@ -124,6 +124,9 @@ pub fn start_recording(shared: &Arc<Shared>) -> Result<(), String> {
     shared.paused.store(true, Ordering::SeqCst);
     shared.cancel.store(false, Ordering::SeqCst);
     shared.generation.fetch_add(1, Ordering::SeqCst);
+    // A new recording session, under the recording lock (M2).
+    #[cfg(windows)]
+    windows::recording_started();
     *r = Some(vec![]);
     Ok(())
 }

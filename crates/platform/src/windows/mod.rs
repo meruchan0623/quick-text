@@ -26,19 +26,33 @@ mod ime;
 mod inject;
 mod input;
 mod keystate;
+mod liveness;
 mod observer;
 #[cfg(test)]
 mod pipeline_tests;
+#[cfg(test)]
+mod pipeline_tests_input;
 mod protection;
 mod rawinput;
 mod recording;
 mod selection;
+mod session;
 pub use actions::{execute, preflight};
 pub use clipboard::clipboard_health;
 pub use foreground::{cursor, foreground};
 pub use input::{engine_ready, input_status, native_ready};
+pub use input::{input_health, reattach};
+pub use recording::finish_and_take;
 pub use recording::finish_recording;
+pub(crate) use recording::recording_started;
 pub use selection::capture_selection;
+pub use session::on_session_end;
+// S-19: the runtime wires the busy-drop sink to the executor's history at merge.
+#[allow(
+    unused_imports,
+    reason = "S-19: used once the runtime installs the sink"
+)]
+pub(crate) use rawinput::{set_dropped_busy_sink, DroppedBusy};
 const MARK: usize = 0x51545854;
 static LAST_GATE: OnceLock<Mutex<String>> = OnceLock::new();
 fn gate(reason: &str) {

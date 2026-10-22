@@ -60,7 +60,7 @@ impl Rig {
     fn new(rule: Rule) -> Self {
         // Physical key state is still a global mirror (boundary): start with
         // nothing held so `physical()` never falls back to GetAsyncKeyState.
-        keystate::PHYSICAL.set(Mutex::new(BTreeSet::new())).ok();
+        keystate::PHYSICAL.mark_seeded();
         let shared = Shared::new();
         shared.paused.store(false, Ordering::SeqCst);
         let config = Config {
