@@ -1,6 +1,7 @@
 // In-memory mock backend (FE-18): answers every command the frontend uses, 0.3 and 0.4, and can
-// push the four runtime events. Used by the browser preview (`npm run dev` outside Tauri, or
-// VITE_MOCK=1) and by Vitest. All sample data is synthetic; no real user phrases.
+// push the four runtime events. Used by the development browser preview (`npm run dev` outside
+// Tauri, or VITE_MOCK=1) and by Vitest, never by a production build (see ./transport). All sample
+// data is synthetic; no real user phrases.
 //
 // Preview switches (query string): ?mock=empty|200|10000 (rule count, default 200),
 // &mock-legacy=1 (behave like a 0.3 backend), &mock-health=<HealthState>,

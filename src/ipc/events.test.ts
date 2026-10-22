@@ -12,6 +12,7 @@ import {
   type Schedule,
 } from './events';
 import { createMockTransport, MockBackend, type MockOptions } from './mock';
+import { BackendUnavailableError } from './transport';
 import { EVENT_NAMES, type RuntimeSnapshot } from './types';
 
 describe('SeqLedger', () => {
@@ -356,6 +357,29 @@ describe('RuntimeSync', () => {
     await settle();
     expect(sync.getView().status).toBe('ready');
     expect(clock.waiting()).toEqual([]);
+  });
+
+  it('does not keep retrying when there is no desktop backend at all', async () => {
+    const focus = new EventTarget();
+    const clock = manualClock();
+    const asked: string[] = [];
+    const nothing: RuntimeIo = {
+      listen: () => Promise.reject(new BackendUnavailableError()),
+      invoke: (command) => {
+        asked.push(command);
+        return Promise.reject(new BackendUnavailableError());
+      },
+    };
+    const sync = new RuntimeSync(nothing, focus, clock.schedule);
+    syncs.push(sync);
+    await sync.start();
+    expect(sync.getView().status).toBe('connecting');
+    expect(clock.waiting()).toEqual([]);
+    // Focus still asks once (cheap, and harmless), but schedules nothing either.
+    focus.dispatchEvent(new Event('focus'));
+    await settle();
+    expect(clock.waiting()).toEqual([]);
+    expect(asked).toEqual(['get_runtime_snapshot', 'get_runtime_snapshot']);
   });
 });
 

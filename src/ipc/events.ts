@@ -9,7 +9,7 @@
 // failed, or followed by a gap), one retry scheduled with a capped backoff.
 import { useEffect, useSyncExternalStore } from 'react';
 import { isMissingCommand } from './errors';
-import { invoke, listen, type Transport, type Unlisten } from './transport';
+import { invoke, isBackendUnavailable, listen, type Transport, type Unlisten } from './transport';
 import type {
   EngineState,
   EventName,
@@ -255,6 +255,10 @@ export class RuntimeSync {
         // A 0.3 backend: no snapshots and no events, now or later.
         this.#held = [];
         this.#set({ ...this.#view, status: 'unsupported' });
+      } else if (isBackendUnavailable(e)) {
+        // A production build outside the desktop app: nothing will ever answer, so no retry loop.
+        // The view stays 「未连接」 and App shows 「未连接到桌面后端」.
+        this.#held = [];
       } else {
         // Keep the view (still consistent) and go on from it; try again later.
         this.#settle(false);

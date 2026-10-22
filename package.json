@@ -14,6 +14,7 @@
     "format": "prettier --check src index.html package.json tsconfig.json vite.config.ts vitest.config.ts eslint.config.js .prettierrc",
     "format:write": "prettier --write src index.html package.json tsconfig.json vite.config.ts vitest.config.ts eslint.config.js .prettierrc",
     "test": "vitest run",
+    "check:bundle": "node scripts/check-bundle.mjs",
     "doctor": "npm run typecheck && npm run lint && npm run format && npm run test"
   },
   "dependencies": {

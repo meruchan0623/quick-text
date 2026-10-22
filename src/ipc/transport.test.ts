@@ -1,0 +1,85 @@
+// Transport selection: the mock backend only ever answers in development, a production build always
+// talks to Tauri, and outside the desktop app it says so instead of falling back to sample data.
+// `inTauri` is captured when the module loads, so every case imports a fresh copy after setting up
+// the environment.
+import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { errorText } from './errors';
+
+type TransportModule = typeof import('./transport');
+
+async function freshTransport(env: { dev: boolean; mock?: string }): Promise<TransportModule> {
+  vi.stubEnv('DEV', env.dev);
+  if (env.mock !== undefined) vi.stubEnv('VITE_MOCK', env.mock);
+  vi.resetModules();
+  return import('./transport');
+}
+
+/** Pretend to run inside the Tauri webview; `load_state` answers with a marker. */
+function insideTauri(): void {
+  mockIPC((command) => (command === 'load_state' ? { from: 'tauri' } : null));
+}
+
+const globals = globalThis as { quickerMock?: unknown };
+const tauriWindow = window as { __TAURI_INTERNALS__?: unknown };
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+  clearMocks();
+  delete tauriWindow.__TAURI_INTERNALS__;
+  delete globals.quickerMock;
+});
+
+describe('production build', () => {
+  it('outside Tauri rejects every call with 「未连接到桌面后端」', async () => {
+    const transport = await freshTransport({ dev: false });
+    expect(transport.usesMock).toBe(false);
+
+    const error: unknown = await transport.invoke('load_state').catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(transport.BackendUnavailableError);
+    expect(transport.isBackendUnavailable(error)).toBe(true);
+    expect((error as Error).message).toBe(transport.NOT_CONNECTED_TEXT);
+    expect(errorText(error)).toBe('未连接到桌面后端');
+
+    await expect(transport.call('load_state')).rejects.toThrow('未连接到桌面后端');
+    await expect(transport.listen('engine-state', () => undefined)).rejects.toThrow(
+      '未连接到桌面后端',
+    );
+    expect(globals.quickerMock).toBeUndefined();
+  });
+
+  it('ignores VITE_MOCK=1: still no mock outside Tauri', async () => {
+    const transport = await freshTransport({ dev: false, mock: '1' });
+    expect(transport.usesMock).toBe(false);
+    await expect(transport.invoke('load_state')).rejects.toThrow('未连接到桌面后端');
+    expect(globals.quickerMock).toBeUndefined();
+  });
+
+  it('inside Tauri uses the real IPC, even with VITE_MOCK=1', async () => {
+    insideTauri();
+    const transport = await freshTransport({ dev: false, mock: '1' });
+    expect(transport.usesMock).toBe(false);
+    await expect(transport.invoke('load_state')).resolves.toEqual({ from: 'tauri' });
+  });
+});
+
+describe('development', () => {
+  it('outside Tauri the preview mock answers', async () => {
+    const transport = await freshTransport({ dev: true });
+    expect(transport.usesMock).toBe(true);
+    const state = await transport.invoke<{ draft: { rules: unknown[] } }>('load_state');
+    expect(state.draft.rules.length).toBeGreaterThan(0);
+    expect(globals.quickerMock).toBeDefined();
+  });
+
+  it('inside Tauri uses the real IPC unless VITE_MOCK=1', async () => {
+    insideTauri();
+    const real = await freshTransport({ dev: true });
+    expect(real.usesMock).toBe(false);
+    await expect(real.invoke('load_state')).resolves.toEqual({ from: 'tauri' });
+
+    const mocked = await freshTransport({ dev: true, mock: '1' });
+    expect(mocked.usesMock).toBe(true);
+    await expect(mocked.invoke('load_state')).resolves.not.toEqual({ from: 'tauri' });
+  });
+});

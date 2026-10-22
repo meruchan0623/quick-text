@@ -68,7 +68,11 @@ async function mount(
 }
 
 /** Poll until `check` passes, letting React and the mock's promises settle in between. */
-async function waitFor({ act }: Mounted, check: () => void, timeout = 2000): Promise<void> {
+async function waitFor(
+  { act }: Pick<Mounted, 'act'>,
+  check: () => void,
+  timeout = 2000,
+): Promise<void> {
   const started = Date.now();
   for (;;) {
     try {
@@ -687,5 +691,40 @@ describe('tolerant reading (B-43)', () => {
     });
     expect(lastSaved(backend).globals.future_global).toBe('kept');
     expect(lastSaved(backend).future_setting).toEqual({ sample: true });
+  });
+});
+
+describe('production build outside the desktop app', () => {
+  it('shows 「未连接到桌面后端」 instead of falling back to sample data', async () => {
+    // What a release bundle sees when opened in a plain browser: no Tauri and no mock.
+    vi.stubEnv('DEV', false);
+    vi.resetModules();
+    const react = await import('react');
+    const { createRoot } = await import('react-dom/client');
+    const { default: App } = await import('./App');
+    const container = document.createElement('div');
+    document.body.append(container);
+    const root = createRoot(container);
+    const act: Act = async (callback) => {
+      await react.act(async () => {
+        await callback();
+      });
+    };
+    cleanups.push(async () => {
+      await act(() => {
+        root.unmount();
+      });
+      container.remove();
+      vi.unstubAllEnvs();
+    });
+    await act(() => {
+      root.render(react.createElement(App));
+    });
+
+    await waitFor({ act }, () => {
+      expect(container.querySelector('[role="alert"]')?.textContent).toContain('未连接到桌面后端');
+    });
+    expect(headerStatus(container)).toBe('未连接');
+    expect((globalThis as { quickerMock?: unknown }).quickerMock).toBeUndefined();
   });
 });
