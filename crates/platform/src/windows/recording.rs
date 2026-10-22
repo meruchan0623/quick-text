@@ -34,6 +34,21 @@ impl RecordMeta {
 }
 /// No recording has run yet.
 static RECORD_META: Mutex<RecordMeta> = Mutex::new(RecordMeta::new(true));
+/// The recording session: advanced each time a recording starts
+/// ([`recording_started`]), so a stop requested during one recording never
+/// ends a later one (M2). 0 before the first recording.
+static SESSION: AtomicU64 = AtomicU64::new(0);
+/// The current recording session; the hooks stamp a stop gesture with it.
+/// One atomic load.
+pub(super) fn recording_session() -> u64 {
+    SESSION.load(Ordering::SeqCst)
+}
+/// A new recording session starts. `start_recording` calls this while it
+/// holds the recording lock, just before it opens the recording, so a stop
+/// checked under that lock always sees which session is current.
+pub(crate) fn recording_started() {
+    SESSION.fetch_add(1, Ordering::SeqCst);
+}
 /// The delay to record between two events captured at hook ticks `from`
 /// and `to` (ms). The tick count wraps, so the gap is taken modulo 2^32; a
 /// gap of more than half the range means `to` came first and counts as no
@@ -97,12 +112,28 @@ pub(super) fn record_event(shared: &Shared, operation: Operation, time: u32) {
     }
     rows.push(Step::new(operation, SourceSpan::default()));
 }
-/// Stops the active recording (Ctrl+Shift+Esc or [`finish_recording`]):
-/// drops the gesture's own Ctrl/Shift presses and releases whatever is
-/// still held. Once per recording; a second stop adds nothing. A stop
-/// before anything was recorded holds as well (M2).
-pub(super) fn stop_record_events(shared: &Shared) {
+/// The stop gesture (Ctrl+Shift+Esc) pressed during recording session
+/// `session` reached the consumer: stops the recording if that session is
+/// still the current one. A stop from an earlier session is stale (its
+/// recording was finished and a new one started before the consumer got
+/// to it) and is dropped (M2).
+pub(super) fn stop_requested(shared: &Shared, session: u64) {
     let mut recorded = shared.recording.lock().unwrap();
+    let current = SESSION.load(Ordering::SeqCst);
+    if session != current {
+        tracing::debug!(event = "recording.stop_stale", session, current);
+        return;
+    }
+    stop_rows(&mut recorded);
+}
+/// Stops the active recording ([`finish_recording`]).
+pub(super) fn stop_record_events(shared: &Shared) {
+    stop_rows(&mut shared.recording.lock().unwrap());
+}
+/// Stops `recorded`: drops the stop gesture's own Ctrl/Shift presses and
+/// releases whatever is still held. Once per recording; a second stop adds
+/// nothing. A stop before anything was recorded holds as well (M2).
+fn stop_rows(recorded: &mut Option<Vec<Step>>) {
     let Some(rows) = recorded.as_mut() else {
         return;
     };

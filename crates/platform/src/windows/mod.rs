@@ -42,6 +42,7 @@ pub use foreground::{cursor, foreground};
 pub use input::{engine_ready, input_status, native_ready};
 pub use input::{input_health, reattach};
 pub use recording::finish_recording;
+pub(crate) use recording::recording_started;
 pub use selection::capture_selection;
 pub use session::on_session_end;
 const MARK: usize = 0x51545854;

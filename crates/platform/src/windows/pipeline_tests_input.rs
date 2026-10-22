@@ -24,7 +24,7 @@ use super::keystate::{
 };
 use super::liveness::{MATCH_WINDOW, MISS_LIMIT, REPEAT_RUN};
 use super::rawinput::{raw_record, InputEvent, RawRecord, KEYBOARD_LAYOUT_CACHE_INTERVAL};
-use super::recording::capture_gap;
+use super::recording::{capture_gap, recording_started};
 use super::session::{end_message, SessionEnd, SessionSignals, Signal};
 use super::*;
 use crate::health::{Component, ComponentHealth, HealthState, ReasonCode};
@@ -393,7 +393,7 @@ fn hook_and_raw_callback_bodies_neither_allocate_nor_block() {
                     ..
                 }),
                 HookRecord::Key(KeyRecord { vk: VK_LSHIFT, .. }),
-                HookRecord::Cancel,
+                HookRecord::Cancel { .. },
                 HookRecord::Move { x: -5, y: 7, .. },
                 HookRecord::Mouse {
                     msg: WM_LBUTTONDOWN,
@@ -610,10 +610,13 @@ fn mouse_at(msg: u32, x: i32, y: i32, time: u32) -> MouseInfo {
         ..mouse(msg, x, y)
     }
 }
-/// Starts a recording on `shared` (callers hold [`serial`]: the recorder's
-/// bookkeeping is global).
+/// Starts a recording on `shared` the way `start_recording` does: a new
+/// session, then the empty recording, under the recording lock (callers
+/// hold [`serial`]: the recorder's bookkeeping is global).
 fn begin_recording(shared: &Shared) {
-    *shared.recording.lock().unwrap() = Some(vec![]);
+    let mut rows = shared.recording.lock().unwrap();
+    recording_started();
+    *rows = Some(vec![]);
 }
 /// Ends the recording on `shared` the way the app does (finish, then take)
 /// and returns what it recorded.
@@ -888,6 +891,40 @@ fn a_stop_before_the_first_recorded_event_still_holds() {
     handle_key(&hooks, &shared, &probe, WM_KEYDOWN, key_at(0x44, 9_000));
     drain(&mut consumer, &shared, &hooks, &raw, &probe);
     assert_eq!(recorded(&shared), [key_down(0x44), key_up(0x44)]);
+}
+
+/// M2: a stop gesture stops only the recording it was pressed in. The
+/// consumer stalls while the user presses the gesture during recording A,
+/// once with room in the hook queue (a queued stop record) and once with
+/// the queue full (the overflow stop); the app finishes and takes A and
+/// starts B before the consumer catches up. That stop is stale: B keeps
+/// recording what follows.
+#[test]
+fn a_stop_from_a_finished_recording_never_stops_the_next_one() {
+    let _serial = serial();
+    for capacity in [32, 3] {
+        let shared = engine("btw");
+        let hooks = HookPipe::new(leaked_keys(), capacity, false, nothing);
+        let raw = Lane::new(4, nothing);
+        let probe = FixedProbe(context());
+        let mut consumer = Consumer::with_windows(NOT_OURS);
+        begin_recording(&shared);
+        handle_key(&hooks, &shared, &probe, WM_KEYDOWN, key_at(0x41, 0));
+        stop_gesture(&hooks, &shared, &probe, 10);
+        let overflowed = u64::from(capacity == 3);
+        assert_eq!(hooks.lane().dropped(), overflowed, "capacity {capacity}");
+        // The app ends A and starts B; the consumer has drained nothing.
+        assert!(recorded(&shared).is_empty(), "capacity {capacity}");
+        begin_recording(&shared);
+        drain(&mut consumer, &shared, &hooks, &raw, &probe);
+        after_stop(&hooks, &shared, &probe, 0x43, &mut || {
+            drain(&mut consumer, &shared, &hooks, &raw, &probe);
+        });
+        let b = recorded(&shared);
+        for step in [key_down(0x43), key_up(0x43), left(ButtonState::Down)] {
+            assert!(b.contains(&step), "capacity {capacity}: {b:?}");
+        }
+    }
 }
 
 /// no-regression #7: the detector never caches the layout, and each key

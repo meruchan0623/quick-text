@@ -31,7 +31,7 @@ use super::{
     rawinput::{
         acceptance_event, detect_candidate, event_from, note_source, Buffer, Event, RawRecord,
     },
-    recording::{record_event, stop_record_events},
+    recording::{record_event, stop_requested},
     session::{self, SessionSignals, Signal},
 };
 use crate::fault::{self, FaultPoint};
@@ -183,6 +183,14 @@ fn own_window_at(x: i32, y: i32) -> bool {
 fn recording(shared: &Shared) -> bool {
     shared.recording.try_lock().is_ok_and(|rows| rows.is_some())
 }
+/// Applies a stop gesture that overflowed the hook queue (M2) to the
+/// recording session it was pressed in; stale ones are dropped.
+fn take_overflowed_stop(shared: &Shared, hooks: &HookPipe) {
+    let session = hooks.take_stop();
+    if session != 0 {
+        stop_requested(shared, session);
+    }
+}
 
 /// Consumer state: the typed-key buffer, the logged lane counters and the
 /// physical key transitions each source saw since the last liveness tick.
@@ -215,12 +223,10 @@ impl Consumer {
         let mut handled = 0;
         while let Some(record) = hooks.lane().pop() {
             handled += 1;
-            // M2: a stop gesture that overflowed the queue ends the
+            // M2: a stop gesture that overflowed the queue ends its
             // recording before this record is accepted. Checked after the
             // pop: a record pushed after the stop then always sees it.
-            if hooks.take_stop() {
-                stop_record_events(shared);
-            }
+            take_overflowed_stop(shared, hooks);
             if let HookRecord::Key(key) = &record {
                 if key.hardware {
                     self.seen.push((Source::Hook, key.vk, key.down));
@@ -229,9 +235,7 @@ impl Consumer {
             self.hook_record(shared, record, probe, enqueue);
         }
         // ...and with nothing queued behind it.
-        if hooks.take_stop() {
-            stop_record_events(shared);
-        }
+        take_overflowed_stop(shared, hooks);
         while let Some(record) = raw.pop() {
             handled += 1;
             // Every record is a hardware key transition, with or without
@@ -257,7 +261,7 @@ impl Consumer {
     ) {
         match record {
             HookRecord::External => gate("External simulated input filtered; matching invalidated"),
-            HookRecord::Cancel => stop_record_events(shared),
+            HookRecord::Cancel { session } => stop_requested(shared, session),
             HookRecord::Key(key) => {
                 let code = Key::WindowsCode { code: key.vk };
                 self.record_key(

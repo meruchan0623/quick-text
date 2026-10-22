@@ -22,6 +22,7 @@ use super::{
     foreground::WinForeground,
     input::{self, Lane},
     keystate::{own_input, KeyBits, PHYSICAL},
+    recording::recording_session,
 };
 use crate::fault::{self, FaultPoint};
 use crate::traits::{ForegroundProbe, InputContext};
@@ -120,9 +121,13 @@ pub(super) enum HookRecord {
     /// An external injected key was filtered (no-regression #4).
     External,
     /// Ctrl+Shift+Esc cancelled the running action and stops a recording
-    /// here, in queue order. When this record does not fit, the stop
-    /// travels as [`HookPipe::take_stop`] instead (M2).
-    Cancel,
+    /// here, in queue order: the recording of `session`, the recording
+    /// session current when the gesture was pressed, and no later one. When
+    /// this record does not fit, the stop travels as
+    /// [`HookPipe::take_stop`] instead (M2).
+    Cancel {
+        session: u64,
+    },
     /// A click or wheel message, with its capture time.
     Mouse {
         msg: u32,
@@ -147,9 +152,10 @@ pub(super) struct HookPipe<'k> {
     /// Acceptance mode, fixed at startup (reading it may allocate).
     test_mode: bool,
     /// A recording stop whose [`HookRecord::Cancel`] did not fit in the
-    /// queue (M2). A flag cannot be dropped; the consumer takes it before it
-    /// accepts the next record.
-    stop: AtomicBool,
+    /// queue (M2): the recording session it was pressed in, 0 for none. It
+    /// cannot be dropped; the consumer takes it before it accepts the next
+    /// record.
+    stop: AtomicU64,
 }
 impl<'k> HookPipe<'k> {
     pub(super) fn new(keys: &'k KeyBits, capacity: usize, test_mode: bool, wake: fn()) -> Self {
@@ -157,16 +163,16 @@ impl<'k> HookPipe<'k> {
             lane: Lane::new(capacity, wake),
             keys,
             test_mode,
-            stop: AtomicBool::new(false),
+            stop: AtomicU64::new(0),
         }
     }
     pub(super) fn lane(&self) -> &Lane<HookRecord> {
         &self.lane
     }
-    /// Consumer side: whether a stop gesture overflowed the queue since the
-    /// last call.
-    pub(super) fn take_stop(&self) -> bool {
-        self.stop.swap(false, Ordering::SeqCst)
+    /// Consumer side: the recording session of a stop gesture that
+    /// overflowed the queue since the last call, or 0.
+    pub(super) fn take_stop(&self) -> u64 {
+        self.stop.swap(0, Ordering::SeqCst)
     }
 }
 /// The production pipe over the global key mirror; created once, before the
@@ -217,11 +223,14 @@ pub(super) fn on_key(
         shared.cancel.store(true, Ordering::SeqCst);
         shared.generation.fetch_add(1, Ordering::SeqCst);
         observer::CARET_EPOCH.fetch_add(1, Ordering::SeqCst);
-        if !pipe.lane.push(HookRecord::Cancel) {
-            // M2: a full queue must not swallow the stop. Set before any
-            // later record is pushed, so the consumer sees it no later
-            // than the first record that follows the gesture.
-            pipe.stop.store(true, Ordering::SeqCst);
+        // M2: the stop belongs to the recording session current now; the
+        // consumer drops it if another recording has started since.
+        let session = recording_session();
+        if !pipe.lane.push(HookRecord::Cancel { session }) {
+            // A full queue must not swallow the stop. Set before any later
+            // record is pushed, so the consumer sees it no later than the
+            // first record that follows the gesture.
+            pipe.stop.store(session, Ordering::SeqCst);
             pipe.lane.wake();
         }
         return HookAction::Swallow;
