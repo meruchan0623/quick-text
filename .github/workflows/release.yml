@@ -15,16 +15,26 @@
 #          - no `fault-injection` / `mock` feature is enabled in the release configuration:
 #            `cargo tree -e features` (scripts/check-release-features.ps1, B-52)
 #          - the source allowlist covers every workspace crate (check-source-allowlist.ps1)
-#     3. cargo test --workspace, then the NSIS installer (tauri build, release profile)
-#     4. after the build, from the binaries:
+#     3. cargo test --workspace
+#     4. third-party notices (S-28): scripts/generate-third-party-licenses.ps1 writes the
+#        copyright and license texts of every distributed Rust crate and npm package and FAILS
+#        when one has no license text; the file replaces the committed placeholder in
+#        src-tauri/resources, which tauri.conf.json bundles into the installer
+#     5. the NSIS installer (tauri build, release profile); the bundled notice file must be the
+#        generated one (hash check), then the placeholder is restored so Source.zip stays clean
+#     6. after the build, from the binaries:
 #          - the PDB is copied to the archive folder and searched for `debug_inject_fault`;
 #            the exe is searched too (scripts/check-binary-strings.ps1, B-52). Method: raw
 #            ASCII and UTF-16LE scan; the PDB of this build must contain `quicker_platform`
 #            (positive control: a scan of an empty or wrong file would find nothing as well)
-#     5. scripts/package-artifacts.ps1 (installer, exe, license text, notices, docs, Source.zip,
-#        SHA256SUMS), then check-source-allowlist.ps1 -Strict on the finished ZIP
-#     6. license / source-acquisition text for the release description
-#     7. upload: package, release notes, and the PDB as a separate artifact
+#     7. dependency sources (S-28): scripts/package-dependency-sources.ps1 builds
+#        Source-deps.zip (cargo vendor --locked plus the production npm packages; offline
+#        resolution is verified). Source.zip and Source-deps.zip together are the complete
+#        corresponding source, so packaging fails without it
+#     8. scripts/package-artifacts.ps1 (installer, exe, license text, notices, docs, Source.zip,
+#        Source-deps.zip, SHA256SUMS), then check-source-allowlist.ps1 -Strict on the finished ZIP
+#     9. license / source-acquisition text for the release description
+#    10. upload: package, release notes, and the PDB as a separate artifact
 #
 # The PDB is not part of the package (it is for offline symbolication of crash records and
 # must not ship with the installer). GitHub keeps workflow artifacts for at most 90 days:
@@ -128,8 +138,49 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      # --- third-party notices (S-28) ---------------------------------------------------
+
+      # Fails (and writes nothing) when any distributed crate or npm package has no license
+      # text, so the installer can never ship an incomplete notice file. The generated file
+      # goes to RUNNER_TEMP first; the copy in src-tauri/resources (committed placeholder,
+      # bundled by tauri.conf.json bundle.resources) is overwritten for the build only.
+      - name: Generate third-party notices
+        run: |
+          $notices = Join-Path $env:RUNNER_TEMP 'notices/THIRD-PARTY-LICENSES.txt'
+          pwsh -NoProfile -File scripts/generate-third-party-licenses.ps1 -OutputFile $notices
+          if ($LASTEXITCODE -ne 0) { throw 'Third-party notice generation failed' }
+          Copy-Item -LiteralPath $notices -Destination src-tauri/resources/THIRD-PARTY-LICENSES.txt -Force
+
       - name: Build NSIS installer
         run: npm run tauri -- build --bundles nsis
+
+      # The bundler read src-tauri/resources/THIRD-PARTY-LICENSES.txt, and tauri-build copied it next
+      # to the exe: both must be the generated file, not the placeholder. The installer itself
+      # is listed with 7-Zip as an extra look (NSIS layout is not guaranteed to be listable, so
+      # that part only warns; the checklist asks for a manual look at an installed copy).
+      - name: Installer bundles the generated notice file (S-28)
+        run: |
+          $expected = (Get-FileHash -LiteralPath (Join-Path $env:RUNNER_TEMP 'notices/THIRD-PARTY-LICENSES.txt') -Algorithm SHA256).Hash
+          foreach ($copy in @('src-tauri/resources/THIRD-PARTY-LICENSES.txt', 'target/release/THIRD-PARTY-LICENSES.txt')) {
+            if (-not (Test-Path -LiteralPath $copy -PathType Leaf)) { throw "Missing $copy after the build" }
+            if ((Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash -ne $expected) { throw "$copy is not the generated notice file" }
+          }
+          $installer = Get-ChildItem -LiteralPath target/release/bundle/nsis -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'NSIS installer not found' }
+          $sevenZip = Get-Command 7z -ErrorAction SilentlyContinue
+          if (-not $sevenZip) {
+            $candidate = 'C:\Program Files\7-Zip\7z.exe'
+            if (Test-Path -LiteralPath $candidate) { $sevenZip = Get-Command $candidate }
+          }
+          if ($sevenZip) {
+            $listing = (& $sevenZip.Source l $installer.FullName) | Out-String
+            if ($listing -match 'THIRD-PARTY-LICENSES\.txt') { Write-Host 'installer listing: THIRD-PARTY-LICENSES.txt present' }
+            else { Write-Host '::warning::7-Zip does not list THIRD-PARTY-LICENSES.txt in the installer; check an installed copy by hand (docs/release-checklist.md)' }
+          } else { Write-Host '::warning::7-Zip not found; check an installed copy by hand (docs/release-checklist.md)' }
+
+      # Source.zip is built from the tree: put the committed placeholder back.
+      - name: Restore the notice placeholder
+        run: git checkout -- src-tauri/resources/THIRD-PARTY-LICENSES.txt
 
       # The build must not have edited the lockfiles it was supposed to follow.
       - name: Lockfiles unchanged by the build
@@ -173,8 +224,24 @@ jobs:
 
       # --- package ----------------------------------------------------------------------
 
-      - name: Package (installer, license, notices, Source.zip, SHA256SUMS)
-        run: pwsh -NoProfile -File scripts/package-artifacts.ps1 -OutputDirectory "$env:RUNNER_TEMP/release"
+      # cargo vendor needs the network; the script verifies the result (every distributed crate
+      # vendored, count equals Cargo.lock, offline resolution from the vendored sources alone).
+      - name: Dependency sources (Source-deps.zip, S-28)
+        run: pwsh -NoProfile -File scripts/package-dependency-sources.ps1 -OutputDirectory "$env:RUNNER_TEMP/deps"
+
+      # Packaging refuses a missing, placeholder or stale notice file and a missing or
+      # wrongly named dependency archive: no release without the complete corresponding source.
+      - name: Package (installer, license, notices, Source.zip, Source-deps.zip, SHA256SUMS)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $notices = Join-Path $env:RUNNER_TEMP 'notices/THIRD-PARTY-LICENSES.txt'
+          $deps = Join-Path $env:RUNNER_TEMP "deps/Quicker-Text-$env:VERSION-Source-deps.zip"
+          foreach ($required in @($notices, $deps)) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Release precondition missing: $required" }
+          }
+          pwsh -NoProfile -File scripts/package-artifacts.ps1 -OutputDirectory "$env:RUNNER_TEMP/release" -ThirdPartyLicensesFile $notices -DependencySourcesZip $deps
+          if ($LASTEXITCODE -ne 0) { throw 'Packaging failed' }
 
       - name: Source ZIP covers every crate (B-51)
         run: pwsh -NoProfile -File scripts/check-source-allowlist.ps1 -Strict -Zip "$env:RUNNER_TEMP/release/Quicker-Text-${{ steps.version.outputs.version }}-Source.zip"
@@ -190,6 +257,7 @@ jobs:
           $arguments = @{
             Version       = $env:VERSION
             SourceZip     = Join-Path $env:RUNNER_TEMP "release/Quicker-Text-$env:VERSION-Source.zip"
+            DependencySourcesZip = Join-Path $env:RUNNER_TEMP "release/Quicker-Text-$env:VERSION-Source-deps.zip"
             RepositoryUrl = $env:REPOSITORY_URL
             Ref           = $env:REF_NAME
             CommitSha     = $env:GITHUB_SHA

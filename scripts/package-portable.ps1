@@ -1,8 +1,18 @@
 #requires -Version 7.0
-param([Parameter(Mandatory=$true)][string]$OutputDirectory)
+# -ThirdPartyLicensesFile: THIRD-PARTY-LICENSES.txt from scripts/generate-third-party-licenses.ps1; defaults to
+#   src-tauri\resources\THIRD-PARTY-LICENSES.txt, where the release build has it. The committed placeholder is refused.
+# -DependencySourcesZip: Quicker-Text-<version>-Source-deps.zip (scripts/package-dependency-sources.ps1). Optional here
+#   because the portable ZIP only carries source\ for the project itself; when given it is copied next to the ZIP.
+#   Whoever distributes the portable ZIP must offer Source.zip and Source-deps.zip with it (GPL-3.0-or-later).
+param(
+    [Parameter(Mandatory=$true)][string]$OutputDirectory,
+    [string]$ThirdPartyLicensesFile,
+    [string]$DependencySourcesZip
+)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'source-allowlist.ps1')
+. (Join-Path $PSScriptRoot 'third-party-set.ps1')
 $version = (Get-Content -LiteralPath (Join-Path $root 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json).version
 $output = [IO.Path]::GetFullPath($OutputDirectory)
 $name = "Quicker-Text-$version-Windows-x64-Portable"
@@ -12,10 +22,25 @@ if ((Test-Path -LiteralPath $folder) -or (Test-Path -LiteralPath $zip)) { throw 
 $exe = Join-Path $root 'target\release\quicker-text.exe'
 $required = @($exe, (Join-Path $root 'THIRD_PARTY_NOTICES.md'), (Join-Path $root 'docs\windows-0.3.0-refactor.md'), (Join-Path $root 'docs\windows-0.3.1-notes.md'))
 foreach ($file in $required) { if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing required artifact: $file" } }
+# Third-party copyright and license notices travel with the package (S-28); refuse a missing, placeholder or stale file.
+if (-not $ThirdPartyLicensesFile) { $ThirdPartyLicensesFile = Join-Path $root 'src-tauri\resources\THIRD-PARTY-LICENSES.txt' }
+$licensesFile = [IO.Path]::GetFullPath($ThirdPartyLicensesFile)
+Assert-ThirdPartyLicensesFile -Path $licensesFile -ProjectRoot $root
+$depsName = "Quicker-Text-$version-Source-deps.zip"
+$depsZip = $null
+if ($DependencySourcesZip) {
+    $depsZip = [IO.Path]::GetFullPath($DependencySourcesZip)
+    if (!(Test-Path -LiteralPath $depsZip -PathType Leaf)) { throw "Missing dependency source archive: $depsZip" }
+    if ((Split-Path -Leaf $depsZip) -ne $depsName) { throw "Dependency source archive must be named $depsName" }
+    if (Test-Path -LiteralPath (Join-Path $output $depsName)) { throw "Output already exists; preserve it: $depsName" }
+} else {
+    Write-Warning "No -DependencySourcesZip: publish $depsName (scripts/package-dependency-sources.ps1) together with this package and Source.zip"
+}
 New-Item -ItemType Directory -Path $folder -Force | Out-Null
 Copy-Item -LiteralPath $exe -Destination (Join-Path $folder 'quicker-text.exe')
 Copy-Item -LiteralPath (Join-Path $root 'README.md'), (Join-Path $root 'LICENSE'), (Join-Path $root 'THIRD_PARTY_NOTICES.md'), (Join-Path $root 'docs\windows-0.3.0-refactor.md'), (Join-Path $root 'docs\windows-0.3.1-notes.md') -Destination $folder
 Copy-Item -LiteralPath (Join-Path $root 'vendor\espanso-win32\LICENSE') -Destination (Join-Path $folder 'LICENSE-ESPANSO-GPL-3.0.txt')
+Copy-Item -LiteralPath $licensesFile -Destination (Join-Path $folder 'THIRD-PARTY-LICENSES.txt')
 # Carry the actual corresponding source, including patched upstream code and build scripts.
 # The explicit allowlist excludes user configuration, imports, logs and workspace snapshots.
 $source = Join-Path $folder 'source'
@@ -46,5 +71,6 @@ try {
     $entryCount = $archive.Entries.Count
 } finally { $archive.Dispose() }
 if ((Get-FileHash -LiteralPath $exe).Hash -ne (Get-FileHash -LiteralPath (Join-Path $folder 'quicker-text.exe')).Hash) { throw 'Executable hash mismatch' }
+if ($depsZip) { Copy-Item -LiteralPath $depsZip -Destination (Join-Path $output $depsName) }
 Get-FileHash -LiteralPath $exe,$zip -Algorithm SHA256 | Format-List Path,Hash
 Write-Output "Verified $entryCount ZIP entries. Portable package: $zip"
