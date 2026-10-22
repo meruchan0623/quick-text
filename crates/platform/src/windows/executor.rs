@@ -24,6 +24,19 @@
 //!   events, the task fail-stops and the executor reports
 //!   Down(ExecutorTimeout). Nothing is ever sent without the lock. Manual
 //!   runs take the same lock ([`serialized`]).
+//!   In flight: a send is *in flight* once it has passed its epoch check
+//!   while holding the send lock. Such a send may overlap the epoch bump
+//!   (the fence bumps under `life`, not under the send lock), but every
+//!   input after it is ordered behind it: all other input and the fence's
+//!   re-sent key-ups go through the send lock, so they run after it
+//!   returns; the re-send reads the bitmap snapshot inside its own, later
+//!   hold, and S2 marked this send's key-downs before the call, so the keys
+//!   it pressed are released too. The bump only withholds permission from
+//!   sends that have not passed the check yet; seen from outside, this
+//!   window is indistinguishable from a `SendInput` that was already
+//!   executing when the fence came. Making the fence take the send lock
+//!   first would not shorten it, it would only make the fence hang
+//!   whenever a `SendInput` hangs.
 //!   S2: the held-key bitmap is settled in the same hold: every key-down of
 //!   the batch (taps and chords alike) is marked before the call; once
 //!   `SendInput` returns `k`, only the accepted prefix is replayed in order
