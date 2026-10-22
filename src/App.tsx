@@ -747,10 +747,16 @@ export default function App() {
    * Save the editor's config, or with `op` the config it makes of the editor's: its change, made
    * again on the editor's config after edits made while it ran (`conclude`). Every path that
    * submits the config ends here (rules, settings, 总开关, import, export, apply).
+   *
+   * Made of the editor's config as it is when the save is sent, not as the caller's render had it:
+   * the caller may have awaited since (a rule committed waits for validate_config), and edits made
+   * meanwhile go with the save. `write` takes the count of edits as it sends, so they are not
+   * edits made since.
    */
   const save = async (op?: Change) => {
     requireReady();
-    return write('save_draft', { config: op ? op(config) : config }, op);
+    const now = editorConfig.current;
+    return write('save_draft', { config: op ? op(now) : now }, op);
   };
   const selectedSet = new Set(selected);
   // Rules the UI can show and edit. Any other entry (one the backend could not read, B-43, or one
@@ -862,7 +868,7 @@ export default function App() {
           rules: found >= 0 ? c.rules.map((r, i) => (i === found ? rule : r)) : [...c.rules, rule],
         };
       };
-      const v = await call('validate_config', { config: commit(config) });
+      const v = await call('validate_config', { config: commit(editorConfig.current) });
       if (!v.valid) throw reject(v.errors);
       try {
         await save(commit);

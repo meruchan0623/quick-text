@@ -2253,7 +2253,9 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
         expect(sentSeparators(backend)).toBe(' |');
       });
 
-      it('puts a rule committed under edits made while it was saved', async () => {
+      // Not a path of the app, where the rule editor is a modal dialog: no edit can be made while
+      // it saves. jsdom's dialog is not modal; kept as cover of `conclude` for a rule committed.
+      it('puts a rule committed under edits made while it was saved (unit cover: modal in the app)', async () => {
         const hold = holdAnswers('save_draft');
         const mounted = await mountReady(hold);
         const { backend, container } = mounted;
@@ -2265,7 +2267,6 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
         await waitFor(mounted, () => {
           expect(hold.held[0]?.read).toBe(true);
         });
-        // In the app the dialog is modal; jsdom's is not, which lets the settings change meanwhile.
         await click(mounted, '文本指令参数设置');
         await type(mounted, field(container, '词分隔符'), ' |');
         await answerHeld(mounted, hold, 0);
@@ -2281,6 +2282,40 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
           ';new',
         ]);
         expect(sentSeparators(backend)).toBe(' |');
+      });
+
+      it('sends the config as it is when the save goes out, with edits made while it was awaited', async () => {
+        // The rule's check is awaited before its save; in the app the editor is modal meanwhile.
+        const check = holdAnswers('validate_config');
+        const mounted = await mountReady(check);
+        const { backend, container } = mounted;
+        await click(mounted, '＋ 添加指令');
+        const editor = dialog(container, '编辑文本指令');
+        await type(mounted, field(editor ?? container, '缩写词'), ';new');
+        check.arm();
+        await clickIn(mounted, editor, '保存');
+        await waitFor(mounted, () => {
+          expect(check.held[0]?.read).toBe(true);
+        });
+        await click(mounted, '文本指令参数设置');
+        await type(mounted, field(container, '词分隔符'), ' |');
+        await answerHeld(mounted, check, 0);
+        await waitFor(mounted, () => {
+          expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+        });
+        await settle(mounted);
+        expect(sentSeparators(backend)).toBe(' |');
+        expect(sent(backend)?.rules.map((r) => r.match.value)).toEqual([
+          ';s1',
+          ';s2',
+          ';s3',
+          ';new',
+        ]);
+        // Saved, not made since: the editor has the store's config, with nothing left to save.
+        expect(separators(container)).toBe(' |');
+        expect(backend.draft.globals.word_separators).toBe(' |');
+        await click(mounted, '文本指令管理');
+        expect(await exportSaves(mounted)).toBe(false);
       });
 
       it('makes nothing again of a save that failed, keeping edits made while it ran', async () => {
