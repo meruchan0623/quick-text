@@ -330,6 +330,36 @@ impl OwnInput {
     }
 }
 
+/// The executor's held-key interface over the same bits, so there is one
+/// record of what this process holds down. Its writers: `inject.rs` notes
+/// the transitions the system accepted; the executor marks a batch's
+/// key-downs before the call and replays the accepted prefix after it, in
+/// the send lock (S2), and clears a key once its MARK key-up is accepted;
+/// the hooks clear a key whose key-up came from elsewhere
+/// ([`OwnInput::released_elsewhere`]), and the executor then sends no
+/// key-up for it. A mark does not move `seq`, like [`Injecting::pressed`];
+/// the sends themselves run inside [`OwnInput::begin`].
+impl super::executor::HeldKeys for OwnInput {
+    fn mark_down(&self, vk: u16) {
+        self.note(vk, true);
+    }
+    fn mark_up(&self, vk: u16) {
+        self.note(vk, false);
+    }
+    fn held_snapshot(&self) -> Vec<u16> {
+        self.held
+            .iter()
+            .zip(0u16..)
+            .flat_map(|(word, index)| {
+                let bits = word.load(Ordering::SeqCst);
+                (0u16..64)
+                    .filter(move |bit| bits & (1u64 << bit) != 0)
+                    .map(move |bit| index * 64 + bit)
+            })
+            .collect()
+    }
+}
+
 /// One injection in flight; see [`OwnInput::begin`].
 pub(super) struct Injecting<'a> {
     own: &'a OwnInput,
@@ -839,6 +869,29 @@ mod tests {
         // A right-side key-up ends only the right side.
         own.released_elsewhere(VK_RSHIFT);
         assert!(!own.holds(VK_SHIFT));
+    }
+
+    #[test]
+    fn the_executor_sees_and_settles_the_same_held_keys() {
+        use super::super::executor::HeldKeys;
+        let own = OwnInput::new();
+        own.begin().pressed(VK_LCONTROL);
+        let seen = own.seq();
+        for vk in [0x41, VK_LBUTTON, VK_RSHIFT, 256] {
+            own.mark_down(vk);
+        }
+        assert!(own.settled(seen), "marks do not move seq");
+        assert!(own.holds(0x41) && own.holds(VK_LBUTTON), "one record");
+        assert_eq!(
+            own.held_snapshot(),
+            vec![VK_LBUTTON, 0x41, VK_RSHIFT, VK_LCONTROL],
+            "ascending; out of range codes are ignored"
+        );
+        own.mark_up(VK_LCONTROL);
+        assert!(!own.holds(VK_CONTROL), "the executor's key-up ends ours");
+        // A key-up from elsewhere: the executor owes no key-up for it.
+        own.released_elsewhere(0x41);
+        assert_eq!(own.held_snapshot(), vec![VK_LBUTTON, VK_RSHIFT]);
     }
 
     #[test]

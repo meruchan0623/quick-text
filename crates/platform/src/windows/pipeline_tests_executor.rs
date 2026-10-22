@@ -269,6 +269,9 @@ struct ExecRig {
     core: Arc<ExecutorCore>,
     runtime: Arc<Runtime>,
     supervisor: Arc<Supervisor>,
+    /// Routes this thread's injections (manual runs) to the core's private
+    /// record of held input, as the worker's are (`keystate::OwnInput`).
+    _own: Box<dyn std::any::Any>,
     _serial: MutexGuard<'static, ()>,
 }
 impl ExecRig {
@@ -301,6 +304,10 @@ impl ExecRig {
         let clipboard = MockClipboard::new(7, vec![(13, utf16("original"))]);
         let sleeps = SleepHook::default();
         let runtime = Arc::new(Runtime::new(clock.clone()));
+        // One record of held input per rig, like the process-wide one in
+        // production: the core takes this thread's at construction.
+        let own: &'static keystate::OwnInput = Box::leak(Box::new(keystate::OwnInput::new()));
+        let track = keystate::track_own_input(own);
         let core = ExecutorCore::new(
             Arc::clone(&shared),
             clock.clone(),
@@ -329,6 +336,7 @@ impl ExecRig {
             core,
             runtime,
             supervisor,
+            _own: Box::new(track),
             _serial: serial,
         };
         rig.supervisor.tick();

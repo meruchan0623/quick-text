@@ -11,12 +11,13 @@
 //!   too, through [`checkpoint`]. The supervisor bumps the epoch when a task
 //!   makes no progress for [`STALL_BUDGET`] ([`ExecutorCore::fence`]), so a
 //!   hung thread that wakes up later sends nothing and quietly exits.
-//! * Keys and mouse buttons pressed but not yet released are tracked in a
-//!   256-bit atomic bitmap behind the small [`HeldKeys`] interface, so
-//!   whoever ends the task (the busy guard, or after a fence on a stall the
-//!   payers of its debt, S3) sends the matching MARK key-ups. At merge the
-//!   implementation is swapped for P1b's `keystate::OwnInput` (one source
-//!   of truth).
+//! * Keys and mouse buttons pressed but not yet released are tracked in
+//!   P1b's `keystate::OwnInput`, the process's one record of the input it
+//!   holds down (shared with `inject.rs` and the hooks), through the small
+//!   [`HeldKeys`] interface, so whoever ends the task (the busy guard, or
+//!   after a fence on a stall the payers of its debt, S3) sends the
+//!   matching MARK key-ups. A key the hooks saw released elsewhere is
+//!   cleared there and gets no key-up from here.
 //! * Send exclusion (`send_lock`). S1: every `SendInput` the executor makes
 //!   (task output, the plan's own cleanup, re-sent key-ups) runs while the
 //!   send lock is held, and the epoch check that allows it is made in the
@@ -134,7 +135,7 @@ use super::actions::{
 use super::clipboard::WinClipboard;
 use super::foreground::WinForeground;
 use super::inject::{WinInjector, SENT_EFFECT};
-use super::keystate::physical;
+use super::keystate::{own_input, physical, OwnInput};
 use super::*;
 use crate::fault::{self, FaultPoint};
 use crate::health::{Component, Outcome, ReasonCode, StageTimings, TriggerKind};
@@ -564,43 +565,15 @@ impl Refusal {
 /// Keys (and mouse buttons, by their VK) that this program pressed and has
 /// not released yet. The executor only reaches the bitmap through this
 /// interface: [`Fenced`] marks, the busy guard and the fence read
-/// `held_snapshot` to send the MARK key-ups. Merge note: P1b's
-/// `keystate::OwnInput` tracks the same thing inside `inject.rs`; at merge
-/// the coordinator replaces [`AtomicHeldKeys`] with an adapter over it so
-/// there is a single source of truth.
+/// `held_snapshot` to send the MARK key-ups. Implemented by P1b's
+/// `keystate::OwnInput` (B-01's 256-bit atomic bitmap), the same record
+/// `inject.rs` notes accepted input in, so there is a single source of
+/// truth; see the adapter there.
 pub(super) trait HeldKeys: Send + Sync {
     fn mark_down(&self, vk: u16);
     fn mark_up(&self, vk: u16);
     /// Currently held keys, ascending.
     fn held_snapshot(&self) -> Vec<u16>;
-}
-
-/// The B-01 256-bit atomic bitmap.
-#[derive(Default)]
-pub(super) struct AtomicHeldKeys([AtomicU64; 4]);
-
-impl AtomicHeldKeys {
-    fn bit(vk: u16) -> (usize, u64) {
-        let vk = usize::from(vk & 0xff);
-        (vk / 64, 1u64 << (vk % 64))
-    }
-}
-
-impl HeldKeys for AtomicHeldKeys {
-    fn mark_down(&self, vk: u16) {
-        let (word, bit) = Self::bit(vk);
-        self.0[word].fetch_or(bit, Ordering::SeqCst);
-    }
-    fn mark_up(&self, vk: u16) {
-        let (word, bit) = Self::bit(vk);
-        self.0[word].fetch_and(!bit, Ordering::SeqCst);
-    }
-    fn held_snapshot(&self) -> Vec<u16> {
-        let words: [u64; 4] = std::array::from_fn(|i| self.0[i].load(Ordering::SeqCst));
-        (0u16..256)
-            .filter(|vk| words[usize::from(*vk) / 64] & (1u64 << (vk % 64)) != 0)
-            .collect()
-    }
 }
 
 /// Mouse flags → (button VK, pressed). `data` selects the X button.
@@ -634,7 +607,10 @@ pub(super) struct ExecutorCore {
     budget: Duration,
     epoch: AtomicU64,
     /// Held-key tracking; key-ups after a stall are taken only from here.
-    held: Box<dyn HeldKeys>,
+    /// The process-wide [`OwnInput`] (`keystate::own_input`); a test rig
+    /// routes its thread to a private one before building the core, and the
+    /// worker thread then injects through that one too.
+    held: &'static OwnInput,
     /// Clock origin for `beat_ns`.
     origin: Instant,
     /// Last progress of the running task, nanoseconds after `origin`.
@@ -683,7 +659,7 @@ impl ExecutorCore {
             budget,
             runtime,
             epoch: AtomicU64::new(0),
-            held: Box::new(AtomicHeldKeys::default()),
+            held: own_input(),
             origin,
             beat_ns: AtomicU64::new(0),
             life: PlMutex::new(Life::default()),
@@ -793,9 +769,15 @@ impl ExecutorCore {
     /// Sends the key-ups of every key in the bitmap and settles the debt by
     /// the result: settled only when none was refused, otherwise the
     /// refused keys stay in the bitmap and stay owed. Clearing the flag here
-    /// is safe against a concurrent fence: while `turn` is held nothing can
-    /// mark a key down, so the bitmap only shrinks, and every key it held
-    /// when the fence recorded its debt was in this snapshot.
+    /// is safe against a concurrent fence: while `turn` is held no task can
+    /// mark a key down (S2 marks only in the send lock), so every key a task
+    /// held when the fence recorded its debt was in this snapshot. Outside
+    /// the lock the shared record only gains notes `inject.rs` makes after
+    /// a send returned: the accepted prefix of a task batch S2 already
+    /// marked (if this payment released such a key first, the late note
+    /// sets it again: at worst one redundant MARK key-up later), or a
+    /// manual run's presses, which that run's own cleanup releases. The
+    /// hooks only clear bits.
     fn release_all(&self, turn: &SendTurn<'_>) -> Payment {
         let (released, refused) = self.release_held(turn);
         let debt = if refused == 0 {
@@ -987,7 +969,14 @@ impl ExecutorCore {
         let (sender, jobs) = mpsc::sync_channel::<Job>(1);
         let handle = std::thread::Builder::new()
             .name(format!("qt-executor-{epoch}"))
-            .spawn(move || me.work(jobs, epoch))
+            .spawn(move || {
+                // Tests: the tasks' injections (`inject.rs`) are noted in
+                // this core's record, as production's are in the one
+                // process-wide record.
+                #[cfg(test)]
+                let _track = super::keystate::track_own_input(me.held);
+                me.work(jobs, epoch)
+            })
             .map_err(|error| format!("executor thread: {error}"))?;
         worker.retired.retain(|old| !old.is_finished());
         if let Some(old) = worker.handle.replace(handle) {
@@ -1126,10 +1115,15 @@ impl ExecutorCore {
     /// stays marked so the next payment retries it. `_turn` proves the send
     /// lock is held (S1), so the snapshot is read inside the same hold that
     /// sends the key-ups, after any send of the old epoch returned (S3).
+    /// The key-ups bypass `inject.rs`, so they are bracketed here like every
+    /// other injection (P1b H1): a resync sampling the asynchronous key state
+    /// meanwhile, or before it caught up, is discarded and retried.
     /// Returns (key-ups accepted, key-ups refused).
     fn release_held(&self, _turn: &SendTurn<'_>) -> (usize, usize) {
+        let held = self.held.held_snapshot();
+        let _injecting = (!held.is_empty()).then(|| self.held.begin());
         let (mut released, mut refused) = (0, 0);
-        for vk in self.held.held_snapshot() {
+        for vk in held {
             if physical(vk) {
                 // The user holds it now: releasing would desync the key.
                 // Their own key-up ends it, so stop tracking it.
@@ -1672,7 +1666,10 @@ impl<I: Injector> Injector for Fenced<'_, I> {
 /// like a refused task ([`record_manual`]). Without an executor (`core` is
 /// `None`: not started, or direct pipeline tests) there is nothing to
 /// exclude and it sends directly. Manual runs carry no epoch and keep their
-/// own key cleanup, so the bitmap is not touched.
+/// own key cleanup, so this wrapper does not touch the bitmap; `inject.rs`
+/// still notes their accepted input in the shared record, so a key a manual
+/// run failed to release is also released when the next task ends or a
+/// debt is paid.
 pub(super) struct Serialized<'a, I> {
     inner: &'a I,
     core: Option<Arc<ExecutorCore>>,
