@@ -145,8 +145,12 @@ fn delta(seen: &mut u64, now: u64) -> u64 {
     new
 }
 
-/// A physical key transition one source saw: (source, virtual key, down).
-pub(super) type Sighting = (Source, u16, bool);
+/// What one source saw, for the liveness cross-check ([`Liveness::tick`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Sighting {
+    /// A physical key transition: (source, virtual key, down).
+    Key(Source, u16, bool),
+}
 
 /// Where recorded input landed: input aimed at one of our own windows is
 /// never recorded. Asked only while a recording is active, on the consumer.
@@ -232,7 +236,8 @@ impl Consumer {
             take_overflowed_stop(shared, hooks);
             if let HookRecord::Key(key) = &record {
                 if key.hardware {
-                    self.seen.push((Source::Hook, key.vk, key.down));
+                    self.seen
+                        .push(Sighting::Key(Source::Hook, key.vk, key.down));
                 }
             }
             self.hook_record(shared, record, probe, enqueue);
@@ -243,7 +248,8 @@ impl Consumer {
             handled += 1;
             // Every record is a hardware key transition, with or without
             // context; only key-downs become text.
-            self.seen.push((Source::Raw, record.vk(), record.down()));
+            self.seen
+                .push(Sighting::Key(Source::Raw, record.vk(), record.down()));
             let event = event_from(shared, &record);
             // S-19: matched in the busy shadow, reported, never executed.
             shadow_step(shared, &mut self.shadow, &record, event.as_ref(), probe);
@@ -894,11 +900,12 @@ impl<'a, P: SourcePorts, C: Clock> Liveness<'a, P, C> {
             self.check.forget();
         }
         let now = self.sources.clock.now();
-        for (source, vk, down) in seen.drain(..) {
-            if down {
-                self.check.saw(source, vk, now);
-            } else {
-                self.check.released(source, vk);
+        for sighting in seen.drain(..) {
+            match sighting {
+                Sighting::Key(source, vk, true) => {
+                    self.check.saw(source, vk, now);
+                }
+                Sighting::Key(source, vk, false) => self.check.released(source, vk),
             }
         }
         while let Some(verdict) = self.check.expire(now) {
