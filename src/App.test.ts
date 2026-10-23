@@ -735,24 +735,34 @@ describe('启动时自动开始监听 (S-09)', () => {
     expect(container.querySelector('.alert.error')).toBeNull();
   });
 
-  it('is disabled in safe mode, which refuses it', async () => {
+  it('stays usable in safe mode, which allows it, unlike 登录后自动启动 (ipc-contract §5)', async () => {
     const mounted = await openSettings({ safeMode: 'crash_loop' });
-    expect(checkbox(mounted.container, AUTO_LISTEN)?.disabled).toBe(true);
+    const { backend, container } = mounted;
+    expect(container.querySelector('.banner')?.textContent).toMatch(/已进入安全模式/);
+    expect(checkbox(container, '登录后自动启动')?.disabled).toBe(true);
+    expect(checkbox(container, AUTO_LISTEN)?.disabled).toBe(false);
+    await toggle(mounted);
+    await waitFor(mounted, () => {
+      expect(checkbox(container, AUTO_LISTEN)?.checked).toBe(true);
+    });
+    expect(callsOf(backend, 'set_auto_listen').map((c) => c.args)).toEqual([{ enabled: true }]);
+    expect(backend.autoListen).toBe(true);
+    expect(container.querySelector('.alert.error')).toBeNull();
   });
 
-  it('keeps the old value and says why when safe mode refuses', async () => {
-    // Safe mode began after the window last heard of it: the backend refuses with the reason.
+  it('keeps the old value and says why when the backend refuses', async () => {
+    // prefs.json cannot be read: the backend never overwrites it and refuses, usually with io.
     const mounted = await openSettings();
     const { backend, container } = mounted;
     backend.failures.set('set_auto_listen', {
-      code: 'safe_mode',
-      detail: { reason: 'crash_loop' },
+      code: 'io',
+      detail: { op: 'read', path: null, os_code: 32 },
     });
     expect(checkbox(container, AUTO_LISTEN)?.checked).toBe(false);
     await toggle(mounted);
     await waitFor(mounted, () => {
       expect(container.querySelector('.alert.error')?.textContent).toMatch(
-        /^当前处于安全模式（.+），暂时不能修改设置。/,
+        /^读取文件失败（系统错误 32）。/,
       );
     });
     expect(checkbox(container, AUTO_LISTEN)?.checked).toBe(false);
@@ -1272,7 +1282,9 @@ describe('store revision and safe mode pushed with store-state', () => {
     expect(button(container, '应用设置')?.disabled).toBe(false);
     await click(mounted, '文本指令参数设置');
     expect(button(container, '保存参数草稿')?.disabled).toBe(true);
-    expect(checkbox(container, '启动时自动开始监听')?.disabled).toBe(true);
+    expect(checkbox(container, '登录后自动启动')?.disabled).toBe(true);
+    // Not a write safe mode refuses (ipc-contract §5 set_auto_listen).
+    expect(checkbox(container, '启动时自动开始监听')?.disabled).toBe(false);
     expect(field(container, '词分隔符').matches(':disabled')).toBe(true);
     // The backend's Locked retry succeeds: store-state says so, and the page follows at once.
     await mounted.act(() => {
@@ -1280,6 +1292,7 @@ describe('store revision and safe mode pushed with store-state', () => {
     });
     expect(container.querySelector('.banner')).toBeNull();
     expect(button(container, '保存参数草稿')?.disabled).toBe(false);
+    expect(checkbox(container, '登录后自动启动')?.disabled).toBe(false);
     expect(checkbox(container, '启动时自动开始监听')?.disabled).toBe(false);
     expect(field(container, '词分隔符').matches(':disabled')).toBe(false);
     await click(mounted, '文本指令管理');

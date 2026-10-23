@@ -485,8 +485,18 @@ export class MockBackend {
       return this.#state();
     },
     set_paused: (args) => {
-      if (args.paused === false && this.recording)
+      const resume = args.paused === false;
+      if (resume && this.options.legacy && this.recording)
         this.#fail({ code: 'busy' }, 'Stop recording before resuming automatic matching');
+      // 0.4 (store set_manual_pause, ipc-contract §4): a resume is refused in safe mode and while
+      // the health does not accept it. Recording no longer refuses it: its own pause reason keeps
+      // the engine paused until it stops.
+      if (resume && !this.options.legacy) {
+        this.#guardSafeMode();
+        const health = this.health.state;
+        if (health !== 'healthy' && health !== 'degraded')
+          this.#fail({ code: 'engine_unavailable', detail: { health } }, '');
+      }
       this.setPaused('manual', args.paused === true);
       return this.#state();
     },
@@ -527,6 +537,8 @@ export class MockBackend {
     },
     cancel_execution: () => true,
     execute_action: () => {
+      // Refused in safe mode before anything else (src-tauri commands/engine.rs ensure_writable).
+      this.#guardSafeMode();
       if (this.engine.busy) this.#fail({ code: 'busy' }, 'An action is already running');
       const entry = this.recordExecution({ rule_id: 'manual-test', trigger: 'manual' });
       return {
@@ -594,6 +606,8 @@ export class MockBackend {
       return { version: 1, dialect: 'structured', source: null, steps: [] };
     },
     set_autostart: (args) => {
+      // Refused in safe mode (src-tauri commands/settings.rs ensure_writable), unlike set_auto_listen.
+      this.#guardSafeMode();
       this.autostart = args.enabled === true;
       return this.autostart;
     },
@@ -664,9 +678,9 @@ export class MockBackend {
           }
         : null;
     },
-    // S-09: a setting, so safe mode refuses it like set_autostart in the backend.
+    // S-09: allowed in safe mode, unlike set_autostart (src-tauri commands/settings.rs,
+    // ipc-contract §5): prefs live apart from what safe mode protects.
     set_auto_listen: (args) => {
-      this.#guardSafeMode();
       this.autoListen = args.enabled === true;
       return this.autoListen;
     },

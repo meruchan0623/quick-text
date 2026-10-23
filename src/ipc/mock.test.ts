@@ -223,7 +223,7 @@ describe('mock backend commands', () => {
     expect(legacy.capabilities.every((c) => c.status === undefined)).toBe(true);
   });
 
-  it('keeps auto_listen_on_start with set_auto_listen (S-09), refused in safe mode, absent in 0.3', async () => {
+  it('keeps auto_listen_on_start with set_auto_listen (S-09), allowed in safe mode, absent in 0.3', async () => {
     const backend = new MockBackend({ rules: 0 });
     use(backend);
     expect(
@@ -236,11 +236,16 @@ describe('mock backend commands', () => {
     expect(await invoke('set_auto_listen', { enabled: false })).toBe(false);
     expect(backend.autoListen).toBe(false);
 
-    use(new MockBackend({ rules: 0, safeMode: 'locked' }));
-    const refused: unknown = await invoke('set_auto_listen', { enabled: true }).catch(
+    // Safe mode allows it, unlike set_autostart (src-tauri commands/settings.rs, ipc-contract §5).
+    const safe = new MockBackend({ rules: 0, safeMode: 'locked' });
+    use(safe);
+    expect(await invoke('set_auto_listen', { enabled: true })).toBe(true);
+    expect(safe.autoListen).toBe(true);
+    const refused: unknown = await invoke('set_autostart', { enabled: true }).catch(
       (e: unknown) => e,
     );
     expect(refused).toEqual({ code: 'safe_mode', detail: { reason: 'locked' } });
+    expect(safe.autostart).toBe(false);
 
     use(new MockBackend({ rules: 0, legacy: true }));
     const missing: unknown = await invoke('set_auto_listen', { enabled: true }).catch(
@@ -253,13 +258,43 @@ describe('mock backend commands', () => {
   });
 
   it('toggles only the manual pause reason', async () => {
-    const backend = new MockBackend({ rules: 0, safeMode: 'crash_loop' });
+    const backend = new MockBackend({ rules: 0 });
     use(backend);
+    await invoke('start_recording');
     await invoke('set_paused', { paused: true });
-    expect(backend.engine.paused_reasons).toEqual(['safe_mode', 'manual']);
+    expect(backend.engine.paused_reasons).toEqual(['recording', 'manual']);
+    // 0.4 (store set_manual_pause): recording no longer refuses a resume; its own reason keeps the
+    // engine paused until it stops.
     const state = await invoke<LegacyState>('set_paused', { paused: false });
-    expect(backend.engine.paused_reasons).toEqual(['safe_mode']);
+    expect(backend.engine.paused_reasons).toEqual(['recording']);
     expect(state.paused).toBe(true);
+  });
+
+  it('refuses a resume in safe mode or while the health does not accept it, never a pause', async () => {
+    const safe = new MockBackend({ rules: 0, safeMode: 'crash_loop' });
+    use(safe);
+    await invoke('set_paused', { paused: true });
+    expect(safe.engine.paused_reasons).toEqual(['safe_mode', 'manual']);
+    const refused: unknown = await invoke('set_paused', { paused: false }).catch((e: unknown) => e);
+    expect(refused).toEqual({ code: 'safe_mode', detail: { reason: 'crash_loop' } });
+    expect(safe.engine.paused_reasons).toEqual(['safe_mode', 'manual']);
+
+    const failed = new MockBackend({ rules: 0, health: 'failed' });
+    use(failed);
+    await invoke('set_paused', { paused: true });
+    const unavailable: unknown = await invoke('set_paused', { paused: false }).catch(
+      (e: unknown) => e,
+    );
+    expect(unavailable).toEqual({ code: 'engine_unavailable', detail: { health: 'failed' } });
+    expect(failed.engine.paused_reasons).toContain('manual');
+  });
+
+  it('refuses a resume while recording in legacy mode, as 0.3 did', async () => {
+    const backend = new MockBackend({ rules: 0, legacy: true });
+    use(backend);
+    await invoke('start_recording');
+    const refused: unknown = await invoke('set_paused', { paused: false }).catch((e: unknown) => e);
+    expect(refused).toBe('Stop recording before resuming automatic matching');
   });
 
   it('refuses writes in safe mode', async () => {

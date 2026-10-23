@@ -1382,10 +1382,13 @@ export default function App() {
                     : '启动后先完成自检，全部通过才开始监听；未通过时保持暂停并提示原因。'
                 }
               >
+                {/* Not `editable`: safe mode allows set_auto_listen, unlike set_autostart
+                    (ipc-contract §5; prefs live apart from what safe mode protects), and turning
+                    it off can be the way out of a crash loop. */}
                 <input
                   type="checkbox"
                   checked={autoListen}
-                  disabled={!editable || autoListenMissing}
+                  disabled={!ready || autoListenMissing}
                   onChange={(e) => setAutoListen(e.target.checked)}
                 />
                 启动时自动开始监听
