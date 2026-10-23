@@ -38,6 +38,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 use tauri_utils::config::FrontendDist;
+use tauri_utils::platform::Target;
 
 const DIGEST_ENV: &str = "QUICKER_TEXT_FRONTEND_DIST_SHA256";
 
@@ -78,24 +79,42 @@ fn main() {
     tauri_build::build()
 }
 
-/// The directory Tauri embeds: `build.frontendDist` read the way tauri-build
-/// and tauri-codegen read it (tauri.conf.json, the platform file, then the
-/// `TAURI_CONFIG` merge patch the Tauri CLI passes), relative to this crate.
+/// The directory Tauri embeds: `build.frontendDist` of the configuration
+/// `tauri::generate_context!` reads, relative to this crate.
+///
+/// Step by step as tauri-codegen 2.7.2 `get_config` (src/lib.rs:59-100), which
+/// the macro calls; tauri-build 2.7.2 `try_build` (src/lib.rs:664-685) does the
+/// same, except that it picks the platform file by `TARGET`:
+/// 1. `tauri_utils::config::parse::read_from(target, <crate directory>)`:
+///    tauri.conf.json merged with the platform file (tauri.windows.conf.json
+///    and so on; this crate has none). The target is `TAURI_ENV_TARGET_TRIPLE`
+///    (set by the Tauri CLI), else the host, which in a build script is the
+///    same host as the proc macro's.
+/// 2. `TAURI_CONFIG` merged into the whole document with `json_patch::merge`
+///    (RFC 7396), the crate both use: a `null` deletes its key, so
+///    `{"build":null}` drops `build.frontendDist` together with the rest of
+///    `build` (Codex hygiene review 3). Both parse it as inline JSON
+///    (`serde_json::from_str`), so whatever form `tauri --config` was given, it
+///    reaches the build as JSON; there is no file path to resolve here.
+/// 3. `build.frontendDist` of the result, joined to the crate directory.
+///
+/// No directory after the merge is an error (recorded as `unavailable`):
+/// tauri-codegen embeds no assets then (src/context.rs:182-204).
 fn frontend_dist() -> Result<PathBuf, String> {
+    println!("cargo:rerun-if-env-changed=TAURI_CONFIG");
+    println!("cargo:rerun-if-env-changed=TAURI_ENV_TARGET_TRIPLE");
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").map_err(|e| e.to_string())?);
-    let target = env::var("TARGET").map_err(|e| e.to_string())?;
-    let target = tauri_utils::platform::Target::from_triple(&target);
-    let (config, _) = tauri_utils::config::parse::read_from(target, &root)
+    let target = env::var("TAURI_ENV_TARGET_TRIPLE")
+        .map(|triple| Target::from_triple(&triple))
+        .unwrap_or_else(|_| Target::current());
+    let (mut config, _) = tauri_utils::config::parse::read_from(target, &root)
         .map_err(|e| format!("Tauri configuration: {e}"))?;
-    let mut value = config.pointer("/build/frontendDist").cloned();
     if let Ok(inline) = env::var("TAURI_CONFIG") {
         let inline: serde_json::Value =
             serde_json::from_str(&inline).map_err(|e| format!("TAURI_CONFIG: {e}"))?;
-        if let Some(patched) = inline.pointer("/build/frontendDist") {
-            value = Some(patched.clone());
-        }
+        json_patch::merge(&mut config, &inline);
     }
-    let dist = match value {
+    let dist = match config.pointer("/build/frontendDist").cloned() {
         None | Some(serde_json::Value::Null) => None,
         Some(value) => Some(
             serde_json::from_value::<FrontendDist>(value)
