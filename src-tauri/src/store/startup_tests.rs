@@ -929,10 +929,12 @@ fn rollback_target_survives_a_restart_after_recovery() {
 /// predecessor is guessed as before (`revisions/<active - 1>.json`, then
 /// `previous.json`): no `previous_revisions` in store-meta.json (a file from
 /// before it existed), an entry for another active revision (one published
-/// by 0.3.1), a recorded snapshot that is gone, or (review I-R2) a record
-/// whose fingerprint is not that of the active.json just read. A record
-/// that applies wins over the guess, also as the second of two. When store-meta.json is read-only for a session,
-/// its publishes leave it untouched and the next launch guesses as before.
+/// by 0.3.1), or (review I-R2) a record whose fingerprint is not that of the
+/// active.json just read. A record that applies wins over the guess, also
+/// as the second of two; one whose snapshot is gone leaves no rollback
+/// target, it is not guessed past (review R8-1). When store-meta.json is
+/// read-only for a session, its publishes leave it untouched and the next
+/// launch guesses as before.
 #[test]
 fn rollback_target_without_a_record_is_guessed_as_before() {
     let world = world();
@@ -965,7 +967,6 @@ fn rollback_target_without_a_record_is_guessed_as_before() {
     for guessed in [
         vec![],
         vec![record(2, Some(1), &matching)],
-        vec![record(3, Some(7), &matching)],
         vec![record(3, Some(1), &other)],
         vec![record(3, None, &other)],
     ] {
@@ -984,6 +985,7 @@ fn rollback_target_without_a_record_is_guessed_as_before() {
         Some(one)
     );
     assert_eq!(previous_with(vec![record(3, None, &matching)]), None);
+    assert_eq!(previous_with(vec![record(3, Some(7), &matching)]), None);
 
     let dir = TempDir::new();
     write_revision(&dir, 1, "one");
@@ -1003,6 +1005,84 @@ fn rollback_target_without_a_record_is_guessed_as_before() {
     let store = Store::load_with(dir.path(), &env(&world));
     assert_eq!(store.active.revision, 3);
     assert_eq!(store.previous, Some(two));
+}
+
+/// Review R8-1 (sequence 1): A, B and C are published as revisions 1, 2
+/// and 3; after the exit `revisions/2.json` is deleted from outside, while
+/// `revisions/1.json` and the record "3 over 2" are kept. After the restart
+/// rollback is unavailable: the record names 2, and the older revision 1 is
+/// not taken in its place.
+#[test]
+fn a_recorded_snapshot_that_is_gone_leaves_no_rollback_target() {
+    let dir = TempDir::new();
+    let world = world();
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    for (revision, id) in [(1, "a"), (2, "b"), (3, "c")] {
+        store.publish(metadata_config(&[id])).unwrap();
+        assert_eq!(store.active.revision, revision);
+    }
+    assert_eq!(
+        store.previous.as_ref().unwrap().rules,
+        metadata_config(&["b"]).rules
+    );
+    assert_eq!(active_record(&dir), (3, Some(2)));
+    clean_exit(store, &world);
+    fs::remove_file(dir.join("revisions/2.json")).unwrap();
+    assert!(dir.join("revisions/1.json").exists());
+    assert!(!dir.join("previous.json").exists());
+
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.safe_mode(), None);
+    assert_eq!(store.active.revision, 3);
+    assert_eq!(store.previous, None);
+    assert!(matches!(
+        store.rollback_previous(),
+        Err(CommandError::NotFound {
+            kind: EntityKind::Revision,
+            ..
+        })
+    ));
+    assert_eq!(store.active.revision, 3);
+}
+
+/// Review R8-1 (sequence 2): without a record the guess goes
+/// `revisions/<active - 1>.json`, then `previous.json` when it reads and is
+/// older than the active revision, and only then the nearest older
+/// snapshot. Active is 4, `previous.json` is 3 and the snapshots go up to
+/// 2: rollback returns to 3.
+#[test]
+fn rollback_target_guess_takes_previous_json_before_an_older_snapshot() {
+    let world = world();
+    let dir = TempDir::new();
+    write_revision(&dir, 1, "one");
+    let two = write_revision(&dir, 2, "two");
+    let at = |revision, id| Config {
+        revision,
+        ..metadata_config(&[id])
+    };
+    write(&dir, "active.json", &bytes(&at(4, "four")));
+    let guess = || {
+        atomic_json(&dir.join(META_FILE), &StoreMeta::default()).unwrap();
+        load_or_fallback(&dir, &env(&world)).previous
+    };
+    write(&dir, "previous.json", &bytes(&at(3, "three")));
+    assert_eq!(guess(), Some(at(3, "three")));
+
+    // `previous.json` not older than the active revision, or not readable:
+    // the nearest older snapshot.
+    for unusable in [
+        bytes(&at(4, "three")),
+        bytes(&at(5, "three")),
+        TRUNCATED.to_vec(),
+    ] {
+        write(&dir, "previous.json", &unusable);
+        assert_eq!(guess(), Some(two.clone()));
+    }
+
+    // `revisions/<active - 1>.json` comes first.
+    write(&dir, "previous.json", &bytes(&at(3, "three")));
+    let snapshot = write_revision(&dir, 3, "three snapshot");
+    assert_eq!(guess(), Some(snapshot));
 }
 
 /// F4-1 review R3: a revision published over the empty stand-in of a new
@@ -2692,6 +2772,43 @@ fn a_revision_number_used_only_by_metadata_is_not_given_out() {
         fs::read(dir.join("revisions/5.metadata.json")).unwrap(),
         METADATA
     );
+}
+
+/// Review R8-2: a file in `revisions/` that this program does not write
+/// uses no number, however large the number its name starts with. With the
+/// active revision at 1, publish, rollback and a publish after a restart
+/// are revisions 2, 3 and 4; the file is left alone.
+fn assert_stray_file_uses_no_number(stray: &str) {
+    let dir = TempDir::new();
+    let world = world();
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    store.publish(metadata_config(&["one"])).unwrap();
+    assert_eq!(store.active.revision, 1);
+    let path = format!("revisions/{stray}");
+    write(&dir, &path, b"not ours");
+    store.publish(metadata_config(&["two"])).unwrap();
+    assert_eq!(store.active.revision, 2);
+    store.rollback_previous().unwrap();
+    assert_eq!(store.active.revision, 3);
+    clean_exit(store, &world);
+
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.safe_mode(), None);
+    store.publish(metadata_config(&["four"])).unwrap();
+    assert_eq!(store.active.revision, 4);
+    assert_eq!(fs::read(dir.join(&path)).unwrap(), b"not ours");
+}
+/// Taken for a number, it would leave no next revision: every publish and
+/// rollback would fail, also after a restart.
+#[test]
+fn a_stray_file_named_after_the_last_revision_number_uses_no_number() {
+    assert_stray_file_uses_no_number("18446744073709551615.x");
+}
+/// Taken for a number, the next publish would be revision `u64::MAX`, and
+/// nothing after it, even once the file is gone.
+#[test]
+fn a_stray_file_named_after_the_one_before_the_last_uses_no_number() {
+    assert_stray_file_uses_no_number("18446744073709551614.x");
 }
 
 /// Review R7-3, diagnostic only: when the backup directory store-meta.json

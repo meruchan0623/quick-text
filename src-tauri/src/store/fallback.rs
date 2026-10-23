@@ -396,6 +396,22 @@ enum Read {
     Failed,
 }
 
+/// A rollback candidate read by [`Loader::rollback_config`].
+enum Stored {
+    Config(Config),
+    Missing,
+    /// Did not read or did not parse.
+    Unusable,
+}
+impl Stored {
+    fn config(self) -> Option<Config> {
+        match self {
+            Stored::Config(config) => Some(config),
+            Stored::Missing | Stored::Unusable => None,
+        }
+    }
+}
+
 /// What `store-meta.json` allows this session.
 enum MetaFile {
     /// Parsed, or not there yet: it may be written.
@@ -660,14 +676,21 @@ impl<'a> Loader<'a> {
     /// `active.json` this load read (`loaded`, review I-R2): its revision and
     /// fingerprint must both match, so a reused revision number, or a
     /// configuration recovered from a fallback candidate (`loaded` is
-    /// `None`), never takes another revision's record. Without a record
-    /// that applies (a meta file from before it existed, not written or
-    /// rebuilt, or a revision published by 0.3.1), or when the recorded
-    /// snapshot is gone, the predecessor is guessed: the nearest snapshot
-    /// below the active revision, which is `revisions/<active - 1>.json`
-    /// whenever that is there (as before), else the next one down, since
-    /// a publish skips the numbers other files in `revisions/` use (review
-    /// R7-2); with none, `previous.json`.
+    /// `None`), never takes another revision's record. The record decides:
+    /// when the snapshot it names is gone or does not read, rollback is
+    /// unavailable, nothing else is tried (review R8-1).
+    ///
+    /// Without a record that applies (a meta file from before it existed,
+    /// not written or rebuilt, or a revision published by 0.3.1) the
+    /// predecessor is a guess, in this order (review R8-1):
+    /// 1. `revisions/<active - 1>.json` when it is there (as before; one that
+    ///    does not read leaves rollback unavailable, as before);
+    /// 2. `previous.json`, when it reads and its revision is below the
+    ///    active one;
+    /// 3. the nearest snapshot below the active revision: only for the gap a
+    ///    publish leaves when it skips the numbers other files in
+    ///    `revisions/` use (review R7-2). The weakest guess: a snapshot
+    ///    deleted from outside makes it return an older one.
     fn previous(
         &self,
         active: &Config,
@@ -675,41 +698,51 @@ impl<'a> Loader<'a> {
         loaded: Option<&Fingerprint>,
     ) -> Option<Config> {
         let revisions = self.dir.join("revisions");
+        let snapshot = |n: u64| revisions.join(format!("{n}.json"));
         let record = loaded.and_then(|loaded| {
             records
                 .iter()
                 .find(|record| record.active == active.revision && &record.fingerprint == loaded)
         });
-        let recorded = match record {
-            Some(record) => {
-                let n = record.revision?;
-                Some(revisions.join(format!("{n}.json"))).filter(|path| path.exists())
+        if let Some(record) = record {
+            return self.rollback_config(&snapshot(record.revision?)).config();
+        }
+        if let Some(below) = active.revision.checked_sub(1) {
+            match self.rollback_config(&snapshot(below)) {
+                Stored::Missing => {}
+                found => return found.config(),
             }
-            None => None,
-        };
-        let path = recorded.unwrap_or_else(|| {
-            revision_numbers(self.dir)
-                .into_iter()
-                .filter(|&n| n < active.revision)
-                .max()
-                .map_or_else(
-                    || self.dir.join("previous.json"),
-                    |n| revisions.join(format!("{n}.json")),
-                )
-        });
-        let Read::Bytes(bytes) = self.read(&path) else {
-            return None;
+        }
+        if let Stored::Config(config) = self.rollback_config(&self.dir.join("previous.json")) {
+            if config.revision < active.revision {
+                return Some(config);
+            }
+        }
+        let nearest = revision_numbers(self.dir)
+            .into_iter()
+            .filter(|&n| n < active.revision)
+            .max()?;
+        self.rollback_config(&snapshot(nearest)).config()
+    }
+
+    /// A file [`Self::previous`] looks at. One that does not parse is
+    /// logged with its name and error code only.
+    fn rollback_config(&self, path: &Path) -> Stored {
+        let bytes = match self.read(path) {
+            Read::Bytes(bytes) => bytes,
+            Read::Missing => return Stored::Missing,
+            Read::Failed => return Stored::Unusable,
         };
         match read_stored_config(&bytes) {
-            Ok(stored) => Some(stored.config),
+            Ok(stored) => Stored::Config(stored.config),
             Err(e) => {
                 tracing::warn!(
                     event = "store.previous_unreadable",
-                    file = %label(&path),
+                    file = %label(path),
                     code = e.code(),
-                    "previous configuration unavailable for rollback"
+                    "file not usable as the rollback target"
                 );
-                None
+                Stored::Unusable
             }
         }
     }
@@ -796,7 +829,7 @@ fn revision_number(name: &str) -> Option<u64> {
     stem.parse().ok()
 }
 
-fn is_revision_stem(stem: &str) -> bool {
+pub(super) fn is_revision_stem(stem: &str) -> bool {
     !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit())
 }
 
@@ -817,7 +850,7 @@ pub(super) fn quarantine_target(path: &Path, wall_ms: i64) -> PathBuf {
 
 /// The stem of a name [`quarantine_target`] produces,
 /// `<stem>.corrupt-<yyyymmdd-hhmmss>[-<n>].json`; `None` for any other name.
-fn quarantined_stem(name: &str) -> Option<&str> {
+pub(super) fn quarantined_stem(name: &str) -> Option<&str> {
     let (stem, rest) = name.strip_suffix(".json")?.split_once(".corrupt-")?;
     let digits = |bytes: &[u8]| !bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit);
     let rest = rest.as_bytes();

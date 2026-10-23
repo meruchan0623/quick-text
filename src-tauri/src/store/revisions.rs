@@ -1,5 +1,6 @@
 //! Publishing a configuration as a new revision, and rolling back to the previous one.
 use super::{
+    fallback::{is_revision_stem, quarantined_stem},
     load::{read_config, read_existing},
     meta::{Fingerprint, PreviousRevision},
     metadata::metadata_for_config,
@@ -155,14 +156,15 @@ impl Store {
         self.report_store_state();
         Ok(())
     }
-    /// One above the active revision and every number a file in
-    /// `revisions/` uses, so that after recovering from an older revision the
-    /// newer snapshots are never overwritten or mistaken for a conflict, and
-    /// a number is never given out twice (review R7): not after its snapshot
-    /// was quarantined (`<n>.corrupt-*.json`) or never written (only
+    /// One above the active revision and every number a file of this program
+    /// in `revisions/` uses, so that after recovering from an older revision
+    /// the newer snapshots are never overwritten or mistaken for a conflict,
+    /// and a number is never given out twice (review R7): not after its
+    /// snapshot was quarantined (`<n>.corrupt-*.json`) or never written (only
     /// `<n>.metadata.json`), where the publish would overwrite that metadata
-    /// and a record for the old revision could match the new one. A
-    /// `revisions/` that cannot be listed refuses the publish.
+    /// and a record for the old revision could match the new one. Other
+    /// names do not count, so a stray file cannot use up the numbers (review
+    /// R8-2). A `revisions/` that cannot be listed refuses the publish.
     fn next_revision(&self) -> Result<u64, CommandError> {
         let revisions = self.dir.join("revisions");
         occupied_revision_numbers(&revisions)
@@ -189,11 +191,10 @@ impl Store {
     }
 }
 
-/// Every revision number that a name in `revisions` uses: `<n>.json`,
-/// `<n>.metadata.json`, `<n>.corrupt-*.json`, any `<n>.<rest>` (review R7-2).
-/// Only for [`Store::next_revision`]; the fallback candidates are the
-/// snapshots alone (`fallback::revision_numbers`). No `revisions/` yet is no
-/// number.
+/// Every revision number that a file of this program in `revisions` uses
+/// (review R7-2), see [`occupied_number`]. Only for [`Store::next_revision`];
+/// the fallback candidates are the snapshots alone
+/// (`fallback::revision_numbers`). No `revisions/` yet is no number.
 fn occupied_revision_numbers(revisions: &Path) -> io::Result<Vec<u64>> {
     let entries = match fs::read_dir(revisions) {
         Ok(entries) => entries,
@@ -207,10 +208,20 @@ fn occupied_revision_numbers(revisions: &Path) -> io::Result<Vec<u64>> {
     Ok(numbers)
 }
 
-/// `n` for a name `<n>.<rest>`.
+/// `n` for the names this program gives files in `revisions/`; `None` for
+/// any other name (review R8-2):
+/// - `<n>.json` and `<n>.metadata.json`;
+/// - their quarantined forms `<n>.corrupt-<stamp>.json` and
+///   `<n>.metadata.corrupt-<stamp>.json` (`fallback::quarantine_target`);
+/// - the temp files `atomic_json` writes them through, `<n>.json.tmp` and
+///   `<n>.metadata.json.tmp`.
 fn occupied_number(name: &str) -> Option<u64> {
-    let (number, _) = name.split_once('.')?;
-    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+    let stem = match name.strip_suffix(".json.tmp") {
+        Some(stem) => stem,
+        None => quarantined_stem(name).or_else(|| name.strip_suffix(".json"))?,
+    };
+    let number = stem.strip_suffix(".metadata").unwrap_or(stem);
+    if !is_revision_stem(number) {
         return None;
     }
     number.parse().ok()
@@ -322,21 +333,69 @@ mod tests {
         assert!(s.engine.paused.load(Ordering::SeqCst));
         fs::remove_dir_all(dir).unwrap();
     }
+    /// Review R8-2: only the names this program writes occupy a number, the
+    /// ones `quarantine_target` and `atomic_json` produce included.
     #[test]
-    fn every_numbered_name_occupies_its_revision() {
+    fn every_name_of_this_program_occupies_its_revision() {
+        let dir = std::env::temp_dir().join(format!("quicker-text-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let quarantined = |name: &str| {
+            let path = dir.join(name);
+            fs::write(&path, b"").unwrap();
+            let target = super::super::fallback::quarantine_target(&path, 0);
+            fs::rename(&path, &target).unwrap();
+            target.file_name().unwrap().to_string_lossy().into_owned()
+        };
+        let first = quarantined("7.json");
+        let second = quarantined("7.json");
+        let metadata = quarantined("8.metadata.json");
+        assert_eq!(
+            [&first, &second, &metadata],
+            [
+                "7.corrupt-19700101-000000.json",
+                "7.corrupt-19700101-000000-1.json",
+                "8.metadata.corrupt-19700101-000000.json",
+            ]
+        );
+        // The temp name `atomic_json` uses.
+        let temp = |name: &str| {
+            let path = Path::new(name).with_extension("json.tmp");
+            path.to_string_lossy().into_owned()
+        };
+        let (snapshot_temp, metadata_temp) = (temp("9.json"), temp("10.metadata.json"));
         for (name, number) in [
             ("3.json", 3),
             ("5.metadata.json", 5),
-            ("7.corrupt-20260101-000000.json", 7),
-            ("7.corrupt-20260101-000000-1.json", 7),
-            ("8.metadata.corrupt-20260101-000000.json", 8),
-            ("9.json.tmp", 9),
+            (first.as_str(), 7),
+            (second.as_str(), 7),
+            (metadata.as_str(), 8),
+            (snapshot_temp.as_str(), 9),
+            (metadata_temp.as_str(), 10),
+            ("18446744073709551615.json", u64::MAX),
         ] {
             assert_eq!(occupied_number(name), Some(number), "{name}");
         }
-        for name in ["index.json", ".json", "a1.json", "1a.json", "-1.json", "12"] {
+        for name in [
+            "index.json",
+            ".json",
+            "a1.json",
+            "1a.json",
+            "-1.json",
+            "12",
+            "5.x",
+            "18446744073709551615.x",
+            "18446744073709551614.x",
+            "3.json.bak",
+            "3.metadata",
+            "3.metadata.metadata.json",
+            "3.backup.json",
+            "7.corrupt-garbage.json",
+            "7.corrupt-19700101-000000.json.tmp",
+            "18446744073709551616.json",
+        ] {
             assert_eq!(occupied_number(name), None, "{name}");
         }
+        fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn revision_overflow_is_error() {

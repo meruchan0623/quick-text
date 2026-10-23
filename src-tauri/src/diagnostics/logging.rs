@@ -149,7 +149,7 @@
 //! | `store.metadata_snapshot_failed` | warn | the active metadata was not snapshotted; error |
 //! | `store.newer_schema` | warn | a file written by a newer release; opened read-only; file name, schema `version` |
 //! | `store.no_valid_config_kept` | warn | no configuration to load, and the candidates an earlier launch quarantined are all that is left: SafeMode(NoValidConfig) again; number `quarantined` |
-//! | `store.previous_unreadable` | warn | the previous configuration is unavailable for rollback; file name, error code |
+//! | `store.previous_unreadable` | warn | a file considered as the rollback target does not parse (`previous.json`: the guess goes on; any other file: rollback is unavailable); file name, error code |
 //! | `store.read_failed` | warn | a file stayed unreadable after retries; file name, error |
 //! | `store.recovered` | warn | active.json was unusable and the configuration was recovered from another file; file name, source, revision |
 //! | `store.rules_skipped` | warn | unreadable rules stay off at runtime; `count` |
