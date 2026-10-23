@@ -17,7 +17,11 @@
 # already sits in the output directory under its own name is used in place).
 # B-52 (scripts/release-binary-checks.ps1): before anything is copied, the release configuration must enable no
 # fault-injection / mock feature, target\release\quicker_text.pdb must be the PDB of the exe, and neither may
-# contain debug_inject_fault. Any failure stops the run with a non-zero exit code.
+# contain debug_inject_fault. FE-18 (same file, Codex review 1): dist\ must be the frontend the exe embeds (the
+# digest its build recorded, src-tauri/build.rs), then scripts/check-bundle.mjs --scan-only dist finds no mock
+# backend in it; a dist\ rebuilt after the exe, or an exe built from a mock frontend, fails. Needs node. Any
+# failure stops the run with a non-zero exit code. To check a build without packaging it:
+#   pwsh -NoProfile -File scripts/check-embedded-frontend.ps1
 #
 #   pwsh -NoProfile -File scripts/package-portable.ps1 -OutputDirectory <new dir> `
 #        -ThirdPartyLicensesFile <THIRD-PARTY-LICENSES.txt> -DependencySourcesZip <...-Source-deps.zip>
@@ -46,7 +50,7 @@ if ((Test-Path -LiteralPath $depsCopy) -and -not $depsInPlace) { throw "Output a
 $exe = Join-Path $root 'target\release\quicker-text.exe'
 $required = @($exe, (Join-Path $root 'THIRD_PARTY_NOTICES.md'), (Join-Path $root 'docs\windows-0.3.0-refactor.md'), (Join-Path $root 'docs\windows-0.3.1-notes.md'))
 foreach ($file in $required) { if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing required artifact: $file" } }
-# B-52 on the exact exe that is copied below, and its PDB. Throws on any failure.
+# B-52 on the exact exe that is copied below and its PDB; FE-18 on the frontend it embeds. Throws on any failure.
 Assert-ReleaseBinaries -Exe $exe -Pdb (Join-Path $root 'target\release\quicker_text.pdb')
 # Third-party copyright and license notices travel with the package (S-28); refuse a missing, placeholder or stale file.
 if (-not $ThirdPartyLicensesFile) { $ThirdPartyLicensesFile = Join-Path $root 'src-tauri\resources\THIRD-PARTY-LICENSES.txt' }

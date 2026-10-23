@@ -3210,6 +3210,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-notification",
  "tauri-plugin-single-instance",
+ "tauri-utils",
  "thiserror 2.0.21",
  "tracing",
  "tracing-appender",

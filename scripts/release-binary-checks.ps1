@@ -1,4 +1,5 @@
-# B-52 checks on the exact binaries a packaging script is about to copy (Codex F3-1).
+# B-52 checks on the exact binaries a packaging script is about to copy (Codex F3-1), and the
+# FE-18 check on the frontend embedded in that exe (Codex review 1).
 #
 # Dot-sourced by scripts/package-artifacts.ps1 and scripts/package-portable.ps1, which call
 # Assert-ReleaseBinaries before they write their first file. The release workflow also runs the
@@ -12,6 +13,10 @@
 #   3. scripts/check-binary-strings.ps1 on that PDB (no `debug_inject_fault`; positive control
 #      `quicker_platform`) and on the exe (no `debug_inject_fault`; positive control
 #      `com.quickertext.desktop`), the same calls as the release workflow.
+#   4. scripts/check-embedded-frontend.ps1 (FE-18, Codex review 1): the exe records the digest of
+#      the frontend directory its build embedded (src-tauri/build.rs); dist/ must have that digest,
+#      so dist/ is the frontend inside this exe and not one rebuilt since; then
+#      `node scripts/check-bundle.mjs --scan-only dist` on it (no mock backend). Needs node.
 # The scripts run in their own pwsh process each; a non-zero exit code throws, so the caller
 # stops before anything is written.
 #
@@ -24,7 +29,7 @@ function Invoke-ReleaseCheckScript {
     if (-not $pwsh -or -not (Test-Path -LiteralPath $pwsh -PathType Leaf)) { $pwsh = 'pwsh' }
     & $pwsh -NoProfile -File (Join-Path $PSScriptRoot $Script) @Arguments | Out-Host
     $code = $LASTEXITCODE
-    if ($code -ne 0) { throw "B-52 check failed (exit code $code): scripts/$Script $($Arguments -join ' ')" }
+    if ($code -ne 0) { throw "Release check failed (exit code $code): scripts/$Script $($Arguments -join ' ')" }
 }
 
 function Get-CodeViewRecord {
@@ -94,8 +99,12 @@ function Assert-PdbMatchesExe {
 }
 
 function Assert-ReleaseBinaries {
-    <# Runs the B-52 checks described at the top of this file on the exe and PDB about to be packaged. Throws on any failure. #>
-    param([Parameter(Mandatory = $true)][string] $Exe, [Parameter(Mandatory = $true)][string] $Pdb)
+    <# Runs the checks described at the top of this file on the exe and PDB about to be packaged and the frontend the exe embeds. Throws on any failure. #>
+    param(
+        [Parameter(Mandatory = $true)][string] $Exe,
+        [Parameter(Mandatory = $true)][string] $Pdb,
+        [string] $Dist = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist')
+    )
     foreach ($file in @($Exe, $Pdb)) {
         if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing build output for the B-52 checks: $file" }
     }
@@ -103,4 +112,5 @@ function Assert-ReleaseBinaries {
     Assert-PdbMatchesExe -Exe $Exe -Pdb $Pdb
     Invoke-ReleaseCheckScript 'check-binary-strings.ps1' @($Pdb, '-RequirePresent', 'quicker_platform')
     Invoke-ReleaseCheckScript 'check-binary-strings.ps1' @($Exe, '-RequirePresent', 'com.quickertext.desktop')
+    Invoke-ReleaseCheckScript 'check-embedded-frontend.ps1' @('-Exe', $Exe, '-Dist', $Dist)
 }

@@ -13,6 +13,11 @@ fault-injection = ["quicker-platform/fault-injection"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# build.rs records the digest of the embedded frontend (scripts/check-embedded-frontend.ps1);
+# it reads build.frontendDist with the same parser as tauri-build (already in the tree).
+sha2 = "0.10"
+serde_json = "1"
+tauri-utils = "2"
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }

@@ -9,7 +9,10 @@
 # is removed again, so no half-finished package is left in the output directory.
 # B-52 (scripts/release-binary-checks.ps1): before anything is copied, the release configuration must enable no
 # fault-injection / mock feature, target\release\quicker_text.pdb must be the PDB of the exe, and neither may
-# contain debug_inject_fault. Any failure stops the run with a non-zero exit code.
+# contain debug_inject_fault. FE-18 (same file, Codex review 1): dist\ must be the frontend the exe embeds (the
+# digest its build recorded, src-tauri/build.rs), then scripts/check-bundle.mjs --scan-only dist finds no mock
+# backend in it. The installer comes from the same `tauri build` as the exe. Needs node. Any failure stops the run
+# with a non-zero exit code.
 param(
     [Parameter(Mandatory=$true)][string]$OutputDirectory,
     [Parameter(Mandatory=$true)][string]$ThirdPartyLicensesFile,
@@ -27,7 +30,7 @@ $exe = Join-Path $projectRoot 'target\release\quicker-text.exe'
 $installer = Join-Path $projectRoot "target\release\bundle\nsis\Quicker Text_${version}_x64-setup.exe"
 $pdb = Join-Path $projectRoot 'target\release\quicker_text.pdb'
 foreach ($file in @($exe, $installer, $pdb)) { if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing build: $file" } }
-# B-52 on the exact exe that is copied below, and its PDB. Throws on any failure.
+# B-52 on the exact exe that is copied below and its PDB; FE-18 on the frontend it embeds. Throws on any failure.
 Assert-ReleaseBinaries -Exe $exe -Pdb $pdb
 # The read-me-first notes belong to one version: a later release must not ship another version's notes
 # under its own file name (0.4+ writes docs\windows-<version>-notes.md before it is packaged).

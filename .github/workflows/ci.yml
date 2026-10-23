@@ -12,7 +12,8 @@
 #                                      advisories check runs weekly / on demand only (the
 #                                      weekly cron, not the nightly one)
 #   frontend       every PR            typecheck, lint, format, test (FE-53), check:bundle
-#                                      (no mock backend in production builds, FE-18)
+#                                      (no mock backend in production builds, FE-18), self-test
+#                                      of the packaging check on the embedded frontend
 #   notices        every PR            every distributed Rust crate and npm package has a license
 #                                      text for THIRD-PARTY-LICENSES.txt (S-28); the release
 #                                      workflow generates the real file and fails the same way
@@ -201,6 +202,12 @@ jobs:
       # the dist/ that `tauri build` embeds (--scan-only).
       - name: Bundle has no mock backend (FE-18)
         run: npm run check:bundle
+
+      # The packaging scripts scan dist/ only after matching it against the frontend digest the
+      # exe records (scripts/check-embedded-frontend.ps1); this tests that comparison on
+      # synthetic files, so a broken check shows up here and not on release day.
+      - name: Embedded-frontend check self-test (FE-18)
+        run: pwsh -NoProfile -File scripts/check-embedded-frontend.ps1 -SelfTest
 
   # Early warning for the release gate: a dependency bump that brings in a crate without a
   # license file fails here, not on release day. Checks only, writes nothing
