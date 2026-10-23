@@ -943,6 +943,16 @@ impl<'a, P: SourcePorts, C: Clock> Liveness<'a, P, C> {
             }
         }
         self.saw_clicks(hook_clicks, raw_clicks, now);
+        for (check, count) in [
+            ("key", self.check.take_dropped()),
+            ("click", self.clicks.take_dropped()),
+        ] {
+            if count > 0 {
+                // Evidence dropped at the pending limit: neither a miss nor
+                // a match.
+                tracing::debug!(event = "input.check_dropped", check, count);
+            }
+        }
         while let Some(verdict) = self.check.expire(now) {
             self.act(shared, verdict);
         }
@@ -963,17 +973,15 @@ impl<'a, P: SourcePorts, C: Clock> Liveness<'a, P, C> {
             (key, click) => key.or(click),
         }
     }
-    /// Feeds one tick's mouse button presses into the click check,
-    /// alternating sources, so a burst both sources saw pairs up within the
-    /// tick however long it is (`PENDING_CAP` never drops one of them).
-    /// A button has no autorepeat: every press is a new one.
+    /// Feeds one tick's mouse button presses into the click check. A
+    /// button has no autorepeat: every press is a new one. However many
+    /// one source brings before the other's (in this tick or a later one),
+    /// they wait for them; only the window makes a miss.
     fn saw_clicks(&mut self, hook: u64, raw: u64, now: Instant) {
-        for index in 0..hook.max(raw) {
-            for (source, count) in [(Source::Hook, hook), (Source::Raw, raw)] {
-                if index < count {
-                    self.clicks.saw(source, 0, now);
-                    self.clicks.released(source, 0);
-                }
+        for (source, count) in [(Source::Hook, hook), (Source::Raw, raw)] {
+            for _ in 0..count {
+                self.clicks.saw(source, 0, now);
+                self.clicks.released(source, 0);
             }
         }
     }

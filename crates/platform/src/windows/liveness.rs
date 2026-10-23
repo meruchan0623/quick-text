@@ -35,9 +35,19 @@ pub(super) const MATCH_WINDOW: Duration = Duration::from_millis(500);
 /// 待 0.4 基线确定: high enough that one swallowed or remapped key (AltGr's
 /// synthetic Ctrl, a key only one source reports) never triggers a verdict.
 pub(super) const MISS_LIMIT: u32 = 5;
-/// Unmatched sightings kept per source; the oldest one beyond this counts as
-/// a miss at once.
+/// Groups of unmatched sightings kept per source. Sightings made at the
+/// same instant share a group (one consumer pass stamps all it drained with
+/// one instant), so this bounds the memory, not the sightings: one that
+/// finds every group taken joins the newest, which then counts from its
+/// instant. Its older sightings so wait longer than [`MATCH_WINDOW`], never
+/// shorter: a full queue delays a verdict and never makes one (F5-2
+/// review). A local capacity limit is no evidence that a source was lost.
 pub(super) const PENDING_CAP: usize = 64;
+/// Unmatched sightings kept per source, however grouped: far more than
+/// anyone types or clicks within [`MATCH_WINDOW`]. Beyond it the oldest is
+/// dropped as evidence (neither a miss nor a match) and counted for a
+/// debug log ([`CrossCheck::take_dropped`]).
+pub(super) const PENDING_LIMIT: usize = 4096;
 /// Each verdict against a source that is not followed by an agreed key
 /// doubles the misses the next verdict needs, up to `K << MAX_STRIKE_SHIFT`.
 /// A source that stays one-sided for a reason a reattach cannot fix (待实测:
@@ -82,10 +92,76 @@ const fn generic(vk: u16) -> u16 {
     }
 }
 
+/// One source's unmatched sightings, oldest first, as groups of those made
+/// at the same instant: (instant, how many). Only [`PENDING_LIMIT`] ever
+/// drops one; [`PENDING_CAP`] bounds the groups (see there).
+#[derive(Default)]
+struct Pending {
+    groups: VecDeque<(Instant, usize)>,
+    /// Sightings over all groups.
+    total: usize,
+}
+impl Pending {
+    /// Adds a sighting made at `now`. Returns false when the oldest one
+    /// was dropped to make room for it.
+    fn push(&mut self, now: Instant) -> bool {
+        let kept = self.total < PENDING_LIMIT;
+        if !kept {
+            self.take();
+        }
+        let full = self.groups.len() >= PENDING_CAP;
+        match self.groups.back_mut() {
+            Some((at, count)) if *at == now || full => {
+                // When full, the newest group counts from now: later for
+                // the sightings already in it, never earlier.
+                *at = (*at).max(now);
+                *count = count.saturating_add(1);
+            }
+            _ => self.groups.push_back((now, 1)),
+        }
+        self.total = self.total.saturating_add(1);
+        kept
+    }
+    /// Takes the oldest sighting, if any.
+    fn take(&mut self) -> bool {
+        let Some((_, count)) = self.groups.front_mut() else {
+            return false;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.groups.pop_front();
+        }
+        self.total = self.total.saturating_sub(1);
+        true
+    }
+    /// Removes the sightings made [`MATCH_WINDOW`] or more before `now`
+    /// and returns how many there were.
+    fn expire(&mut self, now: Instant) -> usize {
+        let mut expired = 0_usize;
+        while let Some(&(at, count)) = self.groups.front() {
+            if now.saturating_duration_since(at) < MATCH_WINDOW {
+                break;
+            }
+            self.groups.pop_front();
+            expired = expired.saturating_add(count);
+        }
+        self.total = self.total.saturating_sub(expired);
+        expired
+    }
+    /// When the oldest sighting was made, if any.
+    fn oldest(&self) -> Option<Instant> {
+        self.groups.front().map(|&(at, _)| at)
+    }
+    fn clear(&mut self) {
+        self.groups.clear();
+        self.total = 0;
+    }
+}
+
 #[derive(Default)]
 struct Side {
-    /// When each of this source's unmatched sightings happened.
-    pending: VecDeque<Instant>,
+    /// This source's unmatched sightings.
+    pending: Pending,
     /// The key this source last reported down and has not reported up
     /// since: another down of it is autorepeat.
     held: Option<u16>,
@@ -118,6 +194,8 @@ impl Side {
 pub(super) struct CrossCheck {
     hook: Side,
     raw: Side,
+    /// Sightings dropped at [`PENDING_LIMIT`] since [`CrossCheck::take_dropped`].
+    dropped: u64,
 }
 impl CrossCheck {
     fn side(&mut self, source: Source) -> &mut Side {
@@ -146,7 +224,7 @@ impl CrossCheck {
         }
         side.held = Some(vk);
         side.merged = 0;
-        if self.other(source).pending.pop_front().is_some() {
+        if self.other(source).pending.take() {
             // Both sources are alive right now.
             for side in [&mut self.hook, &mut self.raw] {
                 side.misses = 0;
@@ -154,13 +232,17 @@ impl CrossCheck {
             }
             return true;
         }
-        let side = self.side(source);
-        side.pending.push_back(now);
-        if side.pending.len() > PENDING_CAP {
-            side.pending.pop_front();
-            self.other(source).misses += 1;
+        // It waits, however many wait already: only an expired sighting is
+        // a miss.
+        if !self.side(source).pending.push(now) {
+            self.dropped = self.dropped.saturating_add(1);
         }
         false
+    }
+    /// Sightings dropped at [`PENDING_LIMIT`] since the last call, for a
+    /// debug log.
+    pub(super) fn take_dropped(&mut self) -> u64 {
+        std::mem::take(&mut self.dropped)
     }
     /// Records a key-up `source` saw: its next down of that key is a new
     /// press, not autorepeat.
@@ -177,18 +259,11 @@ impl CrossCheck {
     /// again until it returns `None`.
     pub(super) fn expire(&mut self, now: Instant) -> Option<Verdict> {
         for source in [Source::Hook, Source::Raw] {
-            let mut expired = 0;
-            let side = self.side(source);
-            while side
-                .pending
-                .front()
-                .is_some_and(|seen| now.saturating_duration_since(*seen) >= MATCH_WINDOW)
-            {
-                side.pending.pop_front();
-                expired += 1;
-            }
+            let expired = self.side(source).pending.expire(now);
             let other = self.other(source);
-            other.misses = other.misses.saturating_add(expired);
+            other.misses = other
+                .misses
+                .saturating_add(u32::try_from(expired).unwrap_or(u32::MAX));
         }
         for (source, verdict) in [
             (Source::Hook, Verdict::HookLost),
@@ -218,7 +293,7 @@ impl CrossCheck {
     pub(super) fn next_due(&self) -> Option<Instant> {
         [&self.hook, &self.raw]
             .into_iter()
-            .filter_map(|side| side.pending.front())
+            .filter_map(|side| side.pending.oldest())
             .min()
             .and_then(|seen| seen.checked_add(MATCH_WINDOW))
     }
@@ -226,8 +301,8 @@ impl CrossCheck {
     #[cfg(test)]
     pub(super) fn pending(&self, source: Source) -> usize {
         match source {
-            Source::Hook => self.hook.pending.len(),
-            Source::Raw => self.raw.pending.len(),
+            Source::Hook => self.hook.pending.total,
+            Source::Raw => self.raw.pending.total,
         }
     }
     /// Forgets pending keys, misses and held keys after a source was
@@ -613,19 +688,89 @@ mod tests {
         assert!(check.saw(Source::Raw, A, t));
     }
 
+    /// F5-2 review: more unmatched sightings than [`PENDING_CAP`] groups,
+    /// each at its own instant, are all kept and none is a miss before its
+    /// window ran out; the ones that found every group taken wait from the
+    /// last of them (longer, never shorter).
     #[test]
-    fn an_overflowing_pending_queue_counts_misses_at_once() {
+    fn a_full_pending_queue_waits_for_the_window() {
+        let mut check = CrossCheck::default();
+        let t = Instant::now();
+        let count = PENDING_CAP + MISS_LIMIT as usize;
+        let end = one_sided(&mut check, Source::Hook, t, count as u16, ms(1));
+        let last = end - ms(1);
+        assert_eq!(check.pending(Source::Hook), count, "none dropped");
+        assert_eq!(check.take_dropped(), 0);
+        assert_eq!(check.expire(t), None, "no miss before the window");
+        assert!(!check.missed(Source::Raw));
+        assert_eq!(check.next_due(), Some(t + MATCH_WINDOW));
+        assert_eq!(check.expire(t + MATCH_WINDOW - ms(1)), None);
+        assert!(!check.missed(Source::Raw));
+        // The groups before the newest expire on time...
+        let newest = t + ms(PENDING_CAP as u64 - 1);
+        assert_eq!(
+            check.expire(newest - ms(1) + MATCH_WINDOW),
+            Some(Verdict::RawLost)
+        );
+        // ...the newest, joined by the rest, waits from the last of them.
+        let left = count - (PENDING_CAP - 1);
+        assert_eq!(check.pending(Source::Hook), left);
+        assert_eq!(check.next_due(), Some(last + MATCH_WINDOW));
+        assert_eq!(check.expire(last + MATCH_WINDOW - ms(1)), None);
+        assert_eq!(check.pending(Source::Hook), left);
+        assert_eq!(check.expire(last + MATCH_WINDOW), None, "2K after a strike");
+        assert_eq!(check.pending(Source::Hook), 0);
+    }
+
+    /// F5-2 review: a burst larger than [`PENDING_CAP`] that one source
+    /// reports in full before the other reports any of it (one consumer
+    /// pass each) pairs up whichever source comes first.
+    #[test]
+    fn a_burst_beyond_the_group_bound_pairs_up_in_either_order() {
+        for (first, second) in [(Source::Raw, Source::Hook), (Source::Hook, Source::Raw)] {
+            for gap in [Duration::ZERO, ms(1)] {
+                let mut check = CrossCheck::default();
+                let t = Instant::now();
+                let count = PENDING_CAP + 5;
+                let end = one_sided(&mut check, first, t, count as u16, gap);
+                assert_eq!(check.expire(end), None);
+                assert_eq!(check.pending(first), count, "{first:?} {gap:?}");
+                let mut now = end + ms(100);
+                for index in 0..count {
+                    let vk = if index % 2 == 0 { A } else { B };
+                    assert!(check.saw(second, vk, now), "{first:?} {gap:?} {index}");
+                    now += gap;
+                }
+                assert_eq!(check.pending(first), 0);
+                assert_eq!(check.pending(second), 0);
+                assert_eq!(check.expire(now + Duration::from_secs(60)), None);
+                assert!(!check.missed(Source::Hook) && !check.missed(Source::Raw));
+                assert_eq!(check.take_dropped(), 0);
+            }
+        }
+    }
+
+    /// Beyond [`PENDING_LIMIT`] the oldest sighting is dropped: counted for
+    /// a debug log, never a miss.
+    #[test]
+    fn beyond_the_limit_the_oldest_sighting_is_dropped_not_missed() {
         let mut check = CrossCheck::default();
         let t = Instant::now();
         one_sided(
             &mut check,
-            Source::Hook,
+            Source::Raw,
             t,
-            (PENDING_CAP + MISS_LIMIT as usize) as u16,
+            (PENDING_LIMIT + 3) as u16,
             Duration::ZERO,
         );
-        assert_eq!(check.pending(Source::Hook), PENDING_CAP);
-        assert_eq!(check.expire(t), Some(Verdict::RawLost));
+        assert_eq!(check.pending(Source::Raw), PENDING_LIMIT);
+        assert_eq!(check.take_dropped(), 3);
+        assert_eq!(check.take_dropped(), 0, "taken");
+        assert_eq!(check.expire(t), None);
+        assert!(!check.missed(Source::Hook), "dropped is not missed");
+        // The kept ones still pair, oldest first.
+        assert!(check.saw(Source::Hook, C, t + ms(1)));
+        assert_eq!(check.pending(Source::Raw), PENDING_LIMIT - 1);
     }
 
     #[test]

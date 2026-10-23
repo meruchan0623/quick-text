@@ -3505,6 +3505,7 @@ fn hook_heartbeat_passes_for_a_removed_hook_with_no_key_since() {
 // F5-2: Windows can remove the low-level mouse hook alone. Clicks must
 // still end the typed prefix (RawInput sees them too), and the loss must be
 // found and repaired like a lost keyboard hook.
+use super::liveness::{Source, PENDING_CAP};
 use super::rawinput::{INPUT_MOUSE_LEFT_BUTTON, INPUT_STATUS_PRESSED, INPUT_STATUS_RELEASED};
 
 impl FakeSources {
@@ -3583,6 +3584,52 @@ impl Pipeline {
             self.drain();
             self.tick(liveness);
             clock.advance(GAP);
+        }
+    }
+    /// One physical click (down and up) as only `source` has reported it
+    /// so far, both sources working: the other one reports it after a
+    /// consumer pass ([`Pipeline::half_click`] with the other source). Not
+    /// drained.
+    fn half_click(&mut self, source: Source) {
+        for (msg, status) in [
+            (WM_LBUTTONDOWN, INPUT_STATUS_PRESSED),
+            (WM_LBUTTONUP, INPUT_STATUS_RELEASED),
+        ] {
+            match source {
+                Source::Hook => handle_mouse(&self.hooks, &self.shared, mouse(msg, 10, 20)),
+                Source::Raw => {
+                    let event = InputEvent::mouse(INPUT_MOUSE_LEFT_BUTTON, status);
+                    let record = raw_record(&self.shared, self.keys, &event, &self.probe).unwrap();
+                    assert!(self.raw.push(record));
+                }
+            }
+        }
+    }
+    /// `count` physical keys (down and up each, no two alike in a row) as
+    /// only `source` has reported them so far, like [`Pipeline::half_click`].
+    /// Not drained.
+    fn half_type(&mut self, source: Source, count: usize) {
+        for index in 0..count {
+            let vk = u16::from(b'A') + (index % 26) as u16;
+            let text = char::from(b'a' + (index % 26) as u8).to_string();
+            for down in [true, false] {
+                match source {
+                    Source::Hook => {
+                        let msg = if down { WM_KEYDOWN } else { WM_KEYUP };
+                        handle_key(&self.hooks, &self.shared, &self.probe, msg, hardware(vk));
+                    }
+                    Source::Raw => {
+                        let event = if down {
+                            InputEvent::key_down(vk, &text, true)
+                        } else {
+                            InputEvent::key_up(vk, true)
+                        };
+                        let record =
+                            raw_record(&self.shared, self.keys, &event, &self.probe).unwrap();
+                        assert!(self.raw.push(record));
+                    }
+                }
+            }
         }
     }
     /// `count` pointer moves. Only the mouse hook sees them: the detector
@@ -4000,7 +4047,8 @@ fn injected_clicks_never_count_against_the_mouse_hook() {
 
 /// More clicks than `PENDING_CAP` that both sources saw, drained in one
 /// consumer pass (a consumer that fell behind), still pair up: the click
-/// check takes each source's clicks alternately, so none is dropped.
+/// check takes all of the hook's before any of RawInput's, and they wait
+/// for their counterparts however many they are.
 #[test]
 fn a_burst_of_clicks_drained_at_once_pairs_up() {
     let _serial = serial();
@@ -4009,7 +4057,7 @@ fn a_burst_of_clicks_drained_at_once_pairs_up() {
     sources.start();
     let mut liveness = Liveness::new(&sources);
     let mut pipe = Pipeline::new();
-    let burst = super::liveness::PENDING_CAP + 36;
+    let burst = PENDING_CAP + 36;
     let (_, lines) = capture::logs(|| {
         for _ in 0..burst {
             pipe.click(&fake);
@@ -4069,4 +4117,188 @@ fn hook_heartbeat_fails_once_raw_input_saw_a_click_the_removed_mouse_hook_missed
     );
     assert!(fake.hooked(HookSet::MOUSE) && sources.hooks_ready());
     assert_eq!(heartbeat(&sources), Ok(()), "the reinstalled hook");
+}
+
+/// The other source of the two.
+fn other_source(source: Source) -> Source {
+    match source {
+        Source::Hook => Source::Raw,
+        Source::Raw => Source::Hook,
+    }
+}
+
+/// F5-2 review (Codex): the consumer took the mouse hook's click count,
+/// then both healthy sources recorded a burst of more than `PENDING_CAP`
+/// clicks before it drained RawInput. One pass brings all of RawInput's,
+/// the next all of the hook's; or the other way round. No verdict, no
+/// gap, no reinstall at either pass, nor once the window ran out: a full
+/// pending queue is no evidence of a lost source.
+#[test]
+fn a_healthy_click_burst_split_across_consumer_passes_pairs_up() {
+    let _serial = serial();
+    for first in [Source::Raw, Source::Hook] {
+        let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+        let sources = Sources::new(&fake, &clock, &signals);
+        sources.start();
+        let mut liveness = Liveness::new(&sources);
+        let mut pipe = Pipeline::new();
+        let burst = PENDING_CAP + 5;
+        let (_, lines) = capture::logs(|| {
+            for _ in 0..burst {
+                pipe.half_click(first);
+            }
+            pipe.drain();
+            pipe.tick(&mut liveness);
+            assert_eq!(heartbeat(&sources), Ok(()), "{first:?} first pass");
+            clock.advance(Duration::from_millis(1));
+            for _ in 0..burst {
+                pipe.half_click(other_source(first));
+            }
+            pipe.drain();
+            pipe.tick(&mut liveness);
+            assert_eq!(heartbeat(&sources), Ok(()), "{first:?} second pass");
+            pipe.settle(&clock, &mut liveness)
+        });
+        assert_eq!(count_of(&lines, "input."), 0, "{first:?}: {lines:?}");
+        assert_eq!(fake.installs(), [HookSet::ALL], "{first:?}");
+        assert_eq!(heartbeat(&sources), Ok(()), "{first:?}");
+    }
+}
+
+/// F5-2 review: a healthy burst of more than `PENDING_CAP` clicks that one
+/// source reports one per consumer pass (each pass its own instant, so the
+/// pending groups fill up) before the other reports any, all within the
+/// match window, pairs up whichever source comes first.
+#[test]
+fn a_healthy_click_burst_split_over_many_passes_pairs_up() {
+    let _serial = serial();
+    for first in [Source::Raw, Source::Hook] {
+        let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+        let sources = Sources::new(&fake, &clock, &signals);
+        sources.start();
+        let mut liveness = Liveness::new(&sources);
+        let mut pipe = Pipeline::new();
+        let burst = PENDING_CAP + 5;
+        let (_, lines) = capture::logs(|| {
+            for (source, step) in [(first, 5), (other_source(first), 1)] {
+                for _ in 0..burst {
+                    pipe.half_click(source);
+                    pipe.drain();
+                    pipe.tick(&mut liveness);
+                    clock.advance(Duration::from_millis(step));
+                }
+            }
+            pipe.settle(&clock, &mut liveness)
+        });
+        assert!(
+            Duration::from_millis(5 * burst as u64 + burst as u64) < MATCH_WINDOW,
+            "the test stays inside the window"
+        );
+        assert_eq!(count_of(&lines, "input."), 0, "{first:?}: {lines:?}");
+        assert_eq!(fake.installs(), [HookSet::ALL], "{first:?}");
+        assert_eq!(heartbeat(&sources), Ok(()), "{first:?}");
+    }
+}
+
+/// F5-2 review, the keyboard side: the key cross-check shares the pending
+/// queue, so a healthy burst of more than `PENDING_CAP` keys split across
+/// two consumer passes (RawInput's first or the hook's first) pairs up the
+/// same way.
+#[test]
+fn a_healthy_key_burst_split_across_consumer_passes_pairs_up() {
+    let _serial = serial();
+    for first in [Source::Raw, Source::Hook] {
+        let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+        let sources = Sources::new(&fake, &clock, &signals);
+        sources.start();
+        let mut liveness = Liveness::new(&sources);
+        let mut pipe = Pipeline::new();
+        let burst = PENDING_CAP + 5;
+        let (_, lines) = capture::logs(|| {
+            pipe.half_type(first, burst);
+            pipe.drain();
+            pipe.tick(&mut liveness);
+            assert_eq!(heartbeat(&sources), Ok(()), "{first:?} first pass");
+            clock.advance(Duration::from_millis(1));
+            pipe.half_type(other_source(first), burst);
+            pipe.drain();
+            pipe.tick(&mut liveness);
+            pipe.settle(&clock, &mut liveness)
+        });
+        assert_eq!(count_of(&lines, "input."), 0, "{first:?}: {lines:?}");
+        assert_eq!(fake.installs(), [HookSet::ALL], "{first:?}");
+        assert_eq!(heartbeat(&sources), Ok(()), "{first:?}");
+    }
+}
+
+/// F5-2 review: a mouse hook that is really gone is still found at the
+/// K-th click only RawInput saw, and never before that click's match
+/// window ran out; nor before the window of a burst of more than
+/// `PENDING_CAP` such clicks drained in one pass.
+#[test]
+fn a_lost_mouse_hook_is_found_at_the_kth_click_only_once_its_window_ran_out() {
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    sources.start();
+    let mut liveness = Liveness::new(&sources);
+    let mut pipe = Pipeline::new();
+    let lost = [
+        line(r#"WARN event="input.check" source="mouse_hook" result="lost""#),
+        line(r#"WARN event="input.reattach" component="mouse_hook" reason="hook_missing" ok=true"#),
+    ];
+    let just = Duration::from_millis(1);
+    fake.drop_mouse_hook();
+    let (_, lines) = capture::logs(|| {
+        pipe.clicks(&fake, &clock, &mut liveness, MISS_LIMIT - 1);
+        pipe.settle(&clock, &mut liveness)
+    });
+    assert_eq!(count_of(&lines, "input."), 0, "K - 1 misses: {lines:?}");
+    // The K-th click.
+    pipe.click(&fake);
+    pipe.drain();
+    let (_, lines) = capture::logs(|| {
+        pipe.tick(&mut liveness);
+        clock.advance(MATCH_WINDOW - just);
+        pipe.tick(&mut liveness)
+    });
+    assert_eq!(
+        count_of(&lines, "input."),
+        0,
+        "inside its window: {lines:?}"
+    );
+    let (_, lines) = capture::logs(|| {
+        clock.advance(just);
+        pipe.tick(&mut liveness)
+    });
+    assert_eq!(lines, lost);
+    assert!(fake.hooked(HookSet::MOUSE));
+    // Healthy again (the agreed clicks also end the backoff), then lost
+    // again: a burst only RawInput saw, drained at once.
+    pipe.clicks(&fake, &clock, &mut liveness, 3);
+    pipe.settle(&clock, &mut liveness);
+    fake.drop_mouse_hook();
+    for _ in 0..PENDING_CAP + 5 {
+        pipe.click(&fake);
+    }
+    pipe.drain();
+    let (_, lines) = capture::logs(|| {
+        pipe.tick(&mut liveness);
+        clock.advance(MATCH_WINDOW - just);
+        pipe.tick(&mut liveness)
+    });
+    assert_eq!(
+        count_of(&lines, "input."),
+        0,
+        "inside the window: {lines:?}"
+    );
+    let (_, lines) = capture::logs(|| {
+        clock.advance(just);
+        pipe.tick(&mut liveness)
+    });
+    assert_eq!(lines, lost);
+    assert_eq!(
+        fake.installs(),
+        [HookSet::ALL, HookSet::LOW_LEVEL, HookSet::LOW_LEVEL]
+    );
 }

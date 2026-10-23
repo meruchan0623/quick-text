@@ -88,7 +88,8 @@
 //! | `hook.install_timeout` | warn | the hook thread did not answer an install request in time |
 //! | `hook.panic` | error | hook callbacks panicked since the last report; `count` |
 //! | `hook.thread_failed` | error | the hook thread could not take an install request; no hook is installed |
-//! | `input.check` | info / warn | an input source check; `source` (`keyboard_hook` / `raw_input`) and `result` (`lost`, `window_missing`, `unregistered` at warn; `registered` at info) |
+//! | `input.check` | info / warn | an input source check; `source` (`keyboard_hook` / `mouse_hook` / `raw_input`) and `result` (`lost`, `window_missing`, `unregistered` at warn; `registered` at info) |
+//! | `input.check_dropped` | debug | a source cross-check dropped its oldest unmatched sightings at the pending limit (neither a miss nor a match); `check` (`key` / `click`), `count` |
 //! | `input.consumer_panic` | error | the input consumer panicked; its state is reset and it keeps running |
 //! | `input.queue_full` | warn | input records were dropped because a queue was full; `source` (`hook` / `rawinput`), `count` |
 //! | `input.reattach` | warn | an input component was reattached; component, the reason code it was down for, `ok` |
