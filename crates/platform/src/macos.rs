@@ -623,19 +623,18 @@ unsafe extern "C" fn tap(_: Id, kind: u32, event: Event, _: Id) -> Event {
                 }
             },
         );
-    } else if matches!(kind, 10..=12) {
-        if shared
+    } else if matches!(kind, 10..=12)
+        && shared
             .recording
             .try_lock()
             .is_ok_and(|record| record.is_some())
-        {
-            if let Ok(mut error) = RECORD_ERROR.get().unwrap().try_lock() {
-                *error = Some(format!(
-                    "Mac hardware keycode {code} cannot be represented safely in portable replay"
-                ));
-            }
-            shared.cancel.store(true, Ordering::SeqCst);
+    {
+        if let Ok(mut error) = RECORD_ERROR.get().unwrap().try_lock() {
+            *error = Some(format!(
+                "Mac hardware keycode {code} cannot be represented safely in portable replay"
+            ));
         }
+        shared.cancel.store(true, Ordering::SeqCst);
     }
     if kind == 11 {
         return event;
@@ -797,9 +796,13 @@ pub fn start_engine(shared: Arc<Shared>) -> Result<(), String> {
         };
         // Let the non-suppressed final immediate key reach the target before deletion.
         std::thread::sleep(Duration::from_millis(15));
-        let mut context = VariableContext::default();
-        context.clipboard = clipboard_text().ok();
-        context.selection = capture_selection().ok();
+        // Built first so `now` is still taken before the clipboard and selection reads.
+        let base = VariableContext::default();
+        let mut context = VariableContext {
+            clipboard: clipboard_text().ok(),
+            selection: capture_selection().ok(),
+            ..base
+        };
         context.parameters.insert(
             "action_parameter".into(),
             candidate
@@ -1652,7 +1655,7 @@ fn preflight_open(target: &str, args: &[String], directory: &Option<String>) -> 
         if !path.is_absolute() || !path.exists() {
             return Err("Open target must be an existing absolute path or HTTP(S) URL".into());
         }
-        if !args.is_empty() && !path.extension().is_some_and(|s| s == "app") {
+        if !args.is_empty() && path.extension().is_none_or(|s| s != "app") {
             use std::os::unix::fs::PermissionsExt;
             if !path.is_file()
                 || std::fs::metadata(path)
