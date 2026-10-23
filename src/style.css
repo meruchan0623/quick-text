@@ -1607,3 +1607,19 @@ input[aria-invalid='true'] {
     grid-template-columns: 36% 64%;
   }
 }
+.sendkeys-cheatsheet {
+  margin: 8px 0;
+  font-size: 12px;
+}
+.sendkeys-cheatsheet summary {
+  cursor: pointer;
+  color: var(--accent-soft-text);
+}
+.sendkeys-cheatsheet table {
+  border-collapse: collapse;
+  margin-top: 6px;
+}
+.sendkeys-cheatsheet td {
+  padding: 3px 12px 3px 0;
+  vertical-align: top;
+}

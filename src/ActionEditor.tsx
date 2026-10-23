@@ -676,6 +676,9 @@ export default function ActionEditor({
           {a.type === 'send_keys' && a.source.type === 'inline' && (
             <div className="builder">
               <h4>用按钮组合文字和按键</h4>
+              <small>
+                上方正文会按从左到右的顺序执行：先添加文字，再插入按键，可反复交替。下方按钮只是帮你往正文末尾追加内容。
+              </small>
               <div className="inline">
                 <input
                   aria-label="要输入的普通文字"
@@ -762,7 +765,7 @@ export default function ActionEditor({
                 </button>
                 <small>
                   先在上方勾选 Ctrl、Shift 或
-                  Alt，再选择要依次按的键。执行时会让每个键都与勾选的键组合。
+                  Alt，再选择要依次按的键。执行时会让每个键都与勾选的键组合；不勾选时就是依次按这几个键。
                 </small>
               </div>
               <button
@@ -777,8 +780,32 @@ export default function ActionEditor({
               >
                 检查并查看将按哪些键
               </button>
+              <details className="sendkeys-cheatsheet">
+                <summary>正文写法速查</summary>
+                <table>
+                  <tbody>
+                    {[
+                      ['你好{Enter}', '输入“你好”，再按一次 Enter'],
+                      ['{Enter 3}', '连按 3 次 Enter（花括号内空格后写次数）'],
+                      ['{Tab}、{Esc}、{Backspace}', '按 Tab、Esc、退格；方向键写 {Left} {Up} 等'],
+                      ['^a', 'Ctrl+A（^ 代表 Ctrl）'],
+                      ['+{Tab}', 'Shift+Tab（+ 代表 Shift）'],
+                      ['%{F4}', 'Alt+F4（% 代表 Alt）'],
+                      ['^(ac)', '按住 Ctrl 依次按 A、C'],
+                      ['{+}、{%}、{{}', '原样输出 + % { 等特殊符号'],
+                    ].map(([code, meaning]) => (
+                      <tr key={code}>
+                        <td>
+                          <code>{code}</code>
+                        </td>
+                        <td>{meaning}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </details>
               <small>
-                这里支持 Ctrl、Shift 和 Alt 组合。需要 Windows 键、播放等媒体键或 F17–F24
+                支持 Ctrl、Shift、Alt 组合。需要 Windows 键、播放等媒体键或 F17–F24
                 时，请选择“按顺序执行多个操作”。
               </small>
             </div>
