@@ -58,7 +58,7 @@
 //! | `engine.shutdown` | info | the engine began shutting down (logged once) |
 //! | `engine.start_failed` | error | `start_engine` failed at startup; the platform's error |
 //! | `events.emit_failed` | warn | an event could not be sent to the frontend; event name and error |
-//! | `events.observer_panic` | warn | an EventBus observer (the tray) panicked; which callback |
+//! | `events.observer_panic` | warn | an EventBus observer (the tray, the last-known-good tracker) panicked; which callback |
 //! | `events.start_failed` | error | the EventBus thread did not start; no events will be sent |
 //! | `executor.clipboard_probe_cached` | debug | the clipboard health could not be read without waiting; the status last read is reported |
 //! | `executor.budget_skipped` | debug | a stall-check round was skipped: a lock it needs is held elsewhere; which lock (`held`) |
@@ -136,6 +136,7 @@
 //! | `store.create_dir_failed` | warn | the data directory could not be created; error |
 //! | `store.diagnostic` | warn | a diagnostic on the stored configuration; code and the path inside the configuration (never the message, which may echo values) |
 //! | `store.last_good` | info | a last-known-good `revision` was recorded |
+//! | `store.last_good_skipped` | debug | the last-known-good tracker (B-04) did not record `revision`: the store refused it; `reason` (`safe_mode`, `revision_changed`, `not_found`, `io`, `other`); not retried until the store state changes |
 //! | `store.locked_recovered` | info | the data directory is readable again after SafeMode(Locked); load outcome |
 //! | `store.locked_retry` | error | the SafeMode(Locked) retry thread did not start; error |
 //! | `store.meta_readonly` | warn | store-meta.json is left untouched; the run marker and crash count are kept in memory |

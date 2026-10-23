@@ -107,6 +107,38 @@ pub trait Observer: Send + 'static {
     fn tick(&mut self) {}
 }
 
+/// Several observers behind one (production: the tray, then the
+/// last-known-good tracker). Each gets every callback in list order, each
+/// guarded on its own, so one that panics does not starve the others. The
+/// earliest [`Observer::due_in`] wins.
+pub struct Observers(pub Vec<Box<dyn Observer>>);
+
+impl Observer for Observers {
+    fn status(&mut self, health: &HealthSnapshot, state: &EngineState) {
+        for observer in &mut self.0 {
+            guarded("status", || observer.status(health, state));
+        }
+    }
+    fn executed(&mut self, entry: &HistoryEntry) {
+        for observer in &mut self.0 {
+            guarded("executed", || observer.executed(entry));
+        }
+    }
+    fn store(&mut self, store: StoreState) {
+        for observer in &mut self.0 {
+            guarded("store", || observer.store(store));
+        }
+    }
+    fn due_in(&self) -> Option<Duration> {
+        self.0.iter().filter_map(|observer| observer.due_in()).min()
+    }
+    fn tick(&mut self) {
+        for observer in &mut self.0 {
+            guarded("tick", || observer.tick());
+        }
+    }
+}
+
 /// Receives each startup problem found after the store was loaded
 /// (`Store::add_problem`, a Locked retry). Never blocks.
 pub type ProblemSink = Arc<dyn Fn(StartupProblem) + Send + Sync>;
@@ -1204,5 +1236,69 @@ mod tests {
             assert_eq!(next_seen(), Err(()), "the tick it asked for");
         }
         assert!(seen.try_recv().is_err(), "one tick per request");
+    }
+
+    /// Logs each callback it gets as `(name, callback)`, then panics if
+    /// told to; asks for a tick after `due`.
+    struct Child {
+        name: &'static str,
+        log: Arc<Mutex<Vec<(&'static str, &'static str)>>>,
+        panics: bool,
+        due: Option<Duration>,
+    }
+    impl Child {
+        fn got(&self, callback: &'static str) {
+            self.log.lock().push((self.name, callback));
+            assert!(!self.panics, "{} panics in {callback}", self.name);
+        }
+    }
+    impl Observer for Child {
+        fn status(&mut self, _: &HealthSnapshot, _: &EngineState) {
+            self.got("status");
+        }
+        fn executed(&mut self, _: &HistoryEntry) {
+            self.got("executed");
+        }
+        fn store(&mut self, _: StoreState) {
+            self.got("store");
+        }
+        fn due_in(&self) -> Option<Duration> {
+            self.due
+        }
+        fn tick(&mut self) {
+            self.got("tick");
+        }
+    }
+
+    /// The tray and the last-known-good tracker share the bus: each gets
+    /// every callback, in list order, one panicking does not starve the
+    /// others, and the earliest tick request wins.
+    #[test]
+    fn observers_each_get_every_callback_even_when_one_panics() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let child = |name, panics, due| -> Box<dyn Observer> {
+            Box::new(Child {
+                name,
+                log: Arc::clone(&log),
+                panics,
+                due,
+            })
+        };
+        let mut all = Observers(vec![
+            child("tray", true, Some(ms(50))),
+            child("lkg", false, Some(ms(20))),
+            child("idle", false, None),
+        ]);
+        all.status(&HealthSnapshot::default(), &EngineState::default());
+        all.executed(&entry(1));
+        all.store(store(2, None));
+        all.tick();
+        assert_eq!(all.due_in(), Some(ms(20)));
+        let expected: Vec<_> = ["status", "executed", "store", "tick"]
+            .into_iter()
+            .flat_map(|callback| ["tray", "lkg", "idle"].map(|name| (name, callback)))
+            .collect();
+        assert_eq!(*log.lock(), expected);
+        assert_eq!(Observers(vec![child("idle", false, None)]).due_in(), None);
     }
 }
