@@ -56,24 +56,29 @@ impl Store {
             return Err(CommandError::Busy);
         }
         let old = self.active.clone();
+        // The empty stand-in for a missing configuration is not backed up
+        // (see `active_on_disk`); there is nothing to roll back to either.
+        let old_on_disk = self.active_on_disk;
         let outcome = (|| {
             let revisions = self.dir.join("revisions");
             fs::create_dir_all(&revisions)
                 .map_err(|e| CommandError::io(IoOp::CreateDir, Some(&revisions), &e))?;
-            let backup = revisions.join(format!("{}.json", old.revision));
-            if backup.exists() {
-                if read_config(&backup)? != old {
-                    return Err(CommandError::internal(
-                        "Historical revision conflict; existing snapshot preserved",
-                    ));
+            if old_on_disk {
+                let backup = revisions.join(format!("{}.json", old.revision));
+                if backup.exists() {
+                    if read_config(&backup)? != old {
+                        return Err(CommandError::internal(
+                            "Historical revision conflict; existing snapshot preserved",
+                        ));
+                    }
+                } else {
+                    atomic_json(&backup, &old)?;
                 }
-            } else {
-                atomic_json(&backup, &old)?;
+                atomic_json(
+                    &revisions.join(format!("{}.metadata.json", old.revision)),
+                    &self.active_unresolved,
+                )?;
             }
-            atomic_json(
-                &revisions.join(format!("{}.metadata.json", old.revision)),
-                &self.active_unresolved,
-            )?;
             atomic_json(&self.dir.join("draft.json"), &config)?;
             atomic_json(
                 &revisions.join(format!("{}.metadata.json", config.revision)),
@@ -94,8 +99,15 @@ impl Store {
         *self.engine.compiled.lock().unwrap() = compiled;
         *self.engine.config.lock().unwrap() = config.clone();
         self.active = config.clone();
-        self.previous = Some(old);
-        self.previous_unresolved = self.active_unresolved.clone();
+        self.active_on_disk = true;
+        // A stand-in was not backed up: there is no revision to roll back to.
+        if old_on_disk {
+            self.previous = Some(old);
+            self.previous_unresolved = self.active_unresolved.clone();
+        } else {
+            self.previous = None;
+            self.previous_unresolved = vec![];
+        }
         self.active_unresolved = metadata.clone();
         self.unresolved = metadata;
         self.pending_import = None;

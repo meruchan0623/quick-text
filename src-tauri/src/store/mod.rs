@@ -17,7 +17,7 @@ pub use meta::clear_run_marker_on_session_end;
 pub use metadata::merge_import_metadata;
 
 use crate::{
-    error::{CommandError, IoOp, SafeModeReason},
+    error::{CommandError, EntityKind, IoOp, SafeModeReason},
     events::{ProblemSink, StoreSink, StoreState},
     startup::{ProblemKind, StartupProblem},
 };
@@ -39,6 +39,15 @@ pub struct Store {
     dir: PathBuf,
     pub draft: Config,
     pub active: Config,
+    /// Whether `active` was read from a file or published by this store.
+    /// False for the empty configuration that stands in when there is none
+    /// (a new data directory, SafeMode(NoValidConfig), the read-only safe
+    /// modes). Only a configuration that was on disk is backed up as
+    /// `revisions/<n>.json`: a backup of the stand-in would be a valid
+    /// fallback candidate, and an interrupted publish out of
+    /// SafeMode(NoValidConfig) would then leave the next launch Recovered
+    /// with an empty configuration instead of still protected (F4-1, R1).
+    active_on_disk: bool,
     previous: Option<Config>,
     disk_hash: Option<Vec<u8>>,
     pub engine: Arc<Shared>,
@@ -263,13 +272,21 @@ impl Store {
     /// once the engine has been Healthy for 60 seconds and at least one
     /// expansion has succeeded on `revision`. There is no timer here. When
     /// `revision` is the active one and has no `revisions/<n>.json` yet, that
-    /// snapshot is written as well so that the candidate exists.
+    /// snapshot is written as well so that the candidate exists. The empty
+    /// stand-in of a data directory without a configuration is never
+    /// snapshotted (see `active_on_disk`): it is `NotFound`.
     #[allow(dead_code)] // Called by the supervisor (P1a).
     pub fn mark_last_good(&self, revision: u64) -> Result<(), CommandError> {
         self.ensure_writable()?;
         let revisions = self.dir.join("revisions");
         let snapshot = revisions.join(format!("{revision}.json"));
         if revision == self.active.revision && !snapshot.exists() {
+            if !self.active_on_disk {
+                return Err(CommandError::NotFound {
+                    kind: EntityKind::Revision,
+                    id: revision.to_string(),
+                });
+            }
             fs::create_dir_all(&revisions)
                 .map_err(|e| CommandError::io(IoOp::CreateDir, Some(&revisions), &e))?;
             atomic_json(&snapshot, &self.active)?;

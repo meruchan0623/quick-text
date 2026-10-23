@@ -97,6 +97,11 @@ pub enum LoadOutcome {
 pub struct LoadReport {
     pub outcome: LoadOutcome,
     pub active: Config,
+    /// Whether `active` was read from a file (`active.json` or a fallback
+    /// candidate). False for the empty configuration a new data directory,
+    /// SafeMode(NoValidConfig) and the read-only safe modes start with: it
+    /// was never on disk, so it must never be backed up as a revision.
+    pub active_on_disk: bool,
     /// `active` compiled rule by rule; rules that failed stay off (B-43).
     pub compiled: CompiledConfig,
     pub draft: Config,
@@ -193,6 +198,7 @@ pub fn load_or_fallback(dir: &Path, env: &StoreEnv) -> LoadReport {
             }
         }
     }
+    let active_on_disk = found.is_some();
     let (stored, mut outcome) = match found {
         Some(found) => found,
         None => {
@@ -298,6 +304,7 @@ pub fn load_or_fallback(dir: &Path, env: &StoreEnv) -> LoadReport {
     LoadReport {
         outcome,
         active,
+        active_on_disk,
         compiled,
         draft,
         previous,
@@ -547,6 +554,7 @@ impl Loader<'_> {
             draft: active.clone(),
             compiled,
             active,
+            active_on_disk: false,
             previous: None,
             disk_hash: None,
             problems,

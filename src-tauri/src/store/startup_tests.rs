@@ -4,14 +4,18 @@
 use super::{
     atomic::atomic_json,
     export::{final_path, StageHooks},
-    fallback::{load_or_fallback, retry_locked, LoadOutcome, LoadReport, StoreEnv, StoreIo},
+    fallback::{
+        load_or_fallback, retry_locked, revision_numbers, LoadOutcome, LoadReport, StoreEnv,
+        StoreIo,
+    },
+    load::read_config,
     meta::{parse_meta, StoreMeta, META_FILE},
     test_support::*,
     RecoverySource, Store,
 };
 use crate::{
     autostart::LoginItem,
-    error::{CommandError, SafeModeReason},
+    error::{CommandError, EntityKind, SafeModeReason},
     startup::{defer_autostart_repair, finish_self_test, ProblemKind, StartupListen},
 };
 use quicker_domain::*;
@@ -549,6 +553,130 @@ fn new_data_directory_is_normal() {
     let store = Store::load_with(dir.path(), &env(&world));
     assert_eq!(store.safe_mode(), None);
     assert!(store.startup_problems().is_empty());
+}
+
+fn refused_no_valid_config(result: Result<(), CommandError>) {
+    assert!(
+        matches!(
+            result,
+            Err(CommandError::SafeMode {
+                reason: SafeModeReason::NoValidConfig
+            })
+        ),
+        "{result:?}"
+    );
+}
+
+/// F4-1 review R1: a publish out of SafeMode(NoValidConfig) that fails
+/// after the backup stage, at the last write before `active.json`, leaves no
+/// valid candidate behind. The empty stand-in is not backed up as a
+/// revision, so the next launches are still NoValidConfig and the imported
+/// draft stays protected. Publishing again once the write works is still
+/// the way out.
+#[test]
+fn interrupted_recovery_publish_stays_no_valid_config() {
+    let dir = TempDir::new();
+    let world = world();
+    write(&dir, "active.json", TRUNCATED);
+    write(&dir, "revisions/1.json", TRUNCATED);
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_no_valid_config(&store);
+    let imported = metadata_config(&["imported"]);
+    store.pending_import = Some((imported.clone(), vec![]));
+    store.save(imported.clone()).unwrap();
+    let blocker = dir.join("active-migration-unresolved.json");
+    fs::create_dir(&blocker).unwrap();
+    assert!(store.publish(store.draft.clone()).is_err());
+    assert_no_valid_config(&store);
+    assert!(!dir.join("active.json").exists());
+    assert_eq!(revision_numbers(&dir), Vec::<u64>::new());
+    clean_exit(store, &world);
+
+    for _ in 0..2 {
+        let mut store = Store::load_with(dir.path(), &env(&world));
+        assert_no_valid_config(&store);
+        assert_eq!(store.draft.rules, imported.rules);
+        let draft_bytes = fs::read(dir.join("draft.json")).unwrap();
+        refused_no_valid_config(store.discard());
+        refused_no_valid_config(store.save(Config::default()));
+        refused_no_valid_config(store.rollback_previous());
+        refused_no_valid_config(store.mark_last_good(0));
+        refused_no_valid_config(store.set_manual_pause(false, || true));
+        assert_eq!(fs::read(dir.join("draft.json")).unwrap(), draft_bytes);
+        clean_exit(store, &world);
+    }
+
+    fs::remove_dir(&blocker).unwrap();
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_no_valid_config(&store);
+    store.pending_import = Some((store.draft.clone(), vec![]));
+    store.save(store.draft.clone()).unwrap();
+    store.publish(store.draft.clone()).unwrap();
+    assert_eq!(store.safe_mode(), None);
+    clean_exit(store, &world);
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.safe_mode(), None);
+    assert_eq!(store.active.rules, imported.rules);
+    assert!(matches!(
+        store.rollback_previous(),
+        Err(CommandError::NotFound {
+            kind: EntityKind::Revision,
+            ..
+        })
+    ));
+}
+
+/// F4-1 review R1: publish backs up the active configuration as
+/// `revisions/<n>.json` only when it was on disk. The empty stand-in of a
+/// new data directory is neither backed up, nor a rollback target, nor
+/// snapshotted as last-known-good; every published configuration still is
+/// backed up, rolled back to (also after a restart) and snapshotted.
+#[test]
+fn publish_backs_up_only_configurations_that_were_on_disk() {
+    let dir = TempDir::new();
+    let world = world();
+    let not_found = |result: Result<(), CommandError>| {
+        assert!(
+            matches!(
+                result,
+                Err(CommandError::NotFound {
+                    kind: EntityKind::Revision,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+    };
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    not_found(store.mark_last_good(0));
+    assert_eq!(store.meta.get().last_good_revision, None);
+    let one = metadata_config(&["one"]);
+    store.publish(one.clone()).unwrap();
+    assert_eq!(revision_numbers(&dir), Vec::<u64>::new());
+    not_found(store.rollback_previous());
+    let two = metadata_config(&["two"]);
+    store.publish(two.clone()).unwrap();
+    assert_eq!(revision_numbers(&dir), [1]);
+    assert_eq!(
+        read_config(&dir.join("revisions/1.json")).unwrap().rules,
+        one.rules
+    );
+    clean_exit(store, &world);
+
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.safe_mode(), None);
+    store.rollback_previous().unwrap();
+    assert_eq!(store.active.revision, 3);
+    assert_eq!(store.active.rules, one.rules);
+    let mut numbers = revision_numbers(&dir);
+    numbers.sort_unstable();
+    assert_eq!(numbers, [1, 2]);
+    store.mark_last_good(3).unwrap();
+    assert_eq!(
+        read_config(&dir.join("revisions/3.json")).unwrap().rules,
+        one.rules
+    );
+    assert_eq!(store.meta.get().last_good_revision, Some(3));
 }
 
 /// Fallback order: last-known-good, other revisions newest first, then

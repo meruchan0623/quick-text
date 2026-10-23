@@ -44,6 +44,7 @@ impl Store {
             dir,
             draft: Config::default(),
             active: Config::default(),
+            active_on_disk: false,
             previous: None,
             disk_hash: None,
             engine,
@@ -84,6 +85,7 @@ impl Store {
         self.meta.replace(report.meta, report.meta_writable);
         self.disk_hash = report.disk_hash;
         self.active = report.active;
+        self.active_on_disk = report.active_on_disk;
         self.draft = report.draft;
         self.previous = report.previous;
         self.pending_import = None;
