@@ -86,6 +86,9 @@ $script:Utf8Bom = New-Object System.Text.UTF8Encoding($true)
 # S-27: 0.4 只记录内存增长，不判失败；1.0 要求增长 < 20 MB（development-plan.md「浸泡」一节）。
 $script:S27LimitMB = 20
 $script:MaxChunkBytes = 8MB
+# Bytes before the read offset compared on each read to notice a log file that
+# was truncated and grew back, or was replaced (Read-LogChunk).
+$script:FingerprintBytes = 64
 $script:CheckpointMinutes = 10
 $script:ListLimit = 30
 
@@ -173,6 +176,9 @@ $script:ListenLabel = @{ listening = '监听中'; paused = '暂停'; unknown = '
 $script:PauseWhyLabel = @{
     manual = '手动暂停'; safe_mode = '安全模式'; auto_listen_off = '启动时未开启自动监听'
     failed = '启动自检未通过'; refused = '启动时恢复监听被拒'
+}
+$script:LogResetLabel = @{
+    shrunk = '文件变短'; replaced = '文件被替换（创建时间变了）'; rewritten = '偏移前的内容变了（截断后又长回来，或被替换）'
 }
 $script:UnhealthyStates = @('starting', 'recovering', 'failed')
 $script:FailedEvents = @('supervisor.circuit_open', 'runtime.failed_latched', 'supervisor.unsupervised',
@@ -510,22 +516,74 @@ function Invoke-LogLine([string] $Line, [DateTime] $Fallback) {
     Update-State $ev $vals $at
 }
 
-# Reads complete lines of $Path from $Offset up to $StopAt (exclusive), sharing
-# the file with the writer (ReadWrite | Delete). Never writes.
-function Read-LogChunk([string] $Path, [long] $Offset, [long] $StopAt) {
+# Where reading one log file goes on from: the byte offset, the file's identity
+# (its creation time in UTC ticks) and a fingerprint of the bytes just before
+# the offset. Identity and fingerprint are $null when not known yet.
+function New-LogCursor([long] $Offset) {
+    return [pscustomobject]@{ Offset = $Offset; Identity = $null; Tail = $null }
+}
+
+# Base64 of the $script:FingerprintBytes bytes before $Offset (fewer near the
+# start), or $null at offset 0 or when they cannot all be read.
+function Get-TailFingerprint([System.IO.Stream] $Stream, [long] $Offset) {
+    $n = [int][Math]::Min([long]$script:FingerprintBytes, $Offset)
+    if ($n -le 0) { return $null }
+    $buf = [byte[]]::new($n)
+    [void]$Stream.Seek($Offset - $n, [System.IO.SeekOrigin]::Begin)
+    $got = 0
+    while ($got -lt $n) {
+        $r = $Stream.Read($buf, $got, $n - $got)
+        if ($r -le 0) { break }
+        $got += $r
+    }
+    if ($got -lt $n) { return $null }
+    return [System.Convert]::ToBase64String($buf)
+}
+
+# Reads complete lines of $Path from $Cursor ($null: from 0) up to $StopAt
+# (exclusive), sharing the file with the writer (ReadWrite | Delete). Never
+# writes. Returns the new cursor in .Cursor.
+#
+# The app only appends, so the cursor starts over from 0 (.Reset says why) when
+# the file at $Path is no longer the one it was taken on:
+#   replaced  - another creation time (deleted and created again, or renamed over);
+#   shrunk    - shorter than the offset (truncated);
+#   rewritten - the bytes before the offset changed (truncated and grown back past
+#               the offset between two reads, or replaced by a file that kept the
+#               creation time through NTFS tunnelling).
+# A UTF-8 BOM is skipped at offset 0 only (including after such a restart).
+function Read-LogChunk([string] $Path, $Cursor, [long] $StopAt) {
+    if ($null -eq $Cursor) { $Cursor = New-LogCursor 0 }
+    $Offset = [long]$Cursor.Offset
     $result = [pscustomobject]@{
-        Status = 'ok'; Offset = $Offset; Reset = $false; Bytes = [long]0
+        Status = 'ok'; Offset = $Offset; Reset = ''; Bytes = [long]0; Cursor = $Cursor
         Lines  = ([System.Collections.Generic.List[string]]::new())
     }
     if (-not [System.IO.File]::Exists($Path)) { $result.Status = 'missing'; return $result }
+    $identity = $Cursor.Identity
+    $tail = $Cursor.Tail
+    $tailAt = $Offset
     $fs = $null
     try {
         $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
         $fs = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+        $created = $null
+        try { $created = [System.IO.File]::GetCreationTimeUtc($Path).Ticks } catch { $created = $null }
         $len = $fs.Length
-        if ($len -lt $Offset) { $Offset = [long]0; $result.Reset = $true }
+        if ($Offset -gt 0) {
+            if ($null -ne $Cursor.Identity -and $null -ne $created -and $created -ne $Cursor.Identity) {
+                $result.Reset = 'replaced'
+            } elseif ($len -lt $Offset) {
+                $result.Reset = 'shrunk'
+            } elseif ($null -ne $Cursor.Tail -and (Get-TailFingerprint $fs $Offset) -ne $Cursor.Tail) {
+                $result.Reset = 'rewritten'
+            }
+            if ($result.Reset) { $Offset = [long]0; $tail = $null; $tailAt = [long]0 }
+        }
+        if ($null -ne $created) { $identity = $created }
         $end = [Math]::Min($len, $StopAt)
         while ($Offset -lt $end) {
+            $chunkStart = $Offset
             $want = [int][Math]::Min($end - $Offset, [long]$script:MaxChunkBytes)
             $buf = [byte[]]::new($want)
             [void]$fs.Seek($Offset, [System.IO.SeekOrigin]::Begin)
@@ -546,7 +604,11 @@ function Read-LogChunk([string] $Path, [long] $Offset, [long] $StopAt) {
                 }
                 break # the last line is not complete yet
             }
-            $text = $script:Utf8NoBom.GetString($buf, 0, $lf + 1)
+            # tracing_appender writes no BOM, but a file saved by an editor may
+            # start with one; it would hide the first line's timestamp from $HeadRx.
+            $skip = 0
+            if ($chunkStart -eq 0 -and $lf -ge 2 -and $buf[0] -eq 0xEF -and $buf[1] -eq 0xBB -and $buf[2] -eq 0xBF) { $skip = 3 }
+            $text = $script:Utf8NoBom.GetString($buf, $skip, $lf + 1 - $skip)
             $Offset += ($lf + 1)
             $result.Bytes += ($lf + 1)
             foreach ($raw in $text.Split([char]10)) {
@@ -554,6 +616,10 @@ function Read-LogChunk([string] $Path, [long] $Offset, [long] $StopAt) {
                 if ($t.Length -gt 0) { $result.Lines.Add($t) }
             }
             if ($got -lt $want) { break }
+        }
+        if ($Offset -ne $tailAt) {
+            $tail = Get-TailFingerprint $fs $Offset
+            $tailAt = $Offset
         }
     } catch {
         $base = $_.Exception.GetBaseException()
@@ -565,18 +631,22 @@ function Read-LogChunk([string] $Path, [long] $Offset, [long] $StopAt) {
     } finally {
         if ($null -ne $fs) { $fs.Dispose() }
     }
+    # A fingerprint taken at another offset says nothing about this one.
+    if ($Offset -ne $tailAt) { $tail = $null }
     $result.Offset = $Offset
+    $result.Cursor = [pscustomobject]@{ Offset = $Offset; Identity = $identity; Tail = $tail }
     return $result
 }
 
 function Invoke-LogRead([string] $Path, [DateTime] $Now) {
-    $offset = [long]0
-    if ($script:Offsets.ContainsKey($Path)) { $offset = [long]$script:Offsets[$Path] }
-    $chunk = Read-LogChunk $Path $offset ([long]::MaxValue)
-    if ($chunk.Reset) { $script:LogResets++ }
+    $chunk = Read-LogChunk $Path $script:Cursors[$Path] ([long]::MaxValue)
+    if ($chunk.Reset) {
+        $script:LogResets++
+        Add-Count $script:LogResetKinds $chunk.Reset 1
+    }
     if ($chunk.Status -eq 'error') { $script:LogReadErrors++ }
     if ($chunk.Status -eq 'oversized') { $script:LogOversized++ }
-    $script:Offsets[$Path] = $chunk.Offset
+    $script:Cursors[$Path] = $chunk.Cursor
     $script:LogBytes += $chunk.Bytes
     foreach ($l in $chunk.Lines) { Invoke-LogLine $l $Now }
     return $chunk.Status
@@ -593,7 +663,7 @@ function Update-Logs([DateTime] $Now) {
             $script:LogRollovers++
         }
         $script:CurrentLog = $today
-        if (-not $script:Offsets.ContainsKey($today)) { $script:Offsets[$today] = [long]0 }
+        if (-not $script:Cursors.ContainsKey($today)) { $script:Cursors[$today] = New-LogCursor 0 }
     } elseif ($script:PreviousLog) {
         $null = Invoke-LogRead $script:PreviousLog $Now
     }
@@ -612,12 +682,12 @@ function Invoke-Baseline([bool] $ProcessRunning) {
         if ([System.IO.File]::Exists($today)) {
             try { $todayLen = ([System.IO.FileInfo]::new($today)).Length } catch { $todayLen = [long]0 }
         }
-        $c = Read-LogChunk $yesterday ([long]0) ([long]::MaxValue)
+        $c = Read-LogChunk $yesterday $null ([long]::MaxValue)
         foreach ($l in $c.Lines) { Invoke-LogLine $l $script:RunStart }
-        $c = Read-LogChunk $today ([long]0) $todayLen
+        $c = Read-LogChunk $today $null $todayLen
         foreach ($l in $c.Lines) { Invoke-LogLine $l $script:RunStart }
         $script:CurrentLog = $today
-        $script:Offsets[$today] = $c.Offset
+        $script:Cursors[$today] = $c.Cursor
     } finally {
         $script:Baseline = $false
     }
@@ -1005,6 +1075,14 @@ function Add-Limited($Out, $Items, [string] $Indent) {
     }
 }
 
+function Format-ResetKinds {
+    $parts = [System.Collections.Generic.List[string]]::new()
+    foreach ($k in @('shrunk', 'replaced', 'rewritten')) {
+        if ($script:LogResetKinds.ContainsKey($k)) { $parts.Add((Get-Label $script:LogResetLabel $k) + ' ' + $script:LogResetKinds[$k] + ' 次') }
+    }
+    return [string]::Join('、', $parts.ToArray())
+}
+
 function Build-Summary([string] $Status) {
     $end = [DateTime]::Now
     if ($script:HealthTransitions.Count -eq 0) {
@@ -1256,6 +1334,11 @@ function Build-Summary([string] $Status) {
         $auto.Add('进程在运行但日志目录不存在（' + $script:LogDirMissingSamples + ' 次采样）：数据目录可能不对（-DataDirectory），或应用没能写日志（log.file_unavailable 只写到 stderr）。')
     }
     if ($script:LogReadErrors -gt 0) { $auto.Add('日志读取出错 ' + $script:LogReadErrors + ' 次，统计可能不全。') }
+    if ($script:LogResets -gt 0) {
+        $auto.Add('日志文件从头重读 ' + $script:LogResets + ' 次（' + (Format-ResetKinds) +
+            '）：应用只追加日志，文件被截断或替换过；截断或替换之前、上次读取之后写进旧文件的事件会漏读，' +
+            '新文件里和旧文件相同的开头会再计一次，事件计数和状态推断可能不准。')
+    }
     if ($script:SampleFailures -gt 0) { $auto.Add('采样出错 ' + $script:SampleFailures + ' 次（最后一次：' + $script:LastSampleFailure + '）。') }
 
     # ---- silent failure ----
@@ -1276,7 +1359,7 @@ function Build-Summary([string] $Status) {
     $o.Add('     6. 进程重启、进程不存在、启动前没有 app.exit、app.panic。')
     $o.Add('     7. 暂停（engine.manual_pause paused=true、安全模式、self_test.startup outcome=auto_listen_off / failed / refused 等）连续 ≥ ' +
         $PauseSuspectSeconds + ' 秒。')
-    $o.Add('     8. 出现 ERROR 级日志；进程在运行但日志目录不存在；日志读取或采样出错。')
+    $o.Add('     8. 出现 ERROR 级日志；进程在运行但日志目录不存在；日志读取或采样出错；日志文件被截断或替换后从头重读。')
     $o.Add('  B. 人工复核项：')
     $o.Add('     1. 输入活动与上面的不可用时段重叠。输入活动 = 采样时 GetLastInputInfo 的空闲时间 < 采样间隔，')
     $o.Add('        不区分键盘和鼠标，外部注入的输入也算；只说明「有人在操作」，不说明打了触发词。')
@@ -1308,7 +1391,9 @@ function Build-Summary([string] $Status) {
     foreach ($k in @('ERROR', 'WARN', 'INFO', 'DEBUG', 'TRACE')) { if ($script:LevelCounts.ContainsKey($k)) { $lv.Add($k + ' ' + $script:LevelCounts[$k]) } }
     $o.Add('新增日志行 ' + $script:LogLines + '（' + [string]::Join('，', $lv.ToArray()) + '），无 event 字段的行 ' + $script:NoEventLines +
         '，续行 ' + $script:ContinuationLines + '，读取 ' + ([double]$script:LogBytes / 1KB).ToString('0.0', $script:Inv) + ' KB')
-    $o.Add('跨日换文件 ' + $script:LogRollovers + ' 次；文件变短后从头重读 ' + $script:LogResets + ' 次；超长行跳过 ' + $script:LogOversized +
+    $resetText = '0 次'
+    if ($script:LogResets -gt 0) { $resetText = [string]$script:LogResets + ' 次（' + (Format-ResetKinds) + '）' }
+    $o.Add('跨日换文件 ' + $script:LogRollovers + ' 次；文件被截断或替换后从头重读 ' + $resetText + '；超长行跳过 ' + $script:LogOversized +
         ' 次；读取出错 ' + $script:LogReadErrors + ' 次')
     $o.Add('进程在运行而当天日志文件尚不存在的采样 ' + $script:LogMissingSamples + ' 次（UTC 零点后应用还没写日志时属正常）；日志目录不存在的采样 ' +
         $script:LogDirMissingSamples + ' 次')
@@ -1343,13 +1428,14 @@ function Initialize-SoakState {
     $script:Baseline = $false
     $script:CurrentLog = $null
     $script:PreviousLog = $null
-    $script:Offsets = @{}
+    $script:Cursors = @{}
     $script:LogLines = 0
     $script:ContinuationLines = 0
     $script:NoEventLines = 0
     $script:LevelCounts = @{}
     $script:LogBytes = [long]0
     $script:LogResets = 0
+    $script:LogResetKinds = @{}
     $script:LogRollovers = 0
     $script:LogMissingSamples = 0
     $script:LogDirMissingSamples = 0

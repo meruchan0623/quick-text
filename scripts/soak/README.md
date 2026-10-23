@@ -147,7 +147,7 @@ pwsh -NoProfile -File scripts/soak/soak.ps1 -DataDirectory D:\qt-acceptance-data
 5. 出现 `input.refused reason=hook_missing`、`input.queue_full`、`runtime.events_dropped`；
 6. 进程重启、进程消失、启动前没有 `app.exit`、`app.panic`；
 7. 暂停持续不少于 `-PauseSuspectSeconds`（手动暂停、安全模式、启动时未自动监听、启动自检未通过等，原因一并列出）；
-8. 出现 ERROR 级日志；进程在运行但日志目录不存在；日志读取或采样出错。
+8. 出现 ERROR 级日志；进程在运行但日志目录不存在；日志读取或采样出错；日志文件被截断或替换后从头重读（见下文「日志的读法」）。
 
 **B. 人工复核项：**
 
@@ -158,6 +158,16 @@ pwsh -NoProfile -File scripts/soak/soak.ps1 -DataDirectory D:\qt-acceptance-data
 
 健康状态的推断规则：`app.start` → 正在启动；`self_test.startup` 的 `health`；`supervisor.recovering`、`supervisor.repair` → 恢复中；`supervisor.recovered` 的 `state`；`supervisor.circuit_open`、`runtime.failed_latched`、`supervisor.unsupervised`、`supervisor.engine_unavailable`、`supervisor.driver_hung` → 故障；`app.exit` 或采样时进程不存在 → 已退出。脚本开始时会回放昨天和今天（UTC）的日志，只用来确定起始状态，不计入统计。
 
+## 日志的读法
+
+- 每个日志文件记一个游标：读到的字节偏移、文件身份（创建时间，UTC）、偏移前 64 字节的指纹。只读完整的行，最后一行没写完时留到下次。
+- 应用只追加日志。所以下次读时出现下面任一情况，就认为这个路径上已经不是原来那个文件，游标回到 0 从头重读，计入「日志从头重读」并列为 A 类可疑项（第 8 条），汇总的「日志读取」一节按原因分别计数：
+  - 文件比偏移短（被截断）——「文件变短」；
+  - 创建时间变了（删掉后重建，或被别的文件改名覆盖）——「文件被替换」；
+  - 偏移前 64 字节和上次不同（两次读取之间被截断又长回偏移以上，或被替换但 NTFS 的文件名隧道保留了原创建时间）——「偏移前的内容变了」。
+- 从头重读的代价：截断或替换之前、上次读取之后写进旧文件的事件会漏读；新文件里和旧文件相同的开头会再计一次。所以出现这一项时，事件计数和状态推断只作参考。
+- 文件开头的 UTF-8 BOM（`EF BB BF`）只在偏移 0 处跳过，包括从头重读的时候；不跳过的话第一行的时间戳对不上行首格式，第一条事件会被当成续行丢掉。应用自己（`tracing_appender`）不写 BOM，用编辑器另存过的文件才会有。
+
 ## 局限
 
 - 日志按 UTC 日期分文件（`logs\quicker-text.YYYY-MM-DD.log`），应用在 UTC 零点之后第一次写日志时才换文件；脚本跨日时先读完旧文件再读新文件，并在之后的每次采样里继续检查旧文件的尾部。
@@ -165,3 +175,29 @@ pwsh -NoProfile -File scripts/soak/soak.ps1 -DataDirectory D:\qt-acceptance-data
 - 输入活动只说明「有人在操作」，不说明打了触发词，也不区分键盘和鼠标。
 - 内存统计以最后一个进程实例为准；进程重启过时另列全程峰值。
 - WebView2 子进程（`msedgewebview2`）不在统计范围内。
+
+## 回归用例 `soak.Tests.ps1`
+
+不依赖 Pester。它用 `[System.Management.Automation.Language.Parser]::ParseFile` 解析 `soak.ps1`，只加载其中的常量和函数（最后一个函数定义及之前的顶层语句；这一段里出现常量和函数以外的语句会直接报错退出），不跑设置和主循环。每个用例先调用 `Initialize-SoakState` 重置状态，在 `%TEMP%\qt-soak-tests-<随机>\` 下自己的目录里写合成日志，再直接调用脚本里的函数，检查计数、游标和汇总里的自动可疑项。
+
+它不启动应用，不查询或结束任何进程，不读写 `%APPDATA%` 下的数据目录（临时目录落在 `%APPDATA%` 里时拒绝运行），不装钩子，不产生输入；结束时删除自己的临时目录。
+
+```powershell
+pwsh -NoProfile -File scripts/soak/soak.Tests.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\soak\soak.Tests.ps1
+```
+
+每个用例输出一行 `PASS` / `FAIL`（失败的断言缩进列在下面），最后一行 `RESULT passed=<n> failed=<n>`；全部通过时退出码为 0，否则为失败的断言数。改过 `soak.ps1` 后两种 PowerShell 都跑一遍，并做一次语法检查：
+
+```powershell
+$t = $null; $e = $null
+[void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path scripts/soak/soak.ps1), [ref]$t, [ref]$e); $e.Count   # 应为 0
+```
+
+| 用例 | 覆盖 |
+|---|---|
+| 5a、5b | 文件开头的 BOM：第一条事件不丢；只在偏移 0 处跳过，从头重读后照样跳过，偏移非 0 时不动 |
+| 2a | 只追加时不误判，游标记下文件身份和指纹 |
+| 2b | 同一个文件在两次读取之间截断又长回旧偏移以上：按「偏移前的内容变了」从头重读，新内容的事件一条不漏，汇总列出 A 类项 |
+| 2c | 同一路径换成另一个文件，旧偏移前的字节完全相同、创建时间不同：按「文件被替换」从头重读 |
+| 2d | 文件变短：按「文件变短」从头重读 |
