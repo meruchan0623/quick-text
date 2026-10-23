@@ -51,13 +51,14 @@ mod tests {
     fn set_auto_listen_writes_prefs_and_returns_the_stored_value() {
         let dir = temp_dir();
         let store = Managed::new(Store::load(dir.clone()));
-        assert!(!prefs::auto_listen_on_start(&dir));
-        assert!(write_auto_listen(&store, true).unwrap());
+        // On by default.
         assert!(prefs::auto_listen_on_start(&dir));
-        // Asking again for the stored value succeeds and changes nothing.
-        assert!(write_auto_listen(&store, true).unwrap());
         assert!(!write_auto_listen(&store, false).unwrap());
         assert!(!prefs::auto_listen_on_start(&dir));
+        // Asking again for the stored value succeeds and changes nothing.
+        assert!(!write_auto_listen(&store, false).unwrap());
+        assert!(write_auto_listen(&store, true).unwrap());
+        assert!(prefs::auto_listen_on_start(&dir));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -71,8 +72,8 @@ mod tests {
             store.lock().safe_mode(),
             Some(SafeModeReason::NoValidConfig)
         );
-        assert!(write_auto_listen(&store, true).unwrap());
-        assert!(prefs::auto_listen_on_start(&dir));
+        assert!(!write_auto_listen(&store, false).unwrap());
+        assert!(!prefs::auto_listen_on_start(&dir));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -47,10 +47,11 @@ impl Default for Prefs {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppPrefs {
-    /// Defaults to false; plan appendix C.1 #11 is still undecided.
+    /// Defaults to true: opening the app starts listening once the startup
+    /// self-test passes (plan appendix C.1 #11).
     pub auto_listen_on_start: bool,
     /// Temporary log level, in effect until `until_ms` (§7 logging).
     pub log_level: Option<LogLevelOverride>,
@@ -58,6 +59,17 @@ pub struct AppPrefs {
     pub clipboard: ClipboardPrefs,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl Default for AppPrefs {
+    fn default() -> Self {
+        Self {
+            auto_listen_on_start: true,
+            log_level: None,
+            clipboard: ClipboardPrefs::default(),
+            extra: Map::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -441,7 +453,7 @@ mod tests {
         let dir = temp_dir();
         let prefs = load_prefs(&dir).unwrap();
         assert_eq!(prefs, Prefs::default());
-        assert!(!prefs.app.auto_listen_on_start);
+        assert!(prefs.app.auto_listen_on_start);
         assert_eq!(prefs.ui, json!({}));
         assert!(!dir.exists());
     }
@@ -867,7 +879,7 @@ mod tests {
     #[test]
     fn update_prefs_changes_one_field_and_keeps_the_rest() {
         let dir = temp_dir();
-        assert!(!auto_listen_on_start(&dir), "missing file: off");
+        assert!(auto_listen_on_start(&dir), "missing file: on");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join(FILE),
@@ -875,14 +887,14 @@ mod tests {
         )
         .unwrap();
         let changed = update_prefs(&dir, |prefs| {
-            prefs.app.auto_listen_on_start = true;
+            prefs.app.auto_listen_on_start = false;
             true
         })
         .unwrap();
         assert!(changed);
-        assert!(auto_listen_on_start(&dir));
+        assert!(!auto_listen_on_start(&dir));
         let written: Value = serde_json::from_slice(&fs::read(dir.join(FILE)).unwrap()).unwrap();
-        assert_eq!(written["app"]["auto_listen_on_start"], true);
+        assert_eq!(written["app"]["auto_listen_on_start"], false);
         assert_eq!(written["app"]["hotkey"], "Ctrl+Q");
         assert_eq!(written["ui"], json!({"theme": "dark"}));
         assert_eq!(written["future"], 1);

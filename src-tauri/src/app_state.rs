@@ -128,16 +128,16 @@ mod tests {
         let store = Store::load(dir.clone());
         assert_eq!(
             serde_json::to_value(store.state()).unwrap()["auto_listen_on_start"],
-            false
+            true
         );
         crate::store::prefs::update_prefs(&dir, |prefs| {
-            prefs.app.auto_listen_on_start = true;
+            prefs.app.auto_listen_on_start = false;
             true
         })
         .unwrap();
         assert_eq!(
             serde_json::to_value(store.state()).unwrap()["auto_listen_on_start"],
-            true
+            false
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
