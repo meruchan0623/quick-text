@@ -52,6 +52,8 @@ for ($i = 0; $i -le $lastFunction; $i++) {
     [void]$definitions.AppendLine($st.Extent.Text)
 }
 . ([scriptblock]::Create($definitions.ToString()))
+# The real reader, for a case that wraps it (4b).
+$script:RealReadLogChunk = ${function:Read-LogChunk}
 
 # soak.ps1's parameters, as its functions read them.
 $Hours = 1.0
@@ -497,12 +499,13 @@ Invoke-TestCase '4b 回放第一次读失败、重试成功：不算出错' {
             (New-TestLine $utc.AddMinutes(-10) 'INFO' 'app.start' 'version="0.4.0"'),
             (New-TestLine $utc.AddMinutes(-10).AddSeconds(1) 'INFO' 'self_test.startup' 'health=Healthy outcome="listening"')))
     $todayLen = ([System.IO.FileInfo]::new($today)).Length
-    $real = ${function:Read-LogChunk}
     $script:FailNext = 1
     $script:FailName = [System.IO.Path]::GetFileName($today)
-    # Shadows Read-LogChunk for calls made from this case's scope (PowerShell
-    # resolves commands dynamically); gone when the case returns.
-    ${function:Read-LogChunk} = {
+    # A function defined in this case's scope shadows Read-LogChunk for the
+    # calls made from it (PowerShell resolves commands through the callers'
+    # scopes) and is gone when the case returns. Not `${function:...} = `:
+    # that replaces the script-scope function and outlives the case.
+    function Read-LogChunk {
         param([string] $Path, $Cursor, [long] $StopAt)
         if ($script:FailNext -gt 0 -and $Path.EndsWith($script:FailName)) {
             $script:FailNext--
@@ -511,7 +514,7 @@ Invoke-TestCase '4b 回放第一次读失败、重试成功：不算出错' {
                 Lines  = ([System.Collections.Generic.List[string]]::new())
             }
         }
-        return (& $real $Path $Cursor $StopAt)
+        return (& $script:RealReadLogChunk $Path $Cursor $StopAt)
     }
     Invoke-Baseline $true
     Assert-Equal 0 $script:FailNext '第一次读确实失败过'
@@ -521,6 +524,50 @@ Invoke-TestCase '4b 回放第一次读失败、重试成功：不算出错' {
     Assert-Equal $todayLen $script:Cursors[$today].Offset '游标在文件末尾'
     $auto = Get-AutoItems (Build-Summary '测试')
     Assert-NoneContains $auto '启动时回放日志出错' '不列'
+}
+
+# ---------------------------------------------------------------------------
+# Manual-run events (src-tauri/src/commands/runtime.rs, executor.rs)
+# ---------------------------------------------------------------------------
+
+Invoke-TestCase '6a 手动执行的失败和被拒：拆字段、列 A 类，trace_id 和 os_code 不进汇总' {
+    $p = Join-Path $script:LogDirectory 'manual.log'
+    $trace = '3f2a7c1e-0d4b-4e8a-9b61-2c5d8e7f9a10'
+    Add-TestBytes $p (ConvertTo-TestBytes @(
+            (New-TestLine $T0 'WARN' 'command.execute_refused' 'reason="jobs_exhausted" limit=4 health=Healthy'),
+            (New-TestLine $T0.AddSeconds(1) 'WARN' 'command.execute_failed' 'category="stalled" reason=ExecutorTimeout health=Recovering'),
+            (New-TestLine $T0.AddSeconds(2) 'ERROR' 'command.execute_failed' ('category="spawn_failed" thread="qt-manual-run" kind=Other os_code=Some(8) trace_id=' + $trace)),
+            (New-TestLine $T0.AddSeconds(3) 'ERROR' 'command.execute_failed' ('category="run_failed" reason=Internal trace_id=' + $trace)),
+            (New-TestLine $T0.AddSeconds(4) 'WARN' 'executor.manual_send_refused' 'reason="send_lock_busy" epoch=3')))
+    $null = Invoke-LogRead $p ([DateTime]::Now)
+    Assert-Equal 1 (Get-EventCount 'command.execute_refused') '被拒 1 次'
+    Assert-Equal 3 (Get-EventCount 'command.execute_failed') '失败 3 次'
+    Assert-Equal 1 (Get-DetailCount 'command.execute_refused' 'reason=jobs_exhausted limit=4 health=Healthy') '被拒的字段'
+    Assert-Equal 1 (Get-DetailCount 'command.execute_failed' 'category=stalled reason=ExecutorTimeout health=Recovering') 'stalled 的字段'
+    Assert-Equal 1 (Get-DetailCount 'command.execute_failed' 'category=spawn_failed thread=qt-manual-run kind=Other') 'spawn_failed 的字段'
+    Assert-Equal 1 (Get-DetailCount 'command.execute_failed' 'category=run_failed reason=Internal') 'run_failed 的字段'
+    Assert-Equal 1 (Get-DetailCount 'executor.manual_send_refused' 'reason=send_lock_busy') '发送被拒的原因'
+    $text = Build-Summary '测试'
+    Assert-True (-not $text.Contains($trace)) 'trace_id 不进汇总'
+    Assert-True (-not $text.Contains('os_code')) 'os_code 不进汇总'
+    Assert-True ($text.Contains('command.execute_refused：1 次')) '关键事件里有被拒'
+    $auto = Get-AutoItems $text
+    Assert-AnyContains $auto 'command.execute_refused 1 次' '被拒列 A 类'
+    Assert-AnyContains $auto 'command.execute_failed category=stalled 1 次' 'stalled 列 A 类'
+    Assert-AnyContains $auto '出现 ERROR 级日志 2 条' 'run_failed、spawn_failed 走 ERROR 一条'
+}
+
+Invoke-TestCase '6b 没有手动执行事件：关键事件照样列出 0 次，不列 A 类' {
+    $p = Join-Path $script:LogDirectory 'quiet.log'
+    Add-TestBytes $p (ConvertTo-TestBytes @(
+            (New-TestLine $T0 'WARN' 'executor.manual_send_refused' 'reason="fenced" epoch=2')))
+    $null = Invoke-LogRead $p ([DateTime]::Now)
+    $text = Build-Summary '测试'
+    Assert-True ($text.Contains('command.execute_failed：0 次')) '失败 0 次照样列'
+    Assert-True ($text.Contains('command.execute_refused：0 次')) '被拒 0 次照样列'
+    $auto = Get-AutoItems $text
+    Assert-NoneContains $auto 'command.execute' '不列 A 类'
+    Assert-NoneContains $auto 'manual_send_refused' '发送被拒只计数'
 }
 
 # ---------------------------------------------------------------------------

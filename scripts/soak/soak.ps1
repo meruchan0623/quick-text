@@ -130,6 +130,9 @@ $script:DetailFields = @{
     'self_test.startup'      = @('health', 'outcome')
     'engine.manual_pause'    = @('paused')
     'executor.panic'         = @('stage', 'kind')
+    'executor.manual_send_refused' = @('reason')
+    'command.execute_failed' = @('category', 'reason', 'health', 'thread', 'kind')
+    'command.execute_refused' = @('reason', 'limit', 'health')
     'session.end'            = @('source')
 }
 
@@ -161,6 +164,9 @@ $script:KeyEvents = @(
     @('executor.send_refused', '发送锁被卡住的发送占着，没有发送'),
     @('executor.clipboard_busy', '剪贴板被卡住的任务占着，粘贴被拒'),
     @('executor.rebuilt', '执行器重建'),
+    @('executor.manual_send_refused', '手动执行的输入没有发送；reason = send_lock_busy / release_owed / fenced / unclaimed'),
+    @('command.execute_refused', '手动执行（「测试动作」「单步测试」）开始前被拒：之前的 4 个手动执行任务都还没结束；reason、limit、health'),
+    @('command.execute_failed', '手动执行失败；category = stalled（WARN，被隔离或被发送互斥拒绝，执行器等重建）/ run_failed / spawn_failed（ERROR）'),
     @('clipboard.lease_refused', '剪贴板备份被拒，没有取得租约'),
     @('rawinput.dropped_busy', '执行器忙，RawInput 匹配被丢弃（debug 级，默认日志级别下不出现）'),
     @('runtime.events_dropped', '执行事件推送丢失（界面和托盘少收，执行历史不受影响）'),
@@ -1441,6 +1447,18 @@ function Build-Summary([string] $Status) {
     if ($qf -gt 0) { $auto.Add('input.queue_full ' + $qf + ' 次：输入记录被丢弃，期间的触发词可能漏检。') }
     $ed = Get-EventCount 'runtime.events_dropped'
     if ($ed -gt 0) { $auto.Add('runtime.events_dropped ' + $ed + ' 次：执行事件没推送到界面和托盘（执行历史不受影响，界面上的实时计数可能偏少）。') }
+    # Manual runs (commands/runtime.rs): run_failed and spawn_failed are ERROR
+    # and listed under the ERROR rule; these two are WARN.
+    $cr = Get-EventCount 'command.execute_refused'
+    if ($cr -gt 0) {
+        $auto.Add('command.execute_refused ' + $cr + ' 次：手动执行（「测试动作」「单步测试」）开始前被拒，之前的 4 个手动执行任务都还没结束，' +
+            '有执行线程卡住没有返回。')
+    }
+    $cs = Get-DetailCount 'command.execute_failed' 'category=stalled'
+    if ($cs -gt 0) {
+        $auto.Add('command.execute_failed category=stalled ' + $cs + ' 次：手动执行卡住被隔离，或被发送互斥拒绝；执行器停用到监督线程重建为止，' +
+            '期间的触发词不会展开。')
+    }
     $o.Add('')
 
     # ---- key events ----
@@ -1452,7 +1470,8 @@ function Build-Summary([string] $Status) {
         $o.Add($name + '：' + (Format-EventStats $st) + ' —— ' + $pair[1])
         foreach ($d in @(Get-SortedKeys $st.Details)) { $o.Add('    ' + $d + '：' + $st.Details[$d]) }
     }
-    $o.Add('执行成功 / 失败次数、执行器忙丢弃（钩子路径）：日志不记录，见「人工复核」。')
+    $o.Add('触发词展开的执行成功 / 失败次数、执行器忙丢弃（钩子路径）：日志不记录，见「人工复核」。' +
+        '手动执行只记失败和被拒（command.execute_failed / command.execute_refused），成功不记。')
     $o.Add('')
 
     # ---- ERROR ----
@@ -1517,7 +1536,7 @@ function Build-Summary([string] $Status) {
     # ---- silent failure ----
     $o.Add('== 「静默失效」可疑项 ==')
     $o.Add('判定方法：')
-    $o.Add('  日志不记每次执行，脚本也看不到界面里的执行历史，所以「有输入却没有展开」不能直接判定。')
+    $o.Add('  日志不记触发词的每次执行，脚本也看不到界面里的执行历史，所以「有输入却没有展开」不能直接判定。')
     $o.Add('  脚本只把能从日志和进程看出的「引擎可能没在工作」的迹象列为自动可疑项，把需要对照执行历史的列为人工复核项。')
     $o.Add('  A. 自动可疑项（任一出现即列出）：')
     $o.Add('     1. 健康（日志推断）处于正在启动 / 恢复中 / 故障，连续 ≥ ' + $UnhealthySuspectSeconds + ' 秒，或到结束仍未恢复；')
@@ -1528,7 +1547,8 @@ function Build-Summary([string] $Status) {
     $o.Add('     3. 进入过安全模式（store.safe_mode）。')
     $o.Add('     4. 输入源丢失（input.check result=lost / window_missing / unregistered）后 ' + $UnhealthySuspectSeconds +
         ' 秒内没有同一组件 input.reattach ok=true（或 supervisor.recovered state=Healthy）；或 input.reattach ok=false。')
-    $o.Add('     5. input.refused reason=hook_missing、input.queue_full、runtime.events_dropped 出现过。')
+    $o.Add('     5. input.refused reason=hook_missing、input.queue_full、runtime.events_dropped、')
+    $o.Add('        command.execute_refused、command.execute_failed category=stalled 出现过（手动执行的另两类是 ERROR 级，归第 8 条）。')
     $o.Add('     6. 进程重启、进程不存在（启动时的检查看到过就算）、启动前没有 app.exit、app.panic；')
     $o.Add('        结束时进程不在运行且最后一次 app.start 之后没有 app.exit；整轮没有看到进程。')
     $o.Add('     7. 暂停（engine.manual_pause paused=true、安全模式、self_test.startup outcome=auto_listen_off / failed / refused 等）连续 ≥ ' +
@@ -1543,7 +1563,7 @@ function Build-Summary([string] $Status) {
     $o.Add('     2. 连续输入活动 ≥ ' + $ActiveWindowMinutes + ' 分钟的时段：请对照界面执行历史，确认触发都有执行记录。')
     $o.Add('     3. 结束健康为「降级」或「未知」（这两种日志里看不全）。')
     $o.Add('     4. 下列各项脚本判定不了，每轮都要人工看：')
-    $o.Add('        - 执行成功 / 失败次数：日志不记录。执行历史只在内存里（最多 200 条、30 分钟），每 30 分钟内至少看一次并记下。')
+    $o.Add('        - 触发词展开的执行成功 / 失败次数：日志不记录（手动执行只记失败和被拒）。执行历史只在内存里（最多 200 条、30 分钟），每 30 分钟内至少看一次并记下。')
     $o.Add('        - 执行器忙丢弃：钩子路径只进执行历史；RawInput 路径的 rawinput.dropped_busy 是 debug 级，默认日志级别下不出现。')
     $o.Add('        - 正常 ↔ 降级的切换：不写日志。')
     $o.Add('        - 结束时的实际健康：以界面健康页为准。')

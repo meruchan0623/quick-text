@@ -119,6 +119,9 @@ pwsh -NoProfile -File scripts/soak/soak.ps1 -DataDirectory D:\qt-acceptance-data
 | `hook.panic` / `rawinput.panic` / `input.consumer_panic` | `crates/platform/src/windows/input.rs` | | 计数 |
 | `executor.panic` | `crates/platform/src/windows/executor.rs` | `stage`、`kind` | 计数 |
 | `executor.stalled` / `fenced` / `unwound` / `send_refused` / `clipboard_busy` / `rebuilt` | `crates/platform/src/windows/executor.rs` | | 计数 |
+| `executor.manual_send_refused` | `crates/platform/src/windows/executor.rs` | `reason` | WARN。手动执行的输入没有发送，`reason` 为 `send_lock_busy` / `release_owed` / `fenced` / `unclaimed`；计数（随后的结果见下两行） |
+| `command.execute_refused` | `src-tauri/src/commands/runtime.rs`（`jobs_exhausted`） | `reason`、`limit`、`health` | WARN。手动执行（「测试动作（真实执行）」「单步测试（真实执行）」）开始前被拒：之前的 4 个（`MAX_MANUAL_JOBS`）手动执行任务的线程都还没结束；`reason` 只有 `jobs_exhausted`。界面在健康为正常 / 降级时显示「上一个动作仍在执行」，否则显示「输入引擎暂时不可用」。列为可疑 |
+| `command.execute_failed` | `src-tauri/src/commands/runtime.rs`（`stalled` / `run_failed` / `not_started`） | `category`、`reason`、`health`、`thread`、`kind` | 手动执行失败，按 `category` 分：`stalled`（WARN，任务卡住被隔离或被发送互斥拒绝，执行器停用到重建为止；带返回给界面的 `health`）列为可疑；`run_failed`（ERROR，带执行的原因码）和 `spawn_failed`（ERROR，`qt-manual-run` / `qt-manual-watch` 线程没起来，带 `thread` 和 OS 错误的 `kind`）按 ERROR 级列为可疑。两者另带的 `trace_id`、`os_code` 不进汇总 |
 | `clipboard.lease_refused` | `crates/platform/src/windows/clipboard.rs` | | 计数 |
 | `rawinput.dropped_busy` | `crates/platform/src/windows/rawinput.rs` | | 执行器忙丢弃（debug 级，默认日志级别下不出现） |
 | `runtime.events_dropped` | `crates/platform/src/runtime.rs` | | 执行事件推送丢失，列为可疑 |
@@ -132,11 +135,11 @@ pwsh -NoProfile -File scripts/soak/soak.ps1 -DataDirectory D:\qt-acceptance-data
 
 其余带 `event` 字段的日志也会按名称计数，ERROR 级日志全部按事件名计数（没有事件名的记为「(无 event 字段)」）。
 
-**日志里没有的：** 每次执行的成功或失败、钩子路径上的执行器忙丢弃、正常 ↔ 降级的切换。这些只能看界面的执行历史和健康页。
+**日志里没有的：** 触发词展开的每次执行的成功或失败、手动执行的成功、钩子路径上的执行器忙丢弃、正常 ↔ 降级的切换。这些只能看界面的执行历史和健康页。手动执行（「测试动作（真实执行）」「单步测试（真实执行）」）的失败和被拒记在上表的 `command.execute_failed` / `command.execute_refused`；校验不通过（动作展不开）不写日志，界面直接显示诊断。
 
 ## 「静默失效」的判定方法
 
-日志不记每次执行，脚本也看不到界面的执行历史，所以「打了触发词却没有展开」不能由脚本直接判定。脚本把能从日志和进程看出的「引擎可能没在工作」的迹象列为**自动可疑项**，把需要对照执行历史的列为**人工复核项**。
+日志不记触发词的每次执行，脚本也看不到界面的执行历史，所以「打了触发词却没有展开」不能由脚本直接判定。脚本把能从日志和进程看出的「引擎可能没在工作」的迹象列为**自动可疑项**，把需要对照执行历史的列为**人工复核项**。
 
 **A. 自动可疑项**（任一出现即列出）：
 
@@ -144,7 +147,7 @@ pwsh -NoProfile -File scripts/soak/soak.ps1 -DataDirectory D:\qt-acceptance-data
 2. 结束时健康为正在启动 / 恢复中 / 故障 / 已退出 / 未运行；
 3. 进入过安全模式；
 4. 输入源丢失后在阈值内没有重新挂接（同一组件 `input.reattach ok=true`，或 `supervisor.recovered state=Healthy`），或出现 `input.reattach ok=false`；
-5. 出现 `input.refused reason=hook_missing`、`input.queue_full`、`runtime.events_dropped`；
+5. 出现 `input.refused reason=hook_missing`、`input.queue_full`、`runtime.events_dropped`、`command.execute_refused`、`command.execute_failed category=stalled`（手动执行的 `run_failed` / `spawn_failed` 是 ERROR 级，归第 8 条）；
 6. 进程重启、进程消失、启动前没有 `app.exit`、`app.panic`；结束时进程不在运行，且最后一次 `app.start` 之后没有 `app.exit`；整轮没有看到进程。脚本启动时的进程检查也算「看到过」：进程在第一次采样之前就没了，同样记为进程消失；
 7. 暂停持续不少于 `-PauseSuspectSeconds`（手动暂停、安全模式、启动时未自动监听、启动自检未通过等，原因一并列出）；
 8. 出现 ERROR 级日志；进程在运行但日志目录不存在；日志读取或采样出错；日志文件被截断或替换后从头重读；进程在运行而当天日志文件超过宽限仍不存在；整轮没有读到任何日志文件；启动时回放日志出错（见下文「日志的读法」）。
@@ -219,7 +222,9 @@ $t = $null; $e = $null
 | 3c | 启动检查和采样都没看到进程：列「整轮没有看到进程」，不记不存在的时段 |
 | 3d | `Get-EndProcessFinding` 的四种组合；启动检查之后第一次采样同一 PID 不算重启，换 PID 算 |
 | 4a | 回放时今天的日志被独占（`FileShare.None`）：重试一次仍失败，计数、标「基线不完整」、列 A 类；昨天的日志照样回放；今天的游标在启动时的文件末尾，之后只计新增 |
-| 4b | 回放第一次读失败、重试成功（临时遮住 `Read-LogChunk`）：不计出错 |
+| 4b | 回放第一次读失败、重试成功（在用例自己的作用域里定义同名函数遮住 `Read-LogChunk`，用例结束即失效）：不计出错 |
+| 6a | 手动执行的 `command.execute_refused`、三类 `command.execute_failed`、`executor.manual_send_refused`：字段拆分正确；被拒和 `stalled` 列 A 类，`run_failed` / `spawn_failed` 计入 ERROR；`trace_id`、`os_code` 不进汇总 |
+| 6b | 没有手动执行事件：关键事件照样列出 0 次，不列 A 类；`executor.manual_send_refused` 只计数 |
 
 **没有自动化的部分**是脚本主体里把真实进程接到这些函数上的几行（启动检查把 `GetProcessesByName` 的结果交给 `Register-StartupProcess`；`Invoke-Sample` 取进程启动时间交给 `Update-LogCoverage`），因为要有真实进程。手工核对时不需要 Quicker Text，也不产生输入：
 
