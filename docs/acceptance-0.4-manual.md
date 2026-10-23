@@ -1,6 +1,27 @@
 # 0.4 实机验收清单（S-25 书面记录模板）
 
-> 状态：2026-10-23 依据 `576aa5a`（`feat/0.4-stability-foundation`）编写，同日按审查意见修订。修订时还依据了前端提交 `cfa41f2`（安全模式横幅按原因给出出路）、`e0fc068`（自检项改名「键盘鼠标监听」）、`9cbe400`（浸泡监视脚本），以及尚未合入 `integrate/0.4` 的分支头：存储 `fe31dec`（含升级前备份 R6、会话结束清标记 R5、回退目标 R3）、上次正常配置 `b32062f`、鼠标重挂 `384f8d1`、执行器 `02c3fd9`、发布卫生 `f5d553a`。**实测用的构建必须包含以上全部提交**，否则 SV-14、ST-13、CP-04、CP-05 等条目的预期不成立。**全部条目待实测**。本文件是记录模板：实测时直接在每条的「结果」行填写，填完后连同日志、诊断包和录屏按 [release-checklist.md](release-checklist.md) §5 存档。
+> 状态：2026-10-23 依据 `576aa5a`（`feat/0.4-stability-foundation`）编写，同日按两轮审查意见修订。
+>
+> **实测用的构建：「`integrate/0.4` 合并后的构建」**，即在 `integrate/0.4`（修订时为 `f1589cb`）上再合入本文件所在的分支 `docs/0.4-manual-acceptance` 之后构建出来的程序。`integrate/0.4` 已包含五个分支头：
+>
+> | 分支 | 分支头 | 本清单用到的内容 |
+> |---|---|---|
+> | 存储 | `43dda1f` | 升级前备份 R6 及审查修正 I-B1～I-B3、R7；回退目标记录 I-R1、I-R2 与 R8；会话结束清标记 R5 |
+> | 执行器 | `b69f3c2` | 手动测试的并发上限与报错（SV-17） |
+> | 鼠标重挂 | `384f8d1` | SV-16 |
+> | 上次正常配置 | `b32062f` | ST-13 |
+> | 发布卫生 | `996d725` | — |
+>
+> 本分支另带三个**不在** `integrate/0.4` 里的提交：`cfa41f2`（安全模式横幅按原因给出出路，并给 `backup_failed` 一条专门的横幅文案）、`e0fc068`（自检项改名「键盘鼠标监听」）、`9cbe400`（浸泡监视脚本 `scripts/soak/`）。只用 `integrate/0.4` 构建时，ST-01、CP-05 等条目的横幅文案对不上。
+>
+> 行号说明：
+>
+> - **本次修订改写过的部分**是 §1.3 的数据目录说明、§1.6 故障注入表的两行、ST-06、ST-12 d、ST-13、CP-01、CP-02、CP-04、CP-05、NR-08、新增的 SV-17，§12 的计数和 §12.3 第 1、4、10、19 条，以及附表 A 中 `startup.rs:195`、`lkg.rs:127` 两行。这些地方的行号如下：
+>   - `src-tauri/src/store/` 下除 `mod.rs` 外的文件（`backup.rs`、`load.rs`、`fallback.rs`、`revisions.rs`、`meta.rs`、`prefs.rs`、`atomic.rs`）取自 `43dda1f`，这些文件在 `integrate/0.4` 中完全相同；
+>   - `store/mod.rs`、`store/startup_tests.rs`（集成时加了一行导入和两个测试，行号比 `43dda1f` 多 1 行，第 2950 行以后多 138 行）、`src-tauri/src/lkg.rs`、`src-tauri/src/startup.rs`、`src-tauri/src/commands/runtime.rs`、`src-tauri/src/error.rs`、`src-tauri/src/diagnostics/logging.rs`、`crates/platform/src/windows/executor.rs` 和前端文件取自 `integrate/0.4`（`f1589cb`）。集成时 `mod.rs` 的 `mark_last_good` 加了备份检查和快照核对，比 `43dda1f` 长；`conclude` 改用 `CommandError::task_failed`，行号比 `b69f3c2` 多两行。
+> - **其余条目**沿用编写时 `576aa5a` 的行号（附表 A 另有说明）。存储模块在 `576aa5a` 之后改动较多，这些条目里的存储模块行号只作参考，请按函数名或事件名检索。
+>
+> **构建不含以上全部提交时**，SV-14、SV-17、ST-12、ST-13、CP-04、CP-05、NR-08 等条目的预期不成立。**全部条目待实测**。本文件是记录模板：实测时直接在每条的「结果」行填写，填完后连同日志、诊断包和录屏按 [release-checklist.md](release-checklist.md) §5 存档。
 >
 > 依据：[开发计划](development-plan.md) §10 退出标准（第 2448 行）、§11 故障注入表（第 2481–2489 行）、隐私测试（第 2491 行）、§5.5 不得倒退清单（第 993–1006 行）、S-25（第 717 行）；[性能基线](performance-baseline.md)；[S-29 spike](spikes/s-29.md)；[验收模式](windows-acceptance-mode.md)。
 
@@ -67,9 +88,14 @@
   - release 构建是 `%APPDATA%\com.quickertext.desktop`；debug-fi 构建是 `QUICKER_TEXT_DATA_DIR` 指定的目录。
   - 主要内容：
     - 配置：`active.json`、`draft.json`、`previous.json`、`prefs.json`、`store-meta.json`；
-    - `store-meta.json` 里与本清单有关的字段：`last_good_revision`（上次正常运行时的生效版本，ST-13）、`previous_revision {active, revision}`（「恢复上一个版本」的目标，只在 `active` 等于当前生效版本时采用，ST-13、NR-08）、`backup_pre_0_4`（`true` 表示升级前备份已建立，`false` 表示不需要备份，CP-04、CP-05）；
+    - `store-meta.json` 里与本清单有关的字段（`src-tauri/src/store/meta.rs:24-81`）：
+      - `last_good_revision`：上次正常运行时的生效版本（ST-13）；
+      - `previous_revisions`：「恢复上一个版本」的目标记录，是一个数组，最多两项，每项形如 `{"active": 5, "revision": 4, "fingerprint": {"len": 1234, "sha256": "…"}}`。`active` 是那次发布写出的版本号，`revision` 是它替换掉的版本（`null` 表示替换的是空白占位配置，没有可回退的目标），`fingerprint` 是那次写出的 `active.json` 的长度和 SHA-256。每次发布在替换 `active.json` 之前写入：第一项描述这次发布，第二项是发布开始时描述当时生效版本的那一项（审查 I-R1：发布中途失败时，已生效的版本仍有自己的记录）。加载时只采用 `active` 和 `fingerprint` 都与读到的 `active.json` 一致的那一项（I-R2），没有就按旧规则推断（ST-13、NR-08）。开发期构建写过单个对象 `previous_revision`，现在不再读取，原样保留在文件里；
+      - `backup_pre_0_4`：`true` 表示升级前备份已建立（新建的或已有的），`false` 表示数据目录里没有 0.4 以前的数据、不需要备份；`null`（旧文件里也可能没有这个键）表示还没处理过（CP-04、CP-05）；
+      - `backup_pre_0_4_dir`：备份所在的目录名，`backup-pre-0.4` 或 `backup-pre-0.4-<UTC 时间>`，与 `backup_pre_0_4: true` 一起写入，其他时候为 `null`；
     - 历史版本：`revisions\<n>.json`、`revisions\<n>.metadata.json`；
-    - 升级前备份：`backup-pre-0.4\`，在 0.3.1 数据目录上首次启动 0.4 时建立，只建一次（CP-04）；
+    - 升级前备份：`backup-pre-0.4\`（同名位置被不完整的备份或别的东西占着时是 `backup-pre-0.4-<UTC 时间>\`），在 0.3.1 数据目录上首次启动 0.4 时建立，只建一次。目录里最后写入的文件是 `manifest.json`，列出每个备份文件的相对路径、长度和 SHA-256；只有带合法 `manifest.json` 且逐个文件核对一致的目录才算完整备份（CP-04）；
+    - **延后隔离**（审查 I-B1）：`store-meta.json` 里的 `backup_pre_0_4` 还是 `null` 或没有这个键时（0.3.1 留下的目录，或这个文件读不出来、被重建），加载发现的损坏文件**先不改名**，日志记 `store.quarantine_deferred file="…"`（`src-tauri/src/store/fallback.rs:185-186、536-561`）。同一次启动里升级前备份把它复制进去之后，才改名为 `*.corrupt-<时间>.json`，日志接着有 `store.backup_pre_0_4 result="created"` 和 `store.quarantine`（`load.rs:99-104`、`backup.rs:552-613`）。备份失败或进入安全模式时，损坏文件留在原处，等下一次写入或下一次启动再处理。ST-05、ST-06、ST-10、ST-12 的预期按「`store-meta.json` 里的 `backup_pre_0_4` 已是 `true` 或 `false`」写：在还没处理过的目录上做，会多出上述日志、多建一个备份目录，安全模式下损坏文件也不会改名。所以先在该数据目录上正常启动一次 0.4 再做（新建的空目录启动一次即可，记 `backup_pre_0_4: false`）；
     - 被隔离的损坏文件：`*.corrupt-<时间>.json`；
     - 崩溃记录：`crash-<UTC yyyymmdd-hhmmss>.txt`；
     - `logs\` 目录。
@@ -277,8 +303,8 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 
 | 注入点 | 何时生效 | param | 条目 |
 |---|---|---|---|
-| `executor_panic` | 下一次执行的第一批 SendInput（`executor.rs:1748-1751、1824`） | 0 | SV-02、SV-15、PR-01 |
-| `executor_hang` | 同上，线程睡眠 param 毫秒 | 200000（计划 §11 的 200 秒）；NR-02 用 30000 | SV-03、NR-02 |
+| `executor_panic` | 下一次执行的第一批 SendInput，自动展开和手动测试都算（integrate `f1589cb` 的 `executor.rs:2266-2274`，手动测试 `2331-2333`、自动展开 `2444-2447`） | 0 | SV-02、SV-15、SV-17、PR-01 |
+| `executor_hang` | 同上，线程睡眠 param 毫秒 | 200000（计划 §11 的 200 秒）；NR-02 用 30000 | SV-03、SV-17、NR-02 |
 | `hook_panic` | 下一次键盘钩子回调（`hook.rs:243`） | 0 | SV-04 |
 | `hook_unhook` | 输入消费循环的下一轮（`input.rs:916`） | 0 | SV-05 |
 | `rawinput_unregister` | 同上（`input.rs:920`） | 0 | SV-06 |
@@ -900,6 +926,98 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 - **出处**：鼠标重挂分支 `384f8d1`；S-06。
 - **结果**：日期 ____；机器 ____；构建 ____；☐已观察 ☐未测；备注（是否出现 `result="lost"`：____）
 
+### M4-SV-17 手动测试动作：真实执行、出错、卡住与并发上限
+
+编辑器里的「测试动作（真实执行）」和「单步测试（真实执行）」都调用 `execute_action`，过程如下（`runtime.rs:52-144`）：
+1. 先检查安全模式和并发上限。
+2. 隐藏主窗口，3 秒后在当时的前台窗口执行。
+3. 结束后显示主窗口。
+
+每次测试在自己的线程里执行。测试卡住时，执行器把它围栏（fence）掉，命令立即返回；但这个线程要等它自己醒来才结束，结束前一直占着一个名额。名额最多 4 个（`MAX_MANUAL_JOBS`）。名额满了以后再点测试，会被直接拒绝：不隐藏窗口，也不写执行历史（`runtime.rs:150-161、197-215、236-256`）。手动测试不计入上次正常配置（`lkg.rs:19-23`）。
+
+- **步骤**：
+  1. a 正常（release 或 debug-fi）：
+     1. 打开记事本，放在主窗口后面。在「文本指令管理」打开 `zzk` 的「编辑文本指令」。
+     2. 点「测试动作（真实执行）」，在 3 秒内点一下记事本的编辑区。
+     3. 等主窗口回来，看弹出的结果和「最近执行」。
+     4. 从「应用设置」起如果只做过手动测试、没有在别处触发缩写，再等 70 秒，检索日志里的 `store.last_good`。
+  2. b 执行出错（debug-fi）：
+     1. 布防 `executor_panic`（§1.6），按 a 的第 1、2 步再测一次。
+     2. 记下界面提示里的追踪编号，检查数据目录里的 `crash-*.txt`，检索日志。
+  3. 退出并重启程序。b 的 panic 和下面 4 次卡住各算一次故障，不重启的话，10 分钟内合计 5 次会触发熔断（SV-15）。
+  4. c 卡住（debug-fi）：
+     1. 布防 `executor_hang`，param 200000（§1.6）。
+     2. 按 a 的第 1、2 步再测一次，开始计时。
+     3. 观察主窗口何时回来，以及界面提示、引擎状态和「最近执行」。
+  5. d 并发上限（debug-fi，紧接 c，c 算第 1 轮）：
+     1. 每轮先等引擎状态回到「正常」，然后布防 `executor_hang` 200000，点「测试动作（真实执行）」，等主窗口回来。这样再做 3 轮。4 轮要在第 1 轮开始后 200 秒内做完。
+     2. 第 4 轮结束、状态回到「正常」后，立即再点一次「测试动作（真实执行）」（不布防）。
+     3. 保持记事本在前台，等到第 4 轮开始后满 200 秒，再按 a 测一次。
+     4. 检索日志里的 `command.execute_`、`executor.`、`supervisor.`。
+- **预期结果**：
+  - a：
+    - 点击后主窗口立即隐藏，约 3 秒后记事本里出现 `Hello QuickerText 0.4 你好`，随后主窗口回来，弹出「动作测试结果」。
+    - 「最近执行」多一条，方式为「手动测试」，结果为成功。
+    - 第 4 步：日志里没有 `store.last_good`。手动测试不算「在触发路径上成功展开一次」。
+  - b：
+    - 记事本里没有输出：panic 发生在第一批发送之前。
+    - 主窗口回来后，界面提示「操作没有完成，发生了内部错误（追踪编号 <id>）。可在「运行状态」中导出诊断包反馈问题。」。
+    - 「最近执行」多一条，方式为「手动测试」，结果为「失败 · 执行器内部错误」。
+    - 日志有：
+      - `app.panic`；
+      - `executor.panic stage="…" kind="str" epoch=<n> manual=true`；
+      - `command.execute_failed category="run_failed" reason=ExecutorPanic trace_id=<id>`，其中 `<id>` 与界面上的相同；
+      - 随后 `supervisor.recovering`、`executor.rebuilt`、`supervisor.recovered`。
+    - 生成一份 `crash-*.txt`，进程没有退出。
+  - c：
+    - 主窗口隐藏，记事本里没有输出。
+    - 点击后约 13 秒（3 秒等待加 10 秒 STALL_BUDGET，巡检最多再晚 1 秒），主窗口回来。界面提示「输入引擎暂时不可用（恢复中），请稍后再试，或在「运行状态」中修复引擎。」。
+    - 日志依次有：
+      - `executor.stalled stalled_ms=… budget_ms=10000 manual=true`；
+      - `executor.fenced epoch=<n> in_flight=false manual=true`；
+      - `command.execute_failed category="stalled" reason=ExecutorTimeout health=Recovering`；
+      - 随后 `supervisor.recovering`、`executor.rebuilt`、`supervisor.recovered`。
+    - 「最近执行」多一条，方式为「手动测试」，结果为「失败 · 执行超时」。这一条由围栏代写，因为卡住的线程自己写不了。
+    - 引擎状态经「恢复中」回到「正常」。
+  - d：
+    - 第 1 步：每轮都同 c。日志里 `supervisor.recovering` 的 `incidents=` 依次增加，不到 5 次，所以不熔断。
+    - 第 2 步：
+      - 主窗口不隐藏，立即提示「上一个动作仍在执行，请稍后再试。」。
+      - 「最近执行」没有新条目，日志有 `command.execute_refused reason="jobs_exhausted" limit=4 health=Healthy`。
+      - 如果这时状态不是「正常」（例如还在「恢复中」），提示会变为「输入引擎暂时不可用（恢复中）…」，日志的 `health=` 也跟着变。这种情况不判不通过：等「正常」后再点一次。
+    - 第 3 步：
+      - 200 秒内和之后，记事本里都没有多出来的字符或退格。卡住的线程醒来后什么都不发。
+      - 名额在线程结束时释放，最后一次测试同 a，能成功。
+  - 第 4 步检索到的 `command.execute_failed` 和 `command.execute_refused` 都只带原因码、健康状态、上限和追踪编号，没有动作正文。
+- **通过标准**：
+  - a 在记事本里只输出一次，且不记录上次正常配置。
+  - b 界面和日志的追踪编号一致，并且自动恢复。
+  - c 约 13 秒内返回并恢复，之后没有多余输出。
+  - d 第 5 次被直接拒绝、不隐藏窗口；卡住的线程结束后又能测试。
+- **说明**：有几种情况实机造不出来，由单元测试覆盖：
+  - 线程启动失败（`category="spawn_failed"`）：`runtime.rs:1139`；
+  - 等线程时没有得到结果（`CommandError::task_failed`，记 `command.internal`）：`runtime.rs:815`；
+  - 名额与执行器占用的先后：`runtime.rs:986`、`1046`。
+- **出处**：integrate `f1589cb`：
+  - `src-tauri/src/commands/runtime.rs`：
+    - `52-144`：`execute_action`。其中 60 行检查安全模式，61 行准入，85 行隐藏窗口，103 行等 3 秒，138 行显示窗口。
+    - `150-161`：`MAX_MANUAL_JOBS`；`197-215`：`admit`；`236-256`：`jobs_exhausted`。
+    - `432-461`：`conclude`；`463-482`：`stalled`；`484-496`：`run_failed`；`498-513`：`spawn_failed`。
+    - 测试：`617`、`682`、`747`、`815`、`885`、`986`、`1046`、`1139`。
+  - `crates/platform/src/windows/executor.rs`：
+    - `1373-1436`：`run_manual`，panic 时记 `executor.panic … manual=true`；
+    - `1641-1658`：围栏时把执行器标为 `ExecutorTimeout` 故障，交给监督器重建；
+    - `1664-1707`：替卡住的测试写历史，记 `executor.fenced`；
+    - `1732-1767`：`executor.stalled`；
+    - `2266-2274`：注入点；`2331-2333`：手动测试每批发送前经过注入点。
+  - `src-tauri/src/lkg.rs:19-23`：手动测试不计入上次正常配置。
+  - `crates/platform/src/supervisor.rs:529-545`：故障计数与熔断。
+  - 前端：
+    - `src/ActionEditor.tsx:358-364`、`1547`、`1608-1617`；
+    - `src/ipc/errors.ts:210-225`；
+    - `src/ipc/labels.ts:40、160-161、172`。
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（c 从点击到主窗口回来的耗时：____；d 第 2 步的提示和 `health=`：____；b 的追踪编号：____）
+
 ## 5. 安全模式与存储（M4-ST）
 
 ### M4-ST-01 配置被锁定进入安全模式，修订号大于 0
@@ -1006,7 +1124,7 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
   - 不进入安全模式，自动恢复到上次正常配置或最近的可用版本；
   - 损坏的文件被保留；
   - 记下恢复来源和版本号。
-- **出处**：development-plan.md:2487（config_corrupt）；`fallback.rs:121-233`；上次正常配置分支 `b32062f`（`src-tauri/src/store/fallback.rs:173-194` 候选顺序）；`src-tauri/src/store/revisions.rs:30-69`。
+- **出处**：development-plan.md:2487（config_corrupt）；`43dda1f`：`src-tauri/src/store/fallback.rs:155-373`（`load_or_fallback`，`store.recovered` 在 230-236）、`fallback.rs:612-648`（`fallback_candidates` 候选顺序）、`fallback.rs:516-587`（`store.corrupt`、`store.quarantine`；`store-meta.json` 没有 `backup_pre_0_4` 时改为 `store.quarantine_deferred`，见 §1.3）。
 - **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（`from=____`，恢复到 v____，应用前的生效版本为 v____，`last_good_revision`=____）
 
 ### M4-ST-07 带 BOM 的 prefs.json、active.json、draft.json
@@ -1140,48 +1258,110 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
     - 日志依次有：
       - `store.corrupt file=active.json …` 和 `store.quarantine file=active.json …`；
       - `store.corrupt file=<k>.json code="config_malformed" kind="eof" …` 和 `store.quarantine file=<k>.json quarantined_as=<k>.corrupt-<时间>.json`；
-      - `store.recovered file=<m>.json from=Revision revision=Some(<m>)`，m 是除 k 以外编号最大的版本（候选顺序：上次正常配置 → revisions 从新到旧，已试过的 k 不再重复，`src-tauri/src/store/fallback.rs:466-490`）。
+      - `store.recovered file=<m>.json from=Revision revision=Some(<m>)`，m 是除 k 以外编号最大的版本（候选顺序：上次正常配置 → revisions 从新到旧，已试过的 k 不再重复，`src-tauri/src/store/fallback.rs:612-648`）。
     - 数据目录里出现 `active.corrupt-<时间>.json`，`revisions\` 里出现 `<k>.corrupt-<时间>.json`，都原样保留。
     - 不进入安全模式。横幅「配置文件无法读取，已自动从历史版本 v<m> 恢复。请检查最近的改动是否还在。」，另有两条「… 已损坏，已改名为 … 保留，可在数据目录中查看。」（`src/status.ts:160-179`）。
-    - 第 4 步可以应用。新版本号按现存的 `<n>.json` 和当前版本中较大者加 1 计算，隔离出去的文件不算（`src-tauri/src/store/revisions.rs:120-130`）；k 原来是最大编号时，新版本会再次用 v<k>。记下实际编号即可，`<k>.corrupt-<时间>.json` 不受影响。
+    - 第 4 步可以应用。新版本号是「当前版本 m」和「`revisions\` 下本程序文件名里出现过的所有编号」中的最大者加 1。这些文件名包括 `<n>.json`、`<n>.metadata.json`、隔离出去的 `<n>.corrupt-<时间>.json` 和 `<n>.metadata.corrupt-<时间>.json`，以及写到一半的 `<n>.json.tmp`；其他文件名不算（`src-tauri/src/store/revisions.rs:159-180、194-228`，复审 R7-2、R8-2）。所以新版本号**一定大于 k**，不会再次用 v<k>，`<k>.corrupt-<时间>.json` 和 `<k>.metadata.json` 都不会被覆盖。通常还会大于损坏之前的生效版本：那个版本发布时写过 `<n>.metadata.json`，编号已被占用。新版本号不大于 k 判为不通过。
+    - 第 4 步之后，`revisions\` 里有 `<m>.json`（原本就在）和新版本的 `<新>.metadata.json`；新版本自己的 `<新>.json` 要等它被下一次发布取代、或被记为上次正常配置时才写（`revisions.rs:82-129`；`integrate/0.4` 的 `store/mod.rs:301-341`）。
 - **通过标准**：四类损坏都不导致启动失败或丢数据。整个文件坏了就隔离并恢复，回退途中遇到的坏版本也隔离并跳过；单条规则坏了只跳过这一条，读不了的原文在保存后仍保留；横幅、日志、诊断包三处的结论一致。
-- **出处**：S-04（development-plan.md:705）；B-43；`crates/domain/src/stored.rs:112-155、251-300`；`src-tauri/src/store/fallback.rs:142-194、224-243、389-460、544-574`；`crates/domain/src/matching.rs:312-342、435-453`。
+- **出处**：S-04（development-plan.md:705）；B-43；`crates/domain/src/stored.rs:112-155、251-300`；`src-tauri/src/store/fallback.rs:142-194、224-243、389-460、544-574`（这一处是 `576aa5a` 的行号，用于 a～c）；d 用 `43dda1f`：`fallback.rs:499-587`（读取、`store.corrupt`、隔离）、`fallback.rs:612-648`（候选顺序）、`revisions.rs:159-228`（新版本号，测试 `revisions.rs:339` `every_name_of_this_program_occupies_its_revision`）；`crates/domain/src/matching.rs:312-342、435-453`。
 - **结果**：日期 ____；机器 ____；构建 ____；a ☐通过 ☐不通过 ☐未测；b ☐通过 ☐不通过 ☐未测；b′ ☐通过 ☐不通过 ☐未测；c ☐通过 ☐不通过 ☐未测；d ☐通过 ☐不通过 ☐未测；备注（c 第 4 步的界面提示原文：____；d：k=____，m=____，第 4 步的新版本 v____）
 
 ### M4-ST-13 上次正常配置（LKG）：记录、恢复，以及恢复后发布再回滚
 
-- **前提**：构建包含 `b32062f`（上次正常配置）和 `7b727ca`（复审 R3，回滚目标记在 `store-meta.json`，在 `fe31dec` 分支上）。在已备份的数据目录上做。
+- **前提**：
+  - 构建是「`integrate/0.4` 合并后的构建」，其中包含：上次正常配置分支的 `b32062f`；存储分支的 `7b727ca`（复审 R3，回滚目标记在 `store-meta.json`）、`5a75e16`（记录带 `active.json` 的指纹）、`e70dab1`（R7，版本号不复用已被占用的号码）和 `43dda1f`（R8，有记录时不再推测回滚目标）。
+  - 在已备份的数据目录上做，`store-meta.json` 里已有 `backup_pre_0_4`（§1.3）。
+  - 准备数据目录以外的一个文件夹，下文用 `D:\qt-st13\`。
 - **步骤**：
   1. 在「文本指令管理」把 `zzk` 的正文末尾加上 `-A`，保存，点「应用设置」。在「运行状态与恢复」记下「当前生效版本」vA。
-  2. 等 2～3 秒，在记事本里输入 `zzk` 加空格，确认展开出的文字以 `-A` 结尾。然后保持「正常」，从应用算起至少 70 秒，期间不要注入故障、不要锁屏。检索日志里的 `store.last_good`，打开 `store-meta.json` 查看。
-  3. 把 `-A` 改成 `-B`，保存，应用，记下 vB。**之后不要再触发任何展开**，直接从托盘「退出」。
-  4. 执行 P3 截断 `active.json`，然后启动。
+  2. 等 2～3 秒，在记事本里输入 `zzk` 加空格，确认展开出的文字以 `-A` 结尾。然后保持「正常」，从应用算起至少 70 秒，期间不要注入故障、不要锁屏。检索日志里的 `store.last_good`，打开 `store-meta.json` 查看，确认 `revisions\<vA>.json` 存在。
+  3. 把 `-A` 改成 `-B`，保存，应用，记下 vB。**之后不要再触发任何展开**，直接从托盘「退出」。打开 `store-meta.json`，记下 `previous_revisions` 的内容。
+  4. 先把完好的 `active.json`（B 版）复制到数据目录以外，第 8 步要用：
+
+     ```powershell
+     Copy-Item "$d\active.json" D:\qt-st13\B.json
+     ```
+
+     然后执行 P3 截断 `active.json`，启动。
   5. 观察横幅、「当前生效版本」和「草稿状态」，在记事本里输入 `zzk` 加空格，检索日志。
-  6. 点「应用设置」，记下新的生效版本 vN。
-  7. 退出程序再启动，打开 `store-meta.json` 查看 `previous_revision`。然后在「运行状态与恢复」点「恢复上一个版本」→「回滚」。
-  8. 在记事本里输入 `zzk` 加空格，查看「当前生效版本」。
+  6. 点「应用设置」，记下新的生效版本 vN，然后退出程序。
+  7. 打开 `store-meta.json` 查看 `previous_revisions`，再算出 `active.json` 的长度和 SHA-256：
+
+     ```powershell
+     (Get-Item "$d\active.json").Length
+     (Get-FileHash "$d\active.json" -Algorithm SHA256).Hash.ToLower()
+     ```
+
+  8. 放一个诱饵：先确认 `revisions\<vN-1>.json` 不存在（vN-1 通常就是 vB），然后把第 4 步的 B 版复制过去：
+
+     ```powershell
+     Copy-Item D:\qt-st13\B.json "$d\revisions\<vN-1>.json"
+     ```
+
+     启动程序，在「运行状态与恢复」点「恢复上一个版本」→「回滚」。
+  9. 在记事本里输入 `zzk` 加空格，查看「当前生效版本」。
+  10. 做完把数据目录整个还原，不要把诱饵文件留在里面。
 - **预期结果**：
   - 第 2 步：
-    - 约 60 秒后日志有 `store.last_good revision=<vA>`（`src-tauri/src/store/mod.rs:279-283`）；
-    - `store-meta.json` 里 `"last_good_revision": <vA>`，`revisions\<vA>.json` 存在。
-  - 第 3 步之后 `last_good_revision` 仍是 vA：B 版没有成功展开过，不满足条件。
+    - 约 60 秒后日志有 `store.last_good revision=<vA>`（`integrate/0.4` 的 `src-tauri/src/store/mod.rs:336-340`）；
+    - `store-meta.json` 里 `"last_good_revision": <vA>`；
+    - `revisions\<vA>.json` 存在。这个快照是记录上次正常配置时写下的，发布本身不写新版本的快照（`mod.rs:301-341`）。
+  - 第 3 步：
+    - `last_good_revision` 仍是 vA：B 版没有成功展开过，不满足条件。
+    - vB 通常是 vA+1。
+    - `previous_revisions` 有两项（I-R1）：
+      - 第一项是 `{"active": <vB>, "revision": <vA>, "fingerprint": {…}}`；
+      - 第二项是发布 vA 时写下的那一项（`"active": <vA>`），因为它与发布 vB 之前磁盘上的 `active.json` 相符，所以被保留下来。
   - 第 5 步：
-    - 日志依次有 `store.corrupt file=active.json …`、`store.quarantine file=active.json …`、`store.recovered file=<vA>.json from=LastGood revision=Some(<vA>)`；
-    - 横幅「配置文件无法读取，已自动从上次正常运行时的配置恢复。请检查最近的改动是否还在。」，另有「active.json 已损坏，已改名为 … 保留，可在数据目录中查看。」；
+    - 日志依次有：
+      - `store.corrupt file=active.json code="config_malformed" kind="eof" …`；
+      - `store.quarantine file=active.json quarantined_as=active.corrupt-<时间>.json`；
+      - `store.recovered file=<vA>.json from=LastGood revision=Some(<vA>)`。
+    - 横幅「配置文件无法读取，已自动从上次正常运行时的配置恢复。请检查最近的改动是否还在。」，另有「active.json 已损坏，已改名为 … 保留，可在数据目录中查看。」。
     - 不进入安全模式；「当前生效版本」为 vA，`zzk` 展开出 `-A`。
     - `draft.json` 没有损坏、单独读取，所以编辑器里 `zzk` 可能仍显示 `-B`，「草稿状态」为「存在未应用的设置」。这是现状，不算失败，记下即可。
-  - 第 6 步：发布成功，vN = vB + 1（新版本号大于磁盘上所有历史版本，`src-tauri/src/store/revisions.rs:149`）。
-  - 第 7 步：`store-meta.json` 里有 `"previous_revision": {"active": <vN>, "revision": <vA>}`。
-  - 第 8 步：`zzk` 展开出 `-A`，即回到恢复时的版本 vA，而不是 vB；「当前生效版本」为 vN+1，因为回滚本身也是一次发布。回到 `-B` 判为不通过：说明回滚目标仍按 `revisions\<vN-1>.json` 推算。
+  - 第 6 步：
+    - 发布成功，vN 通常是 vB+1。`revisions\<vB>.json` 并不存在：vB 既没有被下一次发布取代，也没有被记为上次正常配置。但发布 vB 时写下的 `revisions\<vB>.metadata.json` 已经占用了 vB 这个编号（`revisions.rs:159-180、194-228`，R7-2）。
+    - vN 不大于 vB 判为不通过：那样会覆盖 vB 的元数据，旧记录也可能被错当成新版本的记录。
+  - 第 7 步：
+    - `previous_revisions` **只有一项**：`{"active": <vN>, "revision": <vA>, "fingerprint": {"len": <长度>, "sha256": "<小写十六进制>"}}`。
+    - `len` 和 `sha256` 与第 7 步算出的长度和小写哈希一致。`Get-FileHash` 输出大写，所以命令里用了 `.ToLower()`。
+    - 只有一项，是因为发布 vN 时 `active.json` 已被隔离，磁盘上没有与旧记录相符的文件，旧记录不再保留（`revisions.rs:48-61、112-127`）。
+    - 有第二项，或 `revision` 不是 vA，判为不通过。
+    - 如果文件里还有旧版程序写的 `previous_revision` 键，它保持原样，不参与判断。
+  - 第 9 步：
+    - `zzk` 展开出 `-A`，即回到恢复时的版本 vA，而不是诱饵里的 vB。
+    - 「当前生效版本」为 vN+1，因为回滚本身也是一次发布。
+    - 回到 `-B` 判为不通过：说明程序没有用记录，而是按 `revisions\<vN-1>.json` 推测回滚目标。
+    - 为什么要放诱饵：没有可用的记录时，程序依次推测 `revisions\<vN-1>.json`、版本低于当前版本的 `previous.json`、低于当前版本的最近一个快照（`fallback.rs:670-726`，R8-1）。不放诱饵时 `<vN-1>.json` 不存在，推测最后也会落到最近的快照 vA，看不出用的是记录还是碰巧推测对了。
 - **通过标准**：
   - 只有在「正常」状态持续 60 秒、并且在当前版本上成功展开过一次之后，才记录为上次正常配置；
   - `active.json` 损坏时优先恢复到上次正常配置；
-  - 恢复后发布、再重启，「恢复上一个版本」回到恢复时的版本。
+  - 恢复后发布不复用任何已被占用的版本号；
+  - 恢复后发布、再重启，「恢复上一个版本」按记录回到恢复时的版本，不受 `revisions\<vN-1>.json` 影响。
 - **出处**：
   - B-04；development-plan.md §7.2 LKG。
-  - `b32062f`：`src-tauri/src/lkg.rs:7-23`（条件）、`lkg.rs:136`（60 秒）、`src-tauri/src/store/mod.rs:262-285`（`mark_last_good`）、`src-tauri/src/store/fallback.rs:173-194`（候选顺序）。
-  - `7b727ca`：`src-tauri/src/store/revisions.rs`（发布时在写 `active.json` 之前记录 `previous_revision`）。
-- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（vA=____，vB=____，vN=____，回滚后的版本=____；第 5 步编辑器显示 `-A` 还是 `-B`：____）
+  - `integrate/0.4`：
+    - `src-tauri/src/lkg.rs:7-23`（条件；手动测试不计入）、`lkg.rs:158`（60 秒）；
+    - `src-tauri/src/store/mod.rs:276-341`（`mark_last_good`）。
+  - `43dda1f`：
+    - `src-tauri/src/store/fallback.rs:612-648`（候选顺序）；
+    - `fallback.rs:670-726`（`previous`：记录与读到的 `active.json` 版本号、指纹都相符才用；否则按上面的顺序推测）；
+    - `revisions.rs:48-61、112-127`（发布时在写 `active.json` 之前写记录，并保留与磁盘相符的旧记录）；
+    - `revisions.rs:159-180、194-228`（版本号）；
+    - `meta.rs:24-81`（`previous_revisions` 的格式）。
+  - 测试（`integrate/0.4` 的 `src-tauri/src/store/startup_tests.rs`）：
+    - `rollback_target_survives_a_restart_after_recovery`（881）；
+    - `rollback_target_without_a_record_is_guessed_as_before`（940）；
+    - `a_recorded_snapshot_that_is_gone_leaves_no_rollback_target`（1017）；
+    - `rollback_target_guess_takes_previous_json_before_an_older_snapshot`（1055）；
+    - `mark_last_good_is_the_first_fallback`（1504）；
+    - `a_failed_publish_keeps_the_rollback_target_of_the_committed_revision`（2636）；
+    - `a_record_for_a_reused_revision_number_is_ignored`（2681）；
+    - `an_unchanged_republish_does_not_reuse_the_lost_revision_number`（2723）；
+    - `a_revision_number_used_only_by_metadata_is_not_given_out`（2763）。
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（vA=____，vB=____，vN=____，回滚后的版本=____；第 7 步 `previous_revisions` 的项数：____；第 5 步编辑器显示 `-A` 还是 `-B`：____）
 
 ## 6. 前端状态一致性（M4-FE）
 
@@ -1373,10 +1553,20 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 - **预期结果**：
   - 没有进入安全模式，没有隔离，没有 `store.corrupt`。
   - 条数相同，抽测的规则都能执行。
-  - 第一次启动时就出现 `backup-pre-0.4\`（加载时先备份，再写别的文件），日志有 `store.backup_pre_0_4 result="created" files=<N>`，`store-meta.json` 里有 `"backup_pre_0_4": true`。备份内容在 CP-04 核对。
-  - `active.json`、`draft.json` 的哈希不变。加载时会写当前版本的 `revisions\<n>.metadata.json`（迁移元数据快照），可以接受；它写在备份之后。
+  - 第一次启动时就出现 `backup-pre-0.4\`：加载时要写元数据快照，写之前先备份。
+    - 日志有 `store.backup_pre_0_4 result="created" files=<N> dir="backup-pre-0.4"`。
+    - `store-meta.json` 里有 `"backup_pre_0_4": true` 和 `"backup_pre_0_4_dir": "backup-pre-0.4"`。
+    - 备份内容（包括最后写入的 `manifest.json`）在 CP-04 核对。
+  - `active.json`、`draft.json` 的哈希不变。加载时会写当前版本的 `revisions\<n>.metadata.json`（迁移元数据快照），可以接受：它写在备份之后，原来的文件已在备份里。
+  - 启动后监听是暂停的：0.3.1 的目录里没有 `prefs.json`，「启动时自动开始监听」按默认关闭。日志有 `self_test.startup health=… auto_listen=false outcome="auto_listen_off"`。先点「恢复监听」再做第 4 步。
 - **通过标准**：无损加载（退出标准原文）。
-- **出处**：development-plan.md:2448；§9（development-plan.md:2339-2340）；R6 `fe31dec`：`load.rs:91-95`（加载时先备份，备份失败就不写元数据快照）、`backup.rs`。
+- **出处**：
+  - development-plan.md:2448；§9（development-plan.md:2339-2340）。
+  - `43dda1f`：
+    - `src-tauri/src/store/load.rs:99-105`（加载时先备份，备份成功才写元数据快照）、`load.rs:169-190`（`snapshot_active_metadata`）；
+    - `backup.rs:476-527`（日志与 `store-meta.json`）；
+    - `prefs.rs:340-343`（没有 `prefs.json` 时自动监听为关）。
+  - `integrate/0.4`：`src-tauri/src/startup.rs:297-299`。
 - **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（规则条数：0.3.1 ____ / 0.4 ____；备份 files=____）
 
 ### M4-CP-02 0.4 写入的数据 0.3.1 仍能读取
@@ -1384,9 +1574,15 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 - **步骤**：
   1. 接着 CP-01，在 0.4 中编辑一条规则，点「应用设置」，修改一项参数，然后退出。
   2. 安装或运行 0.3.1，启动，核对条数和被编辑的那一条，并执行一次。
-- **预期结果**：0.3.1 正常加载，看得到 0.4 的修改，忽略 0.4 新增的内容：`store-meta.json`（包括 `previous_revision`、`backup_pre_0_4` 等字段）、`backup-pre-0.4\` 目录、`prefs.json` 中的新键。`revisions\*.json` 与 `*.metadata.json` 是两个版本共用的格式。
+- **预期结果**：
+  - 0.3.1 正常加载，看得到 0.4 的修改。
+  - 0.3.1 忽略 0.4 新增的内容：
+    - `store-meta.json`，包括 `previous_revisions`、`last_good_revision`、`backup_pre_0_4`、`backup_pre_0_4_dir` 等字段；
+    - `backup-pre-0.4\` 目录，包括其中的 `manifest.json`；
+    - `prefs.json`：0.4 新增的文件，0.3.1 不读。
+  - `revisions\*.json` 与 `*.metadata.json` 是两个版本共用的格式。
 - **通过标准**：0.3.1 可以读取（退出标准原文）。
-- **出处**：development-plan.md:2448、2340。
+- **出处**：development-plan.md:2448、2340；`43dda1f`：`src-tauri/src/store/meta.rs:24-54`（`store-meta.json` 的字段）、`backup.rs:81-85`（`prefs.json` 是 0.4 新增的）。
 - **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注 ____
 
 ### M4-CP-03 保留未知字段和读不懂的规则
@@ -1412,54 +1608,167 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 
 ### M4-CP-04 跨版本首次写入前的备份 backup-pre-0.4
 
-R6（`fe31dec`）实现了这项备份：0.4 第一次往 0.3.1 留下的数据目录写任何 0.3.1 会读的文件之前，先把这些文件逐字节复制到 `backup-pre-0.4\`。先复制到临时目录 `backup-pre-0.4.tmp-<时间>`，复制完再改名，所以目录要么完整，要么不存在。加载时就会触发（加载时要写元数据快照），之后每个写入命令前也会检查一次；`store-meta.json` 记下 `backup_pre_0_4` 之后就不再检查。
+R6 实现了这项备份，审查 I-B1～I-B3、R7-1 又补了几处；规则总述见 `43dda1f` 的 `src-tauri/src/store/backup.rs:1-45`。
+
+**什么时候备份**：0.4 第一次改动 0.3.1 会读的文件之前，先把 0.3.1 需要的文件逐字节复制到 `backup-pre-0.4\`。这里的改动包括：加载时的元数据快照、保存草稿、放弃草稿、发布、回滚、记录上次正常配置，以及把损坏文件改名隔离。加载时就会触发，之后每个写入命令前也会检查一次；`store-meta.json` 的 `backup_pre_0_4` 变成 `true` 或 `false` 之后就不再检查。`store-meta.json` 和 `prefs.json` 是 0.4 新增的文件，0.3.1 不读，写它们不经过这道检查。
+
+**原子性**：先复制到临时目录 `backup-pre-0.4.tmp-<UTC 时间>\`，最后写入 `manifest.json`，再把整个目录改名，所以要么有完整的备份，要么没有。
 
 - **步骤**：
-  1. 接着 CP-01（第一次启动 0.4 之后）。用 CP-01 第 1 步记下的 P10 哈希（0.4 启动前）作对照。
-  2. 列出备份里的文件和哈希：
+  1. 接着 CP-01（第一次启动 0.4 之后）。用 CP-01 第 1 步记下的 P10 哈希（0.4 启动前）作对照。打开 `store-meta.json`，记下 `backup_pre_0_4` 和 `backup_pre_0_4_dir`。
+  2. 列出备份里的文件（哈希、长度、相对路径）和 `manifest.json` 的内容，再看数据目录里有哪些以 `backup-pre-0.4` 开头的项：
 
      ```powershell
      $b = "$d\backup-pre-0.4"
-     Get-ChildItem $b -Recurse -File | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $_.FullName.Substring($b.Length + 1) }
-     Get-ChildItem $d -Directory -Filter 'backup-pre-0.4.tmp-*'   # 应为空
+     Get-ChildItem $b -Recurse -File | ForEach-Object { '{0}  {1,8}  {2}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Length, $_.FullName.Substring($b.Length + 1) }
+     (Get-Content "$b\manifest.json" -Raw -Encoding UTF8 | ConvertFrom-Json).files | Format-Table path, len, sha256 -AutoSize
+     Get-ChildItem $d -Filter 'backup-pre-0.4*'   # 只应有 backup-pre-0.4 这一个目录
      ```
 
   3. 做完 CP-02 第 1 步的「应用设置」后，再重启一次 0.4，记下 `backup-pre-0.4\` 的文件列表和修改时间。
-  4. 空目录对照：退出程序，`Rename-Item $d 'com.quickertext.desktop.cp04'`，启动 0.4（会建一个新的空数据目录），看日志和 `store-meta.json`，然后退出，删掉新建的目录，再把 `.cp04` 改回原名。（debug-fi 也可以直接把 `QUICKER_TEXT_DATA_DIR` 指向一个空目录。）
+  4. 空目录对照：
+     - 退出程序，执行 `Rename-Item $d 'com.quickertext.desktop.cp04'`，启动 0.4（会新建一个空数据目录）。
+     - 看日志和 `store-meta.json`，然后退出，删掉新建的目录。
+     - debug-fi 也可以直接把 `QUICKER_TEXT_DATA_DIR` 指向一个空目录。
+  5. 同名文件对照（审查 I-B3）：
+     - 把 CP-01 第 1 步备份的 0.3.1 数据复制成新的 `$d`，然后建一个与备份目录同名的空文件：`New-Item -ItemType File "$d\backup-pre-0.4"`。
+     - 启动 0.4，看日志、`store-meta.json` 和数据目录里的 `backup-pre-0.4*`。
+     - 退出，删掉这个 `$d`，再把 `.cp04` 改回原名。
 - **预期结果**：
-  - 第 2 步：备份里只有下列文件中**存在的那些**（不存在的跳过），每个文件的哈希都与 0.4 启动前的 P10 记录相同：
-    - `active.json`、`draft.json`、`previous.json`、`migration-unresolved.json`、`active-migration-unresolved.json`；
-    - `revisions\` 中三个版本的 `<n>.json` 和 `<n>.metadata.json`：当前生效版本、生效版本减 1（0.3.1 回滚的目标）、`previous.json` 记录的版本；
-    - `prefs.json`、`revisions\index.json`。
-
-    更早的版本不在备份里。没有残留的 `backup-pre-0.4.tmp-*`。日志 `store.backup_pre_0_4 result="created" files=<N>` 中的 N 等于备份里的文件数；`store-meta.json` 有 `"backup_pre_0_4": true`。
-  - 第 3 步：没有第二次备份。目录内容和修改时间都不变，日志里也不再有 `store.backup_pre_0_4`（记下之后直接跳过，不写日志）。
-  - 第 4 步：日志 `store.backup_pre_0_4 result="not_needed" files=0`，没有 `backup-pre-0.4\`，`store-meta.json` 有 `"backup_pre_0_4": false`。
-- **通过标准**：备份内容和哈希与上面一致；只备份一次；空目录不备份。
-- **出处**：development-plan.md:1805、2339；R6 `fe31dec`：`src-tauri/src/store/backup.rs:40-51`（复制哪些文件）、`backup.rs:110-131`、`backup.rs:324-330`（哪三个版本）、`backup.rs:210-238`（已有目录、同名文件、无需备份）、`backup.rs:251-296`（日志和 `store-meta.json`）、`load.rs:91-95`；测试 `startup_tests.rs` 的 `first_write_backs_up_a_031_directory_byte_for_byte`、`fresh_directory_gets_no_backup`。
-- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（files=____；与 P10 不一致的文件：____）
+  - 第 2 步：
+    - 数据目录里只有 `backup-pre-0.4\` 一个备份目录，没有 `backup-pre-0.4-<时间>\`，也没有残留的 `backup-pre-0.4.tmp-*`。
+    - `store-meta.json` 有 `"backup_pre_0_4": true` 和 `"backup_pre_0_4_dir": "backup-pre-0.4"`。
+    - 备份里只有下列文件中**存在的那些**，不存在的跳过。相对路径与数据目录里相同，哈希都与 0.4 启动前的 P10 记录相同：
+      - `active.json`、`draft.json`、`previous.json`、`migration-unresolved.json`、`active-migration-unresolved.json`；
+      - `revisions\` 中下面三个版本的 `<n>.json` 和 `<n>.metadata.json`：
+        - 当前生效版本 n；
+        - n−1，即 0.3.1 回滚的目标；
+        - 0.4 加载时定下的回滚目标。0.3.1 的目录没有 `previous_revisions` 记录，所以这个目标是推测出来的（推测顺序见 ST-13），通常就是 n−1 或 `previous.json` 的版本；
+      - `prefs.json`（0.3.1 不写这个文件，正常没有）和 `revisions\index.json`；
+      - 数据目录和 `revisions\` 里已有的隔离文件 `*.corrupt-*`；其中每个 `revisions\<m>.corrupt-*.json`，连同它对应的 `revisions\<m>.metadata.json` 也一起复制；
+      - 这次加载发现、尚未改名的损坏文件（§1.3 延后隔离）；
+      - `manifest.json`：最后写入，不在 P10 记录里。
+    - 更早的版本不在备份里。
+    - `manifest.json`：
+      - `version` 为 1；
+      - `files` 每项有 `path`（用 `/` 分隔，例如 `revisions/12.json`）、`len` 和 `sha256`（小写十六进制），与第 2 步列出的长度和哈希逐项一致；
+      - `manifest.json` 自己不在列表里。
+    - 日志有 `store.backup_pre_0_4 result="created" files=<N> dir="backup-pre-0.4"`。N 等于 `manifest.json` 中 `files` 的项数，也就是备份里的文件数减 1。
+  - 第 3 步：没有第二次备份。目录内容和修改时间都不变，日志里也不再有 `store.backup_pre_0_4`：`backup_pre_0_4` 已有取值时直接跳过，不写日志。
+  - 第 4 步：
+    - 日志有 `store.backup_pre_0_4 result="not_needed" files=0 dir=""`；
+    - 没有 `backup-pre-0.4\`；
+    - `store-meta.json` 有 `"backup_pre_0_4": false`，`"backup_pre_0_4_dir": null`。
+  - 第 5 步：
+    - 日志先有警告 `store.backup_pre_0_4 result="existing_incomplete" dir=backup-pre-0.4 reason="not_a_directory"`，再有 `store.backup_pre_0_4 result="created" files=<N> dir="backup-pre-0.4-<UTC 时间>"`。
+    - 同名的空文件原样留着；新备份在 `backup-pre-0.4-<UTC 时间>\`，内容与第 2 步相同（含 `manifest.json`）。
+    - `store-meta.json` 有 `"backup_pre_0_4": true`，`"backup_pre_0_4_dir": "backup-pre-0.4-<UTC 时间>"`。
+    - 没有备份失败的横幅，可以照常保存。`fe31dec` 中这样做会让备份失败，旧版 CP-05 就是用它造失败的；现在它不再造成失败，CP-05 已改用别的办法。
+  - 其他情况（不单独测，日志里见到时对照）：
+    - 已有一个完整的备份（`manifest.json` 逐项核对一致）、但 `store-meta.json` 没有记录时，不新建备份，只补记录：`result="existing" files=0 dir="<目录名>"`。
+    - 不完整的原因还可能是 `manifest_missing`、`manifest_unreadable`、`manifest_invalid`、`file_missing`、`file_unreadable`、`file_changed`。
+    - 上一次中断留下的 `backup-pre-0.4.tmp-*` 会先被删掉：`result="stale_temp_removed" file="<目录名>"`；删不掉时是警告 `result="stale_temp_kept"`。
+- **通过标准**：
+  - 备份内容和哈希与上面一致，`manifest.json` 与备份里的文件逐项一致；
+  - 只备份一次；
+  - 空目录不备份；
+  - `backup-pre-0.4` 被占用时不动原物，另建带时间的备份目录。
+- **出处**：
+  - development-plan.md:1805、2339。
+  - `43dda1f`（与 `integrate/0.4` 相同）：
+    - `src-tauri/src/store/backup.rs:74-85`（复制哪些文件）、`backup.rs:117-130`（`manifest.json` 的格式）；
+    - `backup.rs:148-185`（是否需要备份、文件清单）、`backup.rs:196-227`（隔离文件及其元数据）、`backup.rs:231-258`（残留的临时目录）；
+    - `backup.rs:286-355`（复制、写 `manifest.json`、核对已有备份）、`backup.rs:372-459`（已有备份、带时间的目录名、最后整体改名）；
+    - `backup.rs:476-527`（日志和 `store-meta.json`）、`backup.rs:634-640`（哪三个版本）；
+    - `load.rs:99-105`；`meta.rs:41-50`。
+  - 测试（`integrate/0.4` 的 `startup_tests.rs`）：
+    - `first_write_backs_up_a_031_directory_byte_for_byte`（2388）、`fresh_directory_gets_no_backup`（2432）；
+    - `an_existing_backup_is_never_overwritten`（2511）、`an_interrupted_backup_is_made_again`（2547）；
+    - `a_corrupt_active_is_backed_up_before_it_is_quarantined`（2865）、`an_incomplete_existing_backup_is_kept_and_a_dated_one_made`（3095）。
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（files=____；`manifest.json` 项数 ____；与 P10 不一致的文件：____；第 5 步的备份目录名：____）
 
 ### M4-CP-05 备份失败时拒绝写入，修好后补做备份
 
-用一个与备份目录同名的**文件**挡住备份。这是最容易复现的失败方式，不需要任何注入输入的程序；展开用手动打字。
+**做法**：用一个名为 `prefs.json` 的**空目录**让备份失败。`prefs.json` 在备份清单里（`backup.rs:81-85`）。备份逐个用 `fs::read` 读取要复制的文件：不存在的跳过，遇到别的读取错误，整个备份就失败（`backup.rs:286-311`）。在 Windows 上把目录当文件读，得到的是「拒绝访问」（系统错误 5），所以备份停在 `prefs.json`。单元测试 `failed_backup_refuses_writes_until_it_succeeds`（`integrate/0.4` 的 `startup_tests.rs:2454`）就是这样造失败的。
+
+**为什么不用别的办法**：这个做法不改文件权限，不需要管理员权限，也不需要任何注入输入的程序；展开用手动打字。给某个 0.3.1 文件设拒绝读取的 ACL 也能造成失败，但要改文件权限，事后还要恢复，本条不用。旧版本条用「与备份目录同名的文件」挡住备份，现在已经不会失败（见 CP-04 第 5 步）。
 
 - **步骤**：
-  1. 退出程序。把数据目录恢复成 CP-01 第 1 步备份的那份 0.3.1 数据（没有 `store-meta.json`，也没有 `backup-pre-0.4\`）。如果 `store-meta.json` 里已经有 `backup_pre_0_4`，就不会再备份，本条无法测。
-  2. 用 P10 记下哈希，然后建一个同名的空文件：`New-Item -ItemType File "$d\backup-pre-0.4"`。
+  1. 退出程序。把数据目录恢复成 CP-01 第 1 步备份的那份 0.3.1 数据：没有 `store-meta.json`，也没有任何 `backup-pre-0.4*`。
+     - 如果 `store-meta.json` 里的 `backup_pre_0_4` 已经是 `true` 或 `false`，就不会再备份，本条无法测。
+     - 数据目录里如果有 `prefs.json` 文件（0.3.1 不写这个文件，正常没有），先把它移到数据目录以外。
+  2. 用 P10 记下哈希，然后建一个名为 `prefs.json` 的空目录：`New-Item -ItemType Directory "$d\prefs.json"`。
   3. 启动 0.4 release，看横幅、日志和 `store-meta.json`。
-  4. 在记事本手动输入 `zzk` + 空格。
+  4. 点顶部的「恢复监听」，在记事本里手动输入 `zzk` + 空格。
+     - 然后保持「正常」至少 70 秒，期间不要注入故障、不要锁屏，再检索日志。
+     - 不要动「启动时自动开始监听」开关：点了会报「读取文件失败：prefs.json（系统错误 5）。」，与本条无关。
   5. 编辑一条规则并保存，再点「应用设置」。
-  6. 不退出程序，删掉那个文件：`Remove-Item "$d\backup-pre-0.4"`。再保存一次并「应用设置」。
+  6. 不退出程序，删掉那个目录：`Remove-Item "$d\prefs.json"`。再保存一次并「应用设置」。
   7. 记下横幅是否消失，然后重启程序再看一次。
 - **预期结果**：
-  - 第 3 步：没有进入安全模式。横幅显示「升级前备份失败，暂时不能保存，已有配置照常生效。」。日志有 `store.backup_pre_0_4 result="failed" files=0 op=CreateDir file="backup-pre-0.4" error_kind=AlreadyExists`（这个错误不是系统调用返回的，所以没有 `os_code`）。`store-meta.json` 里没有 `backup_pre_0_4` 键；0.3.1 的文件哈希与第 2 步相同（加载时的元数据快照也没有写）。
-  - 第 4 步：照常展开。
-  - 第 5 步：保存和应用都被拒绝，提示「创建文件夹失败：backup-pre-0.4。」（没有系统错误码）。P10 哈希不变，横幅仍在。
-  - 第 6 步：保存和应用成功；出现 `backup-pre-0.4\` 目录，内容按 CP-04 核对；日志 `store.backup_pre_0_4 result="created" files=<N>`；`store-meta.json` 有 `"backup_pre_0_4": true`。
-  - 第 7 步：后端在备份成功时已经撤销了这个问题，但撤销不发事件，前端只合并新增的问题，所以横幅当场不会消失，要到重启后才消失（§12.3 第 19 条），如实记录；重启后不应再出现。
-- **通过标准**：备份失败期间不写任何 0.3.1 会读的文件，已有配置照常展开；问题修好后下一次写入补做备份并成功。第 7 步横幅当场没有消失不判为不通过，只记录。
-- **出处**：R6 `fe31dec`：`backup.rs:213-220`（同名文件 → `CreateDir`/`AlreadyExists`）、`backup.rs:257-276`（失败日志与返回的错误）、`backup.rs:297-322`（`backup_before_write`、`note_backup`）、`load.rs:91-95`、`load.rs:114-116`；测试 `startup_tests.rs` 的 `failed_backup_refuses_writes_until_it_succeeds`；横幅文案 `src/status.ts:217-219`（`cfa41f2`）；错误文案 `src/ipc/errors.ts:200-205`。
-- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（第 7 步横幅当场是否消失：____）
+  - 第 3 步：
+    - 没有进入安全模式，「当前生效版本」与 0.3.1 的相同。
+    - 横幅：
+      - 带 `cfa41f2` 的构建：「升级前备份失败，暂时不能保存，已有配置照常生效。」，只有一条。
+      - 只用 `integrate/0.4` 构建：「启动时发现一个问题：其他（backup_failed）。可在「运行状态与恢复」中导出诊断包了解详情。」，不判为不通过。
+    - 日志有下面几条（顺序不固定）：
+      - **备份失败**（警告）：`store.backup_pre_0_4 result="failed" files=<k> op=Read file="prefs.json" error_kind=PermissionDenied os_code=5`。
+        - k 是在 `prefs.json` 之前已经复制的文件数，即 5 个 0.3.1 文件和三个版本的 `revisions\` 文件中实际存在的个数（清单见 CP-04 第 2 步）。
+        - 这些复制件随即删掉，不留 `backup-pre-0.4.tmp-*`。
+      - **返回给调用方的错误**：紧接着一条 `command.io op=Read path=Some("backup-pre-0.4") error=拒绝访问。 (os error 5)`，英文系统是 `Access is denied. (os error 5)`。路径固定写备份目录名。
+      - **其他读 `prefs.json` 的地方**也各自失败：
+        - `command.io op=Read path=Some("prefs.json") error=拒绝访问。 (os error 5)`；
+        - `store.prefs_unavailable file="prefs.json" error=Read failed (path: Some("prefs.json"), os error: Some(5))`：剪贴板设置改用默认值；
+        - `log.level_restore_failed error=Read failed (path: Some("prefs.json"), os error: Some(5))`：日志级别用默认值。
+        - 界面每次读取状态都会再读一次 `prefs.json`，所以 `path=Some("prefs.json")` 的 `command.io` 会反复出现，属正常。
+      - **监听保持暂停**：`self_test.startup health=… auto_listen=false outcome="auto_listen_off"`。`prefs.json` 读不出来时，「启动时自动开始监听」按关闭处理。
+    - `store-meta.json`：
+      - `backup_pre_0_4` 为 `null`（既不是 `true` 也不是 `false`），`backup_pre_0_4_dir` 为 `null`；
+      - 数据目录里没有任何 `backup-pre-0.4*`。
+    - 0.3.1 的文件哈希与第 2 步相同。加载时的元数据快照也没有写：备份失败时根本不尝试写。
+  - 第 4 步：
+    - 「恢复监听」可以点，照常展开。暂停和恢复不写 0.3.1 的文件，不经过备份检查。
+    - 约 60 秒后：
+      - 日志有一条警告 `store.last_good_skipped revision=<n> reason="io"`；
+      - 同时又有一组 `store.backup_pre_0_4 result="failed" …` 和 `command.io op=Read path=Some("backup-pre-0.4") …`。
+    - 原因：记录上次正常配置也要先通过备份检查，被拒绝后什么都不写。
+    - 之后保持「正常」时，每隔 1、2、4……分钟（最长 32 分钟）重试一次。每次重试都再记那两行，`store.last_good_skipped` 不再重复。
+    - `store-meta.json` 的 `last_good_revision` 仍为 `null`，`revisions\` 里没有新文件。
+  - 第 5 步：
+    - 保存和应用都被拒绝，提示「读取文件失败：backup-pre-0.4（系统错误 5）。」。
+    - 每次拒绝，日志都有一组 `store.backup_pre_0_4 result="failed" …` 和 `command.io op=Read path=Some("backup-pre-0.4") …`。
+    - P10 哈希不变。横幅仍在，而且仍只有一条：`backup_failed` 只列一次。
+  - 第 6 步：
+    - 保存和应用成功。日志有 `store.backup_pre_0_4 result="created" files=<N> dir="backup-pre-0.4"`：这次保存先做备份，再写草稿。
+    - 出现 `backup-pre-0.4\`，内容按 CP-04 第 2 步核对，其中没有 `prefs.json`：它已删掉，不存在的文件跳过。
+    - `store-meta.json` 有 `"backup_pre_0_4": true` 和 `"backup_pre_0_4_dir": "backup-pre-0.4"`。
+    - 备份成功时，补写加载时没写的元数据快照 `revisions\<n>.metadata.json`，n 为第 3 步的生效版本。
+    - 这时不要求出现 `store.last_good`：「应用设置」换了生效版本，上次正常配置的条件对新版本重新计算（ST-13）。
+  - 第 7 步：横幅当场不会消失，要到重启后才消失（§12.3 第 19 条），如实记录；重启后不应再出现。
+    - 原因：后端在备份成功时已经撤销了这个问题，但撤销不发事件，而前端只合并新增的问题。
+- **通过标准**：
+  - 备份失败期间不写任何 0.3.1 会读的文件，包括元数据快照和上次正常配置的快照；
+  - 已有配置照常展开；
+  - 问题修好后，下一次写入补做备份并成功；
+  - 第 7 步横幅当场没有消失不判为不通过，只记录。
+- **出处**：
+  - `43dda1f`（与 `integrate/0.4` 相同）：
+    - `src-tauri/src/store/backup.rs:81-85`（`prefs.json` 在备份清单里）、`backup.rs:286-311`（不存在的跳过，其他读取错误让备份失败）、`backup.rs:454-457`（失败时删掉临时目录）；
+    - `backup.rs:491-505`（失败日志与返回的错误）；
+    - `backup.rs:531-542`（`backup_before_write`）、`backup.rs:618-631`（`note_backup`：`backup_failed` 只列一次，备份成功后撤销并补写元数据快照）；
+    - `load.rs:99-105`、`load.rs:125-127`（加载时备份失败就不写元数据快照）；
+    - `prefs.rs:228-241`、`prefs.rs:267-283`、`prefs.rs:340-343`（`prefs.json` 读不出来时的日志和默认值）。
+  - `integrate/0.4`：
+    - `src-tauri/src/error.rs:145-147`（`command.io`）；
+    - `src-tauri/src/store/mod.rs:301-303`（`mark_last_good` 先过备份检查）；
+    - `src-tauri/src/lkg.rs:85-109`、`lkg.rs:337-376`（拒绝后重试、`store.last_good_skipped`）；
+    - `src-tauri/src/startup.rs:297-299`、`startup.rs:353-359`（`auto_listen_off`）；
+    - `src-tauri/src/diagnostics/level.rs:269-276`。
+  - 测试：`startup_tests.rs` 的 `failed_backup_refuses_writes_until_it_succeeds`（2454）；`lkg.rs` 的 `a_mark_refused_while_the_backup_fails_is_recorded_once_the_backup_succeeds`（900）。
+  - 文案：
+    - 横幅：`src/status.ts:217-219`（`cfa41f2`）；
+    - 错误提示：`src/ipc/errors.ts:200-205`、`src/ipc/labels.ts:92-101`。
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（第 3 步 files=____；第 4 步是否有 `store.last_good_skipped … reason="io"`：____；第 6 步 files=____；第 7 步横幅当场是否消失：____）
 
 ## 9. 性能与浸泡（M4-PF）
 
@@ -1738,18 +2047,30 @@ S-29 在计划里是 0.4 的 **P0** 条目（development-plan.md:630、2381）�
 
 ### M4-NR-08 发布事务化：失败时保留生效配置和暂停状态
 
-发布按固定顺序写文件（R6 `fe31dec` 的 `revisions.rs`）：
-1. 备份检查；
-2. `revisions\<旧>.json`（已有就不写）；
-3. `revisions\<旧>.metadata.json`；
-4. `draft.json`；
-5. `revisions\<新>.metadata.json`；
-6. `migration-unresolved.json`；
-7. `active-migration-unresolved.json`；
-8. `store-meta.json` 的 `previous_revision`；
-9. 最后才是 `active.json`。
+发布按固定顺序进行（`43dda1f` 的 `revisions.rs:22-158`）。下面称「第 n 项」，与测试步骤的「第 n 步」区分。先做检查，这时什么都还没写：
+1. 定新版本号：比生效版本和 `revisions\` 里本程序文件用过的所有号码都大 1。只有 `<n>.metadata.json`、隔离后的 `<n>.corrupt-*.json` 或 `.tmp` 的号码也算用过（R7）。`revisions\` 列不出来时拒绝发布。
+2. 编译配置。
+3. 备份检查（CP-05）。
+4. 比较 `active.json` 的哈希：与加载时或本次会话上次发布时的不同，就报版本冲突。
+5. 在 `store-meta.json` 里找描述当前 `active.json` 的那条回滚记录：`active` 等于生效版本，指纹等于磁盘上的文件（审查 I-R1）。
+6. 持有 MANUAL 暂停原因，发布结束后不论成败都恢复原样。
 
-任何一步失败，整个发布失败：内存里的生效配置不变，暂停状态恢复原样。但第 2～8 步已经写下的文件不会撤回。场景 a、b、c 分别让失败落在第一次写入、开始写入之前、最后一步写入上。
+然后按顺序写文件：
+
+7. `revisions\<旧>.json`（已有就不写）。旧配置是空白占位时，第 7、8 项都跳过。
+8. `revisions\<旧>.metadata.json`。
+9. `draft.json`。
+10. `revisions\<新>.metadata.json`。
+11. `migration-unresolved.json`。
+12. `active-migration-unresolved.json`。
+13. `store-meta.json` 的 `previous_revisions`，有两项：
+    - 第一项是 `{"active": <新>, "revision": <旧>, "fingerprint": <新 active.json 的长度和 SHA-256>}`；
+    - 第二项是第 5 项找到的记录。
+
+    这一步写不了只记警告 `store.meta_write_failed`，发布照常进行。
+14. 最后才是 `active.json`。
+
+除第 13 项外，任何一项失败，整个发布就失败：内存里的生效配置不变，暂停状态恢复原样。但第 7～13 项已经写下的文件不会撤回。场景 a、b、c 分别让失败落在第一次写入、开始写入之前、最后一步写入上。
 
 - **步骤**：
   1. 场景 a（debug-fi，`store_write_fail`）：
@@ -1760,28 +2081,66 @@ S-29 在计划里是 0.4 的 **P0** 条目（development-plan.md:630、2381）�
   2. 场景 a′：先点「暂停监听」，再按场景 a 做一遍，最后恢复监听。
   3. 场景 b（release，P1 独占锁定 `active.json`）：用 P1 锁定 `active.json` 后点「应用设置」；释放锁后再点一次。
   4. 场景 c（release，只允许读的占用）：
-     1. 在 `zzk` 的描述末尾加 `-C1`，「应用设置」，记下 v{N}，用 P10 记下 `active.json` 的哈希。
+     1. 在 `zzk` 的描述末尾加 `-C1`，点「应用设置」，记下 v{N}。用 P10 记下 `active.json` 的哈希，转成小写；再用 `(Get-Item "$d\active.json").Length` 记下长度。
      2. 把描述末尾改成 `-C2`，保存到草稿。
      3. 另开 PowerShell 执行 `$f = [IO.File]::Open("$d\active.json", 'Open', 'Read', 'Read')`。这样程序还能读这个文件，但不能替换它。
-     4. 点「应用设置」，记下提示；查看 `revisions\` 里各文件的修改时间和 `store-meta.json`。
+     4. 点「应用设置」，记下提示。查看 `revisions\` 里各文件的修改时间，以及 `store-meta.json` 的 `previous_revisions`。
      5. 不释放占用，退出程序；然后执行 `$f.Close()`，再启动程序。
-     6. 在「运行状态与恢复」点「恢复上一个版本」→「回滚」，看 `zzk` 的描述。
+     6. 在「运行状态与恢复」点「恢复上一个版本」→「回滚」。看 `zzk` 的描述和「当前生效」的版本号，再看一次 `revisions\` 和 `store-meta.json`。
+     7. 退出程序再启动，再点一次「恢复上一个版本」→「回滚」，看 `zzk` 的描述和版本号。
 - **预期结果**：
   - 场景 a：
     - 第一次应用报错「重命名文件失败：<N>.json。」。如果 `revisions\<N>.json` 已经存在，则是「重命名文件失败：<N>.metadata.json。」。注入的错误不是系统错误，所以没有系统错误码。
-    - 日志有 `command.io op=Rename path=Some("<N>.json") error=injected store_write_fail`（或对应的 metadata 文件名）。
+    - 日志有 `command.io op=Rename path=Some("<N>.json") error=injected store_write_fail`（或对应的 metadata 文件名）。注入时临时文件已删掉，不留 `.tmp`。
     - 生效版本仍是 v{N}，`active.json` 的哈希不变，草稿还在，状态行与操作前相同（监听中）。
-    - 第二次应用成功，生效版本变为 v{N+1}。注入只生效一次。
+    - 第二次应用成功，生效版本变为 v{N+1}，因为注入只生效一次。失败的那次还没写到 `<N+1>.metadata.json`，所以号码 N+1 没被占用。
   - 场景 a′：同场景 a；失败后和成功后状态行都仍是「已暂停」，没有被发布顺带恢复监听。
-  - 场景 b：报「读取文件失败：active.json（系统错误 32）。」。发布在比较 `active.json` 的哈希时就停下了，什么都没写，状态不变；释放后再应用得到 v{N+1}。
+  - 场景 b：报「读取文件失败：active.json（系统错误 32）。」。发布在第 4 项比较哈希时停下，什么都没写，状态不变；释放后再应用得到 v{N+1}。
   - 场景 c：
-    - 第 4 步报「重命名文件失败：active.json（系统错误 5）。」或系统错误 32。`active.json` 的哈希不变，生效版本仍是 v{N}，状态行恢复原样。
-    - 第 4 步时，前面几步已经写下的文件不会撤回：`revisions\<N>.json`（原来没有时）、`<N>.metadata.json`、`<N+1>.metadata.json`、`draft.json`（`-C2`），以及 `store-meta.json` 里的 `"previous_revision": {"active": <N+1>, "revision": <N>}`。
+    - 第 4 步：
+      - 报「重命名文件失败：active.json（系统错误 5）。」或系统错误 32；日志有 `command.io op=Rename path=Some("active.json") error=拒绝访问。 (os error 5)`（英文系统为 `Access is denied. (os error 5)`）。
+      - `active.json` 的哈希不变，生效版本仍是 v{N}，状态行恢复原样。
+      - 第 7～13 项写下的文件不会撤回：`revisions\<N>.json`（原来没有时）、`<N>.metadata.json`、`<N+1>.metadata.json`、`draft.json`（`-C2`），还有替换失败留下的 `active.json.tmp`。真实的替换失败不删临时文件；下次写 `active.json` 时它被覆盖，不影响加载。
+      - `store-meta.json` 的 `previous_revisions` 有两项：
+        - `{"active": <N+1>, "revision": <N>, …}`；
+        - `{"active": <N>, "revision": <M>, "fingerprint": {"len": <第 1 步的长度>, "sha256": "<第 1 步的哈希>"}}`。M 是第 1 步那次发布替换掉的版本，一般是 N−1。
+
+        只有第一项、没有第二项，判不通过（I-R1）。
     - 第 5 步重启后，生效的仍是 v{N}（`-C1`），草稿是 `-C2`。
-    - 第 6 步：`previous_revision.active`（N+1）与真正生效的 v{N} 对不上，这条记录不被采用，回滚目标按旧规则取 `revisions\<N−1>.json`（与 ST-13 的 R3 规则一致）。所以 `zzk` 的描述回到加 `-C1` 之前的样子，生效版本变为 v{N+1}。如果描述仍是 `-C1`，说明错误地采用了那条记录，判不通过。
-- **通过标准**：失败的发布不改变生效配置和暂停状态（§5.5 #8）。错误提示与上面一致。场景 c 残留的文件不影响重启后的回滚，回滚本身（也是一次发布）能成功。
-- **出处**：development-plan.md:1006；R6 `fe31dec`：`src-tauri/src/store/revisions.rs:35-41`（哈希比较）、`revisions.rs:42-58`（备份检查、持有 MANUAL、结束后恢复）、`revisions.rs:64-115`（写入顺序、失败时恢复暂停状态）；`atomic.rs:16-23`（`store_write_fail` 与真实替换失败都报 `Rename`）；`load.rs:226-232`（读文件失败报 `Read`）；`src-tauri/src/error.rs:114-122`（`command.io` 日志、只带文件名）；`fallback.rs:602-621`（`previous_revision` 只在 `active` 对得上时采用，否则取 `revisions\<生效−1>.json`；R3 `7b727ca`）；`src/ipc/errors.ts:200-205`。
-- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（场景 a 报错的文件名：____；场景 c 的系统错误码：____；场景 c 第 6 步回滚后 `zzk` 的描述：____）
+    - 第 6 步：
+      - 第一项的 `active`（N+1）与生效的 v{N} 对不上，不被采用；第二项的版本号和指纹都对得上，回滚目标就是它记的 `revisions\<M>.json`（I-R2）。所以 `zzk` 的描述回到加 `-C1` 之前的样子。
+      - 新版本号是 N+2，不是 N+1，因为第 4 步留下的 `<N+1>.metadata.json` 占用了 N+1（R7）。这个文件的修改时间不变，`active.json.tmp` 也不在了。
+      - `previous_revisions` 变为 `{"active": <N+2>, "revision": <N>, …}` 和 `{"active": <N>, "revision": <M>, …}`。
+      - 如果描述仍是 `-C1`、版本号是 N+1，或者 `<N+1>.metadata.json` 被改写，判不通过。
+    - 第 7 步：
+      - 重启后采用的是 `{"active": <N+2>, "revision": <N>}`，回滚目标是 `revisions\<N>.json`，中间缺的 N+1 不影响：有记录就按记录，不再推测（R8）。`zzk` 的描述回到 `-C1`，生效版本 v{N+3}。
+      - 数据目录里有 0.3.1 留下的 `previous.json` 时，这一步还能分辨回滚目标是按记录还是推测出来的：推测时 `<N+1>.json` 不存在，会先取 `previous.json`（`fallback.rs:710-725`），得到的不是 `-C1`。
+- **通过标准**：
+  - 失败的发布不改变生效配置和暂停状态（§5.5 #8）。错误提示与上面一致。
+  - 场景 c 失败后，已生效版本的回滚记录还在；重启后的回滚按记录进行，回滚本身（也是一次发布）能成功，版本号不复用。
+- **出处**：
+  - development-plan.md:1006。
+  - `43dda1f`：
+    - `src-tauri/src/store/revisions.rs`：
+      - `32`（版本号）、`37`（备份检查）、`38-46`（哈希比较）；
+      - `48-61`（找出生效版本的记录，I-R1）；
+      - `62-77`（持有 MANUAL、结束后恢复）；
+      - `82-133`（写入顺序、失败时恢复暂停状态；`112-126` 记录写在 `active.json` 之前，写不了只告警）；
+      - `159-180`、`194-228`（新版本号跳过已用过的号码，R7）。
+    - `atomic.rs:16-23`：`store_write_fail` 与真实替换失败都报 `Rename`；注入时删临时文件，真实失败不删。
+    - `load.rs:226-243`：读文件失败报 `Read`。
+    - `fallback.rs:670-726`：版本号和指纹都对得上的记录才采用，采用了就按记录，不再推测（I-R2、R8）；没有记录时的推测顺序见 683-693、710-725 行。
+  - integrate `f1589cb`：
+    - `src-tauri/src/error.rs:145-147`：`command.io` 日志，只带文件名。
+    - `src-tauri/src/store/startup_tests.rs`：
+      - `2636`：`a_failed_publish_keeps_the_rollback_target_of_the_committed_revision`；
+      - `2763`：`a_revision_number_used_only_by_metadata_is_not_given_out`；
+      - `3270`：`store_write_fail_keeps_active_and_pause`。
+    - `src-tauri/src/store/revisions.rs`：
+      - `276`：`failed_publish_preserves_active_and_pause`；
+      - `299`：`publish_restores_only_the_manual_reason`。
+    - `src/ipc/errors.ts:200-205`。
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（场景 a 报错的文件名：____；场景 c 的系统错误码：____；场景 c 第 4 步 `previous_revisions` 的两项：____；第 6 步的版本号和 `zzk` 的描述：____；第 7 步的版本号和 `zzk` 的描述：____）
 
 ## 12. 汇总
 
@@ -1791,7 +2150,7 @@ S-29 在计划里是 0.4 的 **P0** 条目（development-plan.md:630、2381）�
 |---|---|---|---|---|---|
 | 2 输入与注入 | M4-IN-01 ～ 10（09、10 可选） | 10 | | | |
 | 3 剪贴板 | M4-CB-01 ～ 09（09 可选） | 9 | | | |
-| 4 监督与自愈 | M4-SV-01 ～ 16（16 可选） | 16 | | | |
+| 4 监督与自愈 | M4-SV-01 ～ 17（16 可选） | 17 | | | |
 | 5 安全模式与存储 | M4-ST-01 ～ 13（03 可选） | 13 | | | |
 | 6 前端状态一致性 | M4-FE-01 ～ 07 | 7 | | | |
 | 7 隐私 | M4-PR-01 ～ 04 | 4 | | | |
@@ -1799,7 +2158,7 @@ S-29 在计划里是 0.4 的 **P0** 条目（development-plan.md:630、2381）�
 | 9 性能与浸泡 | M4-PF-01 ～ 05 | 5 | | | |
 | 10 S-29 spike | M4-SP-01 ～ 04 | 4 | | | |
 | 11 不得倒退 | M4-NR-01 ～ 08 | 8 | | | |
-| **合计** | | **81** | | | |
+| **合计** | | **82** | | | |
 
 ### 12.2 条目与 0.4 退出标准的对应
 
@@ -1807,7 +2166,7 @@ S-29 在计划里是 0.4 的 **P0** 条目（development-plan.md:630、2381）�
 
 | 退出标准 | 覆盖条目 | 判定 |
 |---|---|---|
-| E1 故障注入点（§11）全部能自动恢复或明确提示；`hook_unhook`、`rawinput_unregister` 由交叉校验检出并重建 | 各注入点及其覆盖条目：<br>• `executor_panic`：SV-02、SV-15（熔断）、PR-01<br>• `executor_hang`：SV-03、NR-02<br>• `hook_panic`：SV-04<br>• `hook_unhook`：SV-05<br>• `rawinput_unregister`：SV-06<br>• `rawinput_close`：SV-07<br>• `clipboard_busy`：CB-08，真实场景 CB-07<br>• `store_write_fail`：NR-08<br>• `config_corrupt`：用真实操作代替，ST-05、ST-06<br>• `store_locked`：用真实操作代替，ST-01、ST-02<br>• `autostart_stale`：用真实操作代替，SV-12<br>• `session_end`：SV-14，真实注销 SV-13<br>补充：SV-01、SV-08 ～ SV-11、SV-16（可选）、ST-03、ST-04、ST-07 ～ ST-13、CB-01 ～ CB-06、CB-09 | ☐ |
+| E1 故障注入点（§11）全部能自动恢复或明确提示；`hook_unhook`、`rawinput_unregister` 由交叉校验检出并重建 | 各注入点及其覆盖条目：<br>• `executor_panic`：SV-02、SV-15（熔断）、SV-17（手动测试）、PR-01<br>• `executor_hang`：SV-03、SV-17（手动测试）、NR-02<br>• `hook_panic`：SV-04<br>• `hook_unhook`：SV-05<br>• `rawinput_unregister`：SV-06<br>• `rawinput_close`：SV-07<br>• `clipboard_busy`：CB-08，真实场景 CB-07<br>• `store_write_fail`：NR-08<br>• `config_corrupt`：用真实操作代替，ST-05、ST-06<br>• `store_locked`：用真实操作代替，ST-01、ST-02<br>• `autostart_stale`：用真实操作代替，SV-12<br>• `session_end`：SV-14，真实注销 SV-13<br>补充：SV-01、SV-08 ～ SV-11、SV-16（可选）、ST-03、ST-04、ST-07 ～ ST-13、CB-01 ～ CB-06、CB-09 | ☐ |
 | E2 2 小时浸泡无静默失效 | PF-05（PF-04 作为空闲参照） | ☐ |
 | E3 隐私测试通过（日志、诊断包、执行历史不含正文） | PR-01 ～ PR-04、CB-06 | ☐ |
 | E4 S-25 实机最小集有书面记录 | IN-01 ～ IN-08（记事本、Chrome、微信，各配合微软拼音）；CB-04 ～ CB-06（development-plan.md:2524：0.4 的最低覆盖还包括剪贴板子表，第 2545–2554 行）。本文件填写后存档 | ☐ |
@@ -1832,7 +2191,13 @@ S-29 在计划里是 0.4 的 **P0** 条目（development-plan.md:630、2381）�
 
 本节只记录，本文件的提交不改代码。第 1 ～ 15 条是初稿（`576aa5a`）时记下的，修订时逐条回到代码复核：已经由其他提交修复的标「已修」并写明提交，这些提交不在 `feat/0.4-stability-foundation` 上的，实测构建必须包含它们（见文首）。第 16 ～ 19 条是修订时新发现的。
 
-1. **backup-pre-0.4**（已修，R6 `fe31dec`，`fix/0.4-final-store` 分支）：development-plan.md:1805、2339 要求跨版本首次写入前备份，初稿时代码里没有。`fe31dec` 已实现：加载时和每次写入前检查，备份失败时拒绝写入（CP-04 备份内容，CP-05 备份失败）。
+1. **backup-pre-0.4**（已修，存储分支 `43dda1f`：R6 及审查修正 I-B1～I-B3、R7-1）：development-plan.md:1805、2339 要求跨版本首次写入前备份，初稿时代码里没有。`43dda1f` 的做法：
+   - 加载时和每次写入前检查，备份失败时拒绝写入，并列出 `backup_failed`（CP-05）；
+   - 备份包含加载时隔离的坏文件和各版本的 metadata 文件（I-B2、R7-1，CP-04）；
+   - 加载时发现的坏 `active.json` 要等备份收进去之后才改名隔离，备份失败时留在原处（I-B1）；
+   - 同名备份目录不完整时保留它，另建带日期的备份（I-B3，CP-04 第 5 步）。
+
+   integrate `f1589cb` 让记录上次正常配置（`mark_last_good`）也先过这道备份检查（`store/mod.rs:301-303`，见第 4 条）。
 2. **B-01 ⑤ 与 §5.5 #2 相冲突**：
    - development-plan.md:1819 写的是：剪贴板被卡住的旧线程占着时，新纪元的执行器「改用键入输出」；
    - §5.5 #2 和代码（`executor.rs:1715-1733`）都是拒绝，不改用键入（NR-02）。
@@ -1840,13 +2205,15 @@ S-29 在计划里是 0.4 的 **P0** 条目（development-plan.md:630、2381）�
    - 计划 §11（development-plan.md:2489）预期这个注入点之后结束进程，连续启动两次不会被误判为崩溃循环；
    - 初稿时这个注入点只调用会话结束回调（`session.rs:216-221`），不清除运行标记，连续重启会进入 CrashLoop；
    - `241b3f3` 改为在会话结束回调里清除运行标记，SV-14 按修复后的行为验收；真实注销仍走 RunEvent::Exit 清除运行标记（`startup.rs:384-395`，SV-13）。
-4. **LKG 没有接上**（已修，`b32062f`，`fix/0.4-final-lkg` 分支）：计划把上次正常配置作为第一回退，初稿时生产代码不调用 `mark_last_good`，回退直接从 `revisions/` 开始。`b32062f` 已接上：在「正常」状态持续 60 秒以上并成功展开一次后记录（ST-06、ST-13）；`lkg.rs` 自己列出的限制见附表 A。
+4. **LKG 没有接上**（已修，`b32062f`，`fix/0.4-final-lkg` 分支）：计划把上次正常配置作为第一回退，初稿时生产代码不调用 `mark_last_good`，回退直接从 `revisions/` 开始。`b32062f` 已接上：在「正常」状态持续 60 秒以上并成功展开一次后记录（ST-06、ST-13）；`lkg.rs` 自己列出的限制见附表 A。integrate `f1589cb` 又加了两条：
+   - 记录前先过升级前备份检查；`revisions\<n>.json` 已存在但内容不是生效配置时拒绝记录（`store/mod.rs:301-326`）。
+   - 被拒绝后在同一状态下重试，等待时间从 60 秒起逐次加倍，最长 32 分钟（`lkg.rs:85-102`）。所以备份失败期间不会记录上次正常配置，备份恢复后才会记录（CP-05）。
 5. **恢复横幅每次启动都会出现**（按设计）：从回退候选恢复后不重写 `active.json`，所以直到下一次「应用设置」之前，每次启动都显示恢复横幅（ST-06）。加载流程按设计只隔离坏文件、只写运行标记，不写配置文件（`src-tauri/src/store/fallback.rs:121-141`），所以不算缺陷；ST-06 第 4 步核对应用之后不再出现。
 6. **横幅说「可以导入配置」，Locked 时导入却被拒绝**（已修，`cfa41f2`）：初稿时 safe_mode 横幅对所有原因用同一句话。后端只允许 CrashLoop 和 NoValidConfig 用导入解除，Locked、NewerSchema 下只能预览（`src-tauri/src/store/mod.rs:85-94`）。`cfa41f2` 改为按原因给出出路，只有这两种原因提「可以导入配置」（`src/status.ts:146-157`）（ST-04、ST-08 ～ ST-10）。
 7. **自检项名称不一致**（已修，`e0fc068`）：系统通知里写「键盘鼠标监听」（`startup.rs:363`），初稿时前端横幅写「键盘监听心跳」。`e0fc068` 把前端标签改为「键盘鼠标监听」，与通知一致（SV-11）。
 8. **终止键与计划默认值不同**：代码是 Ctrl+Shift+Esc（`hook.rs:262-275`），计划默认值是 Ctrl+Alt+Pause；development-plan.md:215 标为【待核实】（IN-07）。
 9. **p50/p95 汇总缺失**（未修）：`get_health` 还没有 p50/p95 汇总（`src-tauri/src/commands/diagnostics.rs:506` 是 TODO），只有每条历史的 StageTimings，日志和诊断包里都没有耗时。release 界面只在「最近执行」显示总耗时（`total_us`，按毫秒取整），各阶段耗时只能在 debug-fi 构建里用 `list_history` 取（PF-01）。前端也没有调用 `report_metric`、`self_test`、`set_log_level`。
-10. **`scripts/soak/`**（已补，`9cbe400`）：计划 L6（development-plan.md:2477）要求的浸泡监视脚本已加在 `scripts/soak/`，PF-05 使用。performance-baseline.md:82 仍写「目前尚不存在」，需同步（本次不改）。
+10. **`scripts/soak/`**（已补，`9cbe400`）：计划 L6（development-plan.md:2477）要求的浸泡监视脚本已加在 `scripts/soak/`，PF-05 使用。performance-baseline.md:82 原写「目前尚不存在」，本次修订已同步。
 11. **版本号仍是 0.3.1**：所以本清单的构建栏要求写提交哈希。
 12. **§5.5「现有实现位置」过时**：引用的仍是拆分前的 `windows.rs`、`windows_espanso.rs`、`main.rs` 行号；performance-baseline.md:40 也是如此。
 13. **S-06 与代码参数的关系**：计划 S-06 写「50 次按键」，代码中 K=5、R=8，最多 33 次按下（`liveness.rs:47-51`，符合要求）。但「10 秒内」这一条在用户不打字时由谁保证，代码注释里没有说明（SV-05 变体 b）。
@@ -1855,11 +2222,11 @@ S-29 在计划里是 0.4 的 **P0** 条目（development-plan.md:630、2381）�
 16. **熔断时没有系统通知**（未修）：S-03（development-plan.md:704）要求熔断为「故障」时发通知。托盘只在恢复监听被拒绝、启动自检失败、规则执行时发通知（`src-tauri/src/tray.rs:78-119`），`supervisor.circuit_open` 之后没有通知。SV-15 对这一项单独判定。
 17. **`zzh` 的普通文字留空时，纯文本目标粘贴出空内容**（未修）：编辑器和领域模型都不检查「无法显示格式时使用的普通文字」是否为空（`src/ActionEditor.tsx:827-830`；`crates/domain/src/model.rs:549`），执行时照样把空的 CF_UNICODETEXT 和 HTML Format 一起放进剪贴板（`crates/platform/src/windows/clipboard.rs:561-573`），记事本等纯文本目标静默粘贴出空内容，没有任何提示。本清单在 §1.5 要求 `zzh` 的普通文字不能留空。
 18. **外部修改后「请刷新后再试」做不到，旧草稿发布会覆盖外部修改**（未修，0.5 修）：比对用的磁盘哈希只在启动和发布时更新（`src-tauri/src/store/load.rs:85`、`revisions.rs:103`），「刷新状态」只取内存里的状态（`src-tauri/src/commands/runtime.rs:13-15`），冲突要到重启后才解除；重启后如果不放弃草稿直接应用，发布的是旧草稿，外部修改被覆盖而且没有提示（FE-04）。
-19. **备份补做成功后，backup_failed 横幅当场不消失**（未修）：后端在备份成功时撤销这个问题（`fe31dec` 的 `backup.rs:297-322`），但撤销不发事件；前端只在安全模式解除时用后端的列表替换问题列表，其他时候只合并新增（`src/ipc/events.ts:310-321、439-456`），所以横幅要到重启后才消失（CP-05 第 7 步，只记录）。
+19. **备份补做成功后，backup_failed 横幅当场不消失**（未修）：后端在备份成功时撤销这个问题（`43dda1f` 的 `backup.rs:618-631`，`note_backup`），但撤销不发事件；前端只在安全模式解除时用后端的列表替换问题列表，其他时候只合并新增（`src/ipc/events.ts:310-321、439-456`），所以横幅要到重启后才消失（CP-05 第 7 步，只记录）。
 
 ## 附表 A：代码与文档中的「待实测」由哪条覆盖
 
-代码行号以 `576aa5a` 为准；表尾几行是修订时在其他分支头上新增的「待实测」，行号以对应分支头为准（这些分支上的文件行号整体也有移动，例如鼠标重挂分支的 `hook.rs`、`rawinput.rs`）。
+代码行号以 `576aa5a` 为准；表尾几行是修订时在其他分支头上新增的「待实测」，行号以第一列写明的提交为准，其中 `f1589cb` 是 `integrate/0.4`（这些分支上的文件行号整体也有移动，例如鼠标重挂分支的 `hook.rs`、`rawinput.rs`）。
 
 | 位置 | 内容 | 条目 |
 |---|---|---|
@@ -1899,7 +2266,7 @@ S-29 在计划里是 0.4 的 **P0** 条目（development-plan.md:630、2381）�
 | development-plan.md:215【待核实】 | Ctrl+Shift+Esc 的实际表现 | IN-07 |
 | merge-log 第 525 行 | 剪贴板健康链在实机上的表现 | CB-07、FE-07 |
 | merge-log 第 1270 行（TODO 22） | 管理员窗口在前台时自检误报 | SV-09 |
-| `fe31dec`：`src-tauri/src/startup.rs:195` | 真实会话结束时，tao 能否在进程结束前把它变成 RunEvent::Exit（会话结束回调已先清除运行标记） | SV-13 |
-| `b32062f`：`src-tauri/src/lkg.rs:106` | 上次正常配置的限制：Health 只取最新值、检查与写入之间的窗口、发布安装与事件之间的成功不计、只有 Windows 记录、60 秒的实际时序 | ST-13 |
+| `f1589cb`：`src-tauri/src/startup.rs:195` | 真实会话结束时，tao 能否在进程结束前把它变成 RunEvent::Exit（会话结束回调已先清除运行标记） | SV-13 |
+| `f1589cb`：`src-tauri/src/lkg.rs:127` | 上次正常配置的限制：Health 只取最新值、检查与写入之间的窗口、发布安装与事件之间的成功不计、只有 Windows 记录、60 秒的实际时序 | ST-13 |
 | `384f8d1`：`crates/platform/src/windows/input.rs:901` | 鼠标点击交叉校验沿用按键的 MISS_LIMIT 及退避 | SV-16 |
 | `384f8d1`：`input.rs:998`；`rawinput.rs:407`；`pipeline_tests_input.rs:3785、4004` | 注入的点击是否进入 RawInput（只按「RawInput 看到、鼠标钩子没看到」一个方向判定） | SV-16 |
