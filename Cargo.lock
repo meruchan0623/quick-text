@@ -3159,6 +3159,7 @@ name = "quicker-domain"
 version = "0.3.1"
 dependencies = [
  "chrono",
+ "criterion",
  "encoding_rs",
  "proptest",
  "regex",
@@ -3198,6 +3199,7 @@ dependencies = [
  "arc-swap",
  "base64 0.22.1",
  "image",
+ "json-patch",
  "parking_lot",
  "quicker-domain",
  "quicker-platform",
@@ -3209,6 +3211,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-notification",
  "tauri-plugin-single-instance",
+ "tauri-utils",
  "thiserror 2.0.21",
  "tracing",
  "tracing-appender",

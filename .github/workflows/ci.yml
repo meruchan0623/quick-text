@@ -9,14 +9,23 @@
 #   rust-portable  every PR            quicker-domain tests on Linux (platform independence)
 #   macos-check    every PR            cargo check --workspace (ADR-f: compile check only)
 #   deps           every PR; weekly    dependency direction + cargo deny (B-51); the
-#                                      advisories check runs weekly / on demand only
-#   frontend       every PR            typecheck, lint, format, test (FE-53)
+#                                      advisories check runs weekly / on demand only (the
+#                                      weekly cron, not the nightly one)
+#   frontend       every PR            typecheck, lint, format, test (FE-53), check:bundle
+#                                      (no mock backend in production builds, FE-18), self-test
+#                                      of the packaging check on the embedded frontend
 #   notices        every PR            every distributed Rust crate and npm package has a license
 #                                      text for THIRD-PARTY-LICENSES.txt (S-28); the release
 #                                      workflow generates the real file and fails the same way
+#   bench          nightly; push to    matching with 1000 rules (crates/domain/benches, B-53),
+#                  main; on demand     fails above 120% of the absolute budget, or when any of
+#                                      its seven cases is missing or not from this run
+#                                      (scripts/check-bench-budget.ps1); target/criterion is
+#                                      uploaded for the trend. Not a required check: it does
+#                                      not run on pull requests
 #
-# Not implemented yet (planned in the same table): bindings (0.5), bench (nightly),
-# e2e-windows (nightly, R-10), frontend test:e2e / test:desktop / size (0.5).
+# Not implemented yet (planned in the same table): bindings (0.5), e2e-windows (nightly,
+# R-10), frontend test:e2e / test:desktop / size (0.5).
 name: ci
 
 on:
@@ -26,11 +35,16 @@ on:
     tags-ignore: ['**']
   schedule:
     # Weekly (Monday 03:17 UTC): new RustSec advisories show up without any code change.
+    # Jobs that react to it compare github.event.schedule with this exact string.
     - cron: '17 3 * * 1'
+    # Nightly (02:41 UTC): the bench job only. Same rule: compared as an exact string.
+    - cron: '41 2 * * *'
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Scheduled runs get a group per cron entry. Both run on the default branch, so with the ref
+  # alone the nightly run would cancel (or be cancelled by) a push to main or the weekly run.
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event.schedule || github.event_name }}
   cancel-in-progress: true
 
 permissions:
@@ -125,7 +139,8 @@ jobs:
 
   deps:
     name: deps
-    if: github.event_name != 'push'
+    # Pull requests, on demand, and the weekly cron (not the nightly bench cron).
+    if: github.event_name != 'push' && (github.event_name != 'schedule' || github.event.schedule == '17 3 * * 1')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -147,7 +162,7 @@ jobs:
       # Plan: advisories run weekly, not per PR. A new RustSec advisory can appear against an
       # unchanged Cargo.lock and must not block unrelated pull requests.
       - name: cargo deny (advisories)
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        if: (github.event_name == 'schedule' && github.event.schedule == '17 3 * * 1') || github.event_name == 'workflow_dispatch'
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories
@@ -183,6 +198,18 @@ jobs:
       - name: Test
         run: npm run test
 
+      # FE-18: production builds (plain and VITE_MOCK=1) contain no mock backend, with a
+      # control build that proves the scan sees it when it is there. The release workflow scans
+      # the dist/ that `tauri build` embeds (--scan-only).
+      - name: Bundle has no mock backend (FE-18)
+        run: npm run check:bundle
+
+      # The packaging scripts scan dist/ only after matching it against the frontend digest the
+      # exe records (scripts/check-embedded-frontend.ps1); this tests that comparison on
+      # synthetic files, so a broken check shows up here and not on release day.
+      - name: Embedded-frontend check self-test (FE-18)
+        run: pwsh -NoProfile -File scripts/check-embedded-frontend.ps1 -SelfTest
+
   # Early warning for the release gate: a dependency bump that brings in a crate without a
   # license file fails here, not on release day. Checks only, writes nothing
   # (scripts/generate-third-party-licenses.ps1 -CheckOnly). `cargo metadata` fetches the crates
@@ -207,3 +234,52 @@ jobs:
 
       - name: Every distributed dependency has a license text (S-28)
         run: pwsh -NoProfile -File scripts/generate-third-party-licenses.ps1 -CheckOnly
+
+  # B-53: per-keystroke matching with 1000 synthetic rules (crates/domain/benches/matching.rs).
+  # The gate is absolute: p99 of criterion's per-sample means above 120% of the 1 ms budget
+  # fails (statistic: scripts/check-bench-budget.ps1, docs/performance-baseline.md). Earlier
+  # runs are not compared; the uploaded target/criterion is for reading the trend by hand.
+  # Kept off pull requests and out of the required checks: shared runners are noisy, and a
+  # timing failure must not block an unrelated change.
+  bench:
+    name: bench
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '41 2 * * *') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Budget check self-test (B-53)
+        run: pwsh -NoProfile -File scripts/check-bench-budget.ps1 -SelfTest
+
+      # Codex review 2: judge only results of this run. Delete what the cache or an earlier
+      # attempt left in the group's directory and record when the run starts; the check then
+      # refuses a missing case and any result written before that time.
+      - name: Clear earlier matching results
+        run: |
+          $results = 'target/criterion/match_1000_rules'
+          if (Test-Path -LiteralPath $results) { Remove-Item -LiteralPath $results -Recurse -Force -ErrorAction Stop }
+          "BENCH_STARTED=$([DateTime]::UtcNow.ToString('o'))" >> $env:GITHUB_ENV
+
+      # No filter after `--`: the check needs all seven cases.
+      - name: Matching benchmark (1000 rules)
+        run: cargo bench -p quicker-domain --locked --bench matching
+
+      - name: Within 120% of the matching budget (B-53)
+        run: pwsh -NoProfile -File scripts/check-bench-budget.ps1 -NotBefore $env:BENCH_STARTED
+
+      - name: Upload criterion results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/criterion
+          if-no-files-found: warn
+          retention-days: 90

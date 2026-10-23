@@ -6,14 +6,28 @@
 // 2. Control: builds once more with NODE_ENV=development (import.meta.env.DEV = true, so the mock
 //    is bundled) into a temporary directory, and requires the scan to find it there. This proves
 //    the markers survive minification, so zero hits above means "no mock", not "scan is blind".
+//
+// `--scan-only [dir]` (release workflow, Codex F3-2): skips step 1's builds and scans the
+// existing directory instead (default dist/), then runs the same control. Default mode leaves
+// the VITE_MOCK=1 build in dist/, not the one an installer ships; `tauri build` rebuilds dist/
+// itself (tauri.conf.json build.beforeBuildCommand = `npm run build`) and embeds that output in
+// the exe, so the release workflow scans what it left behind, after the build and before
+// packaging: `node scripts/check-bundle.mjs --scan-only dist`.
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join, relative } from 'node:path';
+import { basename, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const mockSource = join(root, 'src', 'ipc', 'mock.ts');
+
+const argv = process.argv.slice(2);
+if (argv.length > 0 && (argv[0] !== '--scan-only' || argv.length > 2)) {
+  console.error('usage: node scripts/check-bundle.mjs [--scan-only [dir]]');
+  process.exit(2);
+}
+const scanOnlyDir = argv.length > 0 ? resolve(root, argv[1] ?? 'dist') : null;
 
 // String literals and property names from mock.ts (these survive minification), plus a few
 // identifiers that only survive unminified (harmless extra coverage). `createPreviewTransport` is
@@ -93,15 +107,25 @@ function run(command, args, env, shell) {
 const { VITE_MOCK: _ignored, ...baseEnv } = process.env;
 const results = [];
 
-for (const [name, env] of [
-  ['npm run build', { ...baseEnv, NODE_ENV: 'production' }],
-  ['VITE_MOCK=1 npm run build', { ...baseEnv, NODE_ENV: 'production', VITE_MOCK: '1' }],
-]) {
-  console.log(`\n== ${name}`);
-  run('npm run build', [], env, true);
-  const found = scan(join(root, 'dist'));
+if (scanOnlyDir) {
+  const inTree = relative(root, scanOnlyDir);
+  const shown = inTree.startsWith('..') || isAbsolute(inTree) ? scanOnlyDir : inTree || '.';
+  const name = `${shown} as built (no rebuild)`;
+  console.log(`\n== scan only: ${name}`);
+  const found = scan(scanOnlyDir);
   console.log(`-- ${name}: ${describe(found)}`);
   results.push({ name, found });
+} else {
+  for (const [name, env] of [
+    ['npm run build', { ...baseEnv, NODE_ENV: 'production' }],
+    ['VITE_MOCK=1 npm run build', { ...baseEnv, NODE_ENV: 'production', VITE_MOCK: '1' }],
+  ]) {
+    console.log(`\n== ${name}`);
+    run('npm run build', [], env, true);
+    const found = scan(join(root, 'dist'));
+    console.log(`-- ${name}: ${describe(found)}`);
+    results.push({ name, found });
+  }
 }
 
 console.log('\n== control: NODE_ENV=development vite build (mock bundled on purpose)');
@@ -121,4 +145,8 @@ try {
 
 const leaks = results.filter(({ found }) => found.chunks.length > 0 || found.hits.size > 0);
 if (leaks.length > 0) fail(`mock code in: ${leaks.map(({ name }) => name).join('; ')}`);
-console.log('\ncheck:bundle passed: no mock code in either production build.');
+console.log(
+  scanOnlyDir
+    ? `\ncheck:bundle passed: no mock code in ${results[0].name}.`
+    : '\ncheck:bundle passed: no mock code in either production build.',
+);

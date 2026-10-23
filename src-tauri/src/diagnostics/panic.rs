@@ -1,6 +1,11 @@
 //! Panic hook (§7.1 「崩溃记录」): every panic leaves
-//! `crash-<UTC yyyymmdd-hhmmss>.txt` in the data directory and an `app.panic`
-//! log event, then the previous hook runs as before.
+//! `crash-<UTC yyyymmdd-hhmmss>.txt` in the data directory, an `app.panic`
+//! log event and one line on stderr ([`stderr_line`]). The previous (std's
+//! default) hook is not chained: it prints the payload to stderr, and a
+//! payload can quote a phrase or the clipboard (Codex F2-2). Unit-test
+//! builds still chain it, so a failing test shows its assertion message;
+//! `the_hook_writes_one_redacted_line_to_stderr` checks the release behaviour
+//! in a child process.
 //!
 //! The record has the version, thread, location (relative to its crate),
 //! the panic payload's class, length and fingerprint ([`PanicPayload`]; never
@@ -62,26 +67,43 @@ pub mod test_support {
         TEST_CRASH_DIR.with(|crash_dir| crash_dir.borrow_mut().take());
         assert!(result.is_err(), "the closure returned instead of panicking");
     }
+
+    /// Whether the hook also runs the hook it replaced (std's default, which
+    /// prints the payload into libtest's captured output). On by default so
+    /// a failing test shows its assertion message; the stderr child test
+    /// turns it off to get the release behaviour.
+    pub static FORWARD_TO_PREVIOUS_HOOK: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(true);
 }
 
-/// Chains the crash recorder in front of the current panic hook. Call first
-/// thing in `main`; later calls do nothing.
+/// Installs the crash recorder as the panic hook, replacing (not chaining)
+/// std's default hook. Call first thing in `main`; later calls do nothing.
 pub fn install() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
+        #[cfg(test)]
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            if !IN_HOOK.with(|flag| flag.replace(true)) {
-                record(info);
-                IN_HOOK.with(|flag| flag.set(false));
+            if IN_HOOK.with(|flag| flag.replace(true)) {
+                return;
             }
-            previous(info);
+            let line = record(info);
+            IN_HOOK.with(|flag| flag.set(false));
+            #[cfg(test)]
+            if test_support::FORWARD_TO_PREVIOUS_HOOK.load(std::sync::atomic::Ordering::Relaxed) {
+                previous(info);
+                return;
+            }
+            // Not `eprintln!`: it panics when stderr fails, and a panic in
+            // the hook aborts. A release build is a GUI program with no
+            // console, so this usually goes nowhere (written, not read).
+            let _ = io::stderr().lock().write_all(line.as_bytes());
         }));
     });
 }
 
 /// Where crash records go: the data directory, known once setup resolved
-/// it. Panics before that only reach the previous hook.
+/// it. Panics before that leave no crash record (the stderr line says so).
 pub fn set_crash_dir(dir: PathBuf) {
     let _ = CRASH_DIR.set(dir);
 }
@@ -99,15 +121,12 @@ pub struct CrashReport<'a> {
     pub backtrace: String,
 }
 
-fn record(info: &PanicHookInfo<'_>) {
+/// Writes the crash record and the `app.panic` event; returns the line for
+/// stderr.
+fn record(info: &PanicHookInfo<'_>) -> String {
     let now = SystemTime::now();
     let thread = std::thread::current();
     let thread = thread.name().unwrap_or("<unnamed>");
-    let payload = info.payload();
-    let text = payload
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
     let report = CrashReport {
         version: env!("CARGO_PKG_VERSION"),
         debug_build: cfg!(debug_assertions),
@@ -116,7 +135,7 @@ fn record(info: &PanicHookInfo<'_>) {
         location: info
             .location()
             .map(|at| crate_location(at.file(), at.line(), at.column(), &user_homes())),
-        payload: PanicPayload::summarize(text),
+        payload: PanicPayload::of(info.payload()),
         exe_base: exe_base(),
         backtrace: format!("{:#}", Backtrace::force_capture()),
     };
@@ -140,6 +159,32 @@ fn record(info: &PanicHookInfo<'_>) {
         write_error = write_error.as_deref(),
         "panic"
     );
+    stderr_line(
+        report.thread,
+        report.location.as_deref(),
+        crash_file.as_deref(),
+    )
+}
+
+/// The one line the hook writes to stderr in place of std's default message
+/// (`thread '…' panicked at …:` plus the payload): the thread name, the
+/// location as in the crash record ([`crate_location`]) and the crash record
+/// to read. Never the payload. Control characters in the thread name are
+/// replaced so the line stays one line.
+pub fn stderr_line(thread: &str, location: Option<&str>, crash_file: Option<&str>) -> String {
+    let thread: String = thread
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    let location = location.unwrap_or("<unknown>");
+    match crash_file {
+        Some(file) => format!(
+            "thread '{thread}' panicked at {location}: payload redacted, see crash record {file}\n"
+        ),
+        None => format!(
+            "thread '{thread}' panicked at {location}: payload redacted, no crash record written\n"
+        ),
+    }
 }
 
 /// `file:line:col` with the file cut to its crate: from the directory above
@@ -474,6 +519,189 @@ mod tests {
         for (name, text) in &files {
             assert!(!text.contains(S), "{name} leaks:\n{text}");
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Sends this thread's crash records to `dir` until dropped, which also
+    /// happens when the thread unwinds past it.
+    struct ThreadCrashDir;
+    impl ThreadCrashDir {
+        fn set(dir: PathBuf) -> Self {
+            TEST_CRASH_DIR.with(|crash_dir| *crash_dir.borrow_mut() = Some(dir));
+            Self
+        }
+    }
+    impl Drop for ThreadCrashDir {
+        fn drop(&mut self) {
+            TEST_CRASH_DIR.with(|crash_dir| crash_dir.borrow_mut().take());
+        }
+    }
+
+    /// S-08 privacy test, task-join half (Codex F2-1): a panic inside
+    /// `spawn_blocking` reaches the awaiting command as tokio's `JoinError`,
+    /// whose `Display` quotes the payload. Mapped by
+    /// `CommandError::task_failed`, the phrase reaches neither the log nor a
+    /// Summary bundle, and the trace id still finds its log line.
+    #[test]
+    fn a_panic_in_a_blocking_task_never_reaches_the_log_or_the_bundle() {
+        use crate::{
+            diagnostics::{
+                bundle::test_support::summary_entries,
+                logging::{
+                    log_dir,
+                    test_support::{read_logs, scoped},
+                },
+            },
+            error::CommandError,
+        };
+        use tracing::level_filters::LevelFilter;
+
+        const S: &str = "SENTINEL-join-9c41";
+        let dir = temp_dir();
+        install();
+        let built = scoped(&log_dir(&dir), LevelFilter::TRACE);
+        let err = tracing::subscriber::with_default(built.subscriber, || {
+            // The worker logs to the same file and records its crash in
+            // `dir`, as the app's global subscriber and data directory do.
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            let crash_dir = dir.clone();
+            let task = tauri::async_runtime::spawn_blocking(move || {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    let _crash_dir = ThreadCrashDir::set(crash_dir);
+                    // byte index 1 is not a char boundary; ... of `éSENTINEL`
+                    let phrase = std::hint::black_box(format!("é{S}"));
+                    std::hint::black_box(&phrase[..1]);
+                });
+            });
+            let join = tauri::async_runtime::block_on(task).expect_err("the task panicked");
+            // The premise: formatted as is, the join error quotes the phrase.
+            assert!(join.to_string().contains(S), "{join}");
+            CommandError::task_failed(join)
+        });
+        drop(built.guard);
+        let CommandError::Internal { trace_id } = err else {
+            panic!("a failed task must be an internal error, got {err:?}");
+        };
+
+        let log = read_logs(&log_dir(&dir));
+        let line = log
+            .lines()
+            .find(|line| line.contains(&trace_id))
+            .unwrap_or_else(|| panic!("trace id {trace_id} missing from log:\n{log}"));
+        assert!(line.contains("event=\"command.internal\""), "{line}");
+        assert!(line.contains("task=\"panicked\""), "{line}");
+        assert!(line.contains("panic_class=\"byte_index\""), "{line}");
+        assert!(log.contains("event=\"app.panic\""), "{log}");
+        assert!(!log.contains(S), "the log leaks:\n{log}");
+
+        let records = crash_files(&dir);
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record = fs::read_to_string(&records[0]).unwrap();
+        assert!(!record.contains(S), "the crash record leaks:\n{record}");
+
+        let files = summary_entries(&dir);
+        assert!(files.keys().any(|name| name.starts_with("logs/")));
+        assert!(files.keys().any(|name| name.starts_with("crashes/")));
+        for (name, text) in &files {
+            assert!(!text.contains(S), "{name} leaks:\n{text}");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_stderr_line_names_thread_location_and_record_but_never_the_payload() {
+        assert_eq!(
+            stderr_line(
+                "quicker-executor",
+                Some("platform/src/windows/hook.rs:10:5"),
+                Some("crash-20261022-102133.txt"),
+            ),
+            "thread 'quicker-executor' panicked at platform/src/windows/hook.rs:10:5: \
+             payload redacted, see crash record crash-20261022-102133.txt\n"
+        );
+        // Before the data directory is known, or when the write failed.
+        assert_eq!(
+            stderr_line("a\nb\u{1b}[2J", None, None),
+            "thread 'a?b?[2J' panicked at <unknown>: payload redacted, no crash record written\n"
+        );
+    }
+
+    const STDERR_CHILD_TEST: &str =
+        "diagnostics::panic::tests::stderr_child_panics_with_a_sentinel_payload";
+    const STDERR_CHILD_DIR: &str = "QUICKER_TEXT_PANIC_STDERR_CHILD_DIR";
+    const STDERR_SENTINEL: &str = "SENTINEL-stderr-5be2";
+
+    /// The child half of `the_hook_writes_one_redacted_line_to_stderr`, run
+    /// alone in a child process because it turns off forwarding to std's
+    /// default hook for the whole process (the release behaviour).
+    #[test]
+    #[ignore = "run in a child process by the_hook_writes_one_redacted_line_to_stderr"]
+    fn stderr_child_panics_with_a_sentinel_payload() {
+        test_support::FORWARD_TO_PREVIOUS_HOOK.store(false, std::sync::atomic::Ordering::Relaxed);
+        install();
+        let dir = std::env::var_os(STDERR_CHILD_DIR).map_or_else(temp_dir, PathBuf::from);
+        let joined = std::thread::Builder::new()
+            .name("stderr-child".into())
+            .spawn(move || {
+                let _crash_dir = ThreadCrashDir::set(dir);
+                // byte index 1 is not a char boundary; ... of `éSENTINEL…`
+                let phrase = std::hint::black_box(format!("é{STDERR_SENTINEL}"));
+                std::hint::black_box(&phrase[..1]);
+            })
+            .unwrap()
+            .join();
+        assert!(joined.is_err(), "the child thread did not panic");
+    }
+
+    /// Codex F2-2: in place of std's default message, which quotes the
+    /// payload, stderr gets exactly one line naming the thread, the
+    /// crate-relative location and the crash record, and no payload.
+    #[test]
+    fn the_hook_writes_one_redacted_line_to_stderr() {
+        let dir = temp_dir();
+        // `--nocapture`: whatever a hook prints reaches the real stderr, as
+        // in the app, instead of libtest's capture buffer.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                STDERR_CHILD_TEST,
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(STDERR_CHILD_DIR, &dir)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the child test did not run and pass\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let records = crash_files(&dir);
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record_name = records[0].file_name().unwrap().to_string_lossy();
+        let lines: Vec<&str> = stderr
+            .lines()
+            .filter(|line| line.contains("panicked"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{stderr}");
+        assert!(
+            lines[0].starts_with(
+                "thread 'stderr-child' panicked at src-tauri/src/diagnostics/panic.rs:"
+            ),
+            "{stderr}"
+        );
+        assert!(
+            lines[0].ends_with(&format!(
+                ": payload redacted, see crash record {record_name}"
+            )),
+            "{stderr}"
+        );
+        assert!(!stderr.contains(STDERR_SENTINEL), "stderr leaks:\n{stderr}");
+        assert!(!stdout.contains(STDERR_SENTINEL), "stdout leaks:\n{stdout}");
+        let record = fs::read_to_string(&records[0]).unwrap();
+        assert!(!record.contains(STDERR_SENTINEL), "{record}");
         fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -36,9 +36,16 @@
 #            the exe is searched too (scripts/check-binary-strings.ps1, B-52). Method: raw
 #            ASCII and UTF-16LE scan; the PDB of this build must contain `quicker_platform`
 #            (positive control: a scan of an empty or wrong file would find nothing as well)
+#          - the frontend in dist/, as `tauri build` built and embedded it, has no mock backend
+#            (scripts/check-embedded-frontend.ps1: dist/ must match the frontend digest recorded
+#            in the exe by src-tauri/build.rs, then `node scripts/check-bundle.mjs --scan-only
+#            dist`, FE-18; with its own positive control)
 #     8. scripts/package-artifacts.ps1 (installer, exe, license text, notices, docs, Source.zip,
 #        Source-deps.zip, SHA256SUMS; validates the dependency archive again and refuses without
-#        it), then check-source-allowlist.ps1 -Strict on the finished ZIP
+#        it; before copying it repeats the B-52 and FE-18 checks of steps 2 and 7 on the exact
+#        exe it packages and checks that target/release/quicker_text.pdb is that exe's PDB,
+#        scripts/release-binary-checks.ps1), then check-source-allowlist.ps1 -Strict on the
+#        finished ZIP
 #     9. license / source-acquisition text for the release description
 #    10. upload: package, release notes, and the PDB as a separate artifact
 #
@@ -117,6 +124,11 @@ jobs:
 
       - name: Scanner self-test (B-52)
         run: pwsh -NoProfile -File scripts/check-binary-strings.ps1 -SelfTest
+
+      # The packaging step compares dist/ with the frontend digest recorded in the exe before it
+      # scans dist/ (FE-18); this tests that comparison on synthetic files.
+      - name: Embedded-frontend check self-test (FE-18)
+        run: pwsh -NoProfile -File scripts/check-embedded-frontend.ps1 -SelfTest
 
       # `cargo tree -e features`: the release configuration of quicker-text must not enable
       # fault-injection or mock in any crate. Fails too when no crate defines those features
@@ -243,6 +255,17 @@ jobs:
 
       - name: Release exe has no debug_inject_fault (B-52)
         run: pwsh -NoProfile -File scripts/check-binary-strings.ps1 target/release/quicker-text.exe -RequirePresent com.quickertext.desktop
+
+      # FE-18 on the frontend this build shipped: `tauri build` ran `npm run build`
+      # (build.beforeBuildCommand) into dist/ and embedded that output in the exe (compressed, so
+      # the exe scan above cannot see it). check-embedded-frontend.ps1 first requires dist/ to have
+      # the digest src-tauri/build.rs recorded in the exe (so it is the embedded frontend), then
+      # runs `node scripts/check-bundle.mjs --scan-only dist`: scans dist/ as the build left it,
+      # without rebuilding; the control build that proves the scan can see the mock goes to a
+      # temporary directory. Plain `npm run check:bundle` would rebuild dist/ and scan those builds
+      # instead. package-artifacts.ps1 repeats this check on the exe it packages.
+      - name: Shipped frontend has no mock backend (FE-18)
+        run: pwsh -NoProfile -File scripts/check-embedded-frontend.ps1 -Exe target/release/quicker-text.exe -Dist dist
 
       # --- package ----------------------------------------------------------------------
 

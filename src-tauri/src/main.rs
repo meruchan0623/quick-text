@@ -15,6 +15,9 @@ use std::{path::PathBuf, sync::Arc};
 use tauri::Manager;
 
 fn main() {
+    // Keeps the frontend record (bottom of this file) in the binary: the
+    // linker drops an unreferenced static, `#[used]` included.
+    std::hint::black_box(FRONTEND_DIST_RECORD);
     diagnostics::panic::install();
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -160,3 +163,30 @@ fn main() {
             }
         });
 }
+
+// B-52, Codex F3-1: the test-only features never reach an optimized build of
+// the app. Nothing in the repository builds it that way (scripts, workflows,
+// docs: fault injection and the mock run under `cargo test` and debug builds),
+// so any such build is a mistake, caught here before it can be packaged.
+// Tests and debug builds keep both (`debug_assertions` is on).
+#[cfg(all(
+    not(debug_assertions),
+    any(feature = "fault-injection", feature = "mock")
+))]
+compile_error!(
+    "the `fault-injection` and `mock` features are for tests and debug builds only (B-52); \
+     build the release app without them, or use a profile with debug-assertions = true"
+);
+
+// FE-18 / B-52, Codex review 1: which frontend this binary embeds. build.rs
+// hashes the directory `tauri::generate_context!` embeds; the packaging
+// scripts (scripts/check-embedded-frontend.ps1) find this string in the exe
+// and scan the frontend directory only if its digest is the same, so a dist/
+// rebuilt after the exe (or never compiled into it) cannot stand in for the
+// one that ships. `unavailable` when build.rs could not hash the directory,
+// `dev-mode` in Tauri's development mode (no frontend embedded); the
+// packaging check refuses both.
+static FRONTEND_DIST_RECORD: &str = concat!(
+    "quicker-text-frontend-dist-sha256:",
+    env!("QUICKER_TEXT_FRONTEND_DIST_SHA256")
+);
