@@ -73,21 +73,40 @@
 //! # Resets
 //!
 //! - A new store state (another revision or safe mode: publish, rollback, a
-//!   published import, a SafeMode(Locked) retry) clears the success count,
-//!   moves the history mark (above) and restarts the minute (from that
-//!   moment, if Health reads Healthy).
+//!   published import, a SafeMode(Locked) retry) clears the success count
+//!   and the refusals (below), moves the history mark (above) and restarts
+//!   the minute (from that moment, if Health reads Healthy).
 //! - Health leaving Healthy stops the minute; it starts again from zero
 //!   when Health is Healthy again. Successes belong to the revision and are
 //!   kept. The live check finding the runtime not Healthy restarts the
 //!   minute too.
 //! - In safe mode nothing is counted and nothing is marked.
 //!
-//! A revision is marked at most once per session, and a store state is
-//! tried at most once: a refused mark (safe mode, the revision is no longer
-//! active, the active configuration was never written, an I/O error) logs
-//! one `store.last_good_skipped` at debug and is not retried until the
-//! store state changes. No error is logged here and nothing loops; an I/O
-//! error is still logged by the store itself (`command.io`, warn).
+//! # Refusals and retries
+//!
+//! A revision is marked at most once per session. The store can refuse the
+//! mark ([`crate::store::Store::mark_last_good`]): safe mode, the revision
+//! is no longer active, the active configuration was never written, the
+//! pre-0.4 backup fails (the mark passes the same backup gate as every
+//! write, and the corrupt files the load left in place are renamed only
+//! after the backup holds them), another file operation fails, or
+//! `revisions/<n>.json` is there but does not hold the revision.
+//!
+//! A refused mark is tried again on the same store state, so that a backup
+//! that failed for a while (a file held by another program) still lets the
+//! revision be recorded once it succeeds. The minute starts again from the
+//! refusal: Health must read Healthy for [`QUALIFY_AFTER`] after the first
+//! refusal, twice as long after each further one, up to
+//! [`RETRY_WAIT_MAX`] (32 minutes). The successes are kept; a new store
+//! state starts over with a minute. A mark that panics is not tried again
+//! until the store state changes.
+//!
+//! Each `reason` of `store.last_good_skipped` is logged once per store
+//! state: at debug when the next store report resolves it (`safe_mode`,
+//! `revision_changed`, `not_found`), at warn otherwise (`io`,
+//! `snapshot_mismatch`, `other`). The store logs its own lines at every
+//! attempt (a failing backup: `store.backup_pre_0_4` and `command.io`,
+//! warn); the growing wait keeps those to a few an hour.
 //!
 //! # Thread
 //!
@@ -97,11 +116,13 @@
 //! minute is a deadline the bus sleeps until ([`Observer::due_in`]), not a
 //! poll. The mark ([`mark_active`]) takes the store lock, which the hook and
 //! executor never take, and writes `store-meta.json` (and
-//! `revisions/<n>.json` when missing): never on the hook, executor or main
-//! thread, never under a lock of the input path. Reading the runtime's
-//! Health or history `seq` takes its health or history lock briefly, with
-//! no other lock held (the store lock is taken only afterwards, by the
-//! mark). The clock is the runtime's (monotonic, injectable).
+//! `revisions/<n>.json` when missing; while the pre-0.4 backup is still
+//! due, that backup and the renames it held back): never on the hook,
+//! executor or main thread, never under a lock of the input path. Reading
+//! the runtime's Health or history `seq` takes its health or history lock
+//! briefly, with no other lock held (the store lock is taken only
+//! afterwards, by the mark). The clock is the runtime's (monotonic,
+//! injectable).
 //!
 //! # Limits (待实测)
 //!
@@ -120,6 +141,7 @@ use crate::{
     app_state::Managed,
     error::CommandError,
     events::{Observer, StoreState},
+    store::SNAPSHOT_MISMATCH,
 };
 use quicker_platform::{
     health::{EngineState, HealthSnapshot, HealthState, HistoryEntry, Outcome, TriggerKind},
@@ -134,6 +156,10 @@ use std::{
 /// How long Health must read Healthy, without a break, on the active
 /// revision before it can be marked.
 pub const QUALIFY_AFTER: Duration = Duration::from_secs(60);
+
+/// The longest wait between two marks of one store state that the store
+/// keeps refusing: [`QUALIFY_AFTER`] doubled five times.
+const RETRY_WAIT_MAX: Duration = Duration::from_secs(32 * 60);
 
 /// Records a revision as last-known-good. Production: [`mark_in`].
 pub type MarkFn = Box<dyn FnMut(u64) -> Result<(), CommandError> + Send>;
@@ -154,8 +180,15 @@ pub struct LkgTracker {
     healthy_since: Option<Instant>,
     /// Trigger-path successes since this store state took effect.
     successes: u32,
-    /// This store state was already tried (marked or refused).
+    /// A mark of this store state is under way, or panicked: it is not
+    /// tried again until the store state changes.
     tried: bool,
+    /// Marks of this store state the store refused so far; each one
+    /// doubles the wait before the next (see [`LkgTracker::wait`]).
+    refusals: u32,
+    /// The `reason`s of `store.last_good_skipped` already logged for this
+    /// store state.
+    skipped: Vec<&'static str>,
     /// The revision this tracker last marked.
     marked: Option<u64>,
 }
@@ -174,6 +207,8 @@ impl LkgTracker {
             healthy_since: None,
             successes: 0,
             tried: false,
+            refusals: 0,
+            skipped: vec![],
             marked: None,
         }
     }
@@ -203,7 +238,17 @@ impl LkgTracker {
             && self.successes > 0;
         let since = self.healthy_since.filter(|_| waiting)?;
         let healthy_for = self.clock.now().saturating_duration_since(since);
-        Some(QUALIFY_AFTER.saturating_sub(healthy_for))
+        Some(self.wait().saturating_sub(healthy_for))
+    }
+
+    /// How long Health must read Healthy before the next mark:
+    /// [`QUALIFY_AFTER`], and again [`QUALIFY_AFTER`] after the first refusal
+    /// of this store state; each further refusal doubles it, up to
+    /// [`RETRY_WAIT_MAX`].
+    fn wait(&self) -> Duration {
+        // Bounded long before the shift or the product could overflow.
+        let doublings = self.refusals.saturating_sub(1).min(16);
+        (QUALIFY_AFTER * (1 << doublings)).min(RETRY_WAIT_MAX)
     }
 
     /// Marks the current revision if it qualifies now.
@@ -220,16 +265,23 @@ impl LkgTracker {
             return;
         }
         let revision = self.store.revision;
-        // Set first: a mark that panics is not retried either.
+        // Set first: a mark that panics is not retried.
         self.tried = true;
         match (self.mark)(revision) {
             Ok(()) => self.marked = Some(revision),
-            Err(e) => tracing::debug!(
-                event = "store.last_good_skipped",
-                revision,
-                reason = refusal(&e),
-                "last-known-good not recorded"
-            ),
+            Err(e) => {
+                // Refused: tried again once Health has read Healthy for the
+                // (longer) wait from now, so that a backup that failed for a
+                // while still lets the revision be recorded.
+                self.tried = false;
+                self.refusals = self.refusals.saturating_add(1);
+                self.healthy_since = Some(self.clock.now());
+                let reason = refusal(&e);
+                if !self.skipped.contains(&reason) {
+                    self.skipped.push(reason);
+                    log_skipped(revision, reason);
+                }
+            }
         }
     }
 }
@@ -264,6 +316,8 @@ impl Observer for LkgTracker {
             self.counted_after = self.history_seq();
             self.successes = 0;
             self.tried = false;
+            self.refusals = 0;
+            self.skipped.clear();
             if self.healthy_since.is_some() {
                 self.healthy_since = Some(self.clock.now());
             }
@@ -288,16 +342,46 @@ fn refusal(e: &CommandError) -> &'static str {
         CommandError::RevisionConflict { .. } => "revision_changed",
         CommandError::NotFound { .. } => "not_found",
         CommandError::Io { .. } => "io",
+        CommandError::Validation { diagnostics }
+            if diagnostics.iter().any(|d| d.code == SNAPSHOT_MISMATCH) =>
+        {
+            "snapshot_mismatch"
+        }
         _ => "other",
+    }
+}
+
+/// One `store.last_good_skipped` (the first of its `reason` for a store
+/// state). A refusal that the next store report resolves (safe mode, the
+/// revision overtaken by a publish, a configuration never written) is
+/// expected: debug. One that the data directory causes (the pre-0.4 backup
+/// or another file operation failed, a snapshot that does not hold the
+/// revision, anything else) is a warning.
+fn log_skipped(revision: u64, reason: &'static str) {
+    if matches!(reason, "safe_mode" | "revision_changed" | "not_found") {
+        tracing::debug!(
+            event = "store.last_good_skipped",
+            revision,
+            reason,
+            "last-known-good not recorded"
+        );
+    } else {
+        tracing::warn!(
+            event = "store.last_good_skipped",
+            revision,
+            reason,
+            "last-known-good not recorded; tried again later"
+        );
     }
 }
 
 /// Records `revision` as last-known-good if it is still the active one
 /// (a publish may have overtaken the tick: `revision_conflict` with the
-/// current revision). Safe mode is refused by the store
+/// current revision). Safe mode, a failing pre-0.4 backup and a snapshot
+/// that does not hold the revision are refused by the store
 /// ([`crate::store::Store::mark_last_good`]).
 pub fn mark_active(store: &Managed, revision: u64) -> Result<(), CommandError> {
-    let store = store.lock();
+    let mut store = store.lock();
     let current = store.store_state().revision;
     if current != revision {
         return Err(CommandError::RevisionConflict { current });
@@ -673,15 +757,26 @@ mod tests {
         std::env::temp_dir().join(format!("quicker-lkg-{name}-{}", uuid::Uuid::new_v4()))
     }
 
-    /// Refusals are expected (safe mode, the revision overtaken by a
-    /// publish, an active configuration never written): one debug line
-    /// each, nothing at warn or error, and no retry while the store state
-    /// stays the same.
+    /// The `store.last_good_skipped` lines in `log`.
+    fn skipped_lines(log: &str) -> Vec<&str> {
+        log.lines()
+            .filter(|line| line.contains("event=\"store.last_good_skipped\""))
+            .collect()
+    }
+
+    /// Refusals the next store report resolves (an active configuration
+    /// never written, safe mode, the revision overtaken by a publish): one
+    /// debug line per store state, nothing at warn or error. The mark is
+    /// tried again on the same store state (integration fix (c)): a minute
+    /// after the refusal, then after a wait that doubles each time, up to
+    /// `RETRY_WAIT_MAX`. A new store state starts over with a minute.
     #[test]
-    fn a_refused_mark_logs_one_debug_line_and_is_not_retried() {
+    fn an_expected_refusal_logs_one_debug_line_per_state_and_is_retried_with_a_growing_wait() {
         let dir = temp_dir("refused");
         let built = scoped(&dir, LevelFilter::DEBUG);
         let attempts = Arc::new(Mutex::new(vec![]));
+        // In minutes: the qualifying one, then the waits after each refusal.
+        let waits = [1, 1, 2, 4, 8, 16, 32, 32];
         tracing::subscriber::with_default(built.subscriber, || {
             let seen = Arc::clone(&attempts);
             let mark: MarkFn = Box::new(move |revision| {
@@ -701,20 +796,24 @@ mod tests {
             rig.healthy();
             for revision in 1..=3 {
                 rig.store(store(revision, None));
-                for _ in 0..3 {
-                    rig.success();
-                    rig.wait(secs(60));
-                    assert_eq!(rig.due_in(), None, "nothing left to wake up for");
+                rig.success();
+                for (n, minutes) in waits.into_iter().enumerate() {
+                    let wait = secs(60 * minutes);
+                    assert_eq!(rig.due_in(), Some(wait), "before attempt {}", n + 1);
+                    let tried = attempts.lock().len();
+                    rig.wait(wait - Duration::from_millis(1));
+                    assert_eq!(attempts.lock().len(), tried, "not before the wait");
+                    rig.wait(Duration::from_millis(1));
+                    assert_eq!(attempts.lock().len(), tried + 1);
                 }
             }
+            assert_eq!(rig.due_in(), Some(RETRY_WAIT_MAX));
         });
         drop(built.guard);
-        assert_eq!(*attempts.lock(), [1, 2, 3], "one attempt per store state");
+        let expected: Vec<u64> = (1..=3).flat_map(|r| [r; 8]).collect();
+        assert_eq!(*attempts.lock(), expected, "8 attempts per store state");
         let log = read_logs(&dir);
-        let skipped: Vec<&str> = log
-            .lines()
-            .filter(|line| line.contains("event=\"store.last_good_skipped\""))
-            .collect();
+        let skipped = skipped_lines(&log);
         assert_eq!(skipped.len(), 3, "{log}");
         for (line, reason) in skipped
             .iter()
@@ -725,6 +824,153 @@ mod tests {
         }
         assert!(!log.contains("ERROR") && !log.contains("WARN"), "{log}");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Refusals the data directory causes (a file operation such as the
+    /// pre-0.4 backup failed, a snapshot that does not hold the revision,
+    /// anything else) are warnings: one per `reason` and store state,
+    /// however often the mark is tried again. Once the store accepts it,
+    /// the revision is recorded and nothing more is tried.
+    #[test]
+    fn a_refusal_of_the_data_directory_warns_once_per_reason_until_a_retry_records_it() {
+        let dir = temp_dir("warned");
+        let built = scoped(&dir, LevelFilter::DEBUG);
+        let attempts = Arc::new(Mutex::new(0));
+        tracing::subscriber::with_default(built.subscriber, || {
+            let seen = Arc::clone(&attempts);
+            let mark: MarkFn = Box::new(move |_| {
+                let mut n = seen.lock();
+                *n += 1;
+                match *n {
+                    1 | 2 | 4 => Err(CommandError::Io {
+                        op: crate::error::IoOp::Read,
+                        path: Some("backup-pre-0.4".into()),
+                        os_code: Some(32),
+                    }),
+                    3 | 5 => Err(CommandError::invalid_file(
+                        SNAPSHOT_MISMATCH,
+                        "differs",
+                        std::path::Path::new("1.json"),
+                    )),
+                    6 => Err(CommandError::Busy),
+                    _ => Ok(()),
+                }
+            });
+            let mut rig = Rig::with(store(1, None), mark);
+            rig.healthy();
+            rig.success();
+            for _ in 0..7 {
+                let wait = rig.due_in().expect("refused: tried again");
+                rig.wait(wait);
+            }
+            assert_eq!(rig.due_in(), None, "recorded: nothing left to wait for");
+            rig.wait(RETRY_WAIT_MAX * 4);
+        });
+        drop(built.guard);
+        assert_eq!(*attempts.lock(), 7);
+        let log = read_logs(&dir);
+        let skipped = skipped_lines(&log);
+        assert_eq!(skipped.len(), 3, "{log}");
+        for (line, reason) in skipped.iter().zip(["io", "snapshot_mismatch", "other"]) {
+            assert!(line.contains("WARN"), "{line}");
+            assert!(line.contains(&format!("reason=\"{reason}\"")), "{line}");
+            assert!(line.contains("revision=1"), "{line}");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn backup_failed(store: &Store) -> usize {
+        store
+            .startup_problems()
+            .iter()
+            .filter(|problem| matches!(problem.kind, ProblemKind::BackupFailed { .. }))
+            .count()
+    }
+
+    /// Integration fix (c) end to end (Codex finding on `mark_last_good`):
+    /// the launch could not make the pre-0.4 backup (prefs.json cannot be
+    /// read), recovered revision 4 from `previous.json` and left the corrupt
+    /// `revisions/4.json` in place (I-B1). While the backup still fails the
+    /// qualified revision is not recorded: `backup_failed` stays listed and
+    /// one `last_good_skipped` (`io`, warn) is logged however often the
+    /// mark is tried. Once the file can be read, the next try backs up,
+    /// quarantines the corrupt snapshot, writes a valid one and records
+    /// revision 4.
+    #[test]
+    fn a_mark_refused_while_the_backup_fails_is_recorded_once_the_backup_succeeds() {
+        let dir = temp_dir("backup");
+        let logs = temp_dir("backup-logs");
+        let corrupt: &[u8] = b"{\"revision\": 4, \"rul";
+        let four = Config {
+            revision: 4,
+            ..config("four")
+        };
+        fs::create_dir_all(dir.join("revisions")).unwrap();
+        fs::write(dir.join("active.json"), corrupt).unwrap();
+        fs::write(dir.join("revisions/4.json"), corrupt).unwrap();
+        fs::write(
+            dir.join("previous.json"),
+            serde_json::to_vec_pretty(&four).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir(dir.join("prefs.json")).unwrap();
+        let built = scoped(&logs, LevelFilter::DEBUG);
+        tracing::subscriber::with_default(built.subscriber, || {
+            let managed = Arc::new(Managed::new(Store::load(dir.clone())));
+            {
+                let store = managed.lock();
+                assert_eq!(store.safe_mode(), None);
+                assert_eq!(store.active, four);
+                assert_eq!(backup_failed(&store), 1);
+            }
+            let target = Arc::clone(&managed);
+            let mut rig = Rig::with(
+                managed.lock().store_state(),
+                Box::new(move |revision| mark_active(&target, revision)),
+            );
+            rig.healthy();
+            rig.success();
+            // Qualifies, is refused, and is refused twice more.
+            for _ in 0..3 {
+                let wait = rig.due_in().expect("refused: tried again");
+                rig.wait(wait);
+            }
+            assert_eq!(rig.due_in(), Some(QUALIFY_AFTER * 4));
+            assert_eq!(last_good_on_disk(&dir), None);
+            assert_eq!(fs::read(dir.join("revisions/4.json")).unwrap(), corrupt);
+            assert!(!dir.join("backup-pre-0.4").exists());
+            assert_eq!(backup_failed(&managed.lock()), 1, "listed once");
+
+            fs::remove_dir(dir.join("prefs.json")).unwrap();
+            rig.wait(QUALIFY_AFTER * 4);
+            assert_eq!(rig.due_in(), None, "recorded");
+            assert_eq!(last_good_on_disk(&dir), Some(4));
+            let snapshot = fs::read(dir.join("revisions/4.json")).unwrap();
+            assert_eq!(read_stored_config(&snapshot).unwrap().config, four);
+            assert_eq!(
+                fs::read(dir.join("backup-pre-0.4/revisions/4.json")).unwrap(),
+                corrupt
+            );
+            let quarantined: Vec<Vec<u8>> = fs::read_dir(dir.join("revisions"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.to_string_lossy().contains("4.corrupt-"))
+                .map(|path| fs::read(path).unwrap())
+                .collect();
+            assert_eq!(quarantined, [corrupt.to_vec()]);
+            assert_eq!(backup_failed(&managed.lock()), 0);
+            drop(rig);
+        });
+        drop(built.guard);
+        let log = read_logs(&logs);
+        let skipped = skipped_lines(&log);
+        assert_eq!(skipped.len(), 1, "{log}");
+        assert!(skipped[0].contains("WARN"), "{}", skipped[0]);
+        assert!(skipped[0].contains("reason=\"io\""), "{}", skipped[0]);
+        assert!(skipped[0].contains("revision=4"), "{}", skipped[0]);
+        assert!(log.contains("event=\"store.last_good\""), "{log}");
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(logs).unwrap();
     }
 
     fn config(id: &str) -> Config {

@@ -112,7 +112,7 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 
 后端可以新增 kind；前端对未知 kind 显示 `kind` 原文加通用文案。
 
-`recovered` 的 `from: "last_good"` 指 `store-meta.json` 中的 `last_good_revision`。后端在 EventBus 线程上记录它（B-04，`src-tauri/src/lkg.rs`），需要同时满足两个条件：当前版本生效后，至少有一次触发路径展开成功（`trigger` 为 `immediate` 或 `terminator`，`outcome` 为 `succeeded`；手动「执行」不算；只算 `seq` 大于版本生效时历史最大 `seq` 的条目，发布前就已记录、晚到的旧版本成功不算）；Health 持续「正常」满 60 秒，并且真正写入前再读一次运行时当前的 Health，不是「正常」就放弃这次写入、重新计时。换版本（发布、回滚、导入）后重新计时、重新计数，Health 离开「正常」也重新计时。安全模式下不记录。每个版本只记录一次。记录不发事件，也不新增命令，前端无需处理。
+`recovered` 的 `from: "last_good"` 指 `store-meta.json` 中的 `last_good_revision`。后端在 EventBus 线程上记录它（B-04，`src-tauri/src/lkg.rs`），需要同时满足两个条件：当前版本生效后，至少有一次触发路径展开成功（`trigger` 为 `immediate` 或 `terminator`，`outcome` 为 `succeeded`；手动「执行」不算；只算 `seq` 大于版本生效时历史最大 `seq` 的条目，发布前就已记录、晚到的旧版本成功不算）；Health 持续「正常」满 60 秒，并且真正写入前再读一次运行时当前的 Health，不是「正常」就放弃这次写入、重新计时。换版本（发布、回滚、导入）后重新计时、重新计数，Health 离开「正常」也重新计时。安全模式下不记录。每个版本只记录一次。存储拒绝这次记录时（例如 pre-0.4 备份还没做成，或者同号快照 `revisions/<n>.json` 读不出来、与当前版本不一致；后者不覆盖、不记录）不记，从拒绝时起重新计时后再试：第一次拒绝后等 60 秒，之后每次加倍，最长 32 分钟；同一版本、同一原因只记一条日志。记录不发事件，也不新增命令，前端无需处理。
 
 ## 4. 现有命令在 0.4 的变化
 

@@ -35,6 +35,11 @@ use std::{
     },
 };
 
+/// The diagnostic code of the `validation` error with which
+/// [`Store::mark_last_good`] refuses a `revisions/<n>.json` that does not
+/// hold the active revision; `lkg.rs` logs it as `snapshot_mismatch`.
+pub const SNAPSHOT_MISMATCH: &str = "snapshot_mismatch";
+
 pub struct Store {
     dir: PathBuf,
     pub draft: Config,
@@ -273,25 +278,57 @@ impl Store {
     ///
     /// Called by `lkg.rs` (plan §7.2 LKG, B-04: [`crate::lkg::mark_active`]),
     /// once the engine has been Healthy for 60 seconds and at least one
-    /// expansion has succeeded on `revision`. There is no timer here. When
-    /// `revision` is the active one and has no `revisions/<n>.json` yet, that
-    /// snapshot is written as well so that the candidate exists. The empty
-    /// stand-in of a data directory without a configuration is never
-    /// snapshotted (see `active_on_disk`): it is `NotFound`.
-    pub fn mark_last_good(&self, revision: u64) -> Result<(), CommandError> {
+    /// expansion has succeeded on `revision`. There is no timer here.
+    ///
+    /// Like every write command it passes the backup gate first
+    /// (`backup_before_write`, integration fix (c)): while the pre-0.4 backup
+    /// fails it lists `backup_failed` and returns that `io` error with
+    /// nothing written; once the backup succeeds it drops the problem and
+    /// renames the corrupt files the load left in place (I-B1), so a corrupt
+    /// `revisions/<n>.json` of the active revision is moved aside before
+    /// anything else looks at it.
+    ///
+    /// When `revision` is the active one, `revisions/<n>.json` must then hold
+    /// it. A missing snapshot is written, so that the candidate exists. One
+    /// that is there is read as the load reads a candidate
+    /// (`read_stored_config`) and must equal the active configuration; if it
+    /// does not parse or differs, nothing is recorded or overwritten and the
+    /// mark is refused with a `validation` error whose diagnostic code is
+    /// [`SNAPSHOT_MISMATCH`] (a fallback would load that file, not the
+    /// revision that proved itself). One that cannot be read is an `io`
+    /// error. The empty stand-in of a data directory without a configuration
+    /// is never snapshotted (see `active_on_disk`): it is `NotFound`.
+    pub fn mark_last_good(&mut self, revision: u64) -> Result<(), CommandError> {
         self.ensure_writable()?;
+        self.backup_before_write()?;
         let revisions = self.dir.join("revisions");
         let snapshot = revisions.join(format!("{revision}.json"));
-        if revision == self.active.revision && !snapshot.exists() {
-            if !self.active_on_disk {
-                return Err(CommandError::NotFound {
-                    kind: EntityKind::Revision,
-                    id: revision.to_string(),
-                });
+        if revision == self.active.revision {
+            match fs::read(&snapshot) {
+                Ok(bytes) => {
+                    let holds_active =
+                        read_stored_config(&bytes).is_ok_and(|stored| stored.config == self.active);
+                    if !holds_active {
+                        return Err(CommandError::invalid_file(
+                            SNAPSHOT_MISMATCH,
+                            "Snapshot of the active revision differs from it; not recorded",
+                            &snapshot,
+                        ));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if !self.active_on_disk {
+                        return Err(CommandError::NotFound {
+                            kind: EntityKind::Revision,
+                            id: revision.to_string(),
+                        });
+                    }
+                    fs::create_dir_all(&revisions)
+                        .map_err(|e| CommandError::io(IoOp::CreateDir, Some(&revisions), &e))?;
+                    self.write_data(&snapshot, &self.active)?;
+                }
+                Err(e) => return Err(CommandError::io(IoOp::Read, Some(&snapshot), &e)),
             }
-            fs::create_dir_all(&revisions)
-                .map_err(|e| CommandError::io(IoOp::CreateDir, Some(&revisions), &e))?;
-            self.write_data(&snapshot, &self.active)?;
         }
         self.meta
             .update(|meta| meta.last_good_revision = Some(revision))?;

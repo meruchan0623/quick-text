@@ -11,10 +11,11 @@ use super::{
     load::read_config,
     meta::{parse_meta, Fingerprint, PreviousRevision, StoreMeta, META_FILE},
     test_support::*,
-    RecoverySource, Store,
+    RecoverySource, Store, SNAPSHOT_MISMATCH,
 };
 use crate::{
     autostart::LoginItem,
+    diagnostics::logging::{test_support, DEFAULT_LEVEL},
     error::{CommandError, EntityKind, SafeModeReason},
     startup::{defer_autostart_repair, end_session, finish_self_test, ProblemKind, StartupListen},
 };
@@ -2947,6 +2948,143 @@ fn a_failed_backup_leaves_a_corrupt_active_in_place() {
         fs::read(dir.join("revisions/3.metadata.json")).unwrap(),
         b"[ ]\r\n"
     );
+}
+
+/// Integration fix (c) (Codex finding on `mark_last_good`): the launch could
+/// not make the pre-0.4 backup (prefs.json cannot be read), so revision 4
+/// came from `previous.json` while the corrupt `active.json` and the corrupt
+/// `revisions/4.json` stayed in place (I-B1). Marking revision 4 is refused
+/// like any write while the backup fails: nothing is recorded or written
+/// and `backup_failed` stays listed. Once the cause is gone, the mark backs
+/// up first, then quarantines the corrupt snapshot, then writes a valid one
+/// in its place, records revision 4 and drops `backup_failed`.
+#[test]
+fn mark_last_good_backs_up_and_quarantines_before_it_snapshots() {
+    let dir = TempDir::new();
+    let world = world();
+    let four = config_at(4);
+    write(&dir, "active.json", LEGACY_CUT_SHORT);
+    write(&dir, "revisions/4.json", TRUNCATED);
+    write(&dir, "previous.json", &bytes(&four));
+    // prefs.json cannot be read: the backup cannot be completed.
+    fs::create_dir(dir.join("prefs.json")).unwrap();
+    let before = files(&dir);
+    let data_files = || {
+        let mut now = files(&dir);
+        now.remove(Path::new(META_FILE));
+        now
+    };
+
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.safe_mode(), None);
+    assert_eq!(store.active, four);
+    assert_eq!(backup_failed(&store), 1);
+    assert!(quarantined(&problem_kinds(&store)).is_empty());
+    let marked = store.mark_last_good(4);
+    assert!(
+        matches!(
+            marked,
+            Err(CommandError::Io { path: Some(ref path), .. }) if path == "backup-pre-0.4"
+        ),
+        "{marked:?}"
+    );
+    assert_eq!(store.meta.get().last_good_revision, None);
+    assert_eq!(meta_on_disk(&dir).last_good_revision, None);
+    assert_eq!(data_files(), before);
+    assert!(backup_temps(&dir).is_empty());
+    assert_eq!(backup_failed(&store), 1, "listed once");
+
+    fs::remove_dir(dir.join("prefs.json")).unwrap();
+    let logs = TempDir::new();
+    let built = test_support::scoped(&logs, DEFAULT_LEVEL);
+    let marked = tracing::subscriber::with_default(built.subscriber, || store.mark_last_good(4));
+    drop(built.guard);
+    marked.unwrap();
+    // The backup holds both corrupt files as the load found them...
+    let backup = assert_valid_backup(&backup_dir(&dir));
+    assert_eq!(backup[&rel("revisions/4.json")], TRUNCATED);
+    assert_eq!(backup[&rel("active.json")], LEGACY_CUT_SHORT);
+    // ...both were then moved aside...
+    let mut moved = quarantined(&problem_kinds(&store));
+    moved.sort();
+    assert_eq!(moved, ["4.json", "active.json"]);
+    let mut quarantine: Vec<Vec<u8>> = quarantine_files(&dir).into_values().collect();
+    let mut corrupt = vec![LEGACY_CUT_SHORT.to_vec(), TRUNCATED.to_vec()];
+    quarantine.sort();
+    corrupt.sort();
+    assert_eq!(quarantine, corrupt);
+    // ...and the snapshot written in place of the corrupt one is revision 4.
+    assert_eq!(read_config(&dir.join("revisions/4.json")).unwrap(), four);
+    assert_eq!(store.meta.get().last_good_revision, Some(4));
+    assert_eq!(meta_on_disk(&dir).last_good_revision, Some(4));
+    assert_eq!(backup_failed(&store), 0);
+    assert_nothing_lost(&before, &files(&dir));
+    // In that order.
+    let log = test_support::read_logs(&logs);
+    let line = |parts: &[&str]| {
+        log.lines()
+            .position(|line| parts.iter().all(|part| line.contains(part)))
+            .unwrap_or_else(|| panic!("no line with {parts:?}:\n{log}"))
+    };
+    let backed_up = line(&["event=\"store.backup_pre_0_4\"", "result=\"created\""]);
+    let moved_aside = line(&["event=\"store.quarantine\"", "file=4.json"]);
+    let recorded = line(&["event=\"store.last_good\"", "revision=4"]);
+    assert!(backed_up < moved_aside && moved_aside < recorded, "{log}");
+}
+
+/// Integration fix (c): a `revisions/<n>.json` of the active revision that
+/// is there but does not hold it (another configuration under the same
+/// number, or one that does not parse) is not recorded as last-known-good
+/// and not overwritten: the next fallback would load that file, not the
+/// revision that proved itself. A snapshot that holds the revision, in any
+/// byte layout, is recorded and left byte for byte.
+#[test]
+fn mark_last_good_refuses_a_snapshot_that_does_not_hold_the_active_revision() {
+    let four = config_at(4);
+    let other = serde_json::to_vec(&Config {
+        revision: 4,
+        ..metadata_config(&["other"])
+    })
+    .unwrap();
+    for snapshot in [other.as_slice(), TRUNCATED] {
+        let dir = TempDir::new();
+        let world = world();
+        // The backup was dealt with by an earlier launch.
+        settled(&dir);
+        write(&dir, "active.json", &bytes(&four));
+        write(&dir, "revisions/4.json", snapshot);
+        let mut store = Store::load_with(dir.path(), &env(&world));
+        assert_eq!(store.safe_mode(), None);
+        assert_eq!(store.active, four);
+        let marked = store.mark_last_good(4);
+        assert!(
+            matches!(
+                marked,
+                Err(CommandError::Validation { ref diagnostics })
+                    if diagnostics.len() == 1
+                        && diagnostics[0].code == SNAPSHOT_MISMATCH
+                        && diagnostics[0].path == "4.json"
+            ),
+            "{marked:?}"
+        );
+        assert_eq!(fs::read(dir.join("revisions/4.json")).unwrap(), snapshot);
+        assert_eq!(store.meta.get().last_good_revision, None);
+        assert_eq!(meta_on_disk(&dir).last_good_revision, None);
+    }
+
+    // Revision 4 itself, in 0.3.1's compact layout with CRLF.
+    let dir = TempDir::new();
+    let world = world();
+    settled(&dir);
+    let mut compact = serde_json::to_vec(&four).unwrap();
+    compact.extend_from_slice(b"\r\n");
+    write(&dir, "active.json", &bytes(&four));
+    write(&dir, "revisions/4.json", &compact);
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    store.mark_last_good(4).unwrap();
+    assert_eq!(fs::read(dir.join("revisions/4.json")).unwrap(), compact);
+    assert_eq!(store.meta.get().last_good_revision, Some(4));
+    assert_eq!(meta_on_disk(&dir).last_good_revision, Some(4));
 }
 
 /// Review I-B3 (test 5): a `backup-pre-0.4` without a valid manifest (empty,
