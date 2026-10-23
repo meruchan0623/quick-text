@@ -22,10 +22,7 @@ fn main() {
     diagnostics::panic::install();
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.show();
-                let _ = w.set_focus();
-            }
+            tray::show_main(app);
         }))
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
@@ -103,10 +100,19 @@ fn main() {
             // B-10: waits for Healthy, runs the self-test, then listens or
             // stays paused and says why.
             startup::spawn_self_test(app.handle().clone());
-            if std::env::args().any(|x| x == "--background") {
-                if let Some(w) = app.get_webview_window("main") {
-                    w.hide()?;
-                }
+            // The window (`create: false` in tauri.conf.json) is built only
+            // now, after the engine has started, so creating the webview
+            // does not delay listening. It starts hidden: the app stays in
+            // the tray until the user opens it.
+            if let Some(config) = app.config().app.windows.first() {
+                tauri::WebviewWindowBuilder::from_config(app.handle(), config)?.build()?;
+            }
+            if !std::env::args().any(|x| x == "--background") {
+                tray::notify(
+                    app.handle(),
+                    "Quicktext 已在托盘运行",
+                    "单击托盘图标打开管理界面。",
+                );
             }
             Ok(())
         })

@@ -17,8 +17,39 @@ use std::sync::{atomic::Ordering, Arc, PoisonError};
 use tauri::{menu::MenuItem, AppHandle, Manager, Wry};
 use tauri_plugin_notification::NotificationExt;
 
-const TRAY_ID: &str = "quicker-text-tray";
+const TRAY_ID: &str = "quicktext-tray";
 const PAUSE_ID: &str = "pause";
+
+fn tray_icon(app: &tauri::App) -> tauri::image::Image<'_> {
+    #[cfg(windows)]
+    {
+        // Load the ICO frame at the notification area's actual system size,
+        // preserving the hand-tuned small glyph instead of shrinking a taskbar icon.
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetSystemMetrics(index: i32) -> i32;
+        }
+        const SM_CXSMICON: i32 = 49;
+        const SM_CYSMICON: i32 = 50;
+        // SAFETY: GetSystemMetrics accepts these constant indices and owns no memory.
+        let (width, height) = unsafe {
+            (
+                GetSystemMetrics(SM_CXSMICON).max(16) as u32,
+                GetSystemMetrics(SM_CYSMICON).max(16) as u32,
+            )
+        };
+        if let Ok(icon) = tauri::image::Image::from_icon_resource(
+            tauri::utils::platform::WINDOWS_APP_ICON_RESOURCE_ID,
+            width,
+            height,
+        ) {
+            return icon;
+        }
+    }
+    app.default_window_icon()
+        .cloned()
+        .unwrap_or_else(|| tauri::include_image!("icons/32x32.png"))
+}
 
 /// The pause/resume entry's label for the current state: listening offers
 /// to pause, anything else offers to resume (the self_test_failed banner
@@ -46,18 +77,22 @@ pub fn build(app: &tauri::App) -> tauri::Result<MenuItem<Wry>> {
     let starting = StatusText::resolve(HealthState::Starting, PauseReasons::MANUAL, false)
         .tooltip(PauseReasons::MANUAL);
     tauri::tray::TrayIconBuilder::with_id(TRAY_ID)
-        .icon(app.default_window_icon().cloned().unwrap_or_else(|| {
-            tauri::image::Image::new_owned([27, 88, 162, 255].repeat(32 * 32), 32, 32)
-        }))
+        .icon(tray_icon(app))
         .tooltip(starting)
         .menu(&menu)
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "show" => {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            if let tauri::tray::TrayIconEvent::Click {
+                button: tauri::tray::MouseButton::Left,
+                button_state: tauri::tray::MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main(tray.app_handle());
             }
+        })
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_main(app),
             PAUSE_ID => toggle_pause(app),
             "quit" => {
                 let state = app.state::<Managed>();
@@ -71,6 +106,15 @@ pub fn build(app: &tauri::App) -> tauri::Result<MenuItem<Wry>> {
         })
         .build(app)?;
     Ok(pause)
+}
+
+/// Shows and focuses the management window (restored if minimized).
+pub fn show_main(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
 }
 
 /// Toggles the manual reason only, as `set_paused` does: a listening engine
