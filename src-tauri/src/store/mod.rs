@@ -271,14 +271,13 @@ impl Store {
     /// Records `revision` as last-known-good in `store-meta.json`; it is the
     /// first candidate after `active.json` in `load_or_fallback`.
     ///
-    /// Calling convention (plan §7.2 LKG): the supervisor (P1a) calls this
+    /// Called by `lkg.rs` (plan §7.2 LKG, B-04: [`crate::lkg::mark_active`]),
     /// once the engine has been Healthy for 60 seconds and at least one
     /// expansion has succeeded on `revision`. There is no timer here. When
     /// `revision` is the active one and has no `revisions/<n>.json` yet, that
     /// snapshot is written as well so that the candidate exists. The empty
     /// stand-in of a data directory without a configuration is never
     /// snapshotted (see `active_on_disk`): it is `NotFound`.
-    #[allow(dead_code)] // Called by the supervisor (P1a).
     pub fn mark_last_good(&self, revision: u64) -> Result<(), CommandError> {
         self.ensure_writable()?;
         let revisions = self.dir.join("revisions");
