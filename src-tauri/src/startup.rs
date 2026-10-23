@@ -76,6 +76,12 @@ pub enum ProblemKind {
         level: LogLevel,
         until_ms: i64,
     },
+    /// The backup before the first 0.4 write (`backup`, the directory name
+    /// `backup-pre-0.4`) could not be made: saving is refused and retried
+    /// with each write, the active configuration keeps working (R6).
+    BackupFailed {
+        backup: String,
+    },
 }
 
 impl From<ProblemKind> for StartupProblem {
@@ -508,6 +514,12 @@ mod tests {
                     until_ms: 1_792_664_493_000,
                 },
                 json!({"kind": "log_level_elevated", "severity": "info", "args": {"level": "debug", "until_ms": 1_792_664_493_000_i64}}),
+            ),
+            (
+                ProblemKind::BackupFailed {
+                    backup: "backup-pre-0.4".into(),
+                },
+                json!({"kind": "backup_failed", "severity": "warning", "args": {"backup": "backup-pre-0.4"}}),
             ),
         ];
         for (kind, expected) in cases {

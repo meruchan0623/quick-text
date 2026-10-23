@@ -2180,6 +2180,228 @@ fn a_locked_retry_after_the_self_test_decision_stays_paused() {
     assert!(store.runtime.engine_state().listening);
 }
 
+/// A data directory as 0.3.1 leaves it, in a byte layout 0.4 never writes
+/// (compact JSON, CRLF, `[ ]`), so a copy that went through serde would show.
+fn legacy_031_dir(dir: &Path) {
+    let compact = |config: &Config| {
+        let mut out = serde_json::to_vec(config).unwrap();
+        out.extend_from_slice(b"\r\n");
+        out
+    };
+    write(dir, "active.json", &compact(&config_at(3)));
+    write(dir, "draft.json", &compact(&config_at(3)));
+    write(dir, "migration-unresolved.json", b"[]\r\n");
+    write(dir, "revisions/1.json", &compact(&config_at(1)));
+    write(dir, "revisions/2.json", &compact(&config_at(2)));
+    write(dir, "revisions/2.metadata.json", b"[ ]\r\n");
+    write(dir, "revisions/3.metadata.json", b"[ ]\r\n");
+    write(dir, "revisions/index.json", b"{\"legacy\":true}\r\n");
+    write(dir, "prefs.json", b"{}\r\n");
+}
+/// What a backup of [`legacy_031_dir`] holds: everything except
+/// `revisions/1.json`, which is neither the current nor the previous revision.
+const LEGACY_BACKED_UP: [&str; 8] = [
+    "active.json",
+    "draft.json",
+    "migration-unresolved.json",
+    "prefs.json",
+    "revisions/2.json",
+    "revisions/2.metadata.json",
+    "revisions/3.metadata.json",
+    "revisions/index.json",
+];
+fn rel(name: &str) -> PathBuf {
+    name.split('/')
+        .fold(PathBuf::new(), |path, part| path.join(part))
+}
+fn backup_dir(dir: &Path) -> PathBuf {
+    dir.join("backup-pre-0.4")
+}
+/// `names` with their content in `files`.
+fn subset(files: &BTreeMap<PathBuf, Vec<u8>>, names: &[&str]) -> BTreeMap<PathBuf, Vec<u8>> {
+    names
+        .iter()
+        .map(|name| (rel(name), files[&rel(name)].clone()))
+        .collect()
+}
+fn backup_temps(dir: &Path) -> Vec<String> {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("backup-pre-0.4.tmp-"))
+        .collect()
+}
+fn backup_failed(store: &Store) -> usize {
+    let kind = ProblemKind::BackupFailed {
+        backup: "backup-pre-0.4".into(),
+    };
+    store
+        .startup_problems()
+        .iter()
+        .filter(|p| p.kind == kind)
+        .count()
+}
+
+/// R6 (plan §9, B-43): the first 0.4 write into a 0.3.1 directory (the
+/// metadata snapshot at load) is preceded by a byte-for-byte backup of the
+/// files 0.3.1 reads; later writes, in this session or the next, make none.
+#[test]
+fn first_write_backs_up_a_031_directory_byte_for_byte() {
+    let dir = TempDir::new();
+    let world = world();
+    legacy_031_dir(&dir);
+    let before = files(&dir);
+
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.safe_mode(), None);
+    assert_eq!(store.active, config_at(3));
+    assert_eq!(files(&backup_dir(&dir)), subset(&before, &LEGACY_BACKED_UP));
+    // The snapshot rewrote it after the backup was made.
+    assert_ne!(
+        fs::read(dir.join("revisions/3.metadata.json")).unwrap(),
+        before[&rel("revisions/3.metadata.json")]
+    );
+    assert!(backup_temps(&dir).is_empty());
+    assert_eq!(meta_on_disk(&dir).backup_pre_0_4, Some(true));
+    assert_eq!(backup_failed(&store), 0);
+
+    // Without the backup, the next writes do not make it again.
+    fs::remove_dir_all(backup_dir(&dir)).unwrap();
+    store.save(metadata_config(&["b"])).unwrap();
+    store.discard().unwrap();
+    store.publish(metadata_config(&["b"])).unwrap();
+    store.rollback_previous().unwrap();
+    assert!(!backup_dir(&dir).exists());
+    clean_exit(store, &world);
+    let store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.active.revision, 5);
+    assert!(!backup_dir(&dir).exists());
+    assert!(backup_temps(&dir).is_empty());
+}
+
+/// R6: a new data directory has nothing from before 0.4. Nothing is backed
+/// up, the mark is set with the first write, and the files 0.4 writes are no
+/// reason for a backup at the next start either.
+#[test]
+fn fresh_directory_gets_no_backup() {
+    let dir = TempDir::new();
+    let world = world();
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert!(!backup_dir(&dir).exists());
+    assert_eq!(meta_on_disk(&dir).backup_pre_0_4, Some(false));
+    store.publish(metadata_config(&["a"])).unwrap();
+    store.publish(metadata_config(&["b"])).unwrap();
+    clean_exit(store, &world);
+    let store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.active.revision, 2);
+    assert!(!backup_dir(&dir).exists());
+    assert!(backup_temps(&dir).is_empty());
+    assert_eq!(meta_on_disk(&dir).backup_pre_0_4, Some(false));
+}
+
+/// R6: while the backup cannot be made, every write is refused with an
+/// `io` error at `backup-pre-0.4`, nothing that 0.3.1 reads changes, the
+/// engine keeps running on the active configuration and `backup_failed` is
+/// listed once. The next write after the cause is gone backs up and goes
+/// through.
+#[test]
+fn failed_backup_refuses_writes_until_it_succeeds() {
+    let dir = TempDir::new();
+    let world = world();
+    legacy_031_dir(&dir);
+    // prefs.json cannot be read: the backup cannot be completed.
+    fs::remove_file(dir.join("prefs.json")).unwrap();
+    fs::create_dir(dir.join("prefs.json")).unwrap();
+    let before = files(&dir);
+    let data_files = || {
+        let mut now = files(&dir);
+        now.remove(Path::new(META_FILE));
+        now
+    };
+
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.safe_mode(), None);
+    assert_eq!(store.active, config_at(3));
+    assert_eq!(backup_failed(&store), 1);
+    // Not even the metadata snapshot was written.
+    assert_eq!(data_files(), before);
+    assert_eq!(meta_on_disk(&dir).backup_pre_0_4, None);
+    listening(&store);
+
+    let refused = |result: Result<(), CommandError>| {
+        matches!(
+            result,
+            Err(CommandError::Io { path: Some(ref path), .. }) if path == "backup-pre-0.4"
+        )
+    };
+    assert!(refused(store.save(metadata_config(&["b"]))));
+    assert!(refused(store.discard()));
+    assert!(refused(store.publish(metadata_config(&["b"]))));
+    assert_eq!(data_files(), before);
+    assert!(!backup_dir(&dir).exists());
+    assert!(backup_temps(&dir).is_empty(), "the partial copy is removed");
+    assert_eq!(backup_failed(&store), 1, "listed once");
+    assert_eq!(store.active, config_at(3));
+    assert!(store.runtime.engine_state().listening);
+    assert!(store.runtime.pause_reasons().is_empty());
+
+    fs::remove_dir(dir.join("prefs.json")).unwrap();
+    store.publish(metadata_config(&["b"])).unwrap();
+    assert_eq!(store.active.revision, 4);
+    let mut expected = LEGACY_BACKED_UP.to_vec();
+    expected.retain(|name| *name != "prefs.json");
+    assert_eq!(files(&backup_dir(&dir)), subset(&before, &expected));
+    assert_eq!(backup_failed(&store), 0);
+    assert_eq!(meta_on_disk(&dir).backup_pre_0_4, Some(true));
+    assert!(store.runtime.engine_state().listening);
+}
+
+/// R6: a complete `backup-pre-0.4/` found in the directory is kept as it is
+/// and only the mark is set.
+#[test]
+fn an_existing_backup_is_never_overwritten() {
+    let dir = TempDir::new();
+    let world = world();
+    legacy_031_dir(&dir);
+    write(
+        &dir,
+        "backup-pre-0.4/active.json",
+        b"from an earlier backup",
+    );
+    let earlier = files(&backup_dir(&dir));
+
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(meta_on_disk(&dir).backup_pre_0_4, Some(true));
+    store.publish(metadata_config(&["b"])).unwrap();
+    assert_eq!(files(&backup_dir(&dir)), earlier);
+    assert!(backup_temps(&dir).is_empty());
+}
+
+/// R6: the temp directories an interrupted backup left are removed and the
+/// backup is made again from the start.
+#[test]
+fn an_interrupted_backup_is_made_again() {
+    let dir = TempDir::new();
+    let world = world();
+    legacy_031_dir(&dir);
+    let before = files(&dir);
+    write(
+        &dir,
+        "backup-pre-0.4.tmp-20260101-000000/active.json",
+        b"cut short",
+    );
+    write(
+        &dir,
+        "backup-pre-0.4.tmp-20260101-000000-1/revisions/2.json",
+        b"",
+    );
+
+    let store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.safe_mode(), None);
+    assert!(backup_temps(&dir).is_empty());
+    assert_eq!(files(&backup_dir(&dir)), subset(&before, &LEGACY_BACKED_UP));
+}
+
 /// Fault injection (B-52): the store points behave as the real failures.
 #[cfg(feature = "fault-injection")]
 mod injected {

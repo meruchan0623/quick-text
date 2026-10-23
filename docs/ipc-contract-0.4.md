@@ -30,7 +30,7 @@ Rust 侧的共享类型在 `crates/platform/src/health.rs`，JSON 形状由其 s
 | `rule_conflict` | `{ id, current }` | 0.5 使用，0.4 先定义 |
 | `revision_conflict` | `{ current: number }` | |
 | `safe_mode` | `{ reason: SafeModeReason }` | 安全模式下的写命令 |
-| `io` | `{ op: IoOp, path: string \| null, os_code: number \| null }` | `path` 只给数据目录下的相对路径或文件名，不给用户目录全路径 |
+| `io` | `{ op: IoOp, path: string \| null, os_code: number \| null }` | `path` 只给数据目录下的相对路径或文件名，不给用户目录全路径。`path` 为 `backup-pre-0.4` 表示升级前备份没有做成（计划 §9，R6）：这次写入没有执行，已有配置照常生效，下次写入会重试；同时会有 `backup_failed` 启动问题 |
 | `not_found` | `{ kind: EntityKind, id }` | |
 | `busy` | — | 执行器正忙 |
 | `engine_unavailable` | `{ health: HealthState }` | |
@@ -108,6 +108,7 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 | `self_test_failed` | warning | `{ checks: ("raw_input" \| "hook_heartbeat" \| "foreground" \| "clipboard")[] }`：启动自检未通过的项（原因为 `unsupported` 的项不计入），不改变暂停状态：引擎保持暂停，启动期间用户已手动恢复的，保持用户的选择（是否在监听仍由其余暂停原因决定，以 `engine-state` 为准），界面提供「恢复监听」。见 §5「自检」 |
 | `log_level_elevated` | info | `{ level: "error" \| "warn" \| "debug" \| "trace", until_ms: number }`：启动时从 prefs 恢复了仍在有效期内的临时日志级别，`until_ms` 为到期时间（Unix 毫秒） |
 | `store_meta_reset` | warning | `{}`（`store-meta.json` 无法解析，已重建） |
+| `backup_failed` | warning | `{ backup: "backup-pre-0.4" }`：0.4 第一次写入 0.3.1 会读的文件前要做的备份没有做成（计划 §9，R6）。保存、放弃草稿、发布、回滚都会以 `io`（`path` 为 `backup-pre-0.4`）拒绝，已有配置照常生效，每次写入都会重试；备份做成后从 `startup_problems` 中移除。建议文案：「升级前备份失败，暂时不能保存，已有配置照常生效」 |
 
 后端可以新增 kind；前端对未知 kind 显示 `kind` 原文加通用文案。
 

@@ -1,6 +1,5 @@
 //! Startup load of the data directory on top of `load_or_fallback` (B-04).
 use super::{
-    atomic::atomic_json,
     fallback::{load_or_fallback, LoadReport, StoreEnv},
     meta::{MetaHandle, StoreMeta},
     metadata::{metadata_for_config, read_metadata},
@@ -89,7 +88,11 @@ impl Store {
         self.draft = report.draft;
         self.previous = report.previous;
         self.pending_import = None;
-        self.load_metadata(safe_mode.is_none());
+        // R6: the metadata snapshot is the first write into a directory
+        // 0.3.1 left, so the pre-0.4 backup comes first, and without it the
+        // snapshot is not written. Safe mode writes nothing.
+        let backed_up = safe_mode.is_none().then(|| self.backup_pre_0_4().is_ok());
+        self.load_metadata(backed_up == Some(true));
         // Problems found outside the load (autostart, the startup self-test)
         // survive a reload.
         let before = std::mem::take(&mut self.startup_problems);
@@ -104,10 +107,14 @@ impl Store {
                 ProblemKind::AutostartRepaired {}
                     | ProblemKind::SelfTestFailed { .. }
                     | ProblemKind::LogLevelElevated { .. }
+                    | ProblemKind::BackupFailed { .. }
             )
         });
         self.startup_problems = report.problems;
         self.startup_problems.extend(kept);
+        if let Some(ok) = backed_up {
+            self.note_backup(ok);
+        }
         self.set_safe_mode(safe_mode);
         // The new revision and the safe mode it left (or entered) together,
         // in one report, under the lock the caller holds.
@@ -128,20 +135,6 @@ impl Store {
         } else {
             metadata_for_config(&self.active, &unresolved)
         };
-        if write_snapshot {
-            // Persist the legacy fallback before a later draft import can replace it.
-            let revisions = dir.join("revisions");
-            let written = fs::create_dir_all(&revisions)
-                .map_err(|e| CommandError::io(IoOp::CreateDir, Some(&revisions), &e))
-                .and_then(|()| atomic_json(&active_metadata_path, &active_unresolved));
-            if let Err(e) = written {
-                tracing::warn!(
-                    event = "store.metadata_snapshot_failed",
-                    error = %e,
-                    "active metadata not snapshotted"
-                );
-            }
-        }
         let previous_unresolved = self
             .previous
             .as_ref()
@@ -159,6 +152,31 @@ impl Store {
         self.unresolved = unresolved;
         self.active_unresolved = active_unresolved;
         self.previous_unresolved = previous_unresolved;
+        if write_snapshot {
+            self.snapshot_active_metadata();
+        }
+    }
+    /// Writes the active metadata as `revisions/<n>.metadata.json`: the
+    /// legacy fallback is persisted before a later draft import can replace
+    /// `migration-unresolved.json`. Also called once the pre-0.4 backup
+    /// succeeds after the load could not write this (`Store::note_backup`).
+    pub(super) fn snapshot_active_metadata(&self) {
+        let revisions = self.dir.join("revisions");
+        let path = revisions.join(format!("{}.metadata.json", self.active.revision));
+        let written = self
+            .backup_pre_0_4()
+            .and_then(|()| {
+                fs::create_dir_all(&revisions)
+                    .map_err(|e| CommandError::io(IoOp::CreateDir, Some(&revisions), &e))
+            })
+            .and_then(|()| self.write_data(&path, &self.active_unresolved));
+        if let Err(e) = written {
+            tracing::warn!(
+                event = "store.metadata_snapshot_failed",
+                error = %e,
+                "active metadata not snapshotted"
+            );
+        }
     }
 }
 /// The runtime a new store's engine reports to: the process-wide one in the
@@ -215,7 +233,7 @@ pub(super) fn hash_file(path: &Path) -> Result<Option<Vec<u8>>, CommandError> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::*;
+    use super::super::{atomic::atomic_json, test_support::*};
     use super::*;
     #[test]
     fn legacy_metadata_is_snapshotted_before_replacing_draft() {

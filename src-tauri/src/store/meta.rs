@@ -1,5 +1,6 @@
 //! `store-meta.json` (B-04): last-known-good revision, the predecessor of
-//! the active revision, the run marker and the consecutive crash count. A
+//! the active revision, the run marker, the consecutive crash count and
+//! whether the pre-0.4 backup has been dealt with. A
 //! new file that 0.3.1 never reads (§9), so
 //! nothing here touches `active.json` or `revisions/<n>.json`.
 use super::atomic::atomic_json;
@@ -28,6 +29,11 @@ pub struct StoreMeta {
     pub previous_revision: Option<PreviousRevision>,
     pub run_marker: Option<RunMarker>,
     pub crash_count: u32,
+    /// The backup before the first 0.4 write (R6, `store::backup`):
+    /// `true` once `backup-pre-0.4/` exists (made or found), `false` when
+    /// there was nothing from before 0.4 to back up. Absent until then, and
+    /// in a file from before it existed.
+    pub backup_pre_0_4: Option<bool>,
     /// Fields written by a newer release, kept verbatim (B-43).
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -132,6 +138,10 @@ impl MetaHandle {
     #[cfg(test)]
     pub fn get(&self) -> StoreMeta {
         self.0.lock().meta.clone()
+    }
+    /// Reads the content without writing it.
+    pub fn read<R>(&self, read: impl FnOnce(&StoreMeta) -> R) -> R {
+        read(&self.0.lock().meta)
     }
     /// Replaces the content (after a reload) without writing it.
     pub fn replace(&self, meta: StoreMeta, writable: bool) {
@@ -242,8 +252,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.last_good_revision, Some(4));
-        // A file from before the predecessor was recorded (R3).
+        // A file from before the predecessor was recorded (R3) and the
+        // backup mark (R6).
         assert_eq!(parsed.previous_revision, None);
+        assert_eq!(parsed.backup_pre_0_4, None);
         let expected = RunMarker {
             boot_id: Some(7),
             started_ms: 9,
@@ -258,9 +270,11 @@ mod tests {
         assert!(parse_meta(b"{trunc").is_none());
         assert_eq!(parse_meta(b"{}"), Some(StoreMeta::default()));
         let recorded = parse_meta(
-            b"{\"previous_revision\": {\"active\": 3, \"revision\": 1}, \"crash_count\": 0}",
+            b"{\"previous_revision\": {\"active\": 3, \"revision\": 1}, \"crash_count\": 0, \
+              \"backup_pre_0_4\": true}",
         )
         .unwrap();
+        assert_eq!(recorded.backup_pre_0_4, Some(true));
         let previous = PreviousRevision {
             active: 3,
             revision: Some(1),
@@ -272,6 +286,7 @@ mod tests {
             written["previous_revision"],
             serde_json::json!({"active": 3, "revision": 1})
         );
+        assert_eq!(written["backup_pre_0_4"], true);
     }
 
     #[cfg(windows)]

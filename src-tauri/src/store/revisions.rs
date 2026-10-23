@@ -1,6 +1,5 @@
 //! Publishing a configuration as a new revision, and rolling back to the previous one.
 use super::{
-    atomic::atomic_json,
     fallback::revision_numbers,
     load::{hash_file, read_config},
     meta::PreviousRevision,
@@ -40,6 +39,8 @@ impl Store {
                 .unwrap_or(self.active.revision);
             return Err(CommandError::RevisionConflict { current });
         }
+        // R6: before anything is written or the engine held.
+        self.backup_before_write()?;
         // Detection stops while the configuration is swapped: MANUAL is held
         // for the publish and put back as it was afterwards, whatever the
         // outcome (no-regression #8). Only MANUAL is touched, so a reason
@@ -73,20 +74,20 @@ impl Store {
                         ));
                     }
                 } else {
-                    atomic_json(&backup, &old)?;
+                    self.write_data(&backup, &old)?;
                 }
-                atomic_json(
+                self.write_data(
                     &revisions.join(format!("{}.metadata.json", old.revision)),
                     &self.active_unresolved,
                 )?;
             }
-            atomic_json(&self.dir.join("draft.json"), &config)?;
-            atomic_json(
+            self.write_data(&self.dir.join("draft.json"), &config)?;
+            self.write_data(
                 &revisions.join(format!("{}.metadata.json", config.revision)),
                 &metadata,
             )?;
-            atomic_json(&self.dir.join("migration-unresolved.json"), &metadata)?;
-            atomic_json(
+            self.write_data(&self.dir.join("migration-unresolved.json"), &metadata)?;
+            self.write_data(
                 &self.dir.join("active-migration-unresolved.json"),
                 &metadata,
             )?;
@@ -105,7 +106,7 @@ impl Store {
             {
                 tracing::warn!(event = "store.meta_write_failed", error = %e, "store-meta.json not written");
             }
-            atomic_json(&self.dir.join("active.json"), &config)?;
+            self.write_data(&self.dir.join("active.json"), &config)?;
             Ok::<_, CommandError>(())
         })();
         if let Err(e) = outcome {
@@ -171,7 +172,7 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::*;
+    use super::super::{atomic::atomic_json, test_support::*};
     use super::*;
     #[test]
     fn rollback_restores_revision_originals_after_reload() {

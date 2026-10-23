@@ -1,6 +1,7 @@
 //! Configuration store: draft, active and previous configurations plus their
 //! files in the data directory (§7.1 「数据目录」).
 mod atomic;
+mod backup;
 mod export;
 mod fallback;
 mod load;
@@ -21,7 +22,6 @@ use crate::{
     events::{ProblemSink, StoreSink, StoreState},
     startup::{ProblemKind, StartupProblem},
 };
-use atomic::atomic_json;
 use meta::MetaHandle;
 use metadata::metadata_for_config;
 use quicker_domain::*;
@@ -289,7 +289,7 @@ impl Store {
             }
             fs::create_dir_all(&revisions)
                 .map_err(|e| CommandError::io(IoOp::CreateDir, Some(&revisions), &e))?;
-            atomic_json(&snapshot, &self.active)?;
+            self.write_data(&snapshot, &self.active)?;
         }
         self.meta
             .update(|meta| meta.last_good_revision = Some(revision))?;
@@ -303,7 +303,9 @@ impl Store {
     /// Writes the draft. A configuration with error-level diagnostics is
     /// rejected with `Validation` and nothing is written (B-42). In safe mode
     /// only committing a previewed import is allowed (see
-    /// [`import_leaves_safe_mode`]).
+    /// [`import_leaves_safe_mode`]). Like every write of a file 0.3.1 reads,
+    /// it waits for the pre-0.4 backup and is refused while that fails (R6,
+    /// `store::backup`).
     pub fn save(&mut self, config: Config) -> Result<(), CommandError> {
         if let Some(reason) = self.safe_mode {
             let importing = self
@@ -325,8 +327,9 @@ impl Store {
             .filter(|(preview, _)| preview == &config)
             .map(|(_, metadata)| metadata.clone())
             .unwrap_or_else(|| metadata_for_config(&config, &self.unresolved));
-        atomic_json(&self.dir.join("draft.json"), &config)?;
-        atomic_json(&self.dir.join("migration-unresolved.json"), &metadata)?;
+        self.backup_before_write()?;
+        self.write_data(&self.dir.join("draft.json"), &config)?;
+        self.write_data(&self.dir.join("migration-unresolved.json"), &metadata)?;
         self.unresolved = metadata;
         self.pending_import = None;
         self.draft = config;
@@ -335,8 +338,9 @@ impl Store {
     }
     pub fn discard(&mut self) -> Result<(), CommandError> {
         self.ensure_writable()?;
-        atomic_json(&self.dir.join("draft.json"), &self.active)?;
-        atomic_json(
+        self.backup_before_write()?;
+        self.write_data(&self.dir.join("draft.json"), &self.active)?;
+        self.write_data(
             &self.dir.join("migration-unresolved.json"),
             &self.active_unresolved,
         )?;
