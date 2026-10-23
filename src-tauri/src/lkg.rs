@@ -9,9 +9,12 @@
 //! The active revision qualifies once, since it took effect,
 //!
 //! - at least one expansion succeeded on the trigger path: a history entry
-//!   with trigger `immediate` or `terminator` and outcome `succeeded`, and
+//!   with trigger `immediate` or `terminator` and outcome `succeeded`,
+//!   recorded after this store state took effect (see "Which revision a
+//!   run belongs to"), and
 //! - overall Health has read Healthy (「正常」) for [`QUALIFY_AFTER`] without
-//!   a break.
+//!   a break, and the runtime's own Health still reads Healthy when the mark
+//!   is about to be written (see "Live Health before the write").
 //!
 //! The two may come in either order. Manual runs (`execute_action`, trigger
 //! `manual`) do not count: they run an action the frontend hands over (often
@@ -19,14 +22,64 @@
 //! with no rule id, so they say nothing about whether the active revision
 //! works. Degraded is not Healthy and does not count either.
 //!
+//! # Which revision a run belongs to
+//!
+//! History entries carry no revision, and the bus gets them from the
+//! runtime's event thread, which is not ordered with the store's reports: a
+//! success of revision n can reach the tracker after the report of n+1
+//! (review finding 1). So a store state counts only entries whose `seq` is
+//! above the runtime's last `seq` ([`Runtime::history_seq`]: monotonic,
+//! kept across a history clear) as read when the tracker takes that state
+//! on the bus thread.
+//!
+//! - The store reports a new state only after it installed the new
+//!   configuration, so every entry recorded before the install is at or
+//!   below that mark and is ignored however late it arrives.
+//! - An entry above the mark was recorded after the install, and its run
+//!   executed the new configuration. A publish is refused (`busy`) while a
+//!   run is queued or running (`busy` is set when a candidate is queued and
+//!   cleared after its entry is recorded). Before that check the publish
+//!   holds MANUAL (detection stops, an automatic run stops at its next
+//!   step), sets cancel and moves the input generation (a candidate
+//!   detected before stops at its first step). MANUAL is released only
+//!   after the install, so a candidate detected after that was matched
+//!   against the new configuration.
+//! - The mark can only under-count: a success recorded between the install
+//!   and the bus taking the report is ignored, and the revision waits for
+//!   the next one. (If that success reaches the tracker before the report,
+//!   it counts for the old state, whose mark is then refused as
+//!   `revision_changed`: the revision changed under the store lock that
+//!   [`mark_active`] takes.)
+//!
+//! Neither the history entry nor any serde shape changes. Timestamps are not
+//! compared: an entry's `at_ms` is wall-clock, and both it and the ring's
+//! monotonic instant are taken when the entry is recorded, at the end of
+//! the run. The run's start could only be derived from them as an
+//! over-estimate, which errs the unsafe way.
+//!
+//! # Live Health before the write
+//!
+//! The minute is measured on the Health the bus delivers, and the bus can
+//! be behind the runtime. An observer ahead of the tracker (the tray, which
+//! waits for the main thread) can hold the bus while a Failed waits in its
+//! queue (review finding 2). So right before the mark the tracker reads the
+//! runtime's current Health ([`Runtime::health`], the snapshot last
+//! published). If it is not Healthy, nothing is written or logged and the
+//! minute starts again from now. The queued Health stops the minute when it
+//! arrives, until Healthy returns. The runtime offers no "Healthy since"
+//! time or Health generation to compare with (its version counter is
+//! private and shared with State), so only the current state is checked.
+//!
 //! # Resets
 //!
 //! - A new store state (another revision or safe mode: publish, rollback, a
-//!   published import, a SafeMode(Locked) retry) clears the success count
-//!   and restarts the minute (from that moment, if Health reads Healthy).
+//!   published import, a SafeMode(Locked) retry) clears the success count,
+//!   moves the history mark (above) and restarts the minute (from that
+//!   moment, if Health reads Healthy).
 //! - Health leaving Healthy stops the minute; it starts again from zero
 //!   when Health is Healthy again. Successes belong to the revision and are
-//!   kept.
+//!   kept. The live check finding the runtime not Healthy restarts the
+//!   minute too.
 //! - In safe mode nothing is counted and nothing is marked.
 //!
 //! A revision is marked at most once per session, and a store state is
@@ -45,15 +98,21 @@
 //! poll. The mark ([`mark_active`]) takes the store lock, which the hook and
 //! executor never take, and writes `store-meta.json` (and
 //! `revisions/<n>.json` when missing): never on the hook, executor or main
-//! thread, never under a lock of the input path. The clock is the runtime's
-//! (monotonic, injectable).
+//! thread, never under a lock of the input path. Reading the runtime's
+//! Health or history `seq` takes its health or history lock briefly, with
+//! no other lock held (the store lock is taken only afterwards, by the
+//! mark). The clock is the runtime's (monotonic, injectable).
 //!
 //! # Limits (待实测)
 //!
-//! - Health is latest-value: a dip the runtime merges away before the bus
-//!   sees it does not restart the minute.
-//! - History entries carry no revision: a run that started before a
-//!   publish and finishes after it counts for the new revision.
+//! - Health is latest-value, and the write checks only the current Health:
+//!   a dip the runtime merges away before the bus sees it, or one that
+//!   starts and ends entirely while the bus is held (by the tray, say),
+//!   does not restart the minute.
+//! - Health can still change in the short window between the live check
+//!   and the write (the wait for the store lock).
+//! - A success recorded between a publish's install and the bus taking its
+//!   report is not counted (see above).
 //! - Only platforms that record trigger-path history (Windows) ever mark.
 //! - The real timing (60 s of Healthy under the production supervisor, real
 //!   expansions reaching the bus) is verified on a real machine only.
@@ -68,7 +127,7 @@ use quicker_platform::{
     traits::Clock,
 };
 use std::{
-    sync::Arc,
+    sync::{Arc, Weak},
     time::{Duration, Instant},
 };
 
@@ -80,10 +139,16 @@ pub const QUALIFY_AFTER: Duration = Duration::from_secs(60);
 pub type MarkFn = Box<dyn FnMut(u64) -> Result<(), CommandError> + Send>;
 
 pub struct LkgTracker {
+    /// Weak, as the bus's own reference: the runtime holds the bus's
+    /// listener, and the bus owns this tracker.
+    runtime: Weak<Runtime>,
     clock: Arc<dyn Clock>,
     mark: MarkFn,
     /// The store state the counting is for.
     store: StoreState,
+    /// The runtime's last history `seq` when this store state was taken:
+    /// only entries above it count for it.
+    counted_after: u64,
     /// Since when Health has read Healthy for this store state; `None`
     /// while it does not.
     healthy_since: Option<Instant>,
@@ -101,14 +166,32 @@ impl LkgTracker {
     /// starts); the clock is `runtime`'s.
     pub fn new(runtime: &Arc<Runtime>, store: StoreState, mark: MarkFn) -> Self {
         Self {
+            runtime: Arc::downgrade(runtime),
             clock: runtime.clock().clone(),
             mark,
             store,
+            counted_after: runtime.history_seq(),
             healthy_since: None,
             successes: 0,
             tried: false,
             marked: None,
         }
+    }
+
+    /// The runtime's last history `seq`; once the runtime is gone, the
+    /// highest value, so nothing more counts.
+    fn history_seq(&self) -> u64 {
+        self.runtime
+            .upgrade()
+            .map_or(u64::MAX, |runtime| runtime.history_seq())
+    }
+
+    /// Whether the runtime's current Health (not the bus's, which can be
+    /// behind) reads Healthy; false once the runtime is gone.
+    fn healthy_now(&self) -> bool {
+        self.runtime
+            .upgrade()
+            .is_some_and(|runtime| runtime.health().state == HealthState::Healthy)
     }
 
     /// The time left until the current revision qualifies, when time is
@@ -126,6 +209,14 @@ impl LkgTracker {
     /// Marks the current revision if it qualifies now.
     fn poll(&mut self) {
         if self.remaining() != Some(Duration::ZERO) {
+            return;
+        }
+        // The minute ran on the Health the bus delivered; a Health that left
+        // Healthy may still wait behind it. Not written, not tried: the
+        // minute starts again (and the queued Health, once it arrives,
+        // stops it).
+        if !self.healthy_now() {
+            self.healthy_since = Some(self.clock.now());
             return;
         }
         let revision = self.store.revision;
@@ -154,7 +245,11 @@ impl Observer for LkgTracker {
     }
 
     fn executed(&mut self, entry: &HistoryEntry) {
-        let counts = entry.trigger != TriggerKind::Manual && entry.outcome == Outcome::Succeeded;
+        // A run recorded before this store state was taken (a late
+        // delivery of the previous revision's) does not count.
+        let counts = entry.seq > self.counted_after
+            && entry.trigger != TriggerKind::Manual
+            && entry.outcome == Outcome::Succeeded;
         if counts && self.store.safe_mode.is_none() {
             self.successes = self.successes.saturating_add(1);
         }
@@ -164,6 +259,9 @@ impl Observer for LkgTracker {
     fn store(&mut self, store: StoreState) {
         if store != self.store {
             self.store = store;
+            // Read after the store installed this state (it reports only
+            // then): every entry of the previous one is at or below it.
+            self.counted_after = self.history_seq();
             self.successes = 0;
             self.tried = false;
             if self.healthy_since.is_some() {
@@ -222,15 +320,25 @@ mod tests {
     use crate::{
         diagnostics::logging::test_support::{read_logs, scoped},
         error::{EntityKind, SafeModeReason},
-        events::{EventBus, Sink, ENGINE_HEALTH},
+        events::{EventBus, Observers, Sink, ENGINE_HEALTH},
         startup::ProblemKind,
         store::{RecoverySource, Store},
     };
     use parking_lot::Mutex;
     use quicker_domain::*;
-    use quicker_platform::{health::ReasonCode, history::Record};
+    use quicker_platform::{
+        health::{EngineEvent, PauseReasons, ReasonCode},
+        history::Record,
+    };
     use serde_json::Value;
-    use std::{fs, path::PathBuf, sync::mpsc};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
+    };
     use tracing::level_filters::LevelFilter;
 
     /// A monotonic clock that only moves when told to.
@@ -464,6 +572,77 @@ mod tests {
         assert_eq!(rig.marks(), [2, 3]);
     }
 
+    /// Review finding 1: entries reach the bus from the runtime's event
+    /// thread, unordered with the store's reports. A success of revision 1,
+    /// recorded before the publish of 2 but delivered after its report, is
+    /// not revision 2's.
+    #[test]
+    fn a_success_recorded_before_a_publish_never_counts_for_the_new_revision() {
+        let mut rig = Rig::new(store(1, None));
+        rig.healthy();
+        let late = record(&rig.runtime, TriggerKind::Terminator, Outcome::Succeeded);
+        rig.store(store(2, None));
+        rig.tracker.executed(&late);
+        assert_eq!(rig.due_in(), None, "revision 2 has no success of its own");
+        rig.wait(secs(600));
+        assert!(rig.marks().is_empty());
+        // A run recorded after the report is revision 2's.
+        rig.success();
+        assert_eq!(rig.marks(), [2]);
+        // The same holds when safe mode ends at the same revision: what
+        // was recorded before does not count after.
+        rig.store(store(3, Some(SafeModeReason::Locked)));
+        let late = record(&rig.runtime, TriggerKind::Terminator, Outcome::Succeeded);
+        rig.store(store(3, None));
+        rig.tracker.executed(&late);
+        rig.wait(secs(600));
+        assert_eq!(rig.marks(), [2]);
+    }
+
+    /// Review finding 2: the bus can be behind the runtime (an observer
+    /// ahead of the tracker blocks while a Failed waits in the queue). The
+    /// write reads the runtime's current Health: not Healthy, nothing is
+    /// written and the minute starts again.
+    #[test]
+    fn a_health_the_bus_has_not_delivered_yet_stops_the_write_and_restarts_the_minute() {
+        let mut rig = Rig::new(store(1, None));
+        rig.healthy();
+        rig.success();
+        rig.wait(secs(59));
+        // The runtime reads Failed; the bus has not delivered it.
+        rig.runtime.publish_health(health(HealthState::Failed));
+        rig.wait(secs(2));
+        assert!(rig.marks().is_empty(), "the runtime no longer read Healthy");
+        assert_eq!(
+            rig.due_in(),
+            Some(secs(60)),
+            "a fresh minute from the check"
+        );
+        // Healthy again before the bus ever showed the dip (merged away):
+        // still a full minute from the check.
+        rig.runtime.publish_health(health(HealthState::Healthy));
+        rig.wait(secs(59));
+        assert!(rig.marks().is_empty());
+        rig.wait(secs(1));
+        assert_eq!(rig.marks(), [1]);
+        // Revision 2: this time the Failed does arrive, later; it stops
+        // the minute until Healthy returns.
+        rig.store(store(2, None));
+        rig.success();
+        rig.wait(secs(59));
+        rig.runtime.publish_health(health(HealthState::Failed));
+        rig.wait(secs(1));
+        assert_eq!(rig.due_in(), Some(secs(60)));
+        rig.tracker
+            .status(&health(HealthState::Failed), &EngineState::default());
+        assert_eq!(rig.due_in(), None);
+        rig.wait(secs(600));
+        assert_eq!(rig.marks(), [1]);
+        rig.healthy();
+        rig.wait(secs(60));
+        assert_eq!(rig.marks(), [1, 2]);
+    }
+
     #[test]
     fn nothing_is_counted_or_marked_in_safe_mode() {
         let crash_loop = Some(SafeModeReason::CrashLoop);
@@ -676,6 +855,165 @@ mod tests {
         record(&runtime, TriggerKind::Manual, Outcome::Succeeded);
         record(&runtime, TriggerKind::Immediate, Outcome::Succeeded);
         assert_eq!(marked.recv_timeout(secs(10)), Ok(2));
+        assert!(marked.try_recv().is_err(), "marked once");
+    }
+
+    /// What the probe saw.
+    #[derive(Debug, PartialEq)]
+    enum Seen {
+        Status(HealthState),
+        Executed(u64),
+        Store(u64),
+    }
+
+    /// Reports every callback. Listed after the tracker: once the probe saw
+    /// something, the tracker has handled it.
+    struct Probe(mpsc::Sender<Seen>);
+    impl Observer for Probe {
+        fn status(&mut self, health: &HealthSnapshot, _state: &EngineState) {
+            let _ = self.0.send(Seen::Status(health.state));
+        }
+        fn executed(&mut self, entry: &HistoryEntry) {
+            let _ = self.0.send(Seen::Executed(entry.seq));
+        }
+        fn store(&mut self, store: StoreState) {
+            let _ = self.0.send(Seen::Store(store.revision));
+        }
+    }
+
+    /// Waits until the probe sees `what`, skipping what comes before it.
+    fn until(seen: &mpsc::Receiver<Seen>, what: Seen) {
+        while seen.recv_timeout(secs(10)).unwrap() != what {}
+    }
+
+    /// Review finding 1 on the bus: a listener ahead of the bus's holds the
+    /// runtime's event thread while it delivers a success of revision 1, so
+    /// the store's report of revision 2 reaches the bus first and the
+    /// success after it. The success does not count for revision 2.
+    #[test]
+    fn on_the_bus_a_success_of_the_old_revision_delivered_after_a_publish_does_not_count() {
+        let clock = FakeClock::new();
+        let runtime = Arc::new(Runtime::new(clock.clone()));
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel::<()>();
+        let gate = Mutex::new(Some((entered_tx, release_rx)));
+        runtime.subscribe(Box::new(move |event| {
+            if matches!(event, EngineEvent::Execution(_)) {
+                let held = gate.lock().take();
+                if let Some((entered, release)) = held {
+                    let _ = entered.send(());
+                    let _ = release.recv();
+                }
+            }
+        }));
+        let (mark_tx, marked) = mpsc::channel();
+        let tracker = LkgTracker::new(&runtime, store(1, None), reported(mark_tx));
+        let (probe, seen) = mpsc::channel();
+        let (tx, _emitted) = mpsc::channel();
+        let bus = EventBus::start(
+            &runtime,
+            store(1, None),
+            Channel(tx),
+            Box::new(Observers(vec![Box::new(tracker), Box::new(Probe(probe))])),
+        );
+        let reports = bus.store_sink();
+        runtime.publish_health(health(HealthState::Healthy));
+        until(&seen, Seen::Status(HealthState::Healthy));
+        // Revision 1 succeeds; its entry is held on the way to the bus.
+        let old = record(&runtime, TriggerKind::Terminator, Outcome::Succeeded);
+        entered.recv_timeout(secs(10)).unwrap();
+        // Revision 2 is installed and reported; the bus takes the report
+        // first, then the held entry.
+        reports.report(store(2, None));
+        until(&seen, Seen::Store(2));
+        release.send(()).unwrap();
+        until(&seen, Seen::Executed(old.seq));
+        // Healthy for well over a minute since; a repeated report wakes
+        // the tracker.
+        clock.advance(QUALIFY_AFTER * 10);
+        reports.report(store(2, None));
+        until(&seen, Seen::Store(2));
+        assert!(
+            marked.try_recv().is_err(),
+            "revision 1's success counted for revision 2"
+        );
+        // A success recorded after the report is revision 2's.
+        record(&runtime, TriggerKind::Terminator, Outcome::Succeeded);
+        assert_eq!(marked.recv_timeout(secs(10)), Ok(2));
+        assert!(marked.try_recv().is_err(), "marked once");
+    }
+
+    /// Stands in for the tray: once armed, its next status call signals and
+    /// then blocks until released (the main thread busy).
+    struct Tray {
+        armed: Arc<AtomicBool>,
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+    impl Observer for Tray {
+        fn status(&mut self, _health: &HealthSnapshot, _state: &EngineState) {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                let _ = self.entered.send(());
+                let _ = self.release.recv();
+            }
+        }
+        fn executed(&mut self, _entry: &HistoryEntry) {}
+    }
+
+    /// Review finding 2 on the bus: the tray, ahead of the tracker, blocks
+    /// across the end of the minute while a Failed waits behind it. When it
+    /// returns, the tracker sees the minute up on the Health it last had,
+    /// Healthy; the runtime's current Health, Failed, stops the write.
+    #[test]
+    fn on_the_bus_a_failed_queued_behind_a_blocked_observer_stops_the_write() {
+        let clock = FakeClock::new();
+        let runtime = Arc::new(Runtime::new(clock.clone()));
+        let (mark_tx, marked) = mpsc::channel();
+        let tracker = LkgTracker::new(&runtime, store(1, None), reported(mark_tx));
+        let armed = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let tray = Tray {
+            armed: Arc::clone(&armed),
+            entered: entered_tx,
+            release: release_rx,
+        };
+        let (probe, seen) = mpsc::channel();
+        let (tx, _emitted) = mpsc::channel();
+        let bus = EventBus::start(
+            &runtime,
+            store(1, None),
+            Channel(tx),
+            Box::new(Observers(vec![
+                Box::new(tray),
+                Box::new(tracker),
+                Box::new(Probe(probe)),
+            ])),
+        );
+        runtime.publish_health(health(HealthState::Healthy));
+        until(&seen, Seen::Status(HealthState::Healthy));
+        let run = record(&runtime, TriggerKind::Terminator, Outcome::Succeeded);
+        until(&seen, Seen::Executed(run.seq));
+        clock.advance(secs(59));
+        // The tray blocks on the next status (a pause change)...
+        armed.store(true, Ordering::SeqCst);
+        runtime.set_pause(PauseReasons::TIMED, true);
+        entered.recv_timeout(secs(10)).unwrap();
+        // ...while the engine fails and the minute ends.
+        runtime.publish_health(health(HealthState::Failed));
+        clock.advance(secs(2));
+        release.send(()).unwrap();
+        until(&seen, Seen::Status(HealthState::Failed));
+        assert!(
+            marked.try_recv().is_err(),
+            "marked while the runtime read Failed"
+        );
+        // Healthy again: marked once it has been for a full minute.
+        runtime.publish_health(health(HealthState::Healthy));
+        until(&seen, Seen::Status(HealthState::Healthy));
+        clock.advance(QUALIFY_AFTER);
+        bus.store_sink().report(store(1, None));
+        assert_eq!(marked.recv_timeout(secs(10)), Ok(1));
         assert!(marked.try_recv().is_err(), "marked once");
     }
 }
