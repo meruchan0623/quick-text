@@ -931,25 +931,41 @@ impl<'a, P: SourcePorts, C: Clock> Liveness<'a, P, C> {
             self.clicks.forget();
         }
         let now = self.sources.clock.now();
-        let (mut hook_clicks, mut raw_clicks) = (0_u64, 0_u64);
+        // This pass's presses per source, paired as one batch (F5-2 review
+        // 2): the two sources' presses of one pass meet before either
+        // waits, whichever the pass drained first. A mouse button has no
+        // autorepeat: every press of it counts.
+        let (mut hook_keys, mut raw_keys) = (0_usize, 0_usize);
+        let (mut hook_clicks, mut raw_clicks) = (0_usize, 0_usize);
         for sighting in seen.drain(..) {
-            match sighting {
+            let count = match sighting {
                 Sighting::Key(source, vk, true) => {
-                    self.check.saw(source, vk, now);
+                    if !self.check.counts(source, vk) {
+                        continue;
+                    }
+                    match source {
+                        Source::Hook => &mut hook_keys,
+                        Source::Raw => &mut raw_keys,
+                    }
                 }
-                Sighting::Key(source, vk, false) => self.check.released(source, vk),
-                Sighting::Click(Source::Hook) => hook_clicks += 1,
-                Sighting::Click(Source::Raw) => raw_clicks += 1,
-            }
+                Sighting::Key(source, vk, false) => {
+                    self.check.released(source, vk);
+                    continue;
+                }
+                Sighting::Click(Source::Hook) => &mut hook_clicks,
+                Sighting::Click(Source::Raw) => &mut raw_clicks,
+            };
+            *count = count.saturating_add(1);
         }
-        self.saw_clicks(hook_clicks, raw_clicks, now);
+        self.check.pair_up(hook_keys, raw_keys, now);
+        self.clicks.pair_up(hook_clicks, raw_clicks, now);
         for (check, count) in [
             ("key", self.check.take_dropped()),
             ("click", self.clicks.take_dropped()),
         ] {
             if count > 0 {
-                // Evidence dropped at the pending limit: neither a miss nor
-                // a match.
+                // Beyond the pending limit: kept to pair with the other
+                // source's, but no miss when they expire.
                 tracing::debug!(event = "input.check_dropped", check, count);
             }
         }
@@ -971,18 +987,6 @@ impl<'a, P: SourcePorts, C: Clock> Liveness<'a, P, C> {
         match (self.check.next_due(), self.clicks.next_due()) {
             (Some(key), Some(click)) => Some(key.min(click)),
             (key, click) => key.or(click),
-        }
-    }
-    /// Feeds one tick's mouse button presses into the click check. A
-    /// button has no autorepeat: every press is a new one. However many
-    /// one source brings before the other's (in this tick or a later one),
-    /// they wait for them; only the window makes a miss.
-    fn saw_clicks(&mut self, hook: u64, raw: u64, now: Instant) {
-        for (source, count) in [(Source::Hook, hook), (Source::Raw, raw)] {
-            for _ in 0..count {
-                self.clicks.saw(source, 0, now);
-                self.clicks.released(source, 0);
-            }
         }
     }
     /// F5-2: a verdict of the click check. Only "RawInput saw presses the

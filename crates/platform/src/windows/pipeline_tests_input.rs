@@ -4302,3 +4302,155 @@ fn a_lost_mouse_hook_is_found_at_the_kth_click_only_once_its_window_ran_out() {
         [HookSet::ALL, HookSet::LOW_LEVEL, HookSet::LOW_LEVEL]
     );
 }
+
+// F5-2 review 2: the consumer pairs one pass's presses as a batch, and the
+// pending limit keeps its oldest evidence (the newest beyond it are spare).
+use super::input::Sighting;
+use super::liveness::PENDING_LIMIT;
+
+impl FakeSources {
+    /// Windows removes the low-level keyboard hook and nothing else.
+    fn drop_keyboard_hook(&self) {
+        self.hooked.lock().unwrap()[0] = false;
+    }
+}
+impl Pipeline {
+    /// `count` presses only `source` reported, put straight among the
+    /// sightings of the next consumer pass: more than the test lanes hold,
+    /// as a consumer that fell behind can drain in one pass while the
+    /// producers refill its lanes. Keys are A and B in turn (down and up
+    /// each), clicks button presses.
+    fn sightings(&mut self, keys: bool, source: Source, count: usize) {
+        let seen = self.consumer.seen();
+        for index in 0..count {
+            if keys {
+                let vk = if index % 2 == 0 { 0x41 } else { 0x42 };
+                seen.push(Sighting::Key(source, vk, true));
+                seen.push(Sighting::Key(source, vk, false));
+            } else {
+                seen.push(Sighting::Click(source));
+            }
+        }
+    }
+}
+
+/// F5-2 review 2 (I1): a consumer that fell behind drains in one pass more
+/// than `PENDING_LIMIT + K` presses both healthy sources saw. The pass
+/// pairs them with each other, whichever source it drained first, so none
+/// waits or reaches the pending limit: no log at all (not even the debug
+/// one), no verdict, no reinstall. Clicks and keys alike.
+#[test]
+fn a_huge_healthy_burst_drained_in_one_pass_pairs_within_it() {
+    let _serial = serial();
+    let burst = PENDING_LIMIT + MISS_LIMIT as usize;
+    for keys in [false, true] {
+        for first in [Source::Hook, Source::Raw] {
+            let (fake, clock, signals) =
+                (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+            let sources = Sources::new(&fake, &clock, &signals);
+            sources.start();
+            let mut liveness = Liveness::new(&sources);
+            let mut pipe = Pipeline::new();
+            let (_, lines) = capture::logs(|| {
+                pipe.sightings(keys, first, burst);
+                pipe.sightings(keys, other_source(first), burst);
+                assert_eq!(pipe.tick(&mut liveness), None, "nothing waits");
+                pipe.settle(&clock, &mut liveness)
+            });
+            assert_eq!(
+                count_of(&lines, "input."),
+                0,
+                "keys {keys}, {first:?}: {lines:?}"
+            );
+            assert_eq!(fake.installs(), [HookSet::ALL]);
+            assert_eq!(heartbeat(&sources), Ok(()));
+        }
+    }
+}
+
+/// F5-2 review 2 (I1): the same burst split across two passes, one
+/// source's all in the first and the other's all in the next, either
+/// first: what is beyond the pending limit waits as spare (one debug line)
+/// and still pairs. No verdict, no gap, no reinstall, at either pass nor
+/// once the window ran out. Clicks and keys alike.
+#[test]
+fn a_huge_healthy_burst_split_across_passes_pairs_up() {
+    let _serial = serial();
+    let k = MISS_LIMIT as usize;
+    for keys in [false, true] {
+        for first in [Source::Hook, Source::Raw] {
+            let (fake, clock, signals) =
+                (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+            let sources = Sources::new(&fake, &clock, &signals);
+            sources.start();
+            let mut liveness = Liveness::new(&sources);
+            let mut pipe = Pipeline::new();
+            let (_, lines) = capture::logs(|| {
+                pipe.sightings(keys, first, PENDING_LIMIT + k);
+                pipe.tick(&mut liveness);
+                assert_eq!(heartbeat(&sources), Ok(()), "{first:?} first pass");
+                clock.advance(Duration::from_millis(1));
+                pipe.sightings(keys, other_source(first), PENDING_LIMIT + k);
+                assert_eq!(pipe.tick(&mut liveness), None, "all paired");
+                assert_eq!(heartbeat(&sources), Ok(()), "{first:?} second pass");
+                pipe.settle(&clock, &mut liveness)
+            });
+            let check = if keys { "key" } else { "click" };
+            assert_eq!(
+                lines,
+                [format!(
+                    r#"DEBUG event="input.check_dropped" check="{check}" count={k}"#
+                )],
+                "{first:?}"
+            );
+            assert_eq!(fake.installs(), [HookSet::ALL], "keys {keys}, {first:?}");
+            assert_eq!(heartbeat(&sources), Ok(()), "keys {keys}, {first:?}");
+        }
+    }
+}
+
+/// F5-2 review 2 (I2): Windows removed the mouse hook while RawInput
+/// floods the consumer with clicks without pause, far past the pending
+/// limit (512 a pass, a pass every [`GAP`]). The oldest evidence is never
+/// dropped or moved, so the hook is found and reinstalled at the first
+/// expiry of the K-th unmatched click: one window after the first pass,
+/// with the flood still going. The same for the keyboard hook under a key
+/// flood.
+#[test]
+fn a_lost_hook_is_found_within_a_window_under_a_non_stop_flood() {
+    let _serial = serial();
+    for keys in [false, true] {
+        let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+        let sources = Sources::new(&fake, &clock, &signals);
+        sources.start();
+        let mut liveness = Liveness::new(&sources);
+        let mut pipe = Pipeline::new();
+        let (component, hook) = if keys {
+            fake.drop_keyboard_hook();
+            ("keyboard_hook", HookSet::KEYBOARD)
+        } else {
+            fake.drop_mouse_hook();
+            ("mouse_hook", HookSet::MOUSE)
+        };
+        let lost = format!(r#"event="input.check" source="{component}" result="lost""#);
+        let start = clock.elapsed();
+        let mut found = None;
+        let mut dropped = 0;
+        for _ in 0..60 {
+            let (_, lines) = capture::logs(|| {
+                pipe.sightings(keys, Source::Raw, 512);
+                pipe.tick(&mut liveness)
+            });
+            dropped += count_of(&lines, "input.check_dropped");
+            if count_of(&lines, &lost) > 0 {
+                found = Some(clock.elapsed() - start);
+                break;
+            }
+            clock.advance(GAP);
+        }
+        assert!(dropped > 0, "{component}: the flood overflowed the limit");
+        assert_eq!(found, Some(MATCH_WINDOW), "{component}");
+        assert!(fake.hooked(hook), "{component} reinstalled");
+        assert_eq!(fake.installs(), [HookSet::ALL, HookSet::LOW_LEVEL]);
+    }
+}
