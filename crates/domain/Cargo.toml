@@ -13,7 +13,16 @@ encoding_rs = "0.8"
 
 [dev-dependencies]
 proptest = "1"
+# B-53 matching benchmark; same requirement as quicker-platform, so Cargo.lock gains no package.
+criterion = { version = "0.8", default-features = false }
 
 [lints]
 workspace = true
+
+# Per-keystroke matching against 1000 synthetic rules (B-53, performance-baseline.md).
+# Run with `cargo bench -p quicker-domain --bench matching`; budget gate is
+# scripts/check-bench-budget.ps1.
+[[bench]]
+name = "matching"
+harness = false
 

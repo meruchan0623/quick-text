@@ -3159,6 +3159,7 @@ name = "quicker-domain"
 version = "0.3.1"
 dependencies = [
  "chrono",
+ "criterion",
  "encoding_rs",
  "proptest",
  "regex",
