@@ -12,7 +12,6 @@ use crate::{
 };
 use quicker_domain::*;
 use quicker_platform::{fault::FaultPoint, runtime::Runtime, Shared};
-use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -54,6 +53,7 @@ impl Store {
             pending_import: None,
             safe_mode: None,
             startup_problems: vec![],
+            deferred: vec![],
             meta,
             safe_import: false,
             writable_hooks: vec![],
@@ -88,17 +88,27 @@ impl Store {
         self.draft = report.draft;
         self.previous = report.previous;
         self.pending_import = None;
+        self.deferred = report.deferred;
+        let mut problems = report.problems;
         // R6: the metadata snapshot is the first write into a directory
         // 0.3.1 left, so the pre-0.4 backup comes first, and without it the
-        // snapshot is not written. Safe mode writes nothing.
+        // snapshot is not written. Safe mode writes nothing. I-B1: the
+        // corrupt files the load left in place are renamed only once the
+        // backup holds them; while it fails they stay, and the next write or
+        // launch tries again.
         let backed_up = safe_mode.is_none().then(|| self.backup_pre_0_4().is_ok());
+        if backed_up == Some(true) {
+            // A file that stays in place refuses the writes that would
+            // replace it (logged as `store.quarantine_failed`).
+            let _ = self.quarantine_deferred(&mut problems);
+        }
         self.load_metadata(backed_up == Some(true));
         // Problems found outside the load (autostart, the startup self-test)
         // survive a reload.
         let before = std::mem::take(&mut self.startup_problems);
         // A reload (Locked retry) reports what it found that was not
         // already listed; at the first load nobody listens yet.
-        for problem in report.problems.iter().filter(|p| !before.contains(p)) {
+        for problem in problems.iter().filter(|p| !before.contains(p)) {
             self.report_problem(problem);
         }
         let kept = before.into_iter().filter(|p| {
@@ -110,7 +120,7 @@ impl Store {
                     | ProblemKind::BackupFailed { .. }
             )
         });
-        self.startup_problems = report.problems;
+        self.startup_problems = problems;
         self.startup_problems.extend(kept);
         if let Some(ok) = backed_up {
             self.note_backup(ok);
@@ -223,12 +233,14 @@ pub(super) fn read_config(path: &Path) -> Result<Config, CommandError> {
                 .at(file_label(path).unwrap_or_default())])
         })
 }
-pub(super) fn hash_file(path: &Path) -> Result<Option<Vec<u8>>, CommandError> {
+/// The content of `path`; `None` when it does not exist.
+pub(super) fn read_existing(path: &Path) -> Result<Option<Vec<u8>>, CommandError> {
     if !path.exists() {
         return Ok(None);
     }
-    let bytes = fs::read(path).map_err(|e| CommandError::io(IoOp::Read, Some(path), &e))?;
-    Ok(Some(Sha256::digest(bytes).to_vec()))
+    fs::read(path)
+        .map(Some)
+        .map_err(|e| CommandError::io(IoOp::Read, Some(path), &e))
 }
 
 #[cfg(test)]

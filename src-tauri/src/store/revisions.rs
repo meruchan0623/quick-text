@@ -1,8 +1,8 @@
 //! Publishing a configuration as a new revision, and rolling back to the previous one.
 use super::{
     fallback::revision_numbers,
-    load::{hash_file, read_config},
-    meta::PreviousRevision,
+    load::{read_config, read_existing},
+    meta::{Fingerprint, PreviousRevision},
     metadata::metadata_for_config,
     Store,
 };
@@ -31,16 +31,34 @@ impl Store {
         }
         config.revision = self.next_revision()?;
         let compiled = compile_config(&config).map_err(CommandError::validation)?;
+        // R6: before anything is written or the engine held. Also before the
+        // conflict check: a corrupt `active.json` the load left in place
+        // (I-B1) is renamed by it, as the load would have done.
+        self.backup_before_write()?;
         let active_path = self.dir.join("active.json");
-        if hash_file(&active_path)? != self.disk_hash {
+        let on_disk = read_existing(&active_path)?;
+        if on_disk.as_ref().map(|bytes| Sha256::digest(bytes).to_vec()) != self.disk_hash {
             // Edited externally: report the revision now on disk so the caller can reload.
             let current = read_config(&active_path)
                 .map(|c| c.revision)
                 .unwrap_or(self.active.revision);
             return Err(CommandError::RevisionConflict { current });
         }
-        // R6: before anything is written or the engine held.
-        self.backup_before_write()?;
+        let new_bytes = serde_json::to_vec_pretty(&config).expect("validated config serialization");
+        // I-R1: the record that describes the `active.json` on disk now
+        // (the one that matched at load, or that this session's last publish
+        // wrote) is kept beside the new one, so that if this publish fails
+        // after recording, the revision that stays active keeps its target.
+        let current = on_disk.as_deref().map(Fingerprint::of);
+        let committed = self.meta.read(|meta| {
+            meta.previous_revisions
+                .iter()
+                .find(|record| {
+                    record.active == self.active.revision
+                        && Some(&record.fingerprint) == current.as_ref()
+                })
+                .cloned()
+        });
         // Detection stops while the configuration is swapped: MANUAL is held
         // for the publish and put back as it was afterwards, whatever the
         // outcome (no-regression #8). Only MANUAL is touched, so a reason
@@ -94,16 +112,16 @@ impl Store {
             // R3: the predecessor is recorded before the new revision becomes
             // active, so that after a restart rollback returns where it would
             // now. If it is not written (store-meta.json read-only this
-            // session, or the write fails), the entry left on disk describes
-            // an older active revision, and the next load guesses as before.
+            // session, or the write fails), no entry on disk matches the new
+            // `active.json` (I-R2), and the next load guesses as before.
             let previous = PreviousRevision {
                 active: config.revision,
                 revision: old_on_disk.then_some(old.revision),
+                fingerprint: Fingerprint::of(&new_bytes),
             };
-            if let Err(e) = self
-                .meta
-                .update(|meta| meta.previous_revision = Some(previous))
-            {
+            let records: Vec<PreviousRevision> =
+                std::iter::once(previous).chain(committed).collect();
+            if let Err(e) = self.meta.update(|meta| meta.previous_revisions = records) {
                 tracing::warn!(event = "store.meta_write_failed", error = %e, "store-meta.json not written");
             }
             self.write_data(&self.dir.join("active.json"), &config)?;
@@ -129,12 +147,7 @@ impl Store {
         self.unresolved = metadata;
         self.pending_import = None;
         self.draft = config;
-        self.disk_hash = Some(
-            Sha256::digest(
-                serde_json::to_vec_pretty(&self.active).expect("validated config serialization"),
-            )
-            .to_vec(),
-        );
+        self.disk_hash = Some(Sha256::digest(&new_bytes).to_vec());
         restore(self);
         if self.safe_mode.is_some() {
             tracing::info!(event = "store.safe_mode_import", "import published");

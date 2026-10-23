@@ -61,6 +61,9 @@ pub struct Store {
     pub pending_import: Option<(Config, Vec<MigrationItem>)>,
     safe_mode: Option<SafeModeReason>,
     startup_problems: Vec<StartupProblem>,
+    /// Corrupt files the load left in place until the pre-0.4 backup holds
+    /// them (review I-B1, `Store::quarantine_deferred`).
+    deferred: Vec<fallback::DeferredQuarantine>,
     meta: MetaHandle,
     /// In safe mode: the draft was committed from an import and may be
     /// published, which ends safe mode.

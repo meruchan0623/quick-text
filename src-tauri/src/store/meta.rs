@@ -6,6 +6,7 @@
 use super::atomic::atomic_json;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -25,15 +26,28 @@ const BOOT_ID_TOLERANCE_S: u64 = 10;
 pub struct StoreMeta {
     pub last_good_revision: Option<u64>,
     /// What rollback returns to after a restart (R3), written by every
-    /// publish. Absent in a file from before it existed.
-    pub previous_revision: Option<PreviousRevision>,
+    /// publish before it replaces `active.json`: at most two records, the
+    /// one of that publish first, then the one that described the revision
+    /// active when it started (review I-R1), so that a publish that fails or
+    /// is cut short after this write leaves the committed revision its own
+    /// record. The load takes the record whose `active` and `fingerprint`
+    /// match the `active.json` it read (review I-R2), and guesses as before
+    /// without one. Absent in a file from before it existed. (A development
+    /// build wrote a single `previous_revision` object instead; that field is
+    /// no longer read and stays in `extra`.)
+    pub previous_revisions: Vec<PreviousRevision>,
     pub run_marker: Option<RunMarker>,
     pub crash_count: u32,
     /// The backup before the first 0.4 write (R6, `store::backup`):
-    /// `true` once `backup-pre-0.4/` exists (made or found), `false` when
+    /// `true` once a complete backup exists (made or found), `false` when
     /// there was nothing from before 0.4 to back up. Absent until then, and
     /// in a file from before it existed.
     pub backup_pre_0_4: Option<bool>,
+    /// The directory of that backup in the data directory (review I-B3):
+    /// `backup-pre-0.4`, or `backup-pre-0.4-<UTC time>` when an incomplete
+    /// `backup-pre-0.4` was in the way. Set with `backup_pre_0_4: true`;
+    /// absent otherwise and in a file from before it existed.
+    pub backup_pre_0_4_dir: Option<String>,
     /// Fields written by a newer release, kept verbatim (B-43).
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -43,7 +57,7 @@ pub struct StoreMeta {
 /// because it is a fact that `active - 1` only guesses: revision 3
 /// published over revision 1 recovered as last-known-good is not preceded
 /// by revision 2.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreviousRevision {
     /// The revision that was published. Any other active revision (one
     /// published by 0.3.1, which never writes this file, or one recovered
@@ -52,6 +66,29 @@ pub struct PreviousRevision {
     /// `revisions/<n>.json`; `None` when `active` replaced the empty
     /// stand-in, which is never backed up, so there is nothing to return to.
     pub revision: Option<u64>,
+    /// Of the `active.json` that publish wrote. A revision number alone can
+    /// be reused (a lost revision recovered from an older one, with this
+    /// file unreadable meanwhile): the record applies only to those bytes.
+    pub fingerprint: Fingerprint,
+}
+
+/// Identifies file content: its length and SHA-256 (lowercase hex). Used for
+/// the records above and the manifest of the pre-0.4 backup.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fingerprint {
+    pub len: u64,
+    pub sha256: String,
+}
+impl Fingerprint {
+    pub fn of(bytes: &[u8]) -> Self {
+        Self {
+            len: bytes.len() as u64,
+            sha256: Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+        }
+    }
 }
 
 /// Written at startup and cleared on a clean exit or session end; one still
@@ -254,8 +291,9 @@ mod tests {
         assert_eq!(parsed.last_good_revision, Some(4));
         // A file from before the predecessor was recorded (R3) and the
         // backup mark (R6).
-        assert_eq!(parsed.previous_revision, None);
+        assert!(parsed.previous_revisions.is_empty());
         assert_eq!(parsed.backup_pre_0_4, None);
+        assert_eq!(parsed.backup_pre_0_4_dir, None);
         let expected = RunMarker {
             boot_id: Some(7),
             started_ms: 9,
@@ -269,24 +307,67 @@ mod tests {
         assert!(parse_meta(b"{\"crash_count\": \"x\"}").is_none());
         assert!(parse_meta(b"{trunc").is_none());
         assert_eq!(parse_meta(b"{}"), Some(StoreMeta::default()));
+        let record = serde_json::json!({
+            "active": 3,
+            "revision": 1,
+            "fingerprint": {"len": 2, "sha256": "ab"}
+        });
         let recorded = parse_meta(
-            b"{\"previous_revision\": {\"active\": 3, \"revision\": 1}, \"crash_count\": 0, \
-              \"backup_pre_0_4\": true}",
+            serde_json::json!({
+                "previous_revisions": [record],
+                "crash_count": 0,
+                "backup_pre_0_4": true,
+                "backup_pre_0_4_dir": "backup-pre-0.4-20260101-000000"
+            })
+            .to_string()
+            .as_bytes(),
         )
         .unwrap();
         assert_eq!(recorded.backup_pre_0_4, Some(true));
+        assert_eq!(
+            recorded.backup_pre_0_4_dir.as_deref(),
+            Some("backup-pre-0.4-20260101-000000")
+        );
         let previous = PreviousRevision {
             active: 3,
             revision: Some(1),
+            fingerprint: Fingerprint {
+                len: 2,
+                sha256: "ab".into(),
+            },
         };
-        assert_eq!(recorded.previous_revision, Some(previous));
+        assert_eq!(recorded.previous_revisions, [previous]);
         assert!(recorded.extra.is_empty());
         let written = serde_json::to_value(&recorded).unwrap();
+        assert_eq!(written["previous_revisions"], serde_json::json!([record]));
+        assert_eq!(written["backup_pre_0_4"], true);
+        // The single record of a development build is kept but not read.
+        let old = parse_meta(b"{\"previous_revision\": {\"active\": 3, \"revision\": 1}}").unwrap();
+        assert!(old.previous_revisions.is_empty());
         assert_eq!(
-            written["previous_revision"],
+            old.extra["previous_revision"],
             serde_json::json!({"active": 3, "revision": 1})
         );
-        assert_eq!(written["backup_pre_0_4"], true);
+    }
+
+    /// Review I-R2: the fingerprint is the length and the SHA-256 of the
+    /// bytes, the same on every run (unlike `DefaultHasher`).
+    #[test]
+    fn fingerprint_is_length_and_sha256() {
+        assert_eq!(
+            Fingerprint::of(b""),
+            Fingerprint {
+                len: 0,
+                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+            }
+        );
+        assert_eq!(
+            Fingerprint::of(b"abc"),
+            Fingerprint {
+                len: 3,
+                sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            }
+        );
     }
 
     #[cfg(windows)]

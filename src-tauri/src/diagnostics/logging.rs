@@ -129,9 +129,11 @@
 //! | `session.start_failed` | warn | session monitoring did not start; `stage` (`thread`, `window`, `desktop_switch`, or `wts` with `attempts`) |
 //! | `store.quarantine` | warn | a damaged file was renamed aside |
 //! | `store.quarantine_failed` | error | the rename failed; the file stays in place |
+//! | `store.quarantine_deferred` | warn | a damaged file that 0.3.1 reads is left in place until the pre-0.4 backup holds it (review I-B1); file name |
+//! | `store.quarantine_stale` | info | a damaged file left in place changed or went away before it could be renamed aside, and is left as it is; file name |
 //! | `store.prefs_invalid` | warn | a prefs field had the wrong type or was out of range and its default is used; file name, field path, problem, the JSON type found (or an out-of-range number with `min` / `max`), never a string value |
 //! | `store.prefs_unavailable` | warn | prefs.json could not be read at startup; clipboard restore uses the defaults; file name and error |
-//! | `store.backup_pre_0_4` | info / warn | the backup before the first 0.4 write of a file 0.3.1 reads (R6): `result` `created` with the number of `files` copied, `existing` (a `backup-pre-0.4/` already there is kept), `not_needed` (nothing from before 0.4), `failed` (warn; nothing written: `files` copied before the failure, `op`, file name, `error_kind`, `os_code`), `stale_temp_removed` / `stale_temp_kept` (warn) for the temp directory of an interrupted attempt with its name |
+//! | `store.backup_pre_0_4` | info / warn | the backup before the first 0.4 write of a file 0.3.1 reads (R6): `result` `created` with the number of `files` copied, `existing` (a complete backup already there is kept), `not_needed` (nothing from before 0.4), all three with the backup directory as `dir` (empty for `not_needed`); `existing_incomplete` (warn; a backup directory without a valid manifest, left as it is: `dir` and `reason`), `failed` (warn; nothing written: `files` copied before the failure, `op`, file name, `error_kind`, `os_code`), `stale_temp_removed` / `stale_temp_kept` (warn) for the temp directory of an interrupted attempt with its name |
 //! | `store.corrupt` | warn | a configuration file does not parse; file name, error code, `kind` for `config_malformed` (`utf8`, `syntax`, `eof` = cut short, `shape`), `line` and `column` (0 without a position, as in the diagnostics bundle), error |
 //! | `store.crash_loop` | warn | consecutive crashes at startup; `crash_count` |
 //! | `store.create_dir_failed` | warn | the data directory could not be created; error |

@@ -9,7 +9,7 @@ use super::{
         StoreIo,
     },
     load::read_config,
-    meta::{parse_meta, PreviousRevision, StoreMeta, META_FILE},
+    meta::{parse_meta, Fingerprint, PreviousRevision, StoreMeta, META_FILE},
     test_support::*,
     RecoverySource, Store,
 };
@@ -194,6 +194,16 @@ fn meta_on_disk(dir: &Path) -> StoreMeta {
     parse_meta(&fs::read(dir.join(META_FILE)).unwrap()).unwrap()
 }
 const TRUNCATED: &[u8] = b"{\"version\": 1, \"rules\": [";
+/// Marks the pre-0.4 backup as dealt with in store-meta.json, as a launch of
+/// 0.4 that made it leaves the directory: the load then renames corrupt
+/// files aside itself instead of leaving them for the backup (review I-B1).
+fn settled(dir: &Path) {
+    let meta = StoreMeta {
+        backup_pre_0_4: Some(true),
+        ..StoreMeta::default()
+    };
+    atomic_json(&dir.join(META_FILE), &meta).unwrap();
+}
 
 /// S-04 acceptance: the five corruption samples plus a BOM and a newer
 /// version all start, and no file is deleted.
@@ -237,6 +247,10 @@ fn corruption_samples_start_without_losing_files() {
             write(&dir, "revisions/1.json", &bytes(&config_at(1)));
         }
         let before = files(&dir);
+        if matches!(name, "truncated" | "invalid utf-8") {
+            // Renamed aside at the load, as after the pre-0.4 backup.
+            settled(&dir);
+        }
         let report = load_or_fallback(&dir, &env(&world));
         let after = files(&dir);
         assert_nothing_lost(&before, &after);
@@ -364,6 +378,7 @@ fn failed_quarantine_is_locked() {
     let world = world();
     write(&dir, "active.json", TRUNCATED);
     write(&dir, "revisions/1.json", &bytes(&config_at(1)));
+    settled(&dir);
     world.rename_fails.store(true, Ordering::SeqCst);
     let before = files(&dir);
     let report = load_or_fallback(&dir, &env(&world));
@@ -383,6 +398,7 @@ fn no_valid_config_starts_empty_and_keeps_every_file() {
     write(&dir, "revisions/1.json", b"\xFF");
     write(&dir, "previous.json", b"[]");
     let before = files(&dir);
+    settled(&dir);
     let report = load_or_fallback(&dir, &env(&world));
     assert_eq!(
         report.outcome,
@@ -432,6 +448,7 @@ fn no_valid_config_survives_clean_restarts() {
     write(&dir, "revisions/1.json", b"\xFF");
     write(&dir, "previous.json", b"[]");
     let before = files(&dir);
+    settled(&dir);
     let store = Store::load_with(dir.path(), &env(&world));
     assert_no_valid_config(&store);
     let problems: Vec<_> = store.startup_problems().iter().map(|p| &p.kind).collect();
@@ -471,6 +488,7 @@ fn no_valid_config_keeps_protecting_a_surviving_draft() {
         write(&dir, name, TRUNCATED);
     }
     write(&dir, "draft.json", &bytes(&drafted));
+    settled(&dir);
     let draft_bytes = fs::read(dir.join("draft.json")).unwrap();
     let store = Store::load_with(dir.path(), &env(&world));
     assert_no_valid_config(&store);
@@ -715,6 +733,7 @@ fn unlistable_evidence_keeps_no_valid_config_and_the_draft() {
         let world = world();
         write(&dir, candidate, TRUNCATED);
         write(&dir, "draft.json", &bytes(&drafted));
+        settled(&dir);
         let draft_bytes = fs::read(dir.join("draft.json")).unwrap();
         let store = Store::load_with(dir.path(), &env(&world));
         assert_no_valid_config(&store);
@@ -836,6 +855,15 @@ fn write_revision(dir: &Path, revision: u64, id: &str) -> Config {
     atomic_json(&metadata, &vec![original(id, id)]).unwrap();
     config
 }
+/// The first record in store-meta.json, the one of the active revision:
+/// its active revision and predecessor. Its fingerprint matches active.json.
+fn active_record(dir: &Path) -> (u64, Option<u64>) {
+    let meta = meta_on_disk(dir);
+    let record = meta.previous_revisions.first().expect("a record");
+    let active = fs::read(dir.join("active.json")).unwrap();
+    assert_eq!(record.fingerprint, Fingerprint::of(&active));
+    (record.active, record.revision)
+}
 /// What rollback would return to, with its migration metadata.
 fn rollback_target(store: &Store) -> (Option<Config>, Value) {
     let metadata = serde_json::to_value(&store.previous_unresolved).unwrap();
@@ -866,13 +894,7 @@ fn rollback_target_survives_a_restart_after_recovery() {
     store.publish(three.clone()).unwrap();
     assert_eq!(store.active.revision, 3);
     assert_eq!(store.previous.as_ref().unwrap().rules, one.rules);
-    assert_eq!(
-        meta_on_disk(&dir).previous_revision,
-        Some(PreviousRevision {
-            active: 3,
-            revision: Some(1)
-        })
-    );
+    assert_eq!(active_record(&dir), (3, Some(1)));
     let target = rollback_target(&store);
     clean_exit(store, &world);
 
@@ -905,10 +927,11 @@ fn rollback_target_survives_a_restart_after_recovery() {
 
 /// F4-1 review R3: without a record for the active revision the
 /// predecessor is guessed as before (`revisions/<active - 1>.json`, then
-/// `previous.json`): no `previous_revision` in store-meta.json (a file from
+/// `previous.json`): no `previous_revisions` in store-meta.json (a file from
 /// before it existed), an entry for another active revision (one published
-/// by 0.3.1), or a recorded snapshot that is gone. A record that applies
-/// wins over the guess. When store-meta.json is read-only for a session,
+/// by 0.3.1), a recorded snapshot that is gone, or (review I-R2) a record
+/// whose fingerprint is not that of the active.json just read. A record
+/// that applies wins over the guess, also as the second of two. When store-meta.json is read-only for a session,
 /// its publishes leave it untouched and the next launch guesses as before.
 #[test]
 fn rollback_target_without_a_record_is_guessed_as_before() {
@@ -921,20 +944,46 @@ fn rollback_target_without_a_record_is_guessed_as_before() {
         ..metadata_config(&["three"])
     };
     write(&dir, "active.json", &bytes(&three));
-    let previous_with = |recorded: Option<PreviousRevision>| {
+    let previous_with = |recorded: Vec<PreviousRevision>| {
         let meta = StoreMeta {
-            previous_revision: recorded,
+            previous_revisions: recorded,
             ..StoreMeta::default()
         };
         atomic_json(&dir.join(META_FILE), &meta).unwrap();
         load_or_fallback(&dir, &env(&world)).previous
     };
-    let recorded = |active, revision| Some(PreviousRevision { active, revision });
-    for guessed in [None, recorded(2, Some(1)), recorded(3, Some(7))] {
-        assert_eq!(previous_with(guessed), Some(two.clone()), "{guessed:?}");
+    let matching = Fingerprint::of(&bytes(&three));
+    let other = Fingerprint::of(&bytes(&Config {
+        revision: 3,
+        ..metadata_config(&["other"])
+    }));
+    let record = |active, revision, fingerprint: &Fingerprint| PreviousRevision {
+        active,
+        revision,
+        fingerprint: fingerprint.clone(),
+    };
+    for guessed in [
+        vec![],
+        vec![record(2, Some(1), &matching)],
+        vec![record(3, Some(7), &matching)],
+        vec![record(3, Some(1), &other)],
+        vec![record(3, None, &other)],
+    ] {
+        assert_eq!(
+            previous_with(guessed.clone()),
+            Some(two.clone()),
+            "{guessed:?}"
+        );
     }
-    assert_eq!(previous_with(recorded(3, Some(1))), Some(one));
-    assert_eq!(previous_with(recorded(3, None)), None);
+    assert_eq!(
+        previous_with(vec![record(3, Some(1), &matching)]),
+        Some(one.clone())
+    );
+    assert_eq!(
+        previous_with(vec![record(3, None, &other), record(3, Some(1), &matching)]),
+        Some(one)
+    );
+    assert_eq!(previous_with(vec![record(3, None, &matching)]), None);
 
     let dir = TempDir::new();
     write_revision(&dir, 1, "one");
@@ -966,13 +1015,7 @@ fn stand_in_has_no_rollback_target_after_a_restart() {
     let mut store = Store::load_with(dir.path(), &env(&world));
     store.publish(metadata_config(&["first"])).unwrap();
     assert_eq!(store.previous, None);
-    assert_eq!(
-        meta_on_disk(&dir).previous_revision,
-        Some(PreviousRevision {
-            active: 1,
-            revision: None
-        })
-    );
+    assert_eq!(active_record(&dir), (1, None));
     clean_exit(store, &world);
     write(&dir, "previous.json", &bytes(&config_at(0)));
     let mut store = Store::load_with(dir.path(), &env(&world));
@@ -1019,6 +1062,7 @@ fn recovers_in_plan_order_and_publishes_past_every_revision() {
     write(&dir, "active.json", TRUNCATED);
     write(&dir, "revisions/1.json", &bytes(&config_at(1)));
     write(&dir, "revisions/2.json", TRUNCATED);
+    settled(&dir);
     let report = load_or_fallback(&dir, &env(&world));
     assert_eq!(
         report.outcome,
@@ -1044,6 +1088,8 @@ fn recovers_in_plan_order_and_publishes_past_every_revision() {
     assert_eq!(report.active, config_at(4));
 }
 
+/// Before the pre-0.4 backup the corrupt draft stays where it is, listed
+/// for the store to rename once the backup holds it (review I-B1).
 #[test]
 fn corrupt_draft_is_quarantined_and_restarts_from_active() {
     let dir = TempDir::new();
@@ -1053,7 +1099,17 @@ fn corrupt_draft_is_quarantined_and_restarts_from_active() {
     let report = load_or_fallback(&dir, &env(&world));
     assert_eq!(report.outcome, LoadOutcome::Normal);
     assert_eq!(report.draft, config_at(1));
+    assert!(quarantined(&kinds(&report)).is_empty());
+    let deferred: Vec<_> = report.deferred.iter().map(|d| &d.path).collect();
+    assert_eq!(deferred, [&dir.join("draft.json")]);
+    assert_eq!(fs::read(dir.join("draft.json")).unwrap(), TRUNCATED);
+
+    settled(&dir);
+    let report = load_or_fallback(&dir, &env(&world));
+    assert_eq!(report.outcome, LoadOutcome::Normal);
+    assert_eq!(report.draft, config_at(1));
     assert_eq!(quarantined(&kinds(&report)), ["draft.json"]);
+    assert!(report.deferred.is_empty());
 }
 
 /// Unclean starts in the same boot within five minutes count; the second
@@ -2182,6 +2238,8 @@ fn a_locked_retry_after_the_self_test_decision_stays_paused() {
 
 /// A data directory as 0.3.1 leaves it, in a byte layout 0.4 never writes
 /// (compact JSON, CRLF, `[ ]`), so a copy that went through serde would show.
+/// Plus a `prefs.json`: 0.3.1 never reads it (the file is new in 0.4), but
+/// one that 0.4 wrote before the backup is copied along.
 fn legacy_031_dir(dir: &Path) {
     let compact = |config: &Config| {
         let mut out = serde_json::to_vec(config).unwrap();
@@ -2255,7 +2313,14 @@ fn first_write_backs_up_a_031_directory_byte_for_byte() {
     let mut store = Store::load_with(dir.path(), &env(&world));
     assert_eq!(store.safe_mode(), None);
     assert_eq!(store.active, config_at(3));
-    assert_eq!(files(&backup_dir(&dir)), subset(&before, &LEGACY_BACKED_UP));
+    assert_eq!(
+        assert_valid_backup(&backup_dir(&dir)),
+        subset(&before, &LEGACY_BACKED_UP)
+    );
+    assert_eq!(
+        meta_on_disk(&dir).backup_pre_0_4_dir.as_deref(),
+        Some("backup-pre-0.4")
+    );
     // The snapshot rewrote it after the backup was made.
     assert_ne!(
         fs::read(dir.join("revisions/3.metadata.json")).unwrap(),
@@ -2350,31 +2415,49 @@ fn failed_backup_refuses_writes_until_it_succeeds() {
     assert_eq!(store.active.revision, 4);
     let mut expected = LEGACY_BACKED_UP.to_vec();
     expected.retain(|name| *name != "prefs.json");
-    assert_eq!(files(&backup_dir(&dir)), subset(&before, &expected));
+    assert_eq!(
+        assert_valid_backup(&backup_dir(&dir)),
+        subset(&before, &expected)
+    );
     assert_eq!(backup_failed(&store), 0);
     assert_eq!(meta_on_disk(&dir).backup_pre_0_4, Some(true));
     assert!(store.runtime.engine_state().listening);
 }
 
-/// R6: a complete `backup-pre-0.4/` found in the directory is kept as it is
-/// and only the mark is set.
+/// R6: a complete `backup-pre-0.4/` found in the directory (one whose
+/// manifest checks out, I-B3) is kept as it is and only the mark is set.
 #[test]
 fn an_existing_backup_is_never_overwritten() {
     let dir = TempDir::new();
     let world = world();
     legacy_031_dir(&dir);
+    let earlier_active: &[u8] = b"from an earlier backup";
+    write(&dir, "backup-pre-0.4/active.json", earlier_active);
+    let manifest = json!({
+        "version": 1,
+        "files": [{
+            "path": "active.json",
+            "len": earlier_active.len(),
+            "sha256": Fingerprint::of(earlier_active).sha256,
+        }],
+    });
     write(
         &dir,
-        "backup-pre-0.4/active.json",
-        b"from an earlier backup",
+        "backup-pre-0.4/manifest.json",
+        &value_bytes(&manifest),
     );
     let earlier = files(&backup_dir(&dir));
 
     let mut store = Store::load_with(dir.path(), &env(&world));
     assert_eq!(meta_on_disk(&dir).backup_pre_0_4, Some(true));
+    assert_eq!(
+        meta_on_disk(&dir).backup_pre_0_4_dir.as_deref(),
+        Some("backup-pre-0.4")
+    );
     store.publish(metadata_config(&["b"])).unwrap();
     assert_eq!(files(&backup_dir(&dir)), earlier);
     assert!(backup_temps(&dir).is_empty());
+    assert!(dated_backups(&dir).is_empty());
 }
 
 /// R6: the temp directories an interrupted backup left are removed and the
@@ -2399,7 +2482,333 @@ fn an_interrupted_backup_is_made_again() {
     let store = Store::load_with(dir.path(), &env(&world));
     assert_eq!(store.safe_mode(), None);
     assert!(backup_temps(&dir).is_empty());
-    assert_eq!(files(&backup_dir(&dir)), subset(&before, &LEGACY_BACKED_UP));
+    assert_eq!(
+        assert_valid_backup(&backup_dir(&dir)),
+        subset(&before, &LEGACY_BACKED_UP)
+    );
+}
+
+/// The files of the backup in `backup` after checking them against its
+/// manifest (I-B3), independently of `store::backup`: every file is listed
+/// with its length and SHA-256, and nothing else is in the directory.
+fn assert_valid_backup(backup: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    use sha2::{Digest, Sha256};
+    let mut contents = files(backup);
+    let manifest = contents
+        .remove(Path::new("manifest.json"))
+        .unwrap_or_else(|| panic!("{} has no manifest", backup.display()));
+    let manifest: Value = serde_json::from_slice(&manifest).unwrap();
+    let listed: BTreeMap<PathBuf, (u64, String)> = manifest["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                rel(entry["path"].as_str().unwrap()),
+                (
+                    entry["len"].as_u64().unwrap(),
+                    entry["sha256"].as_str().unwrap().to_string(),
+                ),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed.keys().collect::<Vec<_>>(),
+        contents.keys().collect::<Vec<_>>()
+    );
+    for (path, content) in &contents {
+        let sha256: String = Sha256::digest(content)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let expected = (content.len() as u64, sha256);
+        assert_eq!(listed[path], expected, "{}", path.display());
+    }
+    contents
+}
+/// `store-meta.json` as JSON, fields of any release included.
+fn meta_value(dir: &Path) -> Value {
+    serde_json::from_slice(&fs::read(dir.join(META_FILE)).unwrap()).unwrap()
+}
+/// The names of the dated backups (`backup-pre-0.4-<UTC>`) in `dir`.
+fn dated_backups(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("backup-pre-0.4-"))
+        .collect();
+    names.sort();
+    names
+}
+fn problem_kinds(store: &Store) -> Vec<&ProblemKind> {
+    store.startup_problems().iter().map(|p| &p.kind).collect()
+}
+/// `active.json` damaged in the way 0.3.1 could leave it (cut short, CRLF).
+const LEGACY_CUT_SHORT: &[u8] = b"{\"version\":1,\"rules\":[\r\n";
+
+/// Review I-R1 (test 1): a publish that fails after store-meta.json was
+/// written, at `active.json`, does not change the rollback target of the
+/// revision that stays active. Revision 3 was published over revision 1
+/// (recovered as last-known-good); publishing 4 fails; after a restart
+/// rollback still returns to 1, not to the guessed 2.
+#[test]
+fn a_failed_publish_keeps_the_rollback_target_of_the_committed_revision() {
+    let dir = TempDir::new();
+    let world = world();
+    let one = write_revision(&dir, 1, "one");
+    write_revision(&dir, 2, "two");
+    write(&dir, "active.json", TRUNCATED);
+    let meta = StoreMeta {
+        last_good_revision: Some(1),
+        ..StoreMeta::default()
+    };
+    atomic_json(&dir.join(META_FILE), &meta).unwrap();
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.active, one);
+    store.publish(metadata_config(&["three"])).unwrap();
+    assert_eq!(store.active.revision, 3);
+    let target = rollback_target(&store);
+    assert_eq!(target.0.as_ref().unwrap().rules, one.rules);
+    clean_exit(store, &world);
+
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(rollback_target(&store), target);
+    let committed = fs::read(dir.join("active.json")).unwrap();
+    // The temp file of active.json cannot be created: every write before it,
+    // store-meta.json included, goes through.
+    let blocker = dir.join("active.json.tmp");
+    fs::create_dir(&blocker).unwrap();
+    assert!(store.publish(metadata_config(&["four"])).is_err());
+    assert_eq!(fs::read(dir.join("active.json")).unwrap(), committed);
+    clean_exit(store, &world);
+    fs::remove_dir(&blocker).unwrap();
+
+    let store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.active.revision, 3);
+    assert_eq!(rollback_target(&store), target);
+}
+
+/// Review I-R2 (test 2): a record applies only to the `active.json` it was
+/// written for. Revision 3 (published over 1, no snapshot of its own yet)
+/// is lost with a damaged `active.json` while store-meta.json cannot be
+/// read; recovered from 2, the next publish is revision 3 again and its
+/// record cannot be written. Once store-meta.json reads again, the old
+/// record for "3" does not describe this revision 3: rollback returns to 2.
+#[test]
+fn a_record_for_a_reused_revision_number_is_ignored() {
+    let dir = TempDir::new();
+    let world = world();
+    write_revision(&dir, 1, "one");
+    let two = write_revision(&dir, 2, "two");
+    write(&dir, "active.json", TRUNCATED);
+    let meta = StoreMeta {
+        last_good_revision: Some(1),
+        ..StoreMeta::default()
+    };
+    atomic_json(&dir.join(META_FILE), &meta).unwrap();
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    store.publish(metadata_config(&["three"])).unwrap();
+    assert_eq!(store.active.revision, 3);
+    clean_exit(store, &world);
+
+    write(&dir, "active.json", TRUNCATED);
+    assert!(!dir.join("revisions/3.json").exists());
+    world.locked.lock().push(META_FILE);
+    let meta_before = fs::read(dir.join(META_FILE)).unwrap();
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.active, two);
+    store.publish(metadata_config(&["three again"])).unwrap();
+    assert_eq!(store.active.revision, 3);
+    assert_eq!(store.previous, Some(two.clone()));
+    clean_exit(store, &world);
+    assert_eq!(fs::read(dir.join(META_FILE)).unwrap(), meta_before);
+    world.locked.lock().clear();
+
+    let store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.active.revision, 3);
+    assert_eq!(store.active.rules, metadata_config(&["three again"]).rules);
+    assert_eq!(store.previous, Some(two));
+}
+
+/// Review I-B1 (test 3): at the first 0.4 start a damaged `active.json` is
+/// not renamed by the load. The backup holds its original bytes under the
+/// name `active.json`; the quarantine copy appears only once that backup
+/// is complete.
+#[test]
+fn a_corrupt_active_is_backed_up_before_it_is_quarantined() {
+    let dir = TempDir::new();
+    let world = world();
+    legacy_031_dir(&dir);
+    write(&dir, "active.json", LEGACY_CUT_SHORT);
+    let before = files(&dir);
+    let data_files = || {
+        let mut now = files(&dir);
+        now.remove(Path::new(META_FILE));
+        now
+    };
+
+    // The load alone (no backup yet) leaves every file where 0.3.1 reads it.
+    let report = load_or_fallback(&dir, &env(&world));
+    assert_eq!(
+        report.outcome,
+        LoadOutcome::Recovered {
+            from: RecoverySource::Revision,
+            revision: Some(2)
+        }
+    );
+    assert!(quarantined(&kinds(&report)).is_empty());
+    assert_eq!(data_files(), before);
+    world.advance(10 * 60 * 1000);
+
+    let store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.safe_mode(), None);
+    let backup = assert_valid_backup(&backup_dir(&dir));
+    assert_eq!(backup[&rel("active.json")], LEGACY_CUT_SHORT);
+    assert_eq!(quarantined(&problem_kinds(&store)), ["active.json"]);
+    assert!(!dir.join("active.json").exists());
+    let quarantine: Vec<Vec<u8>> = quarantine_files(&dir).into_values().collect();
+    assert_eq!(quarantine, [LEGACY_CUT_SHORT.to_vec()]);
+    assert_nothing_lost(&before, &files(&dir));
+}
+
+/// Review I-B1 (test 4): while the backup fails, the damaged `active.json`
+/// is not renamed either: every file 0.3.1 reads stays byte for byte, the
+/// write is refused, and the next write tries both again.
+#[test]
+fn a_failed_backup_leaves_a_corrupt_active_in_place() {
+    let dir = TempDir::new();
+    let world = world();
+    legacy_031_dir(&dir);
+    write(&dir, "active.json", LEGACY_CUT_SHORT);
+    // prefs.json cannot be read: the backup cannot be completed.
+    fs::remove_file(dir.join("prefs.json")).unwrap();
+    fs::create_dir(dir.join("prefs.json")).unwrap();
+    let before = files(&dir);
+    let data_files = || {
+        let mut now = files(&dir);
+        now.remove(Path::new(META_FILE));
+        now
+    };
+
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.safe_mode(), None);
+    assert_eq!(store.active.revision, 2);
+    assert_eq!(backup_failed(&store), 1);
+    assert!(quarantined(&problem_kinds(&store)).is_empty());
+    assert_eq!(data_files(), before);
+    let refused = |result: Result<(), CommandError>| {
+        matches!(
+            result,
+            Err(CommandError::Io { path: Some(ref path), .. }) if path == "backup-pre-0.4"
+        )
+    };
+    assert!(refused(store.save(metadata_config(&["b"]))));
+    assert!(refused(store.publish(metadata_config(&["b"]))));
+    assert_eq!(data_files(), before);
+
+    fs::remove_dir(dir.join("prefs.json")).unwrap();
+    store.save(metadata_config(&["b"])).unwrap();
+    assert_eq!(backup_failed(&store), 0);
+    let backup = assert_valid_backup(&backup_dir(&dir));
+    assert_eq!(backup[&rel("active.json")], LEGACY_CUT_SHORT);
+    assert!(!dir.join("active.json").exists());
+    assert_eq!(quarantined(&problem_kinds(&store)), ["active.json"]);
+    store.publish(store.draft.clone()).unwrap();
+    assert_eq!(store.active.revision, 3);
+}
+
+/// Review I-B3 (test 5): a `backup-pre-0.4` without a valid manifest (empty,
+/// cut short, or a file) is never taken as the backup and never changed or
+/// removed: a dated `backup-pre-0.4-<UTC>/` with a manifest is made beside
+/// it, and store-meta.json names it. Later writes and launches keep both.
+#[test]
+fn an_incomplete_existing_backup_is_kept_and_a_dated_one_made() {
+    for existing in ["empty", "partial", "file"] {
+        let dir = TempDir::new();
+        let world = world();
+        legacy_031_dir(&dir);
+        let before = files(&dir);
+        match existing {
+            "empty" => fs::create_dir(backup_dir(&dir)).unwrap(),
+            "partial" => write(&dir, "backup-pre-0.4/active.json", b"cut short"),
+            _ => write(&dir, "backup-pre-0.4", b"not a directory"),
+        }
+        let original = || {
+            let mut entries: BTreeMap<PathBuf, Vec<u8>> = files(&dir)
+                .into_iter()
+                .filter(|(path, _)| path.starts_with("backup-pre-0.4"))
+                .collect();
+            if backup_dir(&dir).is_dir() {
+                let count = fs::read_dir(backup_dir(&dir)).unwrap().count();
+                entries.insert(PathBuf::from("<entries>"), vec![count as u8]);
+            }
+            entries
+        };
+        let earlier = original();
+
+        let mut store = Store::load_with(dir.path(), &env(&world));
+        assert_eq!(store.safe_mode(), None, "{existing}");
+        assert_eq!(backup_failed(&store), 0, "{existing}");
+        assert_eq!(original(), earlier, "{existing}");
+        let dated = dated_backups(&dir);
+        assert_eq!(dated.len(), 1, "{existing}");
+        let backup = assert_valid_backup(&dir.join(&dated[0]));
+        assert_eq!(backup, subset(&before, &LEGACY_BACKED_UP), "{existing}");
+        let meta = meta_value(&dir);
+        assert_eq!(meta["backup_pre_0_4"], true, "{existing}");
+        assert_eq!(meta["backup_pre_0_4_dir"], dated[0].as_str(), "{existing}");
+
+        store.publish(metadata_config(&["b"])).unwrap();
+        clean_exit(store, &world);
+        let store = Store::load_with(dir.path(), &env(&world));
+        assert_eq!(store.active.revision, 4);
+        assert_eq!(original(), earlier, "{existing}");
+        assert_eq!(dated_backups(&dir), dated, "{existing}");
+        assert!(backup_temps(&dir).is_empty());
+    }
+}
+
+/// Review I-B2 (test 6): a recovery import after every candidate turned out
+/// corrupt is no new data directory. The mark is never `false`, and the
+/// backup holds the originals: the damaged candidates this launch found
+/// (still unrenamed), and the quarantine copies an earlier launch left.
+#[test]
+fn a_recovery_import_backs_up_the_corrupt_candidates() {
+    let import = |dir: &Path, world: &Arc<World>| {
+        let mut store = Store::load_with(dir.to_path_buf(), &env(world));
+        assert_no_valid_config(&store);
+        let imported = metadata_config(&["imported"]);
+        store.pending_import = Some((imported.clone(), vec![]));
+        store.save(imported).unwrap();
+        store.publish(store.draft.clone()).unwrap();
+        assert_eq!(store.safe_mode(), None);
+        assert_eq!(meta_value(dir)["backup_pre_0_4"], true);
+        assert_valid_backup(&backup_dir(dir))
+    };
+
+    let dir = TempDir::new();
+    let world = world();
+    write(&dir, "active.json", TRUNCATED);
+    write(&dir, "revisions/1.json", b"\xFF");
+    write(&dir, "previous.json", b"[]");
+    let before = files(&dir);
+    let backup = import(&dir, &world);
+    let names = ["active.json", "revisions/1.json", "previous.json"];
+    assert_eq!(subset(&backup, &names), before);
+    assert_eq!(quarantine_files(&dir).len(), 3);
+    assert_nothing_lost(&before, &files(&dir));
+
+    let dir = TempDir::new();
+    let world = self::world();
+    write(&dir, "active.corrupt-20260101-000000.json", TRUNCATED);
+    write(&dir, "revisions/1.corrupt-20260101-000000.json", b"\xFF");
+    let before = files(&dir);
+    let backup = import(&dir, &world);
+    let names = [
+        "active.corrupt-20260101-000000.json",
+        "revisions/1.corrupt-20260101-000000.json",
+    ];
+    assert_eq!(subset(&backup, &names), before);
 }
 
 /// Fault injection (B-52): the store points behave as the real failures.
