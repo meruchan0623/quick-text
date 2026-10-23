@@ -250,6 +250,16 @@ impl Task {
         }
     }
 
+    /// A manual run (no rule) in `process`, started at `started`.
+    fn manual(process: &str, started: Instant) -> Self {
+        Self {
+            rule_id: String::new(),
+            trigger: TriggerKind::Manual,
+            process: Some(process.to_owned()).filter(|name| !name.is_empty()),
+            queued_at: started,
+        }
+    }
+
     fn record(&self, verdict: Verdict, skipped_formats: Vec<u32>, timings: StageTimings) -> Record {
         Record {
             process: self.process.clone(),
@@ -447,13 +457,7 @@ pub(super) fn record_manual(process: &str, report: &RunReport, started: Instant)
     } else {
         classify(&report.result, report.reason, current_stage(), sent)
     };
-    let task = Task {
-        rule_id: String::new(),
-        trigger: TriggerKind::Manual,
-        process: Some(process.to_owned()).filter(|name| !name.is_empty()),
-        queued_at: started,
-    };
-    crate::runtime::current().record(task.record(
+    crate::runtime::current().record(Task::manual(process, started).record(
         verdict,
         report.skipped_formats.clone(),
         stage_timings(None, started, end, &stage_marks()),
@@ -1517,17 +1521,10 @@ impl ExecutorCore {
             Ok(report) => (report.result, report.reason, report.skipped_formats),
             Err(payload) => {
                 panicked = true;
-                let kind = if payload.is::<&'static str>() {
-                    "str"
-                } else if payload.is::<String>() {
-                    "string"
-                } else {
-                    "other"
-                };
                 tracing::error!(
                     event = "executor.panic",
                     stage = current_stage().as_str(),
-                    kind,
+                    kind = panic_kind(&*payload),
                     epoch,
                     "executor task panicked; the worker keeps serving"
                 );
@@ -1577,6 +1574,18 @@ impl ExecutorCore {
             },
         };
         guard.settle(verdict, skipped_formats, Some(last), end);
+    }
+}
+
+/// What `executor.panic` records of a panic payload: its kind only, never
+/// its text.
+fn panic_kind(payload: &(dyn std::any::Any + Send)) -> &'static str {
+    if payload.is::<&'static str>() {
+        "str"
+    } else if payload.is::<String>() {
+        "string"
+    } else {
+        "other"
     }
 }
 
@@ -1718,8 +1727,24 @@ impl TaskScope {
         &self,
         open: impl FnOnce() -> Result<C, String>,
     ) -> Result<Claimed<C>, String> {
-        let token = self.epoch + 1;
-        let holder = &self.core.clipboard_holder;
+        self.core
+            .claim_clipboard(self.epoch, &self.clipboard_refused, open)
+    }
+}
+
+impl ExecutorCore {
+    /// Claims the clipboard for a lease of a run of `epoch` (token
+    /// `epoch + 1`), then opens the backend. Refused (`ClipboardBusy`,
+    /// flagged in `refused`) while a fenced run still holds it; a backend
+    /// that fails to open gives the claim back at once.
+    fn claim_clipboard<C: ClipboardBackend>(
+        self: &Arc<Self>,
+        epoch: u64,
+        refused: &AtomicBool,
+        open: impl FnOnce() -> Result<C, String>,
+    ) -> Result<Claimed<C>, String> {
+        let token = epoch + 1;
+        let holder = &self.clipboard_holder;
         if holder
             .compare_exchange(0, token, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
@@ -1728,13 +1753,13 @@ impl TaskScope {
                 event = "executor.clipboard_busy",
                 "clipboard held by a stalled task; paste refused"
             );
-            self.clipboard_refused.store(true, Ordering::SeqCst);
+            refused.store(true, Ordering::SeqCst);
             return Err(CLIPBOARD_HELD.into());
         }
         match open() {
             Ok(inner) => Ok(Claimed {
                 inner,
-                core: Arc::clone(&self.core),
+                core: Some(Arc::clone(self)),
                 token,
             }),
             Err(error) => {
@@ -1743,16 +1768,16 @@ impl TaskScope {
             }
         }
     }
+}
 
-    /// Fault-injection points on the send path (no-ops without the feature).
-    fn faults(&self) {
-        if fault::take(FaultPoint::ExecutorPanic).is_some() {
-            panic!("fault injection: executor panic");
-        }
-        if let Some(ms) = fault::take(FaultPoint::ExecutorHang) {
-            // A real stall of this thread, not the injected clock.
-            std::thread::sleep(Duration::from_millis(ms));
-        }
+/// Fault-injection points on the send path (no-ops without the feature).
+fn send_faults() {
+    if fault::take(FaultPoint::ExecutorPanic).is_some() {
+        panic!("fault injection: executor panic");
+    }
+    if let Some(ms) = fault::take(FaultPoint::ExecutorHang) {
+        // A real stall of this thread, not the injected clock.
+        std::thread::sleep(Duration::from_millis(ms));
     }
 }
 
@@ -1821,13 +1846,13 @@ impl<I: Injector> Fenced<'_, I> {
     fn send(&self, events: &[KeyEvent], send: impl FnOnce() -> u32) -> u32 {
         let scope = self.scope;
         let core = &scope.core;
-        scope.faults();
+        send_faults();
         // A fenced or refused task leaves at once, without waiting.
         if scope.refused.load(Ordering::SeqCst) || scope.check().is_err() {
             return 0;
         }
         core.pause(Pause::BeforeSend);
-        let _turn = match core.lock_send(SEND_LOCK_WAIT) {
+        let turn = match core.lock_send(SEND_LOCK_WAIT) {
             Ok(turn) => turn,
             Err(refusal) => {
                 scope.refused.store(true, Ordering::SeqCst);
@@ -1841,17 +1866,33 @@ impl<I: Injector> Fenced<'_, I> {
         if scope.check().is_err() {
             return 0;
         }
+        core.send_held(&turn, events, &scope.sent, send)
+    }
+}
+
+impl ExecutorCore {
+    /// Makes one batch's call in the caller's hold of the send lock
+    /// (`_turn`, S1, its epoch already checked there) and settles the
+    /// held-key bitmap around it (S2). `sent` records that the call
+    /// accepted at least one event.
+    fn send_held(
+        &self,
+        _turn: &SendTurn<'_>,
+        events: &[KeyEvent],
+        sent: &AtomicBool,
+        send: impl FnOnce() -> u32,
+    ) -> u32 {
         // S2: every key-down of the batch is marked in flight before the
         // call...
         for &(vk, up) in events {
             if !up {
-                core.held.mark_down(vk);
+                self.held.mark_down(vk);
             }
         }
         let accepted = send();
         if accepted > 0 {
             // Side effects of a run the fence may have to record.
-            scope.sent.store(true, Ordering::SeqCst);
+            sent.store(true, Ordering::SeqCst);
         }
         // ...and once it returned a usable count, still in this hold, the
         // batch's key-downs are settled as held and only the accepted prefix
@@ -1861,14 +1902,14 @@ impl<I: Injector> Fenced<'_, I> {
         if let Some(prefix) = events.get(..accepted as usize) {
             for &(vk, up) in events {
                 if !up {
-                    core.held.settle_down(vk);
+                    self.held.settle_down(vk);
                 }
             }
             for &(vk, up) in prefix {
                 if up {
-                    core.held.mark_up(vk);
+                    self.held.mark_up(vk);
                 } else {
-                    core.held.settle_down(vk);
+                    self.held.settle_down(vk);
                 }
             }
         }
@@ -1973,20 +2014,23 @@ pub(super) fn serialized<I: Injector>(inner: &I) -> Serialized<'_, I> {
 
 /// A clipboard backend whose lease holds the task's clipboard claim; the
 /// claim is returned when the lease drops it (after its restore attempt).
+/// Without a core it holds no claim and only forwards.
 pub(super) struct Claimed<C> {
     inner: C,
-    core: Arc<ExecutorCore>,
+    core: Option<Arc<ExecutorCore>>,
     token: u64,
 }
 
 impl<C> Drop for Claimed<C> {
     fn drop(&mut self) {
-        let _ = self.core.clipboard_holder.compare_exchange(
-            self.token,
-            0,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
+        if let Some(core) = &self.core {
+            let _ = core.clipboard_holder.compare_exchange(
+                self.token,
+                0,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
     }
 }
 
