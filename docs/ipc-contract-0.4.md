@@ -163,7 +163,7 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 | 检查项 | 含义（Windows） | 失败原因 |
 |---|---|---|
 | `raw_input` | `raw_input` 组件健康，检测窗口存在，进程的键盘 RawInput 注册指向它 | 组件给出的原因，否则 `raw_input_missing` |
-| `hook_heartbeat` | `keyboard_hook`、`mouse_hook` 组件健康（已安装），钩子线程在 1.5 秒内应答一条消息，且自上次物理按键以来没有投递缺口（RawInput 看到、钩子没看到的物理按键，哪怕只有一个、远不到交叉校验判定丢失的数量）。钩子被静默移除后若还没有任何物理按键，无法与正常的钩子区分，此项通过；之后的按键由交叉校验发现并重装 | 组件给出的原因（如 `hook_install_failed`），否则 `hook_missing` |
+| `hook_heartbeat` | `keyboard_hook`、`mouse_hook` 组件健康（已安装），钩子线程在 1.5 秒内应答一条消息，且自上次物理按键以来没有投递缺口（RawInput 看到、钩子没看到的物理按键，哪怕只有一个、远不到交叉校验判定丢失的数量）。鼠标钩子同理按鼠标按键按下校验（RawInput 看到、鼠标钩子没看到的按下；只有键盘钩子在工作时也能发现单独被移除的鼠标钩子）。钩子被静默移除后若还没有任何物理按键（鼠标钩子：鼠标按键），无法与正常的钩子区分，此项通过；之后的按键由交叉校验发现并重装 | 组件给出的原因（如 `hook_install_failed`），否则 `hook_missing` |
 | `foreground` | 存在前台窗口，能取到它的进程 id 和焦点控件（不读标题） | `focus_changed`（安全桌面、锁屏、切换中） |
 | `clipboard` | 剪贴板能打开，随即关闭（不读不写，序号与所有者不变） | `clipboard_busy` |
 

@@ -150,6 +150,10 @@ fn delta(seen: &mut u64, now: u64) -> u64 {
 pub(super) enum Sighting {
     /// A physical key transition: (source, virtual key, down).
     Key(Source, u16, bool),
+    /// A mouse button press (F5-2). The mouse hook reports every press,
+    /// whatever its origin; RawInput reports the presses its detector
+    /// delivers, which carry no origin.
+    Click(Source),
 }
 
 /// Where recorded input landed: input aimed at one of our own windows is
@@ -198,7 +202,8 @@ fn take_overflowed_stop(shared: &Shared, hooks: &HookPipe) {
 }
 
 /// Consumer state: the typed-key buffer, the logged lane counters and the
-/// physical key transitions each source saw since the last liveness tick.
+/// physical key transitions and mouse button presses each source saw since
+/// the last liveness tick.
 #[derive(Default)]
 pub(super) struct Consumer {
     buffer: Buffer,
@@ -244,11 +249,18 @@ impl Consumer {
         }
         // ...and with nothing queued behind it.
         take_overflowed_stop(shared, hooks);
+        for _ in 0..hooks.take_clicks() {
+            self.seen.push(Sighting::Click(Source::Hook));
+        }
         while let Some(record) = raw.pop() {
             handled += 1;
             if record.mouse() {
                 // F5-2: a mouse button event. The callback already
                 // invalidated the prefix; it is neither text nor a key.
+                // Presses go to the click cross-check.
+                if record.down() {
+                    self.seen.push(Sighting::Click(Source::Raw));
+                }
                 continue;
             }
             // Every other record is a hardware key transition, with or
@@ -265,7 +277,7 @@ impl Consumer {
         self.report(hooks.lane(), raw);
         handled
     }
-    /// Key transitions for [`Liveness::tick`], which drains them.
+    /// Key transitions and clicks for [`Liveness::tick`], which drains them.
     pub(super) fn seen(&mut self) -> &mut Vec<Sighting> {
         &mut self.seen
     }
@@ -626,9 +638,11 @@ pub(super) struct Sources<'a, P: SourcePorts, C: Clock> {
     /// invalidates (H3); bound once, before the sources start.
     engine: OnceLock<Arc<Shared>>,
     /// Published by [`Liveness::tick`]: RawInput saw at least one physical
-    /// key the keyboard hook missed since the two last agreed on a key
-    /// ([`CrossCheck::missed`]), even if too few for a verdict. Read by the
-    /// `hook_heartbeat` self-test check without any lock (review A5).
+    /// key the keyboard hook missed since the two last agreed on a key, or
+    /// one mouse button press the mouse hook missed since the two last
+    /// agreed on a press (F5-2) ([`CrossCheck::missed`]), even if too few
+    /// for a verdict. Read by the `hook_heartbeat` self-test check without
+    /// any lock (review A5).
     hook_gap: AtomicBool,
 }
 impl<'a, P: SourcePorts, C: Clock> Sources<'a, P, C> {
@@ -645,9 +659,10 @@ impl<'a, P: SourcePorts, C: Clock> Sources<'a, P, C> {
             hook_gap: AtomicBool::new(false),
         }
     }
-    /// Whether the cross-check holds evidence that the keyboard hook missed
-    /// a physical key since it last delivered one RawInput also saw (see
-    /// `hook_gap`). An atomic load: never waits for the consumer.
+    /// Whether the cross-checks hold evidence that the keyboard hook missed
+    /// a physical key, or the mouse hook a button press, since it last
+    /// delivered one RawInput also saw (see `hook_gap`). An atomic load:
+    /// never waits for the consumer.
     pub(super) fn hook_gap(&self) -> bool {
         self.hook_gap.load(Ordering::SeqCst)
     }
@@ -879,6 +894,15 @@ pub(super) fn raw_lost() {
 pub(super) struct Liveness<'a, P: SourcePorts, C: Clock> {
     sources: &'a Sources<'a, P, C>,
     check: CrossCheck,
+    /// F5-2: the same check over mouse button presses, which finds a mouse
+    /// hook Windows removed alone (the key check cannot: keys still flow
+    /// through the keyboard hook). Only one direction counts, see
+    /// [`Liveness::act_clicks`]. K is the key check's `MISS_LIMIT` with
+    /// its backoff (待实测): typed-prefix safety does not wait for this
+    /// verdict (RawInput clicks invalidate it themselves, see
+    /// `rawinput::mouse_record`), so it is tuned against false verdicts,
+    /// each of which reinstalls both low-level hooks.
+    clicks: CrossCheck,
     epoch: u64,
 }
 impl<'a, P: SourcePorts, C: Clock> Liveness<'a, P, C> {
@@ -886,13 +910,14 @@ impl<'a, P: SourcePorts, C: Clock> Liveness<'a, P, C> {
         Self {
             sources,
             check: CrossCheck::default(),
+            clicks: CrossCheck::default(),
             epoch: sources.epoch.load(Ordering::SeqCst),
         }
     }
-    /// Takes armed input faults, drains `seen` into the cross-check and
+    /// Takes armed input faults, drains `seen` into the cross-checks and
     /// handles due verdicts. Returns when the next sighting expires. Keys
-    /// seen before [`Sources::start`] (RawInput runs before the hooks are
-    /// installed) are dropped.
+    /// and clicks seen before [`Sources::start`] (RawInput runs before the
+    /// hooks are installed) are dropped.
     pub(super) fn tick(&mut self, shared: &Shared, seen: &mut Vec<Sighting>) -> Option<Instant> {
         self.inject_faults();
         if !self.sources.started.load(Ordering::SeqCst) {
@@ -903,25 +928,78 @@ impl<'a, P: SourcePorts, C: Clock> Liveness<'a, P, C> {
         if epoch != self.epoch {
             self.epoch = epoch;
             self.check.forget();
+            self.clicks.forget();
         }
         let now = self.sources.clock.now();
+        let (mut hook_clicks, mut raw_clicks) = (0_u64, 0_u64);
         for sighting in seen.drain(..) {
             match sighting {
                 Sighting::Key(source, vk, true) => {
                     self.check.saw(source, vk, now);
                 }
                 Sighting::Key(source, vk, false) => self.check.released(source, vk),
+                Sighting::Click(Source::Hook) => hook_clicks += 1,
+                Sighting::Click(Source::Raw) => raw_clicks += 1,
             }
         }
+        self.saw_clicks(hook_clicks, raw_clicks, now);
         while let Some(verdict) = self.check.expire(now) {
             self.act(shared, verdict);
         }
+        // A reattach above replaced the mouse hook too: what the old one
+        // missed says nothing about the new one.
+        if self.sources.epoch.load(Ordering::SeqCst) != self.epoch {
+            self.clicks.forget();
+        }
+        while let Some(verdict) = self.clicks.expire(now) {
+            self.act_clicks(shared, verdict);
+        }
         // Published after the verdicts, which are unchanged: a verdict (and
         // its reattach) starts the miss count again.
-        self.sources
-            .hook_gap
-            .store(self.check.missed(Source::Hook), Ordering::SeqCst);
-        self.check.next_due()
+        let gap = self.check.missed(Source::Hook) || self.clicks.missed(Source::Hook);
+        self.sources.hook_gap.store(gap, Ordering::SeqCst);
+        match (self.check.next_due(), self.clicks.next_due()) {
+            (Some(key), Some(click)) => Some(key.min(click)),
+            (key, click) => key.or(click),
+        }
+    }
+    /// Feeds one tick's mouse button presses into the click check,
+    /// alternating sources, so a burst both sources saw pairs up within the
+    /// tick however long it is (`PENDING_CAP` never drops one of them).
+    /// A button has no autorepeat: every press is a new one.
+    fn saw_clicks(&mut self, hook: u64, raw: u64, now: Instant) {
+        for index in 0..hook.max(raw) {
+            for (source, count) in [(Source::Hook, hook), (Source::Raw, raw)] {
+                if index < count {
+                    self.clicks.saw(source, 0, now);
+                    self.clicks.released(source, 0);
+                }
+            }
+        }
+    }
+    /// F5-2: a verdict of the click check. Only "RawInput saw presses the
+    /// mouse hook missed" counts, `MISS_LIMIT` in a row: the hook sees
+    /// every click RawInput can report (our own and injected ones
+    /// included), so that is only a lost hook (or one another program's
+    /// earlier hook swallows; the reattach puts ours first again). The
+    /// other direction is expected and ignored: touch and pen clicks, and
+    /// injected clicks RawInput may not report (待实测), reach only the
+    /// hook. RawInput's own loss is the key check's to find.
+    fn act_clicks(&mut self, shared: &Shared, verdict: Verdict) {
+        if verdict != Verdict::HookLost {
+            return;
+        }
+        let sources = self.sources;
+        // Clicks went unseen: what was typed around them is not one word
+        // (H3), though RawInput's clicks have already broken it.
+        invalidate_prefix(shared);
+        tracing::warn!(
+            event = "input.check",
+            source = "mouse_hook",
+            result = "lost"
+        );
+        sources.lost(Component::MouseHook, ReasonCode::HookMissing);
+        let _ = sources.reattach(Component::MouseHook);
     }
     fn inject_faults(&self) {
         let ports = self.sources.ports;
