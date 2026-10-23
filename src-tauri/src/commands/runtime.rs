@@ -433,8 +433,10 @@ async fn run_job<T: Send + 'static>(
 /// [`run_job`] got and the supervisor's health. Fenced or refused by the
 /// send exclusion: `EngineUnavailable`. A failed run, or one whose thread
 /// did not start: `Internal`, logged by its reason code or the OS error's
-/// kind and code, and its trace id. Nothing the run's text says reaches the
-/// log or the frontend.
+/// kind and code, and its trace id. A job that unwound, or a wait that ended
+/// without an answer: `Internal` through [`CommandError::task_failed`]
+/// (F2-1), which logs a fixed class and never the error's text. Nothing the
+/// run's text says reaches the log or the frontend.
 fn conclude(
     joined: Joined<Result<ExecutionResult, RunError>>,
     health: HealthState,
@@ -454,8 +456,7 @@ fn conclude(
         }
         Joined::Ended(Ok(Err(RunError::Failed(failure)))) => Err(run_failed(failure)),
         Joined::NotStarted(thread, error) => Err(not_started(thread, &error)),
-        // 集成时改用 CommandError::task_failed（F2-1）
-        Joined::Ended(Err(e)) => Err(CommandError::internal(e)),
+        Joined::Ended(Err(e)) => Err(CommandError::task_failed(e)),
     }
 }
 
@@ -803,6 +804,37 @@ mod tests {
         assert!(line.contains("event=\"command.execute_failed\""), "{line}");
         assert!(line.contains("category=\"run_failed\""), "{line}");
         assert!(line.contains("reason=PreflightFailed"), "{line}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// F2-1 at the manual run's join: a job that unwound, or a wait that
+    /// ended without an answer, goes through `CommandError::task_failed`,
+    /// which logs `command.internal` with a fixed task class and the trace
+    /// id, never the error's text.
+    #[test]
+    fn a_run_without_an_answer_is_logged_by_task_failed_without_its_text() {
+        use crate::diagnostics::logging::{test_support, DEFAULT_LEVEL};
+        const SENTINEL: &str = "SENTINEL-join-text-3b52";
+        let dir = std::env::temp_dir().join(format!("quicker-exec-join-{}", uuid::Uuid::new_v4()));
+        let built = test_support::scoped(&dir, DEFAULT_LEVEL);
+        let error = tracing::subscriber::with_default(built.subscriber, || {
+            let joined = Joined::Ended(Err(io::Error::other(SENTINEL).into()));
+            conclude(joined, HealthState::Healthy).expect_err("the run gave no answer")
+        });
+        drop(built.guard);
+        let CommandError::Internal { trace_id } = &error else {
+            panic!("a run without an answer is an internal error, got {error:?}");
+        };
+        let shown = serde_json::to_string(&error).unwrap();
+        assert!(!shown.contains(SENTINEL), "{shown}");
+        let log = test_support::read_logs(&dir);
+        assert!(!log.contains(SENTINEL), "{log}");
+        let line = log
+            .lines()
+            .find(|line| line.contains(trace_id.as_str()))
+            .unwrap_or_else(|| panic!("trace id {trace_id} missing from log:\n{log}"));
+        assert!(line.contains("event=\"command.internal\""), "{line}");
+        assert!(line.contains("task=\"failed\""), "{line}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
