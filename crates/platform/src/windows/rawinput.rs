@@ -76,11 +76,30 @@ impl InputEvent {
             ..Self::key_down(vk, "", hardware)
         }
     }
+    /// A mouse button event as the vendored detector reports it: `button`
+    /// is native.h's `INPUT_MOUSE_*` code, `status` an `INPUT_STATUS_*`
+    /// value (the detector sends only pressed or released). It never sets
+    /// `has_known_source` for the mouse, and never reports a move or the
+    /// wheel.
+    #[cfg(test)]
+    pub(super) fn mouse(button: i32, status: i32) -> Self {
+        Self {
+            event_type: INPUT_EVENT_TYPE_MOUSE,
+            key_code: button,
+            status,
+            has_known_source: 0,
+            ..Self::key_down(0, "", false)
+        }
+    }
 }
-/// The detector's `INPUT_EVENT_TYPE_KEYBOARD` and `INPUT_STATUS_*` (native.h).
+/// The detector's `INPUT_EVENT_TYPE_*` and `INPUT_STATUS_*` (native.h).
 const INPUT_EVENT_TYPE_KEYBOARD: i32 = 1;
-const INPUT_STATUS_PRESSED: i32 = 1;
-const INPUT_STATUS_RELEASED: i32 = 2;
+const INPUT_EVENT_TYPE_MOUSE: i32 = 2;
+pub(super) const INPUT_STATUS_PRESSED: i32 = 1;
+pub(super) const INPUT_STATUS_RELEASED: i32 = 2;
+/// native.h's `INPUT_MOUSE_LEFT_BUTTON` (tests).
+#[cfg(test)]
+pub(super) const INPUT_MOUSE_LEFT_BUTTON: i32 = 1;
 #[repr(C)]
 struct InitOptions {
     keyboard_layout_cache_interval: i32,
@@ -259,8 +278,9 @@ fn stamp_of(context: InputContext, revision: u64) -> Stamp {
         layout: context.layout as usize,
     }
 }
-/// One hardware key transition, captured by the detector callback. Fixed
-/// size and `Copy`: building and queueing it never allocates.
+/// One hardware key transition (or mouse button event, F5-2), captured by
+/// the detector callback. Fixed size and `Copy`: building and queueing it
+/// never allocates.
 #[derive(Clone, Copy)]
 pub(super) struct RawRecord {
     vk: u16,
@@ -285,6 +305,10 @@ pub(super) struct RawRecord {
     /// records means a key between them is missing; the busy shadow breaks
     /// its prefix there (S-19), as the generation gap breaks the matcher's.
     lost: u64,
+    /// A mouse button press or release, not a key (F5-2): no text, no
+    /// context, never matched; a press counts for the mouse hook
+    /// cross-check. Its invalidation already happened in the callback.
+    mouse: bool,
 }
 /// The key's text is redacted (B-09), N in UTF-16 units, and so is which key
 /// it was.
@@ -300,30 +324,40 @@ impl std::fmt::Debug for RawRecord {
             .field("paused", &self.paused)
             .field("busy", &self.busy)
             .field("lost", &self.lost)
+            .field("mouse", &self.mouse)
             .finish()
     }
 }
 impl RawRecord {
-    /// The detector's virtual-key code (generic Shift/Ctrl/Alt).
+    /// The detector's virtual-key code (generic Shift/Ctrl/Alt); 0 for a
+    /// mouse button.
     pub(super) fn vk(&self) -> u16 {
         self.vk
     }
-    /// Key-down (true) or key-up.
+    /// Key-down or button press (true), or key-up or button release.
     pub(super) fn down(&self) -> bool {
         self.down
+    }
+    /// A mouse button event rather than a key (F5-2).
+    pub(super) fn mouse(&self) -> bool {
+        self.mouse
     }
 }
 /// Callback body: filters the detector event and captures everything the
 /// consumer needs. Atomics plus the probe's input context only. Every
 /// accepted key-down takes the next generation, so a key that is later lost
 /// leaves a gap instead of joining its neighbours. A key-up takes neither a
-/// generation nor the input context.
+/// generation nor the input context. A mouse button event invalidates the
+/// typed prefix by itself ([`mouse_record`]).
 pub(super) fn raw_record(
     shared: &Shared,
     keys: &KeyBits,
     event: &InputEvent,
     probe: &impl ForegroundProbe,
 ) -> Option<RawRecord> {
+    if event.event_type == INPUT_EVENT_TYPE_MOUSE {
+        return mouse_record(shared, event);
+    }
     let down = hardware_key(event.event_type, event.status, event.has_known_source)?;
     if !down {
         return Some(RawRecord {
@@ -337,6 +371,7 @@ pub(super) fn raw_record(
             paused: false,
             busy: false,
             lost: 0,
+            mouse: false,
         });
     }
     let generation = shared
@@ -355,6 +390,52 @@ pub(super) fn raw_record(
         paused: shared.paused.load(Ordering::SeqCst),
         busy: shared.busy.load(Ordering::SeqCst),
         lost: 0,
+        mouse: false,
+    })
+}
+/// F5-2: a mouse button press or release RawInput saw. Like a click the
+/// mouse hook sees (`hook::on_mouse`), it advances the generation and the
+/// caret epoch, so typed-prefix safety does not depend on the mouse hook:
+/// Windows can remove that hook alone, without notice, and the cross-check
+/// needs several clicks to notice. The detector handles input in order on
+/// one thread, so the bump lands before the next key is captured: that key
+/// starts a new prefix, and a candidate or erasure planned before the click
+/// fails its generation or stamp check. With both sources alive a click
+/// bumps twice, which breaks contiguity no more than once does.
+///
+/// The detector cannot tell whose click it is (it gives the mouse no device
+/// handle; 待实测: SendInput clicks reach RawInput too). We inject clicks
+/// only while an action runs (`busy`), and a bump then would make that
+/// action's own guard stop it, so a click captured while busy only counts
+/// for the cross-check. A physical click while busy is still caught by the
+/// hook if it works, and keys typed while busy never join a prefix (S-19).
+/// One of our clicks that arrives after the action ended bumps once more,
+/// which is only conservative. Pointer moves and the wheel never reach this
+/// callback (the detector reports button events only); the wheel scrolls
+/// without moving the caret and stays hook-only. Atomics only, no logging.
+fn mouse_record(shared: &Shared, event: &InputEvent) -> Option<RawRecord> {
+    let down = match event.status {
+        INPUT_STATUS_PRESSED => true,
+        INPUT_STATUS_RELEASED => false,
+        _ => return None,
+    };
+    let busy = shared.busy.load(Ordering::SeqCst);
+    if !busy {
+        shared.generation.fetch_add(1, Ordering::SeqCst);
+        observer::CARET_EPOCH.fetch_add(1, Ordering::SeqCst);
+    }
+    Some(RawRecord {
+        vk: 0,
+        down,
+        text: [0; 24],
+        len: 0,
+        context: None,
+        generation: shared.generation.load(Ordering::SeqCst),
+        modified: false,
+        paused: false,
+        busy,
+        lost: 0,
+        mouse: true,
     })
 }
 /// Queues a captured record on the RawInput lane, stamped with the lane's
@@ -1292,6 +1373,7 @@ mod tests {
             paused: false,
             busy: false,
             lost: 0,
+            mouse: false,
         };
         let shown_buffer = format!("{buffer:?}");
         let shown_shadow = format!("{shadow:?}");

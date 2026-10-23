@@ -3501,3 +3501,261 @@ fn hook_heartbeat_passes_for_a_removed_hook_with_no_key_since() {
     assert!(!fake.hooked(HookSet::KEYBOARD), "the hook is gone");
     assert_eq!(heartbeat(&sources), Ok(()), "undetectable without input");
 }
+
+// F5-2: Windows can remove the low-level mouse hook alone. Clicks must
+// still end the typed prefix (RawInput sees them too), and the loss must be
+// found and repaired like a lost keyboard hook.
+use super::rawinput::{INPUT_MOUSE_LEFT_BUTTON, INPUT_STATUS_PRESSED, INPUT_STATUS_RELEASED};
+
+impl FakeSources {
+    /// Windows removes the low-level mouse hook and nothing else: the
+    /// keyboard hook and RawInput keep working (F5-2).
+    fn drop_mouse_hook(&self) {
+        self.hooked.lock().unwrap()[1] = false;
+    }
+}
+impl Pipeline {
+    /// [`Pipeline::new`] with one immediate rule typed as `trigger`.
+    fn with_rule(trigger: &str) -> Self {
+        Self {
+            shared: engine(trigger),
+            ..Self::new()
+        }
+    }
+    /// One physical click (left button down and up), captured by every
+    /// source that works; not drained. The detector reports both events
+    /// as mouse events with no device handle.
+    fn click(&mut self, fake: &FakeSources) {
+        for (msg, status) in [
+            (WM_LBUTTONDOWN, INPUT_STATUS_PRESSED),
+            (WM_LBUTTONUP, INPUT_STATUS_RELEASED),
+        ] {
+            if fake.hooked(HookSet::MOUSE) {
+                handle_mouse(&self.hooks, &self.shared, mouse(msg, 10, 20));
+            }
+            if fake.raw_delivers() {
+                let event = InputEvent::mouse(INPUT_MOUSE_LEFT_BUTTON, status);
+                let record = raw_record(&self.shared, self.keys, &event, &self.probe).unwrap();
+                assert!(self.raw.push(record));
+            }
+        }
+    }
+    /// `count` pointer moves. Only the mouse hook sees them: the detector
+    /// reports button events only, and nothing else it could report for
+    /// a move (no status) is captured. Not drained.
+    fn move_pointer(&mut self, fake: &FakeSources, count: i32) {
+        for step in 0..count {
+            if fake.hooked(HookSet::MOUSE) {
+                handle_mouse(&self.hooks, &self.shared, mouse(WM_MOUSEMOVE, step, -step));
+            }
+            if fake.raw_delivers() {
+                let event = InputEvent::mouse(0, 0);
+                assert!(raw_record(&self.shared, self.keys, &event, &self.probe).is_none());
+            }
+        }
+    }
+    /// One consumer pass; the candidates it detected, whole.
+    fn take_candidates(&mut self) -> Vec<Candidate> {
+        let mut found = Vec::new();
+        self.consumer.drain(
+            &self.shared,
+            &self.hooks,
+            &self.raw,
+            &self.probe,
+            &mut |candidate: Candidate| {
+                found.push(candidate);
+                true
+            },
+        );
+        found
+    }
+}
+
+/// F5-2 scenario a: Windows removed only the mouse hook. A click RawInput
+/// alone sees still ends the typed prefix, with no cross-check verdict
+/// involved: "ab", click, "cd" never completes the immediate rule "abcd",
+/// so nothing is erased or expanded at the caret the click moved.
+#[test]
+fn a_click_only_raw_input_saw_still_breaks_the_typed_prefix() {
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    sources.start();
+    let mut pipe = Pipeline::with_rule("abcd");
+    pipe.type_text(&fake, "abcd");
+    assert_eq!(pipe.candidates(), ["abcd"], "the rule as typed");
+    fake.drop_mouse_hook();
+    assert!(fake.hooked(HookSet::KEYBOARD) && fake.raw_delivers());
+    let mut pipe = Pipeline::with_rule("abcd");
+    pipe.type_text(&fake, "ab");
+    assert!(pipe.candidates().is_empty());
+    let (generation, caret) = (
+        pipe.generation(),
+        observer::CARET_EPOCH.load(Ordering::SeqCst),
+    );
+    pipe.click(&fake);
+    assert!(
+        pipe.hooks.lane().pop().is_none(),
+        "the mouse hook saw nothing"
+    );
+    assert_eq!(pipe.generation(), generation + 2, "press and release");
+    assert!(observer::CARET_EPOCH.load(Ordering::SeqCst) >= caret + 2);
+    pipe.type_text(&fake, "cd");
+    assert!(
+        pipe.candidates().is_empty(),
+        "no expansion across the click"
+    );
+    assert!(sources.hooks_ready(), "safety needed no verdict");
+}
+
+/// F5-2 scenario a, the other order: the rule was complete before the
+/// click RawInput alone saw. The candidate's generation is stale, so the
+/// action stops at its first guard, before any erasure.
+#[test]
+fn a_click_only_raw_input_saw_stops_a_pending_candidate_before_erasure() {
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    sources.start();
+    fake.drop_mouse_hook();
+    let mut pipe = Pipeline::with_rule("abcd");
+    pipe.type_text(&fake, "abcd");
+    let candidate = pipe.take_candidates().pop().unwrap();
+    assert_eq!(candidate.generation, pipe.generation());
+    pipe.click(&fake);
+    let injector = MockInjector::new();
+    let foreground = MockForeground::new(window());
+    let ports = Ports {
+        injector: &injector,
+        foreground: &foreground,
+        clock: &clock,
+        clipboard: || -> Result<crate::mock::MockClipboard, String> { Err("unused".into()) },
+    };
+    let plan = ActionPlan {
+        steps: [
+            Operation::KeyDown {
+                key: Key::named("A"),
+            },
+            Operation::KeyUp {
+                key: Key::named("A"),
+            },
+        ]
+        .into_iter()
+        .map(|operation| Step::new(operation, SourceSpan::default()))
+        .collect(),
+        ..Default::default()
+    };
+    let outcome = execute_with_proof(
+        &ports,
+        &pipe.shared,
+        plan,
+        candidate.focus,
+        candidate.generation,
+        Some(candidate.proof),
+        candidate.terminator,
+        1.0,
+    );
+    let message = match outcome {
+        Ok(result) => result.message,
+        Err(error) => error,
+    };
+    assert!(message.contains("User input changed"), "{message}");
+    assert!(injector.calls().is_empty(), "nothing erased or typed");
+}
+
+/// F5-2 scenario c, safety half: pointer moves alone never end the typed
+/// prefix, on either source, with or without the mouse hook.
+#[test]
+fn pointer_moves_alone_keep_the_typed_prefix() {
+    let _serial = serial();
+    let (fake, clock, signals) = (FakeSources::new(), FakeClock::new(), SessionSignals::new());
+    let sources = Sources::new(&fake, &clock, &signals);
+    sources.start();
+    for drop_mouse_hook in [false, true] {
+        if drop_mouse_hook {
+            fake.drop_mouse_hook();
+        }
+        let mut pipe = Pipeline::with_rule("abcd");
+        pipe.type_text(&fake, "ab");
+        assert!(pipe.candidates().is_empty());
+        let generation = pipe.generation();
+        pipe.move_pointer(&fake, 50);
+        assert_eq!(pipe.generation(), generation, "moves take no generation");
+        pipe.type_text(&fake, "cd");
+        assert_eq!(
+            pipe.candidates(),
+            ["abcd"],
+            "mouse hook dropped: {drop_mouse_hook}"
+        );
+    }
+}
+
+/// F5-2: our own clicks reach RawInput too (待实测: SendInput clicks have
+/// no device handle, like every mouse event the detector reports). They
+/// are injected only while an action runs, so a click captured while busy
+/// takes no generation and leaves the action's guard intact.
+#[test]
+fn a_click_raw_input_captured_while_busy_takes_no_generation() {
+    let _serial = serial();
+    let shared = engine("btw");
+    let keys = leaked_keys();
+    let probe = FixedProbe(context());
+    shared.busy.store(true, Ordering::SeqCst);
+    let generation = shared.generation.load(Ordering::SeqCst);
+    for status in [INPUT_STATUS_PRESSED, INPUT_STATUS_RELEASED] {
+        let event = InputEvent::mouse(INPUT_MOUSE_LEFT_BUTTON, status);
+        let record = raw_record(&shared, keys, &event, &probe).unwrap();
+        assert!(record.mouse() && record.down() == (status == INPUT_STATUS_PRESSED));
+    }
+    assert_eq!(shared.generation.load(Ordering::SeqCst), generation);
+    shared.busy.store(false, Ordering::SeqCst);
+    let event = InputEvent::mouse(INPUT_MOUSE_LEFT_BUTTON, INPUT_STATUS_PRESSED);
+    assert!(raw_record(&shared, keys, &event, &probe).is_some());
+    assert_eq!(shared.generation.load(Ordering::SeqCst), generation + 1);
+}
+
+/// B-02 for the F5-2 path: the RawInput callback body for a mouse button
+/// neither allocates nor takes an engine lock.
+#[test]
+fn the_raw_mouse_callback_body_neither_allocates_nor_blocks() {
+    let _serial = serial();
+    let shared = engine("btw");
+    let keys = leaked_keys();
+    let raw = Arc::new(Lane::<RawRecord>::new(8, nothing));
+    let probe = FixedProbe(context());
+    let compiled = shared.compiled.lock().unwrap();
+    let config = shared.config.lock().unwrap();
+    let recording = shared.recording.lock().unwrap();
+    let last = shared.last.lock().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let worker = {
+        let (shared, raw) = (shared.clone(), raw.clone());
+        std::thread::spawn(move || {
+            let measured = allocations(|| {
+                raw.contained(false, || {
+                    [INPUT_STATUS_PRESSED, INPUT_STATUS_RELEASED]
+                        .into_iter()
+                        .all(|status| {
+                            let event = InputEvent::mouse(INPUT_MOUSE_LEFT_BUTTON, status);
+                            raw_record(&shared, keys, &event, &probe)
+                                .is_some_and(|record| push_raw(&raw, record))
+                        })
+                })
+            });
+            tx.send(measured).unwrap();
+        })
+    };
+    let (queued, count) = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the callback body blocked on an engine lock");
+    drop((compiled, config, recording, last));
+    worker.join().unwrap();
+    assert_eq!(count, 0, "callback bodies must not allocate");
+    assert!(queued);
+    let queued = std::iter::from_fn(|| raw.pop()).collect::<Vec<_>>();
+    assert!(
+        matches!(queued.as_slice(), [press, release] if press.mouse() && press.down()
+            && release.mouse() && !release.down()),
+        "{queued:?}"
+    );
+}

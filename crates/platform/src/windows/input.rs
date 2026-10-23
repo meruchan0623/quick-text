@@ -246,8 +246,13 @@ impl Consumer {
         take_overflowed_stop(shared, hooks);
         while let Some(record) = raw.pop() {
             handled += 1;
-            // Every record is a hardware key transition, with or without
-            // context; only key-downs become text.
+            if record.mouse() {
+                // F5-2: a mouse button event. The callback already
+                // invalidated the prefix; it is neither text nor a key.
+                continue;
+            }
+            // Every other record is a hardware key transition, with or
+            // without context; only key-downs become text.
             self.seen
                 .push(Sighting::Key(Source::Raw, record.vk(), record.down()));
             let event = event_from(shared, &record);
