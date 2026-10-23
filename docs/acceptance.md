@@ -1,4 +1,6 @@
 > 2026-10-15 更新：本文保留 0.2.x 的历史实现/验收记录。Windows 0.3.0 已改为直接集成 espanso 输入组件，当前行为与验收状态以 [0.3.0 重构记录](windows-0.3.0-refactor.md) 为准。
+>
+> 0.4 实机验收清单（S-25 书面记录模板）：[acceptance-0.4-manual.md](acceptance-0.4-manual.md)
 
 # 验收记录与用户手工测试
 
