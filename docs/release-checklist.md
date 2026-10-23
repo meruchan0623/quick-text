@@ -17,7 +17,7 @@
 | 依赖许可证、禁用项、来源 | `licenses` 任务：`cargo deny check bans licenses sources` | 依赖许可证都在 `deny.toml` 的 GPL-3.0-or-later 兼容清单内；没有 `openssl-sys`；没有 crates.io 以外的来源（B-51、S-28） |
 | 版本一致 | `scripts/check-release-version.ps1` | 标签、清单文件、Cargo 包版本相同 |
 | 扫描器自测 | `scripts/check-binary-strings.ps1 -SelfTest` | 下面的 PDB 检查本身能发现问题 |
-| release 没有启用测试特性 | `scripts/check-release-features.ps1` | `cargo tree -e features` 显示 `fault-injection`、`mock` 在发布配置里都没有启用；没有任何 crate 再定义这些特性时也会失败，防止检查变成空检查（B-52） |
+| release 没有启用测试特性 | `scripts/check-release-features.ps1` | `cargo tree -e features` 显示 `fault-injection`、`mock` 在发布配置里都没有启用；没有任何 crate 再定义这些特性时也会失败，防止检查变成空检查（B-52）。另有编译期兜底：`debug_assertions` 关闭（release 配置）时启用这两个特性中的任何一个，`src-tauri/src/main.rs` 的 `compile_error!` 让构建直接失败；需要带故障注入的构建只能用 debug 构建或打开了 `debug-assertions` 的配置 |
 | 源码白名单覆盖所有 crate | `scripts/check-source-allowlist.ps1 -Strict`（构建前）；对生成的 `Source.zip` 再检查一次 | 发布的源码包没有漏掉工作区文件，也没有带入配置、日志等私有文件（B-51） |
 | 钩子模块头部检查 | `scripts/check-hook-lints.ps1` | S-02 |
 | 测试 | `cargo test --workspace --locked` | |
@@ -27,7 +27,7 @@
 | 依赖源码包（先于安装包构建） | `scripts/package-dependency-sources.ps1` | 生成 `Quicker-Text-<版本>-Source-deps.zip`：`cargo vendor --locked` 的全部 crate、会进入前端产物的 npm 生产依赖（用 `npm pack` 取的注册表原始 tarball，放在 `npm/tarballs/`，每个都按 `package-lock.json` 的 sha512 `integrity` 校验）、离线重建说明；检查实际分发的每个 crate 都在、数量与 `Cargo.lock` 一致、只靠这些源码 cargo 能离线解析工作区；写完后用门槛函数把成品再验一遍，不通过就删掉这个包（S-28、B-51）。不需要先 `npm ci` |
 | 安装包构建的门槛 | `src-tauri/tauri.conf.json` 的 `build.beforeBundleCommand`，即 `scripts/check-bundle-preconditions.ps1` | Tauri 在编译完成、写安装包之前运行它。声明文件是占位文件、没有设置 `QT_DEPENDENCY_SOURCES_ZIP`、依赖源码包与本树锁文件不符或不完整，或平台不是 Windows x64，都使打包失败，不产出安装包（见下面「产出可分发二进制的路径」） |
 | 安装包带着生成的声明文件 | `release` 工作流「Installer bundles the generated notice file」 | 构建后 `src-tauri/resources` 与 `target/release` 里的 `THIRD-PARTY-LICENSES.txt` 都是刚生成的那份（哈希相同），不是占位文件；另用 7-Zip 列出安装包内容，列不出只给警告（见第 2 节人工核对） |
-| 打包 | `scripts/package-artifacts.ps1` | 安装包、exe、GPL 全文、第三方声明、`THIRD-PARTY-LICENSES.txt`、说明文档、`Source.zip`、`Source-deps.zip`、`SHA256SUMS`。`-DependencySourcesZip` 必填，并按本树的锁文件逐项校验；缺少、损坏、过期或不完整的依赖源码包，或者声明文件是占位文件、不是用本树的锁文件生成的，直接失败且不留输出：没有对应源码的完整版本不能发布 |
+| 打包 | `scripts/package-artifacts.ps1` | 安装包、exe、GPL 全文、第三方声明、`THIRD-PARTY-LICENSES.txt`、说明文档、`Source.zip`、`Source-deps.zip`、`SHA256SUMS`。`-DependencySourcesZip` 必填，并按本树的锁文件逐项校验；缺少、损坏、过期或不完整的依赖源码包，或者声明文件是占位文件、不是用本树的锁文件生成的，直接失败且不留输出：没有对应源码的完整版本不能发布。复制之前先对将要打包的那个 exe 重跑 B-52 检查（`scripts/release-binary-checks.ps1`：`check-release-features.ps1`；`target\release\quicker_text.pdb` 必须是这个 exe 的 PDB，按 exe 调试目录里的 GUID 核对；PDB 与 exe 的 `check-binary-strings.ps1`），任何一项失败都以非零退出码终止 |
 | 许可证与源码获取文字 | `scripts/write-release-notes.ps1` | 生成 `release-notes.md`，写明文件名、`Source.zip` 与 `Source-deps.zip` 的 SHA256、两者合起来才是完整对应源码，以及版本库位置 |
 
 PDB 检查的做法写在 `scripts/check-binary-strings.ps1` 的头部注释里：对文件做原始字节扫描，同时查 ASCII 与 UTF-16LE。限制：PDB 按 4 KiB 块存放流，正好跨块的名字理论上会漏；同一个符号在多条记录里出现，全部同时跨块的可能性可以忽略。
@@ -41,8 +41,8 @@ PDB 检查的做法写在 `scripts/check-binary-strings.ps1` 的头部注释里�
 | 路径 | 门槛 |
 | --- | --- |
 | `release` 工作流（标签推送与 `workflow_dispatch` 是同一个任务） | 先生成依赖源码包，再构建安装包（`beforeBundleCommand` 检查），再 `package-artifacts.ps1`（再检查一次）。只上传 `package-artifacts.ps1` 的输出、发布说明与 PDB；没有更新包（未配置 Tauri updater），`ci.yml` 不产出安装包或 ZIP |
-| `scripts/package-artifacts.ps1`（发布包） | `-DependencySourcesZip` 必填；检查全部通过之后才写第一个文件，中途失败时清理本次写出的文件 |
-| `scripts/package-portable.ps1`（绿色包） | `-DependencySourcesZip` 必填；检查全部通过之后才写第一个文件；依赖源码包作为附属文件复制到 ZIP 旁边，ZIP 内的 `DEPENDENCY-SOURCES.txt` 写明文件名与 SHA256；中途失败时清理 ZIP、目录和附属文件 |
+| `scripts/package-artifacts.ps1`（发布包） | `-DependencySourcesZip` 必填；B-52 检查（`scripts/release-binary-checks.ps1`）；检查全部通过之后才写第一个文件，中途失败时清理本次写出的文件 |
+| `scripts/package-portable.ps1`（绿色包） | `-DependencySourcesZip` 必填；B-52 检查（同上）；检查全部通过之后才写第一个文件；依赖源码包作为附属文件复制到 ZIP 旁边，ZIP 内的 `DEPENDENCY-SOURCES.txt` 写明文件名与 SHA256；中途失败时清理 ZIP、目录和附属文件 |
 | `npm run tauri build`、`tauri bundle`、`scripts/build-windows.ps1`（安装包） | `build.beforeBundleCommand`（`scripts/check-bundle-preconditions.ps1`）。`scripts/build-windows.ps1 -DependencySourcesZip <...>` 提前检查并设置 `QT_DEPENDENCY_SOURCES_ZIP`；直接运行 `npm run tauri build` 而没有这个变量时失败 |
 | `npm run tauri -- build --no-bundle`、`cargo build --release` | 不打包，只产生 `target\release\quicker-text.exe`，无法挂钩子。这是本机自用的中间产物，不得直接分发；要分发只能经过上面的 `package-artifacts.ps1` 或 `package-portable.ps1` |
 

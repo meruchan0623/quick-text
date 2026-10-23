@@ -38,7 +38,10 @@
 #            (positive control: a scan of an empty or wrong file would find nothing as well)
 #     8. scripts/package-artifacts.ps1 (installer, exe, license text, notices, docs, Source.zip,
 #        Source-deps.zip, SHA256SUMS; validates the dependency archive again and refuses without
-#        it), then check-source-allowlist.ps1 -Strict on the finished ZIP
+#        it; before copying it repeats the B-52 checks of steps 2 and 7 on the exact exe it
+#        packages and checks that target/release/quicker_text.pdb is that exe's PDB,
+#        scripts/release-binary-checks.ps1), then check-source-allowlist.ps1 -Strict on the
+#        finished ZIP
 #     9. license / source-acquisition text for the release description
 #    10. upload: package, release notes, and the PDB as a separate artifact
 #

@@ -15,6 +15,9 @@
 # Everything is checked before the first file is written. When a later step fails, the folder, the ZIP and the
 # companion copy created by this run are removed again (a file you passed in is never touched, and an archive that
 # already sits in the output directory under its own name is used in place).
+# B-52 (scripts/release-binary-checks.ps1): before anything is copied, the release configuration must enable no
+# fault-injection / mock feature, target\release\quicker_text.pdb must be the PDB of the exe, and neither may
+# contain debug_inject_fault. Any failure stops the run with a non-zero exit code.
 #
 #   pwsh -NoProfile -File scripts/package-portable.ps1 -OutputDirectory <new dir> `
 #        -ThirdPartyLicensesFile <THIRD-PARTY-LICENSES.txt> -DependencySourcesZip <...-Source-deps.zip>
@@ -27,6 +30,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'source-allowlist.ps1')
 . (Join-Path $PSScriptRoot 'third-party-set.ps1')
+. (Join-Path $PSScriptRoot 'release-binary-checks.ps1')
 $version = (Get-Content -LiteralPath (Join-Path $root 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json).version
 $output = [IO.Path]::GetFullPath($OutputDirectory)
 $name = "Quicker-Text-$version-Windows-x64-Portable"
@@ -42,6 +46,8 @@ if ((Test-Path -LiteralPath $depsCopy) -and -not $depsInPlace) { throw "Output a
 $exe = Join-Path $root 'target\release\quicker-text.exe'
 $required = @($exe, (Join-Path $root 'THIRD_PARTY_NOTICES.md'), (Join-Path $root 'docs\windows-0.3.0-refactor.md'), (Join-Path $root 'docs\windows-0.3.1-notes.md'))
 foreach ($file in $required) { if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing required artifact: $file" } }
+# B-52 on the exact exe that is copied below, and its PDB. Throws on any failure.
+Assert-ReleaseBinaries -Exe $exe -Pdb (Join-Path $root 'target\release\quicker_text.pdb')
 # Third-party copyright and license notices travel with the package (S-28); refuse a missing, placeholder or stale file.
 if (-not $ThirdPartyLicensesFile) { $ThirdPartyLicensesFile = Join-Path $root 'src-tauri\resources\THIRD-PARTY-LICENSES.txt' }
 $licensesFile = [IO.Path]::GetFullPath($ThirdPartyLicensesFile)

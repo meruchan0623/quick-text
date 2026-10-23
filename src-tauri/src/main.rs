@@ -160,3 +160,17 @@ fn main() {
             }
         });
 }
+
+// B-52, Codex F3-1: the test-only features never reach an optimized build of
+// the app. Nothing in the repository builds it that way (scripts, workflows,
+// docs: fault injection and the mock run under `cargo test` and debug builds),
+// so any such build is a mistake, caught here before it can be packaged.
+// Tests and debug builds keep both (`debug_assertions` is on).
+#[cfg(all(
+    not(debug_assertions),
+    any(feature = "fault-injection", feature = "mock")
+))]
+compile_error!(
+    "the `fault-injection` and `mock` features are for tests and debug builds only (B-52); \
+     build the release app without them, or use a profile with debug-assertions = true"
+);
