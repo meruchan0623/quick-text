@@ -579,6 +579,37 @@ impl ManualError {
     }
 }
 
+/// What a settled manual run returns (F5-1 X1), given its result, whether
+/// the executor refused one of its sends (`refused`: the send lock held past
+/// [`SEND_LOCK_WAIT`], S1, or key-ups still owed, S3) and its verdict's
+/// reason. The pipeline reports such a refusal as a failed result ("accepted
+/// 0/N"), which would reach the caller as a run that merely failed: here it
+/// becomes the executor's error, `ExecutorTimeout`, as a fence is, so the
+/// caller reports the executor unavailable. The history entry and `last`
+/// keep what the run did (its side effects); only the answer changes.
+///
+/// "Executor unavailable" is the executor refusing the run: a fence
+/// (already an error: the adoption's or the settle's), the send lock held
+/// past its wait, or owed key-ups. Not in it: a panic (already an error,
+/// `ExecutorPanic`, a defect reported by trace id), `ClipboardBusy` (the
+/// clipboard held by another program or a stalled run's lease; the executor
+/// serves, the paste alone is refused), and the plan's own 120 s budget
+/// ("Execution timeout"), which shares the `ExecutorTimeout` code but
+/// leaves the executor serving.
+fn unavailable_as_error(
+    result: Result<ExecutionResult, String>,
+    refused: bool,
+    reason: ReasonCode,
+) -> Result<ExecutionResult, ManualError> {
+    match result {
+        Ok(run) if refused => Err(ManualError {
+            reason,
+            text: run.message,
+        }),
+        result => result.map_err(|text| ManualError { reason, text }),
+    }
+}
+
 /// A manual run's claim (F5-1), from [`ManualBusy`]'s claim until it is
 /// given back. Supervised like a task: its heartbeat starts at the claim,
 /// and whoever ends the run first (its settle, or the fence) writes its
@@ -1335,8 +1366,10 @@ impl ExecutorCore {
     /// the run still holds ([`release_manual`](Self::release_manual)) and
     /// settles it ([`settle_manual`](Self::settle_manual)). A run the fence
     /// ended first returns the fence's error, whatever it produced: the
-    /// caller never sees a success the history contradicts. A failure
-    /// carries the run's reason code next to its text.
+    /// caller never sees a success the history contradicts. A run one of
+    /// whose sends the executor refused returns the executor's error too
+    /// ([`unavailable_as_error`]). A failure carries the run's reason code
+    /// next to its text.
     fn run_manual(
         self: &Arc<Self>,
         claim: Option<ManualClaim>,
@@ -1382,9 +1415,10 @@ impl ExecutorCore {
         let effect = SENT_EFFECT.with(Cell::get);
         self.release_manual(scope.epoch);
         let sent = effect || scope.sent.load(Ordering::SeqCst);
+        let refused = scope.refused.load(Ordering::SeqCst);
         let verdict = if panicked {
             Verdict::new(Outcome::Failed, ReasonCode::ExecutorPanic, sent)
-        } else if scope.refused.load(Ordering::SeqCst) {
+        } else if refused {
             // A send found the lock held past SEND_LOCK_WAIT (S1), or
             // key-ups still owed (S3): the verdict of a refused task.
             Verdict::new(Outcome::Failed, ReasonCode::ExecutorTimeout, sent)
@@ -1395,7 +1429,7 @@ impl ExecutorCore {
         let reason = verdict.reason;
         self.pause(Pause::ManualBeforeSettle);
         if self.settle_manual(&scope, verdict, skipped_formats, last, started, end) {
-            result.map_err(|text| ManualError { reason, text })
+            unavailable_as_error(result, refused, reason)
         } else {
             Err(ManualError::fenced())
         }

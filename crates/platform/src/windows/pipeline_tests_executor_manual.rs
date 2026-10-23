@@ -986,3 +986,71 @@ fn a_manual_runs_failure_never_echoes_the_rules_values() {
     let events = capture::since(mark);
     assert!(events.iter().all(|event| !event.mentions(SENTINEL)));
 }
+
+/// F5-1 X1: a manual run whose send the send exclusion refuses (the lock
+/// held past its wait, as by a sender stuck inside `SendInput`) gets the
+/// executor's error, `ExecutorTimeout`, which leaves the crate as
+/// `ManualFailure { reason: ExecutorTimeout }` and reaches the frontend as
+/// `engine_unavailable`, not the "accepted 0/N" failed result the pipeline
+/// made of the refusal. Its first send went out: the history entry and the
+/// published result keep that side effect, and only that send reached the
+/// port. The executor goes Down and the supervisor rebuilds it.
+#[test]
+fn a_manual_send_refused_by_the_send_exclusion_returns_the_executors_error() {
+    let mut rig = ExecRig::new(vec![text_rule("kw", OutputMethod::Keys, TYPED)]);
+    let manual = ManualPorts::of(&rig);
+    let epoch = rig.core.epoch();
+    // The run's second send waits at its first check until the test holds
+    // the send lock.
+    let (arrived, at_second) = std::sync::mpsc::channel::<()>();
+    let (go, held) = std::sync::mpsc::channel::<()>();
+    let held = std::sync::Mutex::new(held);
+    let sends = std::sync::atomic::AtomicUsize::new(0);
+    rig.core.on_pause(move |point| {
+        if point == Pause::BeforeSend
+            && is_thread("qt-manual")
+            && sends.fetch_add(1, Ordering::SeqCst) == 1
+        {
+            let _ = arrived.send(());
+            let _ = held.lock().unwrap_or_else(PoisonError::into_inner).recv();
+        }
+    });
+    let run = manual.spawn(plan(vec![text("x"), text("y")]));
+    at_second.recv().expect("the run reaches its second send");
+    let stuck = rig.core.hold_send_lock();
+    go.send(()).expect("the run waits at its second send");
+    let returned = run.join().expect("the manual thread returns");
+    drop(stuck);
+
+    let error = returned.expect_err("a refused send is the executor's error");
+    assert_eq!(error.reason, ReasonCode::ExecutorTimeout, "{}", error.text);
+    assert_eq!(
+        rig.injector.calls(),
+        vec![InjectCall::Text("x".into())],
+        "only the first send"
+    );
+    assert_eq!(rig.core.epoch(), epoch, "refused, not fenced");
+    let history = rig.history();
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        (
+            history[0].trigger,
+            history[0].outcome,
+            history[0].reason,
+            history[0].side_effects
+        ),
+        (
+            TriggerKind::Manual,
+            Outcome::Failed,
+            ReasonCode::ExecutorTimeout,
+            true
+        )
+    );
+    let last = published(&rig).expect("the run published its result");
+    assert_eq!((last.status.as_str(), last.side_effects), ("failed", true));
+    assert!(!busy(&rig));
+
+    recover(&rig);
+    let auto = rig.run("kw");
+    assert_eq!(auto.status, "unknown", "{}", auto.message);
+}
