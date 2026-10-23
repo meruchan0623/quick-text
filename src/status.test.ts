@@ -194,7 +194,7 @@ describe('problemText', () => {
     );
     // NewerSchema: read-only, never overwritten, no import.
     expect(text('newer_schema')).toBe(
-      '已进入安全模式：配置文件来自更新的版本。当前版本以只读方式打开，不会修改或覆盖它，输入监听已暂停；请改用更新版本的 Quicker Text，或打开数据目录检查。',
+      '已进入安全模式：配置文件来自更新的版本。当前版本以只读方式打开，不会修改或覆盖它，输入监听已暂停；请改用更新版本的 Quicktext，或打开数据目录检查。',
     );
     for (const reason of ['locked', 'newer_schema']) expect(text(reason)).not.toMatch(/导入/);
     // A reason newer than this frontend keeps the generic sentence.

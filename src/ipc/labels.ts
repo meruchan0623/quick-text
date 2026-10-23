@@ -28,7 +28,7 @@ export const diagnosticTexts: Readonly<Record<string, string>> = {
   rule_unreadable: '这条规则的内容无法读取，已原样保留，暂不生效。',
   field_reset: '这项设置的值无法识别，已按默认值使用；保存后会写入默认值。',
   terminator_unsupported: '触发键 Tab、回车在当前平台上暂不支持，按下它们不会执行指令。',
-  schema_newer: '配置来自更新版本的 Quicker Text，当前版本只能查看，不会修改它。',
+  schema_newer: '配置来自更新版本的 Quicktext，当前版本只能查看，不会修改它。',
   config_malformed: '配置文件格式有误，无法读取。',
 };
 

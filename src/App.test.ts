@@ -283,7 +283,7 @@ describe('runtime status area (S-19)', () => {
     await click(mounted, '导出');
     await waitFor(mounted, () => {
       expect(container.querySelector('.status-text')?.textContent).toBe(
-        '诊断包已导出：mock://quicker-text-diagnostics.zip',
+        '诊断包已导出：mock://quicktext-diagnostics.zip',
       );
     });
     expect(callsOf(backend, 'export_diagnostics')[0]?.args).toEqual({ redaction: 'full' });
@@ -668,7 +668,7 @@ describe('rule list, editor and settings (F-04)', () => {
     const { container } = mounted;
     await click(mounted, '导出');
     await waitFor(mounted, () => {
-      expect(statusText(container)).toMatch(/mock:\/\/quicker-text-package\.json/);
+      expect(statusText(container)).toMatch(/mock:\/\/quicktext-package\.json/);
     });
   });
 
@@ -680,9 +680,9 @@ describe('rule list, editor and settings (F-04)', () => {
     await click(mounted, '运行状态与恢复');
     await click(mounted, '退出全部');
     await waitFor(mounted, () => {
-      expect(dialog(container, '退出 Quicker Text？')).not.toBeNull();
+      expect(dialog(container, '退出 Quicktext？')).not.toBeNull();
     });
-    await clickIn(mounted, dialog(container, '退出 Quicker Text？'), '取消');
+    await clickIn(mounted, dialog(container, '退出 Quicktext？'), '取消');
     await mounted.act(() => new Promise((resolve) => setTimeout(resolve, 20)));
     expect(callsOf(backend, 'exit_app')).toHaveLength(0);
   });
@@ -735,11 +735,11 @@ describe('启动时自动开始监听 (S-09)', () => {
     expect(container.querySelector('.alert.error')).toBeNull();
   });
 
-  it('stays usable in safe mode, which allows it, unlike 登录后自动启动 (ipc-contract §5)', async () => {
+  it('stays usable in safe mode, which allows it, unlike 开机时启动 (ipc-contract §5)', async () => {
     const mounted = await openSettings({ safeMode: 'crash_loop' });
     const { backend, container } = mounted;
     expect(container.querySelector('.banner')?.textContent).toMatch(/已进入安全模式/);
-    expect(checkbox(container, '登录后自动启动')?.disabled).toBe(true);
+    expect(checkbox(container, '开机时启动')?.disabled).toBe(true);
     expect(checkbox(container, AUTO_LISTEN)?.disabled).toBe(false);
     await toggle(mounted);
     await waitFor(mounted, () => {
@@ -774,7 +774,7 @@ describe('启动时自动开始监听 (S-09)', () => {
   it('is not shown by a 0.3 backend, which has no such setting', async () => {
     const mounted = await openSettings({ legacy: true });
     const { backend, container } = mounted;
-    expect(checkbox(container, '登录后自动启动')).not.toBeNull();
+    expect(checkbox(container, '开机时启动')).not.toBeNull();
     expect(checkbox(container, AUTO_LISTEN)).toBeNull();
     expect(container.textContent.includes(AUTO_LISTEN)).toBe(false);
     expect(callsOf(backend, 'set_auto_listen')).toHaveLength(0);
@@ -867,7 +867,7 @@ describe('启动时自动开始监听 (S-09)', () => {
     expect(callsOf(backend, 'set_auto_listen')[0]?.args).toEqual({ enabled: true });
     expect(checkbox(container, AUTO_LISTEN)?.checked).toBe(false);
 
-    const autostart = checkbox(container, '登录后自动启动');
+    const autostart = checkbox(container, '开机时启动');
     expect(autostart?.checked).toBe(false);
     await mounted.act(() => {
       autostart?.click();
@@ -877,7 +877,7 @@ describe('启动时自动开始监听 (S-09)', () => {
     });
     await settle(mounted);
     expect(callsOf(backend, 'set_autostart')[0]?.args).toEqual({ enabled: true });
-    expect(checkbox(container, '登录后自动启动')?.checked).toBe(false);
+    expect(checkbox(container, '开机时启动')?.checked).toBe(false);
     expect(container.querySelector('.alert.error')).toBeNull();
   });
 });
@@ -916,7 +916,7 @@ describe('writes wait for the first load_state snapshot (review C2 follow-up)', 
       settings: () => [
         button(container, '保存参数草稿'),
         button(container, '选择当前窗口加入黑名单'),
-        checkbox(container, '登录后自动启动'),
+        checkbox(container, '开机时启动'),
         button(container, '应用设置'),
       ],
       status: () => [
@@ -1079,7 +1079,7 @@ describe('writes wait for the first load_state snapshot (review C2 follow-up)', 
         expect(hold.held[i]?.read).toBe(true);
       });
       await mounted.act(() => {
-        checkbox(container, '登录后自动启动')?.click();
+        checkbox(container, '开机时启动')?.click();
       });
       await waitFor(mounted, () => {
         expect(callsOf(backend, 'set_autostart')).toHaveLength(i + 1);
@@ -1285,7 +1285,7 @@ describe('store revision and safe mode pushed with store-state', () => {
     expect(button(container, '应用设置')?.disabled).toBe(false);
     await click(mounted, '文本指令参数设置');
     expect(button(container, '保存参数草稿')?.disabled).toBe(true);
-    expect(checkbox(container, '登录后自动启动')?.disabled).toBe(true);
+    expect(checkbox(container, '开机时启动')?.disabled).toBe(true);
     // Not a write safe mode refuses (ipc-contract §5 set_auto_listen).
     expect(checkbox(container, '启动时自动开始监听')?.disabled).toBe(false);
     expect(field(container, '词分隔符').matches(':disabled')).toBe(true);
@@ -1306,7 +1306,7 @@ describe('store revision and safe mode pushed with store-state', () => {
     expect(revisionText(container)).toContain('当前生效 v1');
     await click(mounted, '文本指令参数设置');
     expect(button(container, '保存参数草稿')?.disabled).toBe(false);
-    expect(checkbox(container, '登录后自动启动')?.disabled).toBe(false);
+    expect(checkbox(container, '开机时启动')?.disabled).toBe(false);
     expect(checkbox(container, '启动时自动开始监听')?.disabled).toBe(false);
     expect(field(container, '词分隔符').matches(':disabled')).toBe(false);
     await settle(mounted);
@@ -1820,23 +1820,23 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       const mounted = await mountReady(hold);
       const { backend, container } = mounted;
       await click(mounted, '文本指令参数设置');
-      const before = checkbox(container, '登录后自动启动')?.checked;
+      const before = checkbox(container, '开机时启动')?.checked;
       hold.arm();
       await click(mounted, '保存参数草稿');
       await waitFor(mounted, () => {
         expect(hold.held[0]?.read).toBe(true);
       });
       await mounted.act(() => {
-        checkbox(container, '登录后自动启动')?.click();
+        checkbox(container, '开机时启动')?.click();
       });
       await waitFor(mounted, () => {
         expect(callsOf(backend, 'set_autostart')).toHaveLength(1);
       });
       await settle(mounted);
-      expect(checkbox(container, '登录后自动启动')?.checked).toBe(!before);
+      expect(checkbox(container, '开机时启动')?.checked).toBe(!before);
       // Answered with the autostart of before: the save ran first.
       await answerHeld(mounted, hold, 0);
-      expect(checkbox(container, '登录后自动启动')?.checked).toBe(!before);
+      expect(checkbox(container, '开机时启动')?.checked).toBe(!before);
       expect(backend.autostart).toBe(!before);
     });
 
@@ -1861,7 +1861,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
           expect(hold.held[i]?.read).toBe(true);
         });
         await mounted.act(() => {
-          checkbox(container, '登录后自动启动')?.click();
+          checkbox(container, '开机时启动')?.click();
         });
         await waitFor(mounted, () => {
           expect(callsOf(backend, 'set_autostart')).toHaveLength(i + 1);
@@ -2371,7 +2371,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
         await type(mounted, field(container, '词分隔符'), ' |');
         // Another command done meanwhile leaves the notice's buttons usable.
         await mounted.act(() => {
-          checkbox(container, '登录后自动启动')?.click();
+          checkbox(container, '开机时启动')?.click();
         });
         await waitFor(mounted, () => {
           expect(button(container, '放弃修改，载入新配置')?.disabled).toBe(false);
@@ -2518,7 +2518,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
         expect(notices(container)).toContain('配置已在后台更新为 v2。编辑器中未保存的修改仍然保留');
         // Another command done meanwhile leaves the notice's buttons usable.
         await mounted.act(() => {
-          checkbox(container, '登录后自动启动')?.click();
+          checkbox(container, '开机时启动')?.click();
         });
         await waitFor(mounted, () => {
           expect(button(container, '放弃修改，载入新配置')?.disabled).toBe(false);
@@ -2589,7 +2589,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
         await type(mounted, field(container, '词分隔符'), ' |');
         // Another command done meanwhile leaves the notice's buttons usable.
         await mounted.act(() => {
-          checkbox(container, '登录后自动启动')?.click();
+          checkbox(container, '开机时启动')?.click();
         });
         await waitFor(mounted, () => {
           expect(button(container, '放弃修改，载入新配置')?.disabled).toBe(false);
@@ -2763,7 +2763,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
           // 应用设置 is disabled while busy too: another command done meanwhile ends that.
           await click(mounted, '文本指令参数设置');
           await mounted.act(() => {
-            checkbox(container, '登录后自动启动')?.click();
+            checkbox(container, '开机时启动')?.click();
           });
           await waitFor(mounted, () => {
             expect(callsOf(backend, 'set_autostart')).toHaveLength(1);
@@ -2930,21 +2930,27 @@ describe('action types by capability status (S-16, principle 5)', () => {
       expect(mounted.container.querySelectorAll('tbody tr')).toHaveLength(4);
     });
     await click(mounted, '编辑');
+    await mounted.act(() => {
+      typeSelect(mounted).click();
+    });
     return mounted;
   }
 
   const typeSelect = (mounted: Mounted) => {
-    const select = dialog(mounted.container, EDITOR)?.querySelector<HTMLSelectElement>(
-      'select[aria-label="操作类型"]',
+    const select = dialog(mounted.container, EDITOR)?.querySelector<HTMLButtonElement>(
+      '[role="combobox"][aria-label="操作类型"]',
     );
-    if (!select) throw new Error('no select 「操作类型」');
+    if (!select) throw new Error('no picker 「操作类型」');
     return select;
   };
-  const offered = (mounted: Mounted) =>
-    Object.fromEntries(
-      [...typeSelect(mounted).options].map((o) => [
-        o.value,
-        { text: o.textContent, disabled: o.disabled },
+  const offered = (mounted: Mounted): Record<string, { text: string | null; disabled: boolean }> =>
+    Object.fromEntries<{ text: string | null; disabled: boolean }>(
+      [
+        ...(dialog(mounted.container, EDITOR)?.querySelectorAll<HTMLElement>('[role="option"]') ??
+          []),
+      ].map((o) => [
+        o.dataset.value ?? '',
+        { text: o.textContent, disabled: o.getAttribute('aria-disabled') === 'true' },
       ]),
     );
 
@@ -2971,18 +2977,39 @@ describe('action types by capability status (S-16, principle 5)', () => {
     const degraded = `（降级：${reasonNames.executor_timeout ?? ''}）`;
     const unavailable = `（暂不可用：${reasonNames.clipboard_busy ?? ''}）`;
     // Degraded: selectable, with the reason.
-    expect(options.text_keys).toEqual({ text: `键入纯文本${degraded}`, disabled: false });
-    expect(options.hotkey).toEqual({ text: `按快捷键${degraded}`, disabled: false });
-    expect(options.open).toEqual({ text: `打开网页、文件或程序${degraded}`, disabled: false });
+    expect(options.text_keys).toEqual({
+      text: `键入纯文本${degraded}`,
+      disabled: false,
+    });
+    expect(options.hotkey).toEqual({
+      text: `按快捷键${degraded}`,
+      disabled: false,
+    });
+    expect(options.open).toEqual({
+      text: `打开网页、文件或程序${degraded}`,
+      disabled: false,
+    });
     // Unavailable for now: listed, disabled, with the reason.
-    expect(options.text_paste).toEqual({ text: `粘贴纯文本${unavailable}`, disabled: true });
-    expect(options.html).toEqual({ text: `粘贴带格式的文字${unavailable}`, disabled: true });
+    expect(options.text_paste).toEqual({
+      text: `粘贴纯文本${unavailable}`,
+      disabled: true,
+    });
+    expect(options.html).toEqual({
+      text: `粘贴带格式的文字${unavailable}`,
+      disabled: true,
+    });
     // Experimental (macOS): selectable, tagged.
-    expect(options.replay).toEqual({ text: '重放鼠标和键盘操作（实验性）', disabled: false });
+    expect(options.replay).toEqual({
+      text: '重放鼠标和键盘操作（实验性）',
+      disabled: false,
+    });
     // Never provided: not listed.
     expect(options.quicker).toBeUndefined();
     // Needing no capability: plain.
-    expect(options.steps).toEqual({ text: '按顺序执行多个操作', disabled: false });
+    expect(options.steps).toEqual({
+      text: '按顺序执行多个操作',
+      disabled: false,
+    });
     expect(typeSelect(mounted).value).toBe('text_keys');
   });
 
@@ -3531,6 +3558,19 @@ describe('number fields of the editor', () => {
   }
 
   async function choose(mounted: Mounted, label: string, value: string): Promise<void> {
+    if (label === '操作类型') {
+      await mounted.act(() => {
+        dialog(mounted.container, EDITOR)
+          ?.querySelector<HTMLButtonElement>('[role="combobox"]')
+          ?.click();
+      });
+      await mounted.act(() => {
+        dialog(mounted.container, EDITOR)
+          ?.querySelector<HTMLElement>(`[role="option"][data-value="${value}"]`)
+          ?.click();
+      });
+      return;
+    }
     const select = dialog(mounted.container, EDITOR)?.querySelector<HTMLSelectElement>(
       `select[aria-label="${label}"]`,
     );

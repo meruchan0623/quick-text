@@ -152,7 +152,7 @@ export function problemText(problem: StartupProblem, engine: EngineNow | null = 
         // The backend retries the read (`spawn_locked_retry`); leaving safe mode keeps the pause.
         return `已进入安全模式：${why}。输入监听已暂停，期间不会写入任何文件；占用解除后会自动退出安全模式，之后点「恢复监听」即可继续。也可以打开数据目录检查。`;
       if (reason === 'newer_schema')
-        return `已进入安全模式：${why}。当前版本以只读方式打开，不会修改或覆盖它，输入监听已暂停；请改用更新版本的 Quicker Text，或打开数据目录检查。`;
+        return `已进入安全模式：${why}。当前版本以只读方式打开，不会修改或覆盖它，输入监听已暂停；请改用更新版本的 Quicktext，或打开数据目录检查。`;
       return `已进入安全模式：${why}。输入监听已暂停，设置暂时不能修改；可以导入配置或打开数据目录检查。`;
     }
     case 'recovered': {

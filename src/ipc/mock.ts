@@ -599,7 +599,7 @@ export class MockBackend {
         if (this.options.legacy) this.#fail({ code: 'cancelled' }, 'Export cancelled');
         return null;
       }
-      return 'mock://quicker-text-package.json';
+      return 'mock://quicktext-package.json';
     },
     import_config: (args) => {
       const incoming = syntheticRules(2).map((rule, i) => ({
@@ -673,7 +673,7 @@ export class MockBackend {
     startup_problems: () => clone(this.problems),
     get_capabilities: (): Capability[] => this.#capabilities(),
     export_diagnostics: () =>
-      this.options.dialog === 'cancel' ? null : 'mock://quicker-text-diagnostics.zip',
+      this.options.dialog === 'cancel' ? null : 'mock://quicktext-diagnostics.zip',
     // `ttl_hours: null` restores the default level, `info` (diagnostics.rs).
     set_log_level: (args) =>
       typeof args.ttl_hours === 'number'

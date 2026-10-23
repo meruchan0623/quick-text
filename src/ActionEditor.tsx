@@ -13,6 +13,7 @@ import {
   type InvalidNumber,
 } from './lib/numberFields';
 import { inRange, ranges } from './lib/ruleShape';
+import { ActionTypePicker } from './ActionTypePicker';
 import { LinesInput } from './LinesInput';
 import { NumberField } from './NumberField';
 type Props = {
@@ -113,21 +114,6 @@ const cmdNames: Record<string, string> = {
   hwheeldelta: '少量左右滚动',
   pastefile: '粘贴文件',
   pasteimage: '粘贴图片',
-};
-const actionHelp: Record<string, string> = {
-  none: '触发指令后不执行其他操作。',
-  text_paste: '把整段文字一次粘贴到当前输入框，适合较长的回复。只输出文字，不带字体、颜色等格式。',
-  text_keys: '像使用键盘一样，一个字一个字地输入到当前输入框。适合需要逐字输入的场合。',
-  html: '粘贴带有颜色、加粗或链接等格式的文字。需要填写 HTML 代码；接收软件不支持格式时可使用普通文字。',
-  hotkey: '替你按一次组合键，例如 Ctrl+C 复制、Ctrl+V 粘贴。',
-  send_keys: '把普通文字与回车、Tab 等按键组合起来。可用下面的按钮添加文字和按键。',
-  steps: '把键入、等待、快捷键或鼠标操作排成步骤，按顺序执行。',
-  replay: '录下鼠标和键盘操作，再按顺序重放。使用相同的窗口位置更容易得到预期效果。',
-  open: '打开一个网址、文件或程序。通常只需要填写地址或选择文件。',
-  common: '选择复制、粘贴、调整音量等常用电脑操作。',
-  reusable: '执行已经保存的另一条文本指令，方便重复使用相同操作。',
-  quicker:
-    '当前版本不能执行 Quicker 动作。这里仅保留导入的动作编号和附带内容，方便以后改成支持的操作。',
 };
 const stepLabel = (o: Data): string =>
   (
@@ -486,13 +472,6 @@ export default function ActionEditor({
     );
   return (
     <>
-      <p className="muted">{actionHelp[actionChoice(a)]}</p>
-      {platform === 'windows' && (
-        <p className="muted">
-          Windows 使用 espanso
-          输入组件发送文字。“键入纯文本”逐字输入，“粘贴纯文本”一次粘入整段内容。输入框不提供正文时也能发送并继续动作步骤，结果显示“目标处理结果未知”；请查看目标是否收到。切换目标、继续按键或停止动作会中断后续输入；已执行的操作无法自动撤销。
-        </p>
-      )}
       {[...inheritedDiagnostics, ...diagnostics].length > 0 && (
         <div className="action-diagnostics" role="alert">
           <strong>需要修改的设置 · 点击查看位置</strong>
@@ -530,11 +509,14 @@ export default function ActionEditor({
       )}
       <label className="field">
         <span>操作类型</span>
-        <select
-          aria-label="操作类型"
+        <ActionTypePicker
           value={actionChoice(a)}
-          onChange={(e) => {
-            const choice = e.target.value;
+          platform={platform}
+          options={actionOptions.flatMap(([k, v]) => {
+            const { hidden, disabled, note } = offer(k);
+            return hidden ? [] : [{ value: k, label: `${v}${note}`, disabled }];
+          })}
+          onChange={(choice) => {
             onChange(
               a.type === 'text' && choice.startsWith('text_')
                 ? { ...a, method: choice === 'text_paste' ? 'paste' : 'keys' }
@@ -546,18 +528,7 @@ export default function ActionEditor({
             setStepIndex(0);
             setHistory([]);
           }}
-        >
-          {actionOptions.flatMap(([k, v]) => {
-            const { hidden, disabled, note } = offer(k);
-            return hidden
-              ? []
-              : [
-                  <option key={k} value={k} disabled={disabled}>
-                    {`${v}${note}`}
-                  </option>,
-                ];
-          })}
-        </select>
+        />
       </label>
       {(a.type === 'text' || a.type === 'send_keys') && (
         <>

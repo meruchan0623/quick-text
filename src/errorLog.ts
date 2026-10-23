@@ -21,7 +21,7 @@ const KIND: Record<ErrorKind, string> = {
 
 /** Prints what may be printed of an error: its kind, its class and the component names. */
 export function logFrontendError(kind: ErrorKind, error: unknown, componentStack?: string): void {
-  const lines = [`Quicker Text: ${KIND[kind]} (${errorClass(error)}); the message is not shown.`];
+  const lines = [`Quicktext: ${KIND[kind]} (${errorClass(error)}); the message is not shown.`];
   const components = componentFrames(componentStack);
   if (components) lines.push(components);
   console.error(lines.join('\n'));

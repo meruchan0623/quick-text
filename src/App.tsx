@@ -783,6 +783,14 @@ export default function App() {
         throw e;
       }
     });
+  const setAutostart = (enabled: boolean) =>
+    run(async () => {
+      requireReady();
+      // Show what the backend set (Rust returns the resulting value), not the request.
+      const request = ++requests.current;
+      const value = await call<unknown>('set_autostart', { enabled });
+      installSetting('autostart', typeof value === 'boolean' ? value : enabled, request);
+    });
   // The rule as opened, to tell whether closing the editor would lose changes (F-04).
   const editingBase = useRef('');
   const openEditor = (rule: Rule) => {
@@ -963,12 +971,9 @@ export default function App() {
   return (
     <div className="app">
       <header>
-        <div className="brand">
-          <b>Q</b>
-          <div>
-            <strong>文本指令</strong>
-            <small>Quicker Text · 跨平台工作台</small>
-          </div>
+        <div className="brand" aria-hidden="true">
+          <span className="brand-logo" />
+          Quicktext
         </div>
         <div className="header-status">
           <span role="status">
@@ -989,6 +994,23 @@ export default function App() {
             {(live ? live.manualPause : state?.paused) ? '恢复监听' : '暂停监听'}
           </button>
         </div>
+        <span className="header-summary">
+          {!ready
+            ? ''
+            : config.enabled
+              ? `已启用 ${readable.filter((r) => r.enabled).length} / ${config.rules.length} 条指令`
+              : '文本指令总开关已关闭'}
+        </span>
+        <label className="switch startup-toggle">
+          <input
+            type="checkbox"
+            checked={!!state?.autostart}
+            disabled={!editable}
+            onChange={(e) => setAutostart(e.target.checked)}
+          />
+          <span />
+          开机时启动
+        </label>
       </header>
       <nav className="main-tabs">
         <button className={tab === 'manage' ? 'active' : ''} onClick={() => setTab('manage')}>
@@ -1064,254 +1086,263 @@ export default function App() {
         </div>
       )}
       {tab === 'manage' && (
-        <>
-          <div className="toolbar">
-            <label className="switch">
+        <div className="workspace">
+          <div className="panel">
+            <div className="toolbar">
+              <label className="switch">
+                <input
+                  type="checkbox"
+                  checked={config.enabled}
+                  disabled={!writable}
+                  onChange={(e) => {
+                    // Taken now: the change may be made again later (see `save`), when the box shows
+                    // config.enabled again. Set to it, not turned over.
+                    const on = e.target.checked;
+                    void run(() => save((c) => ({ ...c, enabled: on })), '总开关已保存到草稿');
+                  }}
+                />
+                <span />
+                启用文本指令
+              </label>
               <input
-                type="checkbox"
-                checked={config.enabled}
-                disabled={!writable}
-                onChange={(e) => {
-                  // Taken now: the change may be made again later (see `save`), when the box shows
-                  // config.enabled again. Set to it, not turned over.
-                  const on = e.target.checked;
-                  void run(() => save((c) => ({ ...c, enabled: on })), '总开关已保存到草稿');
-                }}
+                className="search"
+                aria-label="搜索指令"
+                placeholder="搜索缩写、说明或分组…"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
               />
-              <span />
-              启用文本指令
-            </label>
-            <input
-              className="search"
-              aria-label="搜索指令"
-              placeholder="搜索缩写、说明或分组…"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-            />
-            <label>
-              <input type="checkbox" checked={hide} onChange={(e) => setHide(e.target.checked)} />
-              隐藏摘要
-            </label>
-            <button
-              className="primary"
-              disabled={!editable}
-              onClick={() => openEditor(newRule(platform))}
-            >
-              ＋ 添加指令
-            </button>
-            <button disabled={!ready} onClick={importData}>
-              导入
-            </button>
-            <button disabled={!ready || changing} onClick={exportData}>
-              导出
-            </button>
-          </div>
-
-          <div className="batch">
-            <span>
-              共 {config.rules.length} 条
-              {unreadable.length > 0 && `（${unreadable.length} 条无法读取）`} · 已选{' '}
-              {selected.length} 条
-            </span>
-            <button
-              disabled={!writable || !selected.length}
-              onClick={() =>
-                mutate((rs) => rs.map((r) => (selectedSet.has(r.id) ? { ...r, enabled: true } : r)))
-              }
-            >
-              启用
-            </button>
-            <button
-              disabled={!writable || !selected.length}
-              onClick={() =>
-                mutate((rs) =>
-                  rs.map((r) => (selectedSet.has(r.id) ? { ...r, enabled: false } : r)),
-                )
-              }
-            >
-              停用
-            </button>
-            <button
-              disabled={!writable || !selected.length}
-              onClick={async () => {
-                const g = await askValue({
-                  title: `把所选 ${selected.length} 条指令移到哪个分组？`,
-                  confirm: '移动',
-                  input: { label: '分组名称', value: '默认' },
-                });
-                if (g)
-                  void mutate((rs) =>
-                    rs.map((r) => (selectedSet.has(r.id) ? { ...r, group: g } : r)),
-                  );
-              }}
-            >
-              移至分组
-            </button>
-            <button
-              disabled={!writable || !selected.length}
-              onClick={async () => {
-                if (
-                  await confirmAction({
-                    title: `删除所选 ${selected.length} 条指令？`,
-                    detail: '此操作保存至草稿。',
-                    confirm: '删除',
-                  })
-                )
-                  void mutate((rs) => rs.filter((r) => !selectedSet.has(r.id)));
-              }}
-            >
-              删除
-            </button>
-            <button onClick={() => setSort(sort === 'match' ? 'group' : 'match')}>
-              排序：{sort === 'match' ? '缩写' : '分组'}
-            </button>
-          </div>
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>
-                    <input
-                      aria-label="全选"
-                      type="checkbox"
-                      checked={!!rows.length && rows.every((r) => selectedSet.has(r.id))}
-                      onChange={(e) => setSelected(e.target.checked ? rows.map((r) => r.id) : [])}
-                    />
-                  </th>
-                  <th>缩写词</th>
-                  <th>触发字符</th>
-                  <th>说明</th>
-                  <th>分组</th>
-                  <th>操作类型</th>
-                  {!hide && <th>摘要</th>}
-                  <th>停用</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((r) => (
-                  <tr
-                    key={r.id}
-                    className={!r.enabled ? 'disabled-row' : ''}
-                    onDoubleClick={() => openEditor(clone(r))}
-                  >
-                    <td>
+              <label>
+                <input type="checkbox" checked={hide} onChange={(e) => setHide(e.target.checked)} />
+                隐藏摘要
+              </label>
+              <button
+                className="primary"
+                disabled={!editable}
+                onClick={() => openEditor(newRule(platform))}
+              >
+                ＋ 添加指令
+              </button>
+              <button disabled={!ready} onClick={importData}>
+                导入
+              </button>
+              <button disabled={!ready || changing} onClick={exportData}>
+                导出
+              </button>
+            </div>
+            <div className="group-tabs">
+              {groups.map((g) => (
+                <button key={g} className={group === g ? 'active' : ''} onClick={() => setGroup(g)}>
+                  {g}
+                  <small>{g === '全部' ? config.rules.length : (groupCounts.get(g) ?? 0)}</small>
+                </button>
+              ))}
+            </div>
+            <div className="batch">
+              <span>
+                共 {config.rules.length} 条
+                {unreadable.length > 0 && `（${unreadable.length} 条无法读取）`} · 已选{' '}
+                {selected.length} 条
+              </span>
+              <button
+                disabled={!writable || !selected.length}
+                onClick={() =>
+                  mutate((rs) =>
+                    rs.map((r) => (selectedSet.has(r.id) ? { ...r, enabled: true } : r)),
+                  )
+                }
+              >
+                启用
+              </button>
+              <button
+                disabled={!writable || !selected.length}
+                onClick={() =>
+                  mutate((rs) =>
+                    rs.map((r) => (selectedSet.has(r.id) ? { ...r, enabled: false } : r)),
+                  )
+                }
+              >
+                停用
+              </button>
+              <button
+                disabled={!writable || !selected.length}
+                onClick={async () => {
+                  const g = await askValue({
+                    title: `把所选 ${selected.length} 条指令移到哪个分组？`,
+                    confirm: '移动',
+                    input: { label: '分组名称', value: '默认' },
+                  });
+                  if (g)
+                    void mutate((rs) =>
+                      rs.map((r) => (selectedSet.has(r.id) ? { ...r, group: g } : r)),
+                    );
+                }}
+              >
+                移至分组
+              </button>
+              <button
+                className="danger"
+                disabled={!writable || !selected.length}
+                onClick={async () => {
+                  if (
+                    await confirmAction({
+                      title: `删除所选 ${selected.length} 条指令？`,
+                      detail: '此操作保存至草稿。',
+                      confirm: '删除',
+                    })
+                  )
+                    void mutate((rs) => rs.filter((r) => !selectedSet.has(r.id)));
+                }}
+              >
+                删除
+              </button>
+              <button onClick={() => setSort(sort === 'match' ? 'group' : 'match')}>
+                排序：{sort === 'match' ? '缩写' : '分组'}
+              </button>
+            </div>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>
                       <input
-                        aria-label={`选择 ${r.match.value}`}
+                        aria-label="全选"
                         type="checkbox"
-                        checked={selectedSet.has(r.id)}
-                        onChange={(e) =>
-                          setSelected(
-                            e.target.checked
-                              ? [...selected, r.id]
-                              : selected.filter((i) => i !== r.id),
-                          )
-                        }
+                        checked={!!rows.length && rows.every((r) => selectedSet.has(r.id))}
+                        onChange={(e) => setSelected(e.target.checked ? rows.map((r) => r.id) : [])}
                       />
-                    </td>
-                    <td>
-                      <strong>{r.match.value}</strong>
-                      <span className="markers">
-                        {r.ignore_case && <i>Aa</i>}
-                        {r.trigger_mode === 'immediate' && <i>即时</i>}
-                        {r.match.kind === 'regex' && <i>正则</i>}
-                      </span>
-                    </td>
-                    <td>
-                      {r.trigger_mode === 'immediate' ? (
-                        '即时'
-                      ) : (
-                        <TerminatorList
-                          keys={r.terminator?.keys ?? config.globals.terminators}
-                          platform={platform}
-                        />
-                      )}
-                      {!r.terminator && r.trigger_mode !== 'immediate' && (
-                        <small className="muted">继承</small>
-                      )}
-                    </td>
-                    <td>{r.description || '—'}</td>
-                    <td>{groupKey(r.group)}</td>
-                    <td>{actionLabel(r.action)}</td>
-                    {!hide && <td className="summary">{summarizeAction(r.action)}</td>}
-                    <td>
-                      <input
-                        aria-label={`停用 ${r.match.value}`}
-                        type="checkbox"
-                        checked={!r.enabled}
-                        disabled={!writable}
-                        onChange={(e) => {
-                          const off = e.target.checked;
-                          void mutate((rs) =>
-                            rs.map((x) => (x.id === r.id ? { ...x, enabled: !off } : x)),
-                          );
-                        }}
-                      />
-                    </td>
-                    <td className="row-tools">
-                      <button onClick={() => openEditor(clone(r))}>编辑</button>
-                      <button
-                        disabled={!writable}
-                        onClick={async () => {
-                          if (
-                            await confirmAction({
-                              title: `删除指令“${r.match.value}”？`,
-                              confirm: '删除',
-                            })
-                          )
-                            void mutate((rs) => rs.filter((x) => x.id !== r.id));
-                        }}
-                      >
-                        删除
-                      </button>
-                    </td>
+                    </th>
+                    <th>缩写词</th>
+                    <th>触发字符</th>
+                    <th>说明</th>
+                    <th>分组</th>
+                    <th>操作类型</th>
+                    {!hide && <th>摘要</th>}
+                    <th>停用</th>
+                    <th>操作</th>
                   </tr>
-                ))}
-                {unreadableRows.map((u) => (
-                  <tr key={`unreadable-${u.index}`} className="unreadable-row">
-                    <td />
-                    <td colSpan={hide ? 7 : 8}>
-                      <strong>无法读取的规则</strong>
-                      {u.id && <span className="unreadable-id">{u.id}</span>}
-                      {/* Read-only here means only that this UI cannot edit the entry safely; the
+                </thead>
+                <tbody>
+                  {rows.map((r) => (
+                    <tr
+                      key={r.id}
+                      className={!r.enabled ? 'disabled-row' : ''}
+                      onDoubleClick={() => openEditor(clone(r))}
+                    >
+                      <td>
+                        <input
+                          aria-label={`选择 ${r.match.value}`}
+                          type="checkbox"
+                          checked={selectedSet.has(r.id)}
+                          onChange={(e) =>
+                            setSelected(
+                              e.target.checked
+                                ? [...selected, r.id]
+                                : selected.filter((i) => i !== r.id),
+                            )
+                          }
+                        />
+                      </td>
+                      <td>
+                        <strong>{r.match.value}</strong>
+                        <span className="markers">
+                          {r.ignore_case && <i>Aa</i>}
+                          {r.trigger_mode === 'immediate' && <i>即时</i>}
+                          {r.match.kind === 'regex' && <i>正则</i>}
+                        </span>
+                      </td>
+                      <td>
+                        {r.trigger_mode === 'immediate' ? (
+                          '即时'
+                        ) : (
+                          <TerminatorList
+                            keys={r.terminator?.keys ?? config.globals.terminators}
+                            platform={platform}
+                          />
+                        )}
+                        {!r.terminator && r.trigger_mode !== 'immediate' && (
+                          <small className="muted">继承</small>
+                        )}
+                      </td>
+                      <td>{r.description || '—'}</td>
+                      <td>{groupKey(r.group)}</td>
+                      <td>{actionLabel(r.action)}</td>
+                      {!hide && <td className="summary">{summarizeAction(r.action)}</td>}
+                      <td>
+                        <input
+                          aria-label={`停用 ${r.match.value}`}
+                          type="checkbox"
+                          checked={!r.enabled}
+                          disabled={!writable}
+                          onChange={(e) => {
+                            const off = e.target.checked;
+                            void mutate((rs) =>
+                              rs.map((x) => (x.id === r.id ? { ...x, enabled: !off } : x)),
+                            );
+                          }}
+                        />
+                      </td>
+                      <td className="row-tools">
+                        <button onClick={() => openEditor(clone(r))}>编辑</button>
+                        <button
+                          className="danger"
+                          disabled={!writable}
+                          onClick={async () => {
+                            if (
+                              await confirmAction({
+                                title: `删除指令“${r.match.value}”？`,
+                                confirm: '删除',
+                              })
+                            )
+                              void mutate((rs) => rs.filter((x) => x.id !== r.id));
+                          }}
+                        >
+                          删除
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                  {unreadableRows.map((u) => (
+                    <tr key={`unreadable-${u.index}`} className="unreadable-row">
+                      <td />
+                      <td colSpan={hide ? 7 : 8}>
+                        <strong>无法读取的规则</strong>
+                        {u.id && <span className="unreadable-id">{u.id}</span>}
+                        {/* Read-only here means only that this UI cannot edit the entry safely; the
                           backend may still read and run it, so the row makes no claim either way.
                           Only a backend rule_unreadable diagnostic may say it is not in effect, and
                           the list has none to map to a rule. */}
-                      <small className="muted">
-                        这条规则含有当前界面无法编辑的内容，只能查看；已保留在配置中。
-                      </small>
-                      {u.unsafeNumber && (
-                        <small className="unreadable-reason">
-                          含超出可安全保存范围的数值，保存其他内容时该数值可能被改写。
+                        <small className="muted">
+                          这条规则含有当前界面无法编辑的内容，只能查看；已保留在配置中。
                         </small>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            {/* No empty state before the first load_state snapshot (F-04); set_paused's answer
+                        {u.unsafeNumber && (
+                          <small className="unreadable-reason">
+                            含超出可安全保存范围的数值，保存其他内容时该数值可能被改写。
+                          </small>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {/* No empty state before the first load_state snapshot (F-04); set_paused's answer
                 may fill `state` earlier. */}
-            {ready && !rows.length && !unreadableRows.length && (
-              <div className="empty">
-                <div aria-hidden="true">⌨</div>
-                <strong>{search ? '没有匹配的指令' : '建立你的第一条文本指令'}</strong>
-                <p>设置缩写、触发条件和操作，保存后应用设置。</p>
-                <button disabled={!editable} onClick={() => openEditor(newRule(platform))}>
-                  添加指令
-                </button>
-              </div>
-            )}
+              {ready && !rows.length && !unreadableRows.length && (
+                <div className="empty">
+                  <div className="empty-art" aria-hidden="true" />
+                  <strong>{search ? '没有匹配的指令' : '建立你的第一条文本指令'}</strong>
+                  <p>设置缩写、触发条件和操作，保存后应用设置。</p>
+                  <button
+                    className="primary"
+                    disabled={!editable}
+                    onClick={() => openEditor(newRule(platform))}
+                  >
+                    添加指令
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
-          <div className="group-tabs">
-            {groups.map((g) => (
-              <button key={g} className={group === g ? 'active' : ''} onClick={() => setGroup(g)}>
-                {g}
-                <small>{g === '全部' ? config.rules.length : (groupCounts.get(g) ?? 0)}</small>
-              </button>
-            ))}
-          </div>
-        </>
+        </div>
       )}
       {tab === 'settings' && (
         <section className="settings">
@@ -1399,28 +1430,6 @@ export default function App() {
             选择当前窗口加入黑名单
           </button>
           <div className="section-line">
-            <label>
-              <input
-                type="checkbox"
-                checked={!!state?.autostart}
-                disabled={!editable}
-                onChange={(e) =>
-                  run(async () => {
-                    requireReady();
-                    const enabled = e.target.checked;
-                    // Show what the backend set (Rust returns the resulting value), not the request.
-                    const request = ++requests.current;
-                    const value = await call<unknown>('set_autostart', { enabled });
-                    installSetting(
-                      'autostart',
-                      typeof value === 'boolean' ? value : enabled,
-                      request,
-                    );
-                  })
-                }
-              />
-              登录后自动启动
-            </label>
             {autoListen !== null && (
               <label
                 title={
@@ -1451,7 +1460,7 @@ export default function App() {
           </button>
           <h3>许可证与第三方声明</h3>
           <p className="muted license">
-            Quicker Text 是自由软件，按 GNU 通用公共许可证第 3 版或（由你选择）任何更新的版本授权
+            Quicktext 是自由软件，按 GNU 通用公共许可证第 3 版或（由你选择）任何更新的版本授权
             （GPL-3.0-or-later），不提供任何担保。许可证全文见源码中的
             LICENSE，所用第三方组件及其许可证见 THIRD_PARTY_NOTICES.md。
           </p>
@@ -1506,10 +1515,11 @@ export default function App() {
               停止当前动作
             </button>
             <button
+              className="danger"
               onClick={async () => {
                 if (
                   await confirmAction({
-                    title: '退出 Quicker Text？',
+                    title: '退出 Quicktext？',
                     detail: '退出后文本指令不再生效，直到再次启动。',
                     confirm: '退出',
                   })
