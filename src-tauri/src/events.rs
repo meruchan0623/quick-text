@@ -27,7 +27,8 @@
 //!
 //! Idle cost: the bus thread sleeps in `recv` and only sets a timeout while
 //! something is held back (a trailing Health/State, held executions, a busy
-//! re-check), so it adds no periodic wake-ups.
+//! re-check) or the observer asked for a tick ([`Observer::due_in`]), so it
+//! adds no periodic wake-ups.
 use crate::{error::SafeModeReason, startup::StartupProblem};
 use parking_lot::Mutex;
 use quicker_platform::{
@@ -91,6 +92,51 @@ pub trait Observer: Send + 'static {
     fn status(&mut self, health: &HealthSnapshot, state: &EngineState);
     /// One finished execution (every history entry, never rate-limited).
     fn executed(&mut self, entry: &HistoryEntry);
+    /// Each store state the store reports ([`StoreSink::report`]), in order,
+    /// before the `store-state` dedup: a value equal to the last one can
+    /// arrive again. The value the bus started with is not repeated here.
+    fn store(&mut self, _store: StoreState) {}
+    /// How long until the observer next wants [`Observer::tick`] without any
+    /// input arriving; `None` (the default) adds no wake-up. Asked after
+    /// every wake-up of the bus thread.
+    fn due_in(&self) -> Option<Duration> {
+        None
+    }
+    /// Called after every wake-up of the bus thread (an input, or a
+    /// deadline: the observer's own [`Observer::due_in`] or the bus's).
+    fn tick(&mut self) {}
+}
+
+/// Several observers behind one (production: the tray, then the
+/// last-known-good tracker). Each gets every callback in list order, each
+/// guarded on its own, so one that panics does not starve the others. The
+/// earliest [`Observer::due_in`] wins.
+pub struct Observers(pub Vec<Box<dyn Observer>>);
+
+impl Observer for Observers {
+    fn status(&mut self, health: &HealthSnapshot, state: &EngineState) {
+        for observer in &mut self.0 {
+            guarded("status", || observer.status(health, state));
+        }
+    }
+    fn executed(&mut self, entry: &HistoryEntry) {
+        for observer in &mut self.0 {
+            guarded("executed", || observer.executed(entry));
+        }
+    }
+    fn store(&mut self, store: StoreState) {
+        for observer in &mut self.0 {
+            guarded("store", || observer.store(store));
+        }
+    }
+    fn due_in(&self) -> Option<Duration> {
+        self.0.iter().filter_map(|observer| observer.due_in()).min()
+    }
+    fn tick(&mut self) {
+        for observer in &mut self.0 {
+            guarded("tick", || observer.tick());
+        }
+    }
 }
 
 /// Receives each startup problem found after the store was loaded
@@ -217,6 +263,7 @@ impl EventBus {
             health,
             state,
             busy_check: None,
+            observer_due: None,
         };
         let spawned = std::thread::Builder::new()
             .name("qt-event-bus".into())
@@ -305,17 +352,24 @@ struct Worker {
     state: EngineState,
     /// Next `busy` re-check and how many are left.
     busy_check: Option<(Instant, u32)>,
+    /// When the observer next wants a tick ([`Observer::due_in`]).
+    observer_due: Option<Instant>,
 }
 
 impl Worker {
     fn run(mut self) {
         self.observe_status();
+        self.tick_observer(Instant::now());
         let mut out = Vec::new();
         loop {
-            let wake = [self.throttle.deadline(), self.busy_check.map(|(at, _)| at)]
-                .into_iter()
-                .flatten()
-                .min();
+            let wake = [
+                self.throttle.deadline(),
+                self.busy_check.map(|(at, _)| at),
+                self.observer_due,
+            ]
+            .into_iter()
+            .flatten()
+            .min();
             let input = match wake {
                 Some(at) => match self
                     .rx
@@ -339,7 +393,19 @@ impl Worker {
             for item in out.drain(..) {
                 deliver(&self.view, &*self.sink, item);
             }
+            self.tick_observer(now);
         }
+    }
+
+    /// Gives the observer its tick and asks when it wants the next one.
+    fn tick_observer(&mut self, now: Instant) {
+        let observer = &mut self.observer;
+        let mut due = None;
+        guarded("tick", || {
+            observer.tick();
+            due = observer.due_in();
+        });
+        self.observer_due = due.map(|after| now + after);
     }
 
     fn take(&mut self, input: Input, now: Instant, out: &mut Vec<Out>) {
@@ -363,7 +429,11 @@ impl Worker {
             Input::Problem(problem) => out.push(Out::Problem(problem)),
             // Unthrottled; `deliver` drops a report equal to the view's
             // (the baseline or the last one sent).
-            Input::Store(store) => out.push(Out::Store(store)),
+            Input::Store(store) => {
+                let observer = &mut self.observer;
+                guarded("store", || observer.store(store));
+                out.push(Out::Store(store));
+            }
         }
     }
 
@@ -1110,5 +1180,125 @@ mod tests {
         assert_eq!(pushed.last(), Some(&(15, 4)));
         // The observer: each of the fifteen, in order.
         assert_eq!(seen.lock().executed, (1..=15).collect::<Vec<u64>>());
+    }
+
+    /// Reports every store state it gets and asks for one tick a little
+    /// after each, which it reports when it comes.
+    struct Timed {
+        tx: mpsc::Sender<Result<StoreState, ()>>,
+        armed: Option<Instant>,
+    }
+    impl Observer for Timed {
+        fn status(&mut self, _: &HealthSnapshot, _: &EngineState) {}
+        fn executed(&mut self, _: &HistoryEntry) {}
+        fn store(&mut self, store: StoreState) {
+            let _ = self.tx.send(Ok(store));
+            self.armed = Some(Instant::now() + ms(20));
+        }
+        fn due_in(&self) -> Option<Duration> {
+            self.armed
+                .map(|at| at.saturating_duration_since(Instant::now()))
+        }
+        fn tick(&mut self) {
+            if self.armed.is_some_and(|at| Instant::now() >= at) {
+                self.armed = None;
+                let _ = self.tx.send(Err(()));
+            }
+        }
+    }
+
+    /// The observer gets every store report in order (repeats included: the
+    /// `store-state` dedup is the bus's), and a tick at the time it asked
+    /// for, with no input to wake the bus.
+    #[test]
+    fn the_observer_gets_store_reports_and_the_ticks_it_asks_for() {
+        let runtime = Arc::new(Runtime::new(Arc::new(SystemClock)));
+        let (tx, _rx) = mpsc::channel();
+        let (seen_tx, seen) = mpsc::channel();
+        let bus = EventBus::start(
+            &runtime,
+            store(1, None),
+            Channel(tx),
+            Box::new(Timed {
+                tx: seen_tx,
+                armed: None,
+            }),
+        );
+        let sink = bus.store_sink();
+        let next_seen = || seen.recv_timeout(Duration::from_secs(10)).unwrap();
+        for report in [
+            store(2, None),
+            store(2, None),
+            store(3, Some(SafeModeReason::CrashLoop)),
+        ] {
+            sink.report(report);
+            assert_eq!(next_seen(), Ok(report));
+            assert_eq!(next_seen(), Err(()), "the tick it asked for");
+        }
+        assert!(seen.try_recv().is_err(), "one tick per request");
+    }
+
+    /// Logs each callback it gets as `(name, callback)`, then panics if
+    /// told to; asks for a tick after `due`.
+    struct Child {
+        name: &'static str,
+        log: Arc<Mutex<Vec<(&'static str, &'static str)>>>,
+        panics: bool,
+        due: Option<Duration>,
+    }
+    impl Child {
+        fn got(&self, callback: &'static str) {
+            self.log.lock().push((self.name, callback));
+            assert!(!self.panics, "{} panics in {callback}", self.name);
+        }
+    }
+    impl Observer for Child {
+        fn status(&mut self, _: &HealthSnapshot, _: &EngineState) {
+            self.got("status");
+        }
+        fn executed(&mut self, _: &HistoryEntry) {
+            self.got("executed");
+        }
+        fn store(&mut self, _: StoreState) {
+            self.got("store");
+        }
+        fn due_in(&self) -> Option<Duration> {
+            self.due
+        }
+        fn tick(&mut self) {
+            self.got("tick");
+        }
+    }
+
+    /// The tray and the last-known-good tracker share the bus: each gets
+    /// every callback, in list order, one panicking does not starve the
+    /// others, and the earliest tick request wins.
+    #[test]
+    fn observers_each_get_every_callback_even_when_one_panics() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let child = |name, panics, due| -> Box<dyn Observer> {
+            Box::new(Child {
+                name,
+                log: Arc::clone(&log),
+                panics,
+                due,
+            })
+        };
+        let mut all = Observers(vec![
+            child("tray", true, Some(ms(50))),
+            child("lkg", false, Some(ms(20))),
+            child("idle", false, None),
+        ]);
+        all.status(&HealthSnapshot::default(), &EngineState::default());
+        all.executed(&entry(1));
+        all.store(store(2, None));
+        all.tick();
+        assert_eq!(all.due_in(), Some(ms(20)));
+        let expected: Vec<_> = ["status", "executed", "store", "tick"]
+            .into_iter()
+            .flat_map(|callback| ["tray", "lkg", "idle"].map(|name| (name, callback)))
+            .collect();
+        assert_eq!(*log.lock(), expected);
+        assert_eq!(Observers(vec![child("idle", false, None)]).due_in(), None);
     }
 }

@@ -6,6 +6,7 @@ mod diagnostics;
 mod error;
 mod events;
 mod faults;
+mod lkg;
 mod startup;
 mod store;
 mod tray;
@@ -73,11 +74,18 @@ fn main() {
             let bus = {
                 let managed = app.state::<Managed>();
                 let mut store = managed.lock();
+                // B-04: marks the active revision last-known-good once it
+                // has proven itself; runs on the bus thread.
+                let lkg = lkg::LkgTracker::new(
+                    &runtime,
+                    store.store_state(),
+                    lkg::mark_in(app.handle().clone()),
+                );
                 let bus = events::EventBus::start(
                     &runtime,
                     store.store_state(),
                     app.handle().clone(),
-                    Box::new(status),
+                    Box::new(events::Observers(vec![Box::new(status), Box::new(lkg)])),
                 );
                 store.set_problem_sink(bus.problem_sink());
                 // Review A9: writes the revision and safe mode into the
