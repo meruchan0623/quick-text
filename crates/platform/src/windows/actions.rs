@@ -277,17 +277,17 @@ pub fn execute(
     terminator: Option<String>,
     speed: f64,
 ) -> Result<ExecutionResult, String> {
-    // Manual run (no rule): recorded in the history too (B-35).
-    let started = SystemClock.now();
-    begin_trace();
+    // Manual run (no rule): supervised by the executor like a task (F5-1)
+    // and recorded in the history too (B-35).
     let process = target.process.clone();
-    let report = if erase != 0 {
-        RunReport::text(Err("Automatic erasure requires observed text proof".into()))
-    } else {
-        execute_inner(s, plan, target, generation, None, terminator, speed)
-    };
-    super::executor::record_manual(&process, &report, started);
-    report.result
+    let core = super::executor::manual_core(&s);
+    super::executor::run_manual(core, &process, || {
+        if erase != 0 {
+            RunReport::text(Err("Automatic erasure requires observed text proof".into()))
+        } else {
+            execute_inner(s, plan, target, generation, None, terminator, speed)
+        }
+    })
 }
 pub(super) fn execute_inner(
     s: Arc<Shared>,
@@ -300,11 +300,13 @@ pub(super) fn execute_inner(
 ) -> RunReport {
     run_plan(
         &Ports {
-            // Manual output takes the executor's send lock too (S1).
+            // Manual output takes the executor's send lock too (S1), behind
+            // the supervised run's epoch fence (F5-1); its clipboard lease
+            // takes the run's clipboard claim.
             injector: &super::executor::serialized(&WinInjector),
             foreground: &WinForeground,
             clock: &SystemClock,
-            clipboard: WinClipboard::new,
+            clipboard: || super::executor::manual_clipboard(WinClipboard::new),
         },
         &s,
         plan,
@@ -783,9 +785,10 @@ where
         completed_steps: completed,
         side_effects: SENT_EFFECT.with(|flag| flag.get()) || completed > 0,
     };
-    // An executor task publishes its result itself, from its busy guard and
-    // only while it still owns the run (B-01); manual runs publish here.
-    if !super::executor::in_task() {
+    // An executor task, or a supervised manual run, publishes its result
+    // when it settles and only while it still owns the run (B-01, F5-1);
+    // unsupervised manual runs publish here.
+    if !super::executor::publishes_on_settle() {
         *s.last
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.clone());

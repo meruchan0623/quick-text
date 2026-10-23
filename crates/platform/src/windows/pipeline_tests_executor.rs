@@ -2711,3 +2711,6 @@ fn physical_key_conflicts_are_modifier_held_on_the_real_paths() {
 // P5-B: the clipboard path on this rig (probe, structured reasons).
 #[path = "pipeline_tests_executor_clipboard.rs"]
 mod clipboard_path;
+// F5-1: manual runs under the executor's supervision.
+#[path = "pipeline_tests_executor_manual.rs"]
+mod manual_path;
