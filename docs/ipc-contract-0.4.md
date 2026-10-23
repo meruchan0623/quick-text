@@ -30,7 +30,7 @@ Rust 侧的共享类型在 `crates/platform/src/health.rs`，JSON 形状由其 s
 | `rule_conflict` | `{ id, current }` | 0.5 使用，0.4 先定义 |
 | `revision_conflict` | `{ current: number }` | |
 | `safe_mode` | `{ reason: SafeModeReason }` | 安全模式下的写命令 |
-| `io` | `{ op: IoOp, path: string \| null, os_code: number \| null }` | `path` 只给数据目录下的相对路径或文件名，不给用户目录全路径 |
+| `io` | `{ op: IoOp, path: string \| null, os_code: number \| null }` | `path` 只给数据目录下的相对路径或文件名，不给用户目录全路径。`path` 为 `backup-pre-0.4` 表示升级前备份没有做成（计划 §9，R6）：这次写入没有执行，已有配置照常生效，下次写入会重试；同时会有 `backup_failed` 启动问题 |
 | `not_found` | `{ kind: EntityKind, id }` | |
 | `busy` | — | 执行器正忙 |
 | `engine_unavailable` | `{ health: HealthState }` | |
@@ -60,7 +60,7 @@ Rust 侧的共享类型在 `crates/platform/src/health.rs`，JSON 形状由其 s
 | `engine-health` | `{ seq, state: HealthState, components: ComponentHealth[] }` | 状态变化时立即发送；状态不变时最多每 5 秒重发一次。细则：`state` 变化立即发送；`state` 不变、只有 `components` 变化时，距上次发送满 5 秒立即发送，否则只保留最新值，到 5 秒时发出（其间变回上次发出的值则不发）；没有变化不重发（无心跳） |
 | `engine-state` | `{ seq, listening: boolean, paused_reasons: PauseReason[], busy: boolean, current_process: string \| null }` | 100ms 内的多次变化合并为一次。细则：距上次发送满 100ms 的变化立即发送，否则只保留最新值，在上次发送后 100ms 发出（其间变回上次发出的值则不发） |
 | `execution-result` | `{ seq, entry: HistoryEntry, suppressed: number }` | ≤ 10 条/秒；超出的条目不单独推送，下一条推送的 `suppressed` 记被合并的条数，前端据此显示「另有 N 条」，需要明细时调用 `list_history`。细则：1 秒滑动窗口；窗口满时只保留最新一条，窗口一有空位就发出（或被随后的新条目带走），`suppressed` 是被它合并、没有单独推送的条数 |
-| `startup-problem` | `{ seq, kind: string, severity: "info" \| "warning" \| "error", args: object }` | 每个问题一次；同时可通过 `startup_problems` 命令取全集。只推送加载之后才出现的问题（SafeMode(Locked) 重试成功后新出现的问题、`autostart_repaired`、`self_test_failed`、`log_level_elevated`）；加载时已有的问题不推送，由 `load_state.startup_problems` 提供。问题消失（例如 Locked 重试成功后移除 `safe_mode`）不发事件，前端在 `store-state` 的 `safe_mode` 变为 `null` 时（或 `engine-state` 的 `paused_reasons` 不再含 `safe_mode` 时）可以重新调用 `startup_problems` |
+| `startup-problem` | `{ seq, kind: string, severity: "info" \| "warning" \| "error", args: object }` | 每个问题一次；同时可通过 `startup_problems` 命令取全集。只推送加载之后才出现的问题（SafeMode(Locked) 重试成功后新出现的问题、`autostart_repaired`、`self_test_failed`、`log_level_elevated`、`backup_failed`、加载之后才改名的 `config_quarantined`）；加载时已有的问题不推送，由 `load_state.startup_problems` 提供。问题消失（例如 Locked 重试成功后移除 `safe_mode`）不发事件，前端在 `store-state` 的 `safe_mode` 变为 `null` 时（或 `engine-state` 的 `paused_reasons` 不再含 `safe_mode` 时）可以重新调用 `startup_problems` |
 | `store-state` | `{ seq, revision: number, safe_mode: SafeModeReason \| null }` | 不限速、不合并。当前生效修订号或安全模式变化时发送一次，不论原因（保存并应用、回滚、导入发布、SafeMode(Locked) 重试成功、其他后端路径）；两者同时变化（如 Locked 重试成功：新修订号与 `safe_mode: null`）是同一条事件；值与上一条 `store-state`（或下方发送规则所说的基线）相同时不重发。初值不推送，从 `get_runtime_snapshot` / `load_state` 取 |
 | `engine-status` | 旧字符串 `"running"` \| `"paused"` \| `"listening"` | 0.4–0.5 保留为别名，不带 `seq`，新代码不要订阅。某条 `engine-state` 使这个字符串变化时紧随其后发送 |
 
@@ -101,13 +101,14 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 |---|---|---|
 | `safe_mode` | error | `{ reason: SafeModeReason }` |
 | `recovered` | warning | `{ from: "last_good" \| "revision" \| "previous", revision: number \| null }` |
-| `config_quarantined` | warning | `{ file, quarantined_as }`（文件名，不含目录） |
+| `config_quarantined` | warning | `{ file, quarantined_as }`（文件名，不含目录）。0.3.1 会读的文件要等升级前备份做成后才改名（计划 §9，审查 I-B1）：加载时备份没做成、或处于安全模式时，改名和这个问题在之后第一次做成备份的写入时才发生，以 `startup-problem` 推送 |
 | `rules_skipped` | warning | `{ count, ids: string[] }`（宽容读取或逐条编译失败的规则） |
 | `terminator_unsupported` | warning | `{ keys: string[] }`（旧配置中的 tab、enter） |
 | `autostart_repaired` | info | `{}`（自启项路径与当前程序不符，已修正） |
 | `self_test_failed` | warning | `{ checks: ("raw_input" \| "hook_heartbeat" \| "foreground" \| "clipboard")[] }`：启动自检未通过的项（原因为 `unsupported` 的项不计入），不改变暂停状态：引擎保持暂停，启动期间用户已手动恢复的，保持用户的选择（是否在监听仍由其余暂停原因决定，以 `engine-state` 为准），界面提供「恢复监听」。见 §5「自检」 |
 | `log_level_elevated` | info | `{ level: "error" \| "warn" \| "debug" \| "trace", until_ms: number }`：启动时从 prefs 恢复了仍在有效期内的临时日志级别，`until_ms` 为到期时间（Unix 毫秒） |
 | `store_meta_reset` | warning | `{}`（`store-meta.json` 无法解析，已重建） |
+| `backup_failed` | warning | `{ backup: "backup-pre-0.4" }`：0.4 第一次写入 0.3.1 会读的文件前要做的备份没有做成（计划 §9，R6）。保存、放弃草稿、发布、回滚都会以 `io`（`path` 为 `backup-pre-0.4`）拒绝，已有配置照常生效，每次写入都会重试；备份做成后从 `startup_problems` 中移除。建议文案：「升级前备份失败，暂时不能保存，已有配置照常生效」 |
 
 后端可以新增 kind；前端对未知 kind 显示 `kind` 原文加通用文案。
 

@@ -3,7 +3,10 @@
 //! every way the data directory can be broken ends in a [`LoadOutcome`].
 use super::{
     atomic::atomic_json,
-    meta::{next_crash_count, parse_meta, RunMarker, StoreMeta, CRASH_LOOP_THRESHOLD, META_FILE},
+    meta::{
+        next_crash_count, parse_meta, Fingerprint, PreviousRevision, RunMarker, StoreMeta,
+        CRASH_LOOP_THRESHOLD, META_FILE,
+    },
 };
 use crate::{
     error::{file_label, SafeModeReason},
@@ -18,6 +21,7 @@ use quicker_platform::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
+    ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
     time::Duration,
@@ -32,6 +36,9 @@ const RETRY_DELAYS_MS: [u64; 4] = [100, 200, 400, 800];
 pub trait StoreIo: Send + Sync {
     fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    /// The names of the entries in `dir`. An entry that cannot be read fails
+    /// the whole listing, so a partial listing is never taken for complete.
+    fn list_dir(&self, dir: &Path) -> io::Result<Vec<OsString>>;
 }
 
 /// The real file system. `fs::read` opens with every share mode on Windows,
@@ -48,6 +55,11 @@ impl StoreIo for FsIo {
     }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         fs::rename(from, to)
+    }
+    fn list_dir(&self, dir: &Path) -> io::Result<Vec<OsString>> {
+        fs::read_dir(dir)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect()
     }
 }
 
@@ -97,6 +109,11 @@ pub enum LoadOutcome {
 pub struct LoadReport {
     pub outcome: LoadOutcome,
     pub active: Config,
+    /// Whether `active` was read from a file (`active.json` or a fallback
+    /// candidate). False for the empty configuration a new data directory,
+    /// SafeMode(NoValidConfig) and the read-only safe modes start with: it
+    /// was never on disk, so it must never be backed up as a revision.
+    pub active_on_disk: bool,
     /// `active` compiled rule by rule; rules that failed stay off (B-43).
     pub compiled: CompiledConfig,
     pub draft: Config,
@@ -108,6 +125,23 @@ pub struct LoadReport {
     pub meta: StoreMeta,
     /// Whether `store-meta.json` may be written this session.
     pub meta_writable: bool,
+    /// Corrupt files left where they are until the pre-0.4 backup holds
+    /// them (review I-B1, see [`DeferredQuarantine`]).
+    pub deferred: Vec<DeferredQuarantine>,
+}
+
+/// A corrupt configuration file that the load did not rename (review I-B1):
+/// while `store-meta.json` does not say the pre-0.4 backup has been dealt
+/// with, nothing that 0.3.1 reads may change, not even by a quarantine
+/// rename. The load goes on as if the file were quarantined; the store
+/// renames it once the backup holds it (`Store::quarantine_deferred`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeferredQuarantine {
+    pub path: PathBuf,
+    /// Of the bytes found corrupt: a file that changed since is left alone.
+    pub fingerprint: Fingerprint,
+    /// When the load found it, for the quarantine name.
+    pub found_ms: i64,
 }
 impl LoadReport {
     pub fn safe_mode(&self) -> Option<SafeModeReason> {
@@ -131,21 +165,33 @@ impl LoadReport {
 ///    `<name>.corrupt-<time>.json`); if that rename fails nothing may
 ///    overwrite the file, so `active.json` and `draft.json` then also mean
 ///    SafeMode(Locked). A newer schema is SafeMode(NewerSchema): read-only.
+///    Until `store-meta.json` says the pre-0.4 backup has been dealt with
+///    (absent or unreadable mark), the rename waits for that backup: the
+///    file stays in place and is listed in [`LoadReport::deferred`]
+///    (review I-B1).
 /// 4. The chosen configuration is read leniently and compiled rule by rule.
 ///    No usable candidate at all is SafeMode(NoValidConfig) with an empty
-///    configuration; two or more consecutive crashes are SafeMode(CrashLoop)
-///    with the data loaded for viewing.
+///    configuration, also on later launches while the candidates an earlier
+///    one quarantined are all that is left, or while a directory that could
+///    hold candidates cannot be listed; two or more consecutive crashes
+///    are SafeMode(CrashLoop) with the data loaded for viewing.
 /// 5. Outside the read-only safe modes `store-meta.json` gets the new run
 ///    marker. One that did not parse is quarantined first; when that rename
 ///    fails, or the file could not be read, it is not written this session
 ///    and the marker and crash count stay in memory.
 pub fn load_or_fallback(dir: &Path, env: &StoreEnv) -> LoadReport {
-    let mut loader = Loader {
-        dir,
-        env,
-        problems: vec![],
-    };
+    let mut loader = Loader::new(dir, env);
     let (meta, meta_file) = loader.read_meta();
+    // I-B1: an unreadable or rebuilt store-meta.json says nothing either.
+    loader.defer = meta.backup_pre_0_4.is_none();
+    // Review R7-3, diagnostic only: once the mark is set the backup is not
+    // checked again, so a recorded directory that went away is only logged.
+    if let (Some(true), Some(name)) = (meta.backup_pre_0_4, &meta.backup_pre_0_4_dir) {
+        let recorded = Path::new(name);
+        if matches!(dir.join(recorded).try_exists(), Ok(false)) {
+            tracing::warn!(event = "store.backup_missing", dir = %label(recorded), "recorded pre-0.4 backup directory is missing");
+        }
+    }
     let now = RunMarker {
         boot_id: env.boot_id,
         started_ms: env.clock.wall_ms(),
@@ -155,11 +201,13 @@ pub fn load_or_fallback(dir: &Path, env: &StoreEnv) -> LoadReport {
 
     let active_path = dir.join("active.json");
     let mut disk_hash = None;
+    let mut loaded_fingerprint = None;
     let mut found = None;
     let mut any_candidate = false;
     match loader.candidate(&active_path) {
         Candidate::Loaded(stored, bytes) => {
-            disk_hash = Some(Sha256::digest(bytes).to_vec());
+            disk_hash = Some(Sha256::digest(&bytes).to_vec());
+            loaded_fingerprint = Some(Fingerprint::of(&bytes));
             found = Some((*stored, LoadOutcome::Normal));
         }
         Candidate::Missing => {}
@@ -170,7 +218,11 @@ pub fn load_or_fallback(dir: &Path, env: &StoreEnv) -> LoadReport {
         Candidate::Newer => return loader.read_only(SafeModeReason::NewerSchema, meta),
     }
     if found.is_none() {
-        for (path, from) in loader.fallback_candidates(meta.last_good_revision) {
+        let (candidates, listed) = loader.fallback_candidates(meta.last_good_revision);
+        // Revisions that could not be listed may hold candidates: like a
+        // candidate that could not be read, that is no new data directory.
+        any_candidate |= !listed;
+        for (path, from) in candidates {
             match loader.candidate(&path) {
                 Candidate::Loaded(stored, _) => {
                     let revision =
@@ -192,6 +244,7 @@ pub fn load_or_fallback(dir: &Path, env: &StoreEnv) -> LoadReport {
             }
         }
     }
+    let active_on_disk = found.is_some();
     let (stored, mut outcome) = match found {
         Some(found) => found,
         None => {
@@ -199,6 +252,28 @@ pub fn load_or_fallback(dir: &Path, env: &StoreEnv) -> LoadReport {
                 config: Config::default(),
                 diagnostics: vec![],
             };
+            // F4-1: candidates an earlier launch quarantined still count, so
+            // SafeMode(NoValidConfig) lasts until an import is published
+            // (which writes active.json). Derived from the directory, not
+            // from a flag in store-meta.json, which may be unreadable or
+            // left unwritten this session.
+            if !any_candidate {
+                match loader.quarantined_candidates() {
+                    Ok(0) => {}
+                    Ok(quarantined) => {
+                        tracing::warn!(
+                            event = "store.no_valid_config_kept",
+                            quarantined,
+                            "no configuration to load; candidates quarantined by an earlier launch"
+                        );
+                        any_candidate = true;
+                    }
+                    // R2: evidence that could not be inspected (logged as
+                    // `store.list_failed`) fails closed, never as a new
+                    // data directory.
+                    Err(_) => any_candidate = true,
+                }
+            }
             if any_candidate {
                 (stored, LoadOutcome::SafeMode(SafeModeReason::NoValidConfig))
             } else {
@@ -219,7 +294,11 @@ pub fn load_or_fallback(dir: &Path, env: &StoreEnv) -> LoadReport {
         }
         Candidate::Newer => return loader.read_only(SafeModeReason::NewerSchema, meta),
     };
-    let previous = loader.previous(&active);
+    let previous = loader.previous(
+        &active,
+        &meta.previous_revisions,
+        loaded_fingerprint.as_ref(),
+    );
 
     // Rules that did not compile plus entries that did not read; entries
     // without a string id count but have no id to list.
@@ -281,6 +360,7 @@ pub fn load_or_fallback(dir: &Path, env: &StoreEnv) -> LoadReport {
     LoadReport {
         outcome,
         active,
+        active_on_disk,
         compiled,
         draft,
         previous,
@@ -288,6 +368,7 @@ pub fn load_or_fallback(dir: &Path, env: &StoreEnv) -> LoadReport {
         problems,
         meta,
         meta_writable,
+        deferred: loader.deferred,
     }
 }
 
@@ -315,6 +396,22 @@ enum Read {
     Failed,
 }
 
+/// A rollback candidate read by [`Loader::rollback_config`].
+enum Stored {
+    Config(Config),
+    Missing,
+    /// Did not read or did not parse.
+    Unusable,
+}
+impl Stored {
+    fn config(self) -> Option<Config> {
+        match self {
+            Stored::Config(config) => Some(config),
+            Stored::Missing | Stored::Unusable => None,
+        }
+    }
+}
+
 /// What `store-meta.json` allows this session.
 enum MetaFile {
     /// Parsed, or not there yet: it may be written.
@@ -329,8 +426,21 @@ struct Loader<'a> {
     dir: &'a Path,
     env: &'a StoreEnv,
     problems: Vec<StartupProblem>,
+    /// Corrupt files are listed in `deferred` instead of renamed (I-B1).
+    defer: bool,
+    deferred: Vec<DeferredQuarantine>,
 }
-impl Loader<'_> {
+impl<'a> Loader<'a> {
+    fn new(dir: &'a Path, env: &'a StoreEnv) -> Self {
+        Self {
+            dir,
+            env,
+            problems: vec![],
+            defer: false,
+            deferred: vec![],
+        }
+    }
+
     fn problem(&mut self, kind: ProblemKind) {
         self.problems.push(kind.into());
     }
@@ -417,14 +527,29 @@ impl Loader<'_> {
                     "configuration file does not parse"
                 );
                 Candidate::Corrupt {
-                    quarantined: self.quarantine(path),
+                    quarantined: self.quarantine(path, &bytes),
                 }
             }
         }
     }
 
-    /// Quarantines a corrupt configuration file and reports it.
-    fn quarantine(&mut self, path: &Path) -> bool {
+    /// Quarantines a corrupt configuration file and reports it. Before the
+    /// pre-0.4 backup has been dealt with the file is only listed for the
+    /// store to rename later, and counts as quarantined here.
+    fn quarantine(&mut self, path: &Path, bytes: &[u8]) -> bool {
+        if self.defer {
+            tracing::warn!(
+                event = "store.quarantine_deferred",
+                file = %label(path),
+                "corrupt file left in place until the pre-0.4 backup holds it"
+            );
+            self.deferred.push(DeferredQuarantine {
+                path: path.to_path_buf(),
+                fingerprint: Fingerprint::of(bytes),
+                found_ms: self.env.clock.wall_ms(),
+            });
+            return true;
+        }
         let Some(target) = self.rename_aside(path) else {
             return false;
         };
@@ -461,9 +586,36 @@ impl Loader<'_> {
         }
     }
 
+    /// The names in `dir`. A directory that does not exist is empty; any
+    /// other failure, of the listing or of one entry, is logged and returned.
+    fn list(&self, dir: &Path) -> io::Result<Vec<String>> {
+        match self.env.io.list_dir(dir) {
+            // Names that are not UTF-8 are no store file names.
+            Ok(names) => Ok(names
+                .into_iter()
+                .filter_map(|name| name.into_string().ok())
+                .collect()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(vec![]),
+            Err(e) => {
+                tracing::warn!(
+                    event = "store.list_failed",
+                    dir = %label(dir),
+                    kind = %e.kind(),
+                    os_code = ?e.raw_os_error(),
+                    "store directory could not be listed"
+                );
+                Err(e)
+            }
+        }
+    }
+
     /// The last-known-good revision, then the other revisions newest first,
-    /// then `previous.json`.
-    fn fallback_candidates(&self, last_good: Option<u64>) -> Vec<(PathBuf, RecoverySource)> {
+    /// then `previous.json`; false when `revisions` could not be listed, so
+    /// the list may miss some.
+    fn fallback_candidates(
+        &self,
+        last_good: Option<u64>,
+    ) -> (Vec<(PathBuf, RecoverySource)>, bool) {
         let revisions = self.dir.join("revisions");
         let mut candidates = vec![];
         if let Some(n) = last_good {
@@ -472,7 +624,13 @@ impl Loader<'_> {
                 RecoverySource::LastGood,
             ));
         }
-        let mut numbers = revision_numbers(self.dir);
+        let listing = self.list(&revisions);
+        let listed = listing.is_ok();
+        let mut numbers: Vec<u64> = listing
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|name| revision_number(name))
+            .collect();
         numbers.sort_unstable_by(|a, b| b.cmp(a));
         candidates.extend(
             numbers
@@ -486,40 +644,112 @@ impl Loader<'_> {
                 }),
         );
         candidates.push((self.dir.join("previous.json"), RecoverySource::Previous));
-        candidates
+        (candidates, listed)
+    }
+
+    /// How many configuration candidates an earlier launch quarantined (F4-1):
+    /// `active` and `previous` beside `store-meta.json`, `revisions/<n>` below
+    /// it, renamed by [`quarantine_target`]. The quarantines of `draft.json`,
+    /// `store-meta.json` and `prefs.json` are not candidates. An error when
+    /// the directories cannot be listed (R2): the caller must not read it as
+    /// "none".
+    fn quarantined_candidates(&self) -> io::Result<usize> {
+        let top = self
+            .list(self.dir)?
+            .iter()
+            .filter(|name| matches!(quarantined_stem(name), Some("active" | "previous")))
+            .count();
+        let revisions = self
+            .list(&self.dir.join("revisions"))?
+            .iter()
+            .filter(|name| quarantined_stem(name).is_some_and(is_revision_stem))
+            .count();
+        Ok(top + revisions)
     }
 
     /// The configuration `rollback` returns to. Not a fallback candidate: a
     /// file that does not read only makes rollback unavailable.
-    fn previous(&self, active: &Config) -> Option<Config> {
-        let historical = self
-            .dir
-            .join("revisions")
-            .join(format!("{}.json", active.revision.saturating_sub(1)));
-        let path = if active.revision > 0 && historical.exists() {
-            historical
-        } else {
-            self.dir.join("previous.json")
-        };
-        let Read::Bytes(bytes) = self.read(&path) else {
-            return None;
+    ///
+    /// The predecessor the publish of `active` recorded, so that a restart
+    /// keeps the rollback target of the session before (R3); `None` when it
+    /// replaced the empty stand-in. A record applies only to the bytes of
+    /// `active.json` this load read (`loaded`, review I-R2): its revision and
+    /// fingerprint must both match, so a reused revision number, or a
+    /// configuration recovered from a fallback candidate (`loaded` is
+    /// `None`), never takes another revision's record. The record decides:
+    /// when the snapshot it names is gone or does not read, rollback is
+    /// unavailable, nothing else is tried (review R8-1).
+    ///
+    /// Without a record that applies (a meta file from before it existed,
+    /// not written or rebuilt, or a revision published by 0.3.1) the
+    /// predecessor is a guess, in this order (review R8-1):
+    /// 1. `revisions/<active - 1>.json` when it is there (as before; one that
+    ///    does not read leaves rollback unavailable, as before);
+    /// 2. `previous.json`, when it reads and its revision is below the
+    ///    active one;
+    /// 3. the nearest snapshot below the active revision: only for the gap a
+    ///    publish leaves when it skips the numbers other files in
+    ///    `revisions/` use (review R7-2). The weakest guess: a snapshot
+    ///    deleted from outside makes it return an older one.
+    fn previous(
+        &self,
+        active: &Config,
+        records: &[PreviousRevision],
+        loaded: Option<&Fingerprint>,
+    ) -> Option<Config> {
+        let revisions = self.dir.join("revisions");
+        let snapshot = |n: u64| revisions.join(format!("{n}.json"));
+        let record = loaded.and_then(|loaded| {
+            records
+                .iter()
+                .find(|record| record.active == active.revision && &record.fingerprint == loaded)
+        });
+        if let Some(record) = record {
+            return self.rollback_config(&snapshot(record.revision?)).config();
+        }
+        if let Some(below) = active.revision.checked_sub(1) {
+            match self.rollback_config(&snapshot(below)) {
+                Stored::Missing => {}
+                found => return found.config(),
+            }
+        }
+        if let Stored::Config(config) = self.rollback_config(&self.dir.join("previous.json")) {
+            if config.revision < active.revision {
+                return Some(config);
+            }
+        }
+        let nearest = revision_numbers(self.dir)
+            .into_iter()
+            .filter(|&n| n < active.revision)
+            .max()?;
+        self.rollback_config(&snapshot(nearest)).config()
+    }
+
+    /// A file [`Self::previous`] looks at. One that does not parse is
+    /// logged with its name and error code only.
+    fn rollback_config(&self, path: &Path) -> Stored {
+        let bytes = match self.read(path) {
+            Read::Bytes(bytes) => bytes,
+            Read::Missing => return Stored::Missing,
+            Read::Failed => return Stored::Unusable,
         };
         match read_stored_config(&bytes) {
-            Ok(stored) => Some(stored.config),
+            Ok(stored) => Stored::Config(stored.config),
             Err(e) => {
                 tracing::warn!(
                     event = "store.previous_unreadable",
-                    file = %label(&path),
+                    file = %label(path),
                     code = e.code(),
-                    "previous configuration unavailable for rollback"
+                    "file not usable as the rollback target"
                 );
-                None
+                Stored::Unusable
             }
         }
     }
 
     /// SafeMode(Locked) or SafeMode(NewerSchema): nothing is loaded and
-    /// nothing is written; `store-meta.json` is neither written nor renamed.
+    /// nothing is written; `store-meta.json` is neither written nor renamed,
+    /// and corrupt files found so far stay where they are.
     fn read_only(self, reason: SafeModeReason, meta: StoreMeta) -> LoadReport {
         let active = Config::default();
         let (compiled, _) = compile_lenient(&active);
@@ -530,11 +760,13 @@ impl Loader<'_> {
             draft: active.clone(),
             compiled,
             active,
+            active_on_disk: false,
             previous: None,
             disk_hash: None,
             problems,
             meta,
             meta_writable: false,
+            deferred: vec![],
         }
     }
 }
@@ -584,18 +816,24 @@ pub(super) fn revision_numbers(dir: &Path) -> Vec<u64> {
     };
     entries
         .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let stem = name.to_str()?.strip_suffix(".json")?;
-            if stem.is_empty() || !stem.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            stem.parse().ok()
-        })
+        .filter_map(|entry| revision_number(entry.file_name().to_str()?))
         .collect()
 }
 
-fn quarantine_target(path: &Path, wall_ms: i64) -> PathBuf {
+/// `n` for the name `<n>.json` of a revision snapshot.
+fn revision_number(name: &str) -> Option<u64> {
+    let stem = name.strip_suffix(".json")?;
+    if !is_revision_stem(stem) {
+        return None;
+    }
+    stem.parse().ok()
+}
+
+pub(super) fn is_revision_stem(stem: &str) -> bool {
+    !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit())
+}
+
+pub(super) fn quarantine_target(path: &Path, wall_ms: i64) -> PathBuf {
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -608,6 +846,18 @@ fn quarantine_target(path: &Path, wall_ms: i64) -> PathBuf {
         n += 1;
     }
     target
+}
+
+/// The stem of a name [`quarantine_target`] produces,
+/// `<stem>.corrupt-<yyyymmdd-hhmmss>[-<n>].json`; `None` for any other name.
+pub(super) fn quarantined_stem(name: &str) -> Option<&str> {
+    let (stem, rest) = name.strip_suffix(".json")?.split_once(".corrupt-")?;
+    let digits = |bytes: &[u8]| !bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit);
+    let rest = rest.as_bytes();
+    let stamp = rest.len() >= 15 && digits(&rest[..8]) && rest[8] == b'-' && digits(&rest[9..15]);
+    let suffix = &rest[rest.len().min(15)..];
+    let suffix = suffix.is_empty() || suffix.strip_prefix(b"-").is_some_and(digits);
+    (stamp && suffix).then_some(stem)
 }
 
 /// `yyyymmdd-hhmmss` in UTC (same format as the prefs quarantine).
@@ -630,4 +880,54 @@ fn utc_stamp(wall_ms: i64) -> String {
         rem % 3600 / 60,
         rem % 60
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F4-1: every name `quarantine_target` produces for a candidate is
+    /// recognised, collision suffix included; other names are not.
+    #[test]
+    fn quarantined_candidates_match_the_quarantine_names() {
+        let dir = std::env::temp_dir().join(format!("quicker-quarantine-{}", uuid::Uuid::new_v4()));
+        let env = StoreEnv::system();
+        let quarantined_candidates =
+            |dir: &Path| Loader::new(dir, &env).quarantined_candidates().unwrap();
+        // A directory that does not exist (yet) is empty (R2).
+        assert_eq!(quarantined_candidates(&dir), 0);
+        fs::create_dir_all(dir.join("revisions")).unwrap();
+        assert_eq!(quarantined_candidates(&dir), 0);
+        // Not candidates, or not names the quarantine produces.
+        for name in [
+            "active.json",
+            "draft.corrupt-20261001-000000.json",
+            "store-meta.corrupt-20261001-000000.json",
+            "prefs.corrupt-20261001-000000.json",
+            "active.corrupt-.json",
+            "active.corrupt-2026-01-01.json",
+            "active.corrupt-20261001-000000-.json",
+            "active.corrupt-20261001-000000-x.json",
+            "active.corrupt-20261001-000000.txt",
+            "revisions/1.json",
+            "revisions/1.metadata.json",
+            "revisions/x.corrupt-20261001-000000.json",
+        ] {
+            fs::write(dir.join(name), "x").unwrap();
+        }
+        assert_eq!(quarantined_candidates(&dir), 0);
+        let wall_ms = 1_800_000_000_000;
+        for (n, name) in ["active.json", "previous.json", "revisions/12.json"]
+            .into_iter()
+            .enumerate()
+        {
+            for _ in 0..2 {
+                // The second one gets the `-1` suffix.
+                let target = quarantine_target(&dir.join(name), wall_ms);
+                fs::write(&target, "x").unwrap();
+            }
+            assert_eq!(quarantined_candidates(&dir), 2 * (n + 1), "{name}");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

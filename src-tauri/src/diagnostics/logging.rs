@@ -129,13 +129,18 @@
 //! | `session.start_failed` | warn | session monitoring did not start; `stage` (`thread`, `window`, `desktop_switch`, or `wts` with `attempts`) |
 //! | `store.quarantine` | warn | a damaged file was renamed aside |
 //! | `store.quarantine_failed` | error | the rename failed; the file stays in place |
+//! | `store.quarantine_deferred` | warn | a damaged file that 0.3.1 reads is left in place until the pre-0.4 backup holds it (review I-B1); file name |
+//! | `store.quarantine_stale` | info | a damaged file left in place changed or went away before it could be renamed aside, and is left as it is; file name |
 //! | `store.prefs_invalid` | warn | a prefs field had the wrong type or was out of range and its default is used; file name, field path, problem, the JSON type found (or an out-of-range number with `min` / `max`), never a string value |
 //! | `store.prefs_unavailable` | warn | prefs.json could not be read at startup; clipboard restore uses the defaults; file name and error |
+//! | `store.backup_pre_0_4` | info / warn | the backup before the first 0.4 write of a file 0.3.1 reads (R6): `result` `created` with the number of `files` copied, `existing` (a complete backup already there is kept), `not_needed` (nothing from before 0.4), all three with the backup directory as `dir` (empty for `not_needed`); `existing_incomplete` (warn; a backup directory without a valid manifest, left as it is: `dir` and `reason`), `failed` (warn; nothing written: `files` copied before the failure, `op`, file name, `error_kind`, `os_code`), `stale_temp_removed` / `stale_temp_kept` (warn) for the temp directory of an interrupted attempt with its name |
+//! | `store.backup_missing` | warn | at load, `store-meta.json` records a pre-0.4 backup whose directory is not there (review R7-3, diagnostic only: writes are not refused and no new backup is made); the directory name as `dir` |
 //! | `store.corrupt` | warn | a configuration file does not parse; file name, error code, `kind` for `config_malformed` (`utf8`, `syntax`, `eof` = cut short, `shape`), `line` and `column` (0 without a position, as in the diagnostics bundle), error |
 //! | `store.crash_loop` | warn | consecutive crashes at startup; `crash_count` |
 //! | `store.create_dir_failed` | warn | the data directory could not be created; error |
 //! | `store.diagnostic` | warn | a diagnostic on the stored configuration; code and the path inside the configuration (never the message, which may echo values) |
 //! | `store.last_good` | info | a last-known-good `revision` was recorded |
+//! | `store.list_failed` | warn | a store directory could not be listed (so without a usable configuration the launch is SafeMode(NoValidConfig)); directory name, error `kind`, `os_code` |
 //! | `store.locked_recovered` | info | the data directory is readable again after SafeMode(Locked); load outcome |
 //! | `store.locked_retry` | error | the SafeMode(Locked) retry thread did not start; error |
 //! | `store.meta_readonly` | warn | store-meta.json is left untouched; the run marker and crash count are kept in memory |
@@ -143,7 +148,8 @@
 //! | `store.meta_write_failed` | warn | store-meta.json was not written; error |
 //! | `store.metadata_snapshot_failed` | warn | the active metadata was not snapshotted; error |
 //! | `store.newer_schema` | warn | a file written by a newer release; opened read-only; file name, schema `version` |
-//! | `store.previous_unreadable` | warn | the previous configuration is unavailable for rollback; file name, error code |
+//! | `store.no_valid_config_kept` | warn | no configuration to load, and the candidates an earlier launch quarantined are all that is left: SafeMode(NoValidConfig) again; number `quarantined` |
+//! | `store.previous_unreadable` | warn | a file considered as the rollback target does not parse (`previous.json`: the guess goes on; any other file: rollback is unavailable); file name, error code |
 //! | `store.read_failed` | warn | a file stayed unreadable after retries; file name, error |
 //! | `store.recovered` | warn | active.json was unusable and the configuration was recovered from another file; file name, source, revision |
 //! | `store.rules_skipped` | warn | unreadable rules stay off at runtime; `count` |

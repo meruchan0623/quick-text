@@ -1,6 +1,7 @@
 //! Configuration store: draft, active and previous configurations plus their
 //! files in the data directory (§7.1 「数据目录」).
 mod atomic;
+mod backup;
 mod export;
 mod fallback;
 mod load;
@@ -17,11 +18,10 @@ pub use meta::clear_run_marker_on_session_end;
 pub use metadata::merge_import_metadata;
 
 use crate::{
-    error::{CommandError, IoOp, SafeModeReason},
+    error::{CommandError, EntityKind, IoOp, SafeModeReason},
     events::{ProblemSink, StoreSink, StoreState},
     startup::{ProblemKind, StartupProblem},
 };
-use atomic::atomic_json;
 use meta::MetaHandle;
 use metadata::metadata_for_config;
 use quicker_domain::*;
@@ -39,6 +39,15 @@ pub struct Store {
     dir: PathBuf,
     pub draft: Config,
     pub active: Config,
+    /// Whether `active` was read from a file or published by this store.
+    /// False for the empty configuration that stands in when there is none
+    /// (a new data directory, SafeMode(NoValidConfig), the read-only safe
+    /// modes). Only a configuration that was on disk is backed up as
+    /// `revisions/<n>.json`: a backup of the stand-in would be a valid
+    /// fallback candidate, and an interrupted publish out of
+    /// SafeMode(NoValidConfig) would then leave the next launch Recovered
+    /// with an empty configuration instead of still protected (F4-1, R1).
+    active_on_disk: bool,
     previous: Option<Config>,
     disk_hash: Option<Vec<u8>>,
     pub engine: Arc<Shared>,
@@ -52,6 +61,9 @@ pub struct Store {
     pub pending_import: Option<(Config, Vec<MigrationItem>)>,
     safe_mode: Option<SafeModeReason>,
     startup_problems: Vec<StartupProblem>,
+    /// Corrupt files the load left in place until the pre-0.4 backup holds
+    /// them (review I-B1, `Store::quarantine_deferred`).
+    deferred: Vec<fallback::DeferredQuarantine>,
     meta: MetaHandle,
     /// In safe mode: the draft was committed from an import and may be
     /// published, which ends safe mode.
@@ -263,16 +275,24 @@ impl Store {
     /// once the engine has been Healthy for 60 seconds and at least one
     /// expansion has succeeded on `revision`. There is no timer here. When
     /// `revision` is the active one and has no `revisions/<n>.json` yet, that
-    /// snapshot is written as well so that the candidate exists.
+    /// snapshot is written as well so that the candidate exists. The empty
+    /// stand-in of a data directory without a configuration is never
+    /// snapshotted (see `active_on_disk`): it is `NotFound`.
     #[allow(dead_code)] // Called by the supervisor (P1a).
     pub fn mark_last_good(&self, revision: u64) -> Result<(), CommandError> {
         self.ensure_writable()?;
         let revisions = self.dir.join("revisions");
         let snapshot = revisions.join(format!("{revision}.json"));
         if revision == self.active.revision && !snapshot.exists() {
+            if !self.active_on_disk {
+                return Err(CommandError::NotFound {
+                    kind: EntityKind::Revision,
+                    id: revision.to_string(),
+                });
+            }
             fs::create_dir_all(&revisions)
                 .map_err(|e| CommandError::io(IoOp::CreateDir, Some(&revisions), &e))?;
-            atomic_json(&snapshot, &self.active)?;
+            self.write_data(&snapshot, &self.active)?;
         }
         self.meta
             .update(|meta| meta.last_good_revision = Some(revision))?;
@@ -286,7 +306,9 @@ impl Store {
     /// Writes the draft. A configuration with error-level diagnostics is
     /// rejected with `Validation` and nothing is written (B-42). In safe mode
     /// only committing a previewed import is allowed (see
-    /// [`import_leaves_safe_mode`]).
+    /// [`import_leaves_safe_mode`]). Like every write of a file 0.3.1 reads,
+    /// it waits for the pre-0.4 backup and is refused while that fails (R6,
+    /// `store::backup`).
     pub fn save(&mut self, config: Config) -> Result<(), CommandError> {
         if let Some(reason) = self.safe_mode {
             let importing = self
@@ -308,8 +330,9 @@ impl Store {
             .filter(|(preview, _)| preview == &config)
             .map(|(_, metadata)| metadata.clone())
             .unwrap_or_else(|| metadata_for_config(&config, &self.unresolved));
-        atomic_json(&self.dir.join("draft.json"), &config)?;
-        atomic_json(&self.dir.join("migration-unresolved.json"), &metadata)?;
+        self.backup_before_write()?;
+        self.write_data(&self.dir.join("draft.json"), &config)?;
+        self.write_data(&self.dir.join("migration-unresolved.json"), &metadata)?;
         self.unresolved = metadata;
         self.pending_import = None;
         self.draft = config;
@@ -318,8 +341,9 @@ impl Store {
     }
     pub fn discard(&mut self) -> Result<(), CommandError> {
         self.ensure_writable()?;
-        atomic_json(&self.dir.join("draft.json"), &self.active)?;
-        atomic_json(
+        self.backup_before_write()?;
+        self.write_data(&self.dir.join("draft.json"), &self.active)?;
+        self.write_data(
             &self.dir.join("migration-unresolved.json"),
             &self.active_unresolved,
         )?;

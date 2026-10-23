@@ -7,7 +7,7 @@
 //! staged in a new temp file next to the target, the location of that open
 //! file is checked again, and the temp file then replaces the target by
 //! rename (see [`stage_and_replace`]).
-use super::{atomic::replace_file, Store};
+use super::{atomic::replace_file, metadata::metadata_for_config, Store};
 use crate::error::{file_label, CommandError, IoOp, SafeModeReason};
 use quicker_domain::*;
 use std::{
@@ -43,13 +43,9 @@ impl Store {
             Some(reason) => return Err(CommandError::SafeMode { reason }),
         }
         // Serialize before touching the file system, so no work sits between
-        // the checks below and the write.
-        let unresolved = self
-            .unresolved
-            .iter()
-            .filter(|x| self.draft.rules.iter().any(|r| r.id == x.rule_id))
-            .cloned()
-            .collect();
+        // the checks below and the write. Originals of unreadable rules go
+        // along with them (F4-2).
+        let unresolved = metadata_for_config(&self.draft, &self.unresolved);
         let package = export_package_with_unresolved(&self.draft, unresolved)
             .map_err(CommandError::validation)?;
         let data_dir = comparable(
