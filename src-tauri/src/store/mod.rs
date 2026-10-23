@@ -67,7 +67,8 @@ pub struct Store {
     safe_mode: Option<SafeModeReason>,
     startup_problems: Vec<StartupProblem>,
     /// Corrupt files the load left in place until the pre-0.4 backup holds
-    /// them (review I-B1, `Store::quarantine_deferred`).
+    /// them and they could be renamed aside (review I-B1, integration fix
+    /// (d), `Store::quarantine_deferred`).
     deferred: Vec<fallback::DeferredQuarantine>,
     meta: MetaHandle,
     /// In safe mode: the draft was committed from an import and may be
@@ -286,7 +287,10 @@ impl Store {
     /// nothing written; once the backup succeeds it drops the problem and
     /// renames the corrupt files the load left in place (I-B1), so a corrupt
     /// `revisions/<n>.json` of the active revision is moved aside before
-    /// anything else looks at it.
+    /// anything else looks at it. While that rename fails (another program
+    /// holds the file) the gate refuses the mark with the `io` error and
+    /// keeps the file listed; the next mark tries the rename again
+    /// (integration fix (d)).
     ///
     /// When `revision` is the active one, `revisions/<n>.json` must then hold
     /// it. A missing snapshot is written, so that the candidate exists. One

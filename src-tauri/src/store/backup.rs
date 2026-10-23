@@ -7,10 +7,11 @@
 //!   (draft, discard, publish and rollback, the metadata snapshot at load,
 //!   the last-known-good snapshot). Renaming a corrupt one aside waits for
 //!   the backup as well (review I-B1): the load leaves it where it is and
-//!   the store renames it once the backup holds it
-//!   ([`Store::quarantine_deferred`]). `store-meta.json` and `prefs.json`
-//!   do not trigger the gate because 0.3.1 never reads them: both files are
-//!   new in 0.4. Logs and exports do not either.
+//!   the store renames it once the backup holds it, at the next write
+//!   again while the rename fails ([`Store::quarantine_deferred`]).
+//!   `store-meta.json` and `prefs.json` do not trigger the gate because
+//!   0.3.1 never reads them: both files are new in 0.4. Logs and exports do
+//!   not either.
 //! - Contents: the files 0.3.1 reads, the snapshot and metadata of the
 //!   active revision, of the one before it and of the recorded predecessor,
 //!   the corrupt files the load left in place and the quarantined ones, and
@@ -545,10 +546,13 @@ impl Store {
     /// once `store-meta.json` says the pre-0.4 backup has been dealt with.
     /// Each rename adds a `config_quarantined` problem to `problems`. A file
     /// that changed or went away since the load is left alone and
-    /// forgotten. One that cannot be renamed must not be overwritten: if it
-    /// is `active.json` or `draft.json` it stays listed and the error
-    /// refuses the write (tried again with the next one); any other is
-    /// never written by the store and is forgotten.
+    /// forgotten (its fingerprint no longer matches). One that cannot be
+    /// read or renamed (another program holds it without delete sharing)
+    /// must not be overwritten: it stays listed, logged as
+    /// `store.quarantine_failed`, and the next call tries again (integration
+    /// fix (d)). If it is a file this store writes
+    /// ([`Store::replaced_by_writes`]) the error refuses the write that
+    /// called the gate; any other only stays listed.
     pub(super) fn quarantine_deferred(
         &mut self,
         problems: &mut Vec<StartupProblem>,
@@ -598,18 +602,47 @@ impl Store {
                 event = "store.quarantine_failed",
                 file = %file,
                 error = %error,
-                "corrupt file could not be renamed; it will not be overwritten"
+                "corrupt file could not be renamed; not overwritten, tried again with the next write"
             );
-            let replaced_by_writes = ["active.json", "draft.json"]
-                .iter()
-                .any(|name| entry.path == self.dir.join(name));
-            if replaced_by_writes {
+            if self.replaced_by_writes(&entry.path) {
                 refused.get_or_insert_with(|| CommandError::io(op, Some(&entry.path), &error));
-                kept.push(entry);
             }
+            kept.push(entry);
         }
         self.deferred = kept;
         refused.map_or(Ok(()), Err)
+    }
+    /// Whether a write command of this store may replace `path`; checked
+    /// against the targets of `write_data`:
+    /// - `draft.json` and `migration-unresolved.json` (save, discard, and
+    ///   publish, rollback and the import, which saves then publishes);
+    /// - `active.json` and `active-migration-unresolved.json` (publish);
+    /// - `revisions/<active>.json`: read, and written when missing, by
+    ///   publish (the snapshot of the revision it replaces) and
+    ///   [`Store::mark_last_good`];
+    /// - `revisions/<active>.metadata.json` (publish, and the metadata
+    ///   snapshot of `snapshot_active_metadata`).
+    ///
+    /// The new revision's `revisions/<new>.metadata.json` is not listed: its
+    /// number is above every file in `revisions/`, a corrupt snapshot left in
+    /// place included. `store-meta.json` and `prefs.json` are never deferred,
+    /// and `previous.json` and older snapshots are never written.
+    fn replaced_by_writes(&self, path: &Path) -> bool {
+        let revisions = self.dir.join("revisions");
+        let active = self.active.revision;
+        [
+            "active.json",
+            "draft.json",
+            "migration-unresolved.json",
+            "active-migration-unresolved.json",
+        ]
+        .iter()
+        .map(|name| self.dir.join(name))
+        .chain([
+            revisions.join(format!("{active}.json")),
+            revisions.join(format!("{active}.metadata.json")),
+        ])
+        .any(|written| written == path)
     }
     /// Lists `backup_failed` once while the backup fails. Once it succeeds
     /// the problem is dropped and the metadata snapshot that the load could

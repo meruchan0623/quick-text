@@ -33,7 +33,10 @@ impl Store {
         let compiled = compile_config(&config).map_err(CommandError::validation)?;
         // R6: before anything is written or the engine held. Also before the
         // conflict check: a corrupt `active.json` the load left in place
-        // (I-B1) is renamed by it, as the load would have done.
+        // (I-B1) is renamed by it, as the load would have done. One that
+        // cannot be renamed yet, `revisions/<active>.json` included, refuses
+        // the publish here (`io`) rather than at the snapshot check below,
+        // and the next publish tries again (integration fix (d)).
         self.backup_before_write()?;
         let active_path = self.dir.join("active.json");
         let on_disk = read_existing(&active_path)?;

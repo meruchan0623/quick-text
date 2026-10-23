@@ -3087,6 +3087,157 @@ fn mark_last_good_refuses_a_snapshot_that_does_not_hold_the_active_revision() {
     assert_eq!(meta_on_disk(&dir).last_good_revision, Some(4));
 }
 
+/// Integration fix (d) (Codex finding on `quarantine_deferred`): another
+/// program holds the corrupt `revisions/4.json` that the load left in place
+/// (I-B1) open for reading without delete sharing, so the load cannot
+/// rename it aside after the backup. It stays listed and in place: marking
+/// revision 4 and publishing, which both replace that file, are refused
+/// with the rename's `io` error (not `snapshot_mismatch`, not an internal
+/// error from reading it) and change nothing. Once the handle is closed,
+/// without a restart, the mark quarantines it, writes a valid snapshot in
+/// its place and records revision 4, and the publish succeeds.
+#[cfg(windows)]
+#[test]
+fn a_deferred_snapshot_that_cannot_be_renamed_refuses_the_mark_and_the_publish_until_it_can() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x1;
+    fn refused<T: std::fmt::Debug>(result: Result<T, CommandError>) {
+        assert!(
+            matches!(
+                result,
+                Err(CommandError::Io { op: crate::error::IoOp::Rename, path: Some(ref path), .. })
+                    if path == "4.json"
+            ),
+            "{result:?}"
+        );
+    }
+    let dir = TempDir::new();
+    let world = world();
+    let four = config_at(4);
+    write(&dir, "active.json", LEGACY_CUT_SHORT);
+    write(&dir, "revisions/4.json", TRUNCATED);
+    write(&dir, "previous.json", &bytes(&four));
+    let snapshot = dir.join("revisions").join("4.json");
+    let holder = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&snapshot)
+        .unwrap();
+    let deferred = |store: &Store| -> Vec<PathBuf> {
+        store
+            .deferred
+            .iter()
+            .map(|entry| entry.path.strip_prefix(dir.path()).unwrap().to_path_buf())
+            .collect()
+    };
+
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.safe_mode(), None);
+    assert_eq!(store.active, four);
+    assert_eq!(backup_failed(&store), 0);
+    // The backup holds the held file (it may be read); `active.json` was
+    // moved aside, `revisions/4.json` could not be.
+    let backup = assert_valid_backup(&backup_dir(&dir));
+    assert_eq!(backup[&rel("revisions/4.json")], TRUNCATED);
+    assert_eq!(quarantined(&problem_kinds(&store)), ["active.json"]);
+    assert_eq!(deferred(&store), [rel("revisions/4.json")]);
+    for _ in 0..2 {
+        refused(store.mark_last_good(4));
+        refused(store.publish(store.draft.clone()));
+        assert_eq!(deferred(&store), [rel("revisions/4.json")], "still listed");
+        assert_eq!(fs::read(&snapshot).unwrap(), TRUNCATED);
+        assert_eq!(store.active, four);
+        assert_eq!(store.meta.get().last_good_revision, None);
+        assert_eq!(meta_on_disk(&dir).last_good_revision, None);
+    }
+    assert!(!dir.join("active.json").exists());
+
+    drop(holder);
+    store.mark_last_good(4).unwrap();
+    assert!(deferred(&store).is_empty());
+    let mut moved = quarantined(&problem_kinds(&store));
+    moved.sort();
+    assert_eq!(moved, ["4.json", "active.json"]);
+    let mut quarantine: Vec<Vec<u8>> = quarantine_files(&dir).into_values().collect();
+    let mut corrupt = vec![LEGACY_CUT_SHORT.to_vec(), TRUNCATED.to_vec()];
+    quarantine.sort();
+    corrupt.sort();
+    assert_eq!(quarantine, corrupt);
+    assert_eq!(read_config(&snapshot).unwrap(), four);
+    assert_eq!(store.meta.get().last_good_revision, Some(4));
+    assert_eq!(meta_on_disk(&dir).last_good_revision, Some(4));
+    store.publish(store.draft.clone()).unwrap();
+    assert_eq!(store.active.revision, 5);
+    assert_eq!(read_config(&dir.join("active.json")).unwrap().revision, 5);
+    assert_eq!(read_config(&snapshot).unwrap(), four);
+}
+
+/// Integration fix (d): a corrupt file left in place that no write of this
+/// store replaces (here `revisions/5.json` while revision 4 is active: the
+/// next publish takes 6) is kept listed while it cannot be renamed, logged
+/// once per write that tries it (`store.quarantine_failed`), and refuses
+/// nothing. The first write after the handle is closed moves it aside.
+#[cfg(windows)]
+#[test]
+fn a_deferred_file_no_write_replaces_is_retried_without_refusing_writes() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x1;
+    let dir = TempDir::new();
+    let world = world();
+    let four = config_at(4);
+    write(&dir, "active.json", LEGACY_CUT_SHORT);
+    write(&dir, "revisions/4.json", &bytes(&four));
+    write(&dir, "revisions/5.json", TRUNCATED);
+    let held = dir.join("revisions").join("5.json");
+    let holder = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&held)
+        .unwrap();
+    let deferred = |store: &Store| -> Vec<PathBuf> {
+        store
+            .deferred
+            .iter()
+            .map(|entry| entry.path.strip_prefix(dir.path()).unwrap().to_path_buf())
+            .collect()
+    };
+
+    let logs = TempDir::new();
+    let built = test_support::scoped(&logs, DEFAULT_LEVEL);
+    let mut store = tracing::subscriber::with_default(built.subscriber, || {
+        let mut store = Store::load_with(dir.path(), &env(&world));
+        assert_eq!(store.safe_mode(), None);
+        assert_eq!(store.active, four);
+        assert_eq!(deferred(&store), [rel("revisions/5.json")]);
+        store.mark_last_good(4).unwrap();
+        store.publish(store.draft.clone()).unwrap();
+        store
+    });
+    drop(built.guard);
+    assert_eq!(store.active.revision, 6);
+    assert_eq!(store.meta.get().last_good_revision, Some(4));
+    assert_eq!(deferred(&store), [rel("revisions/5.json")], "still listed");
+    assert_eq!(fs::read(&held).unwrap(), TRUNCATED);
+    // The load, the mark and the publish each tried once.
+    let log = test_support::read_logs(&logs);
+    let failed = log
+        .lines()
+        .filter(|line| line.contains("event=\"store.quarantine_failed\""))
+        .filter(|line| line.contains("file=5.json"))
+        .count();
+    assert_eq!(failed, 3, "{log}");
+    assert!(!log.contains("event=\"command.io\""), "{log}");
+
+    drop(holder);
+    store.save(metadata_config(&["b"])).unwrap();
+    assert!(deferred(&store).is_empty());
+    assert!(!held.exists());
+    assert!(quarantined(&problem_kinds(&store)).contains(&"5.json".to_string()));
+    assert!(quarantine_files(&dir)
+        .values()
+        .any(|content| content == TRUNCATED));
+}
+
 /// Review I-B3 (test 5): a `backup-pre-0.4` without a valid manifest (empty,
 /// cut short, or a file) is never taken as the backup and never changed or
 /// removed: a dated `backup-pre-0.4-<UTC>/` with a manifest is made beside

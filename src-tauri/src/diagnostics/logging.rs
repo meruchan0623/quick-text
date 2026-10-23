@@ -131,7 +131,7 @@
 //! | `session.signal` | info | a session signal arrived (lock, unlock, ...); signal name |
 //! | `session.start_failed` | warn | session monitoring did not start; `stage` (`thread`, `window`, `desktop_switch`, or `wts` with `attempts`) |
 //! | `store.quarantine` | warn | a damaged file was renamed aside |
-//! | `store.quarantine_failed` | error | the rename failed; the file stays in place |
+//! | `store.quarantine_failed` | error / warn | the rename failed; the file stays in place (error for `prefs.json`; warn for a configuration file, and for one the load left in place (review I-B1) at each write that tries it again, which a file this store writes also refuses) |
 //! | `store.quarantine_deferred` | warn | a damaged file that 0.3.1 reads is left in place until the pre-0.4 backup holds it (review I-B1); file name |
 //! | `store.quarantine_stale` | info | a damaged file left in place changed or went away before it could be renamed aside, and is left as it is; file name |
 //! | `store.prefs_invalid` | warn | a prefs field had the wrong type or was out of range and its default is used; file name, field path, problem, the JSON type found (or an out-of-range number with `min` / `max`), never a string value |

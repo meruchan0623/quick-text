@@ -973,6 +973,97 @@ mod tests {
         fs::remove_dir_all(logs).unwrap();
     }
 
+    /// Integration fix (d) end to end (Codex finding on
+    /// `quarantine_deferred`): another program holds the corrupt
+    /// `revisions/4.json` that the launch left in place open for reading
+    /// without delete sharing, so it cannot be renamed aside. The qualified
+    /// revision is refused with `io` (one `last_good_skipped`, warn; never
+    /// `snapshot_mismatch`) and tried again after the growing wait; each try
+    /// logs one `store.quarantine_failed`, no more. Once the handle is
+    /// closed, without a restart, the next try quarantines the file, writes
+    /// a valid snapshot and records revision 4.
+    #[cfg(windows)]
+    #[test]
+    fn a_mark_refused_while_the_corrupt_snapshot_is_held_is_recorded_once_it_is_released() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        let dir = temp_dir("held");
+        let logs = temp_dir("held-logs");
+        let corrupt: &[u8] = b"{\"revision\": 4, \"rul";
+        let four = Config {
+            revision: 4,
+            ..config("four")
+        };
+        fs::create_dir_all(dir.join("revisions")).unwrap();
+        fs::write(dir.join("active.json"), corrupt).unwrap();
+        fs::write(dir.join("revisions/4.json"), corrupt).unwrap();
+        fs::write(
+            dir.join("previous.json"),
+            serde_json::to_vec_pretty(&four).unwrap(),
+        )
+        .unwrap();
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(dir.join("revisions/4.json"))
+            .unwrap();
+        let built = scoped(&logs, LevelFilter::DEBUG);
+        tracing::subscriber::with_default(built.subscriber, || {
+            let managed = Arc::new(Managed::new(Store::load(dir.clone())));
+            {
+                let store = managed.lock();
+                assert_eq!(store.safe_mode(), None);
+                assert_eq!(store.active, four);
+            }
+            let target = Arc::clone(&managed);
+            let mut rig = Rig::with(
+                managed.lock().store_state(),
+                Box::new(move |revision| mark_active(&target, revision)),
+            );
+            rig.healthy();
+            rig.success();
+            // Qualifies, is refused, and is refused twice more.
+            for _ in 0..3 {
+                let wait = rig.due_in().expect("refused: tried again");
+                rig.wait(wait);
+            }
+            assert_eq!(rig.due_in(), Some(QUALIFY_AFTER * 4));
+            assert_eq!(last_good_on_disk(&dir), None);
+            assert_eq!(fs::read(dir.join("revisions/4.json")).unwrap(), corrupt);
+
+            drop(holder);
+            rig.wait(QUALIFY_AFTER * 4);
+            assert_eq!(rig.due_in(), None, "recorded");
+            assert_eq!(last_good_on_disk(&dir), Some(4));
+            let snapshot = fs::read(dir.join("revisions/4.json")).unwrap();
+            assert_eq!(read_stored_config(&snapshot).unwrap().config, four);
+            let quarantined: Vec<Vec<u8>> = fs::read_dir(dir.join("revisions"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.to_string_lossy().contains("4.corrupt-"))
+                .map(|path| fs::read(path).unwrap())
+                .collect();
+            assert_eq!(quarantined, [corrupt.to_vec()]);
+            drop(rig);
+        });
+        drop(built.guard);
+        let log = read_logs(&logs);
+        let skipped = skipped_lines(&log);
+        assert_eq!(skipped.len(), 1, "{log}");
+        assert!(skipped[0].contains("WARN"), "{}", skipped[0]);
+        assert!(skipped[0].contains("reason=\"io\""), "{}", skipped[0]);
+        assert!(!log.contains("snapshot_mismatch"), "{log}");
+        // The load and the three refused marks each tried the rename once.
+        let failed = log
+            .lines()
+            .filter(|line| line.contains("event=\"store.quarantine_failed\""))
+            .count();
+        assert_eq!(failed, 4, "{log}");
+        assert!(log.contains("event=\"store.last_good\""), "{log}");
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(logs).unwrap();
+    }
+
     fn config(id: &str) -> Config {
         Config {
             rules: vec![Rule {
