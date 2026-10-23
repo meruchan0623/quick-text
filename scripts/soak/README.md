@@ -145,9 +145,9 @@ pwsh -NoProfile -File scripts/soak/soak.ps1 -DataDirectory D:\qt-acceptance-data
 3. 进入过安全模式；
 4. 输入源丢失后在阈值内没有重新挂接（同一组件 `input.reattach ok=true`，或 `supervisor.recovered state=Healthy`），或出现 `input.reattach ok=false`；
 5. 出现 `input.refused reason=hook_missing`、`input.queue_full`、`runtime.events_dropped`；
-6. 进程重启、进程消失、启动前没有 `app.exit`、`app.panic`；
+6. 进程重启、进程消失、启动前没有 `app.exit`、`app.panic`；结束时进程不在运行，且最后一次 `app.start` 之后没有 `app.exit`；整轮没有看到进程。脚本启动时的进程检查也算「看到过」：进程在第一次采样之前就没了，同样记为进程消失；
 7. 暂停持续不少于 `-PauseSuspectSeconds`（手动暂停、安全模式、启动时未自动监听、启动自检未通过等，原因一并列出）；
-8. 出现 ERROR 级日志；进程在运行但日志目录不存在；日志读取或采样出错；日志文件被截断或替换后从头重读（见下文「日志的读法」）。
+8. 出现 ERROR 级日志；进程在运行但日志目录不存在；日志读取或采样出错；日志文件被截断或替换后从头重读；进程在运行而当天日志文件超过宽限仍不存在；整轮没有读到任何日志文件；启动时回放日志出错（见下文「日志的读法」）。
 
 **B. 人工复核项：**
 
@@ -156,7 +156,7 @@ pwsh -NoProfile -File scripts/soak/soak.ps1 -DataDirectory D:\qt-acceptance-data
 3. 结束健康为「降级」或「未知」：日志里看不全，以健康页为准；
 4. 每轮固定要人工看的：执行成功 / 失败 / 未执行的条数，结束时健康页的实际状态，每次触发是否真的产生了输出。
 
-健康状态的推断规则：`app.start` → 正在启动；`self_test.startup` 的 `health`；`supervisor.recovering`、`supervisor.repair` → 恢复中；`supervisor.recovered` 的 `state`；`supervisor.circuit_open`、`runtime.failed_latched`、`supervisor.unsupervised`、`supervisor.engine_unavailable`、`supervisor.driver_hung` → 故障；`app.exit` 或采样时进程不存在 → 已退出。脚本开始时会回放昨天和今天（UTC）的日志，只用来确定起始状态，不计入统计。
+健康状态的推断规则：`app.start` → 正在启动；`self_test.startup` 的 `health`；`supervisor.recovering`、`supervisor.repair` → 恢复中；`supervisor.recovered` 的 `state`；`supervisor.circuit_open`、`runtime.failed_latched`、`supervisor.unsupervised`、`supervisor.engine_unavailable`、`supervisor.driver_hung` → 故障；`app.exit` 或采样时进程不存在 → 已退出。脚本开始时会回放昨天和今天（UTC）的日志，只用来确定起始状态，不计入统计；回放时读文件出错会隔 0.5 秒重试一次，仍失败就计入「启动时回放出错」，起始状态的依据后面标「基线不完整」，并列为 A 类可疑项（第 8 条）。今天的文件回放失败时，监视仍从脚本启动时的文件末尾读起，启动前的历史不会被当成新增。
 
 ## 日志的读法
 
@@ -167,6 +167,13 @@ pwsh -NoProfile -File scripts/soak/soak.ps1 -DataDirectory D:\qt-acceptance-data
   - 偏移前 64 字节和上次不同（两次读取之间被截断又长回偏移以上，或被替换但 NTFS 的文件名隧道保留了原创建时间）——「偏移前的内容变了」。
 - 从头重读的代价：截断或替换之前、上次读取之后写进旧文件的事件会漏读；新文件里和旧文件相同的开头会再计一次。所以出现这一项时，事件计数和状态推断只作参考。
 - 文件开头的 UTF-8 BOM（`EF BB BF`）只在偏移 0 处跳过，包括从头重读的时候；不跳过的话第一行的时间戳对不上行首格式，第一条事件会被当成续行丢掉。应用自己（`tracing_appender`）不写 BOM，用编辑器另存过的文件才会有。
+- **当天日志文件缺失的宽限。** 进程在运行、日志目录存在、当天（UTC）的日志文件却不存在时，脚本按连续的采样记一段「缺失」，超过宽限就在控制台提示一次，并在汇总里列为 A 类可疑项（第 8 条）；宽限内文件出现了就只计数，不列。宽限从文件「应该出现」的时刻算：
+  - 进程在当前 UTC 日启动：从进程启动算 **120 秒**。`tracing_appender` 在日志初始化时就建当天的文件（`src-tauri/src/diagnostics/logging.rs` 的 `file_writer`），正常情况下进程一起来文件就在；
+  - 进程在 UTC 零点之前就在运行：从 UTC 零点算 **60 分钟**。零点之后，新一天的文件要等应用写第一行日志时才建，而应用没有定时日志，一直空闲时可能很久都不写；所以这一项出现时先想想这段时间应用是否真的写过日志。想确认时可在「运行状态与恢复」里点一次「导出诊断包」，它会写一条 `diagnostics.export`；
+  - 读不到进程启动时间：从第一次发现缺失算，按 60 分钟。
+- **整轮没有读到日志。** 回放和监视期间一次都没能读到日志文件（不存在或读取出错）时，列为 A 类可疑项：健康、监听和事件都无从推断。
+
+宽限值是脚本里的常量 `$LogStartupGraceSeconds`、`$LogRolloverGraceMinutes`，不是参数。
 
 ## 局限
 
@@ -201,3 +208,23 @@ $t = $null; $e = $null
 | 2b | 同一个文件在两次读取之间截断又长回旧偏移以上：按「偏移前的内容变了」从头重读，新内容的事件一条不漏，汇总列出 A 类项 |
 | 2c | 同一路径换成另一个文件，旧偏移前的字节完全相同、创建时间不同：按「文件被替换」从头重读 |
 | 2d | 文件变短：按「文件变短」从头重读 |
+| 1a | 当天启动的进程：日志文件缺失到 110 秒不列，125 秒第一次超过宽限、只提示一次；汇总列出，文件出现后这一段照样列出 |
+| 1b | 宽限内文件出现：不列 |
+| 1c | 跨日：从 UTC 零点算，50 分钟不列，61 分钟列 |
+| 1d | 读不到进程启动时间：从第一次发现算 60 分钟 |
+| 1e | 换了日志文件：上一段结束，新文件另起一段 |
+| 1f | 整轮没有读到日志：列出；读到过一次就不列，不存在的文件不算读到 |
+| 3a | 启动检查看到进程（两个同名时跟踪最早启动的）、第一次采样前就没了：记进程不存在，健康改为已退出，结束时没有 `app.exit` 另列一项 |
+| 3b | 读到 `app.exit` 后进程消失：进程不存在照样列，不列「没有正常退出」 |
+| 3c | 启动检查和采样都没看到进程：列「整轮没有看到进程」，不记不存在的时段 |
+| 3d | `Get-EndProcessFinding` 的四种组合；启动检查之后第一次采样同一 PID 不算重启，换 PID 算 |
+| 4a | 回放时今天的日志被独占（`FileShare.None`）：重试一次仍失败，计数、标「基线不完整」、列 A 类；昨天的日志照样回放；今天的游标在启动时的文件末尾，之后只计新增 |
+| 4b | 回放第一次读失败、重试成功（临时遮住 `Read-LogChunk`）：不计出错 |
+
+**没有自动化的部分**是脚本主体里把真实进程接到这些函数上的几行（启动检查把 `GetProcessesByName` 的结果交给 `Register-StartupProcess`；`Invoke-Sample` 取进程启动时间交给 `Update-LogCoverage`），因为要有真实进程。手工核对时不需要 Quicker Text，也不产生输入：
+
+1. 建一个空目录，例如 `%TEMP%\qt-soak-manual\`，在里面建空的 `logs\` 子目录；
+2. 启动记事本，随即运行 `pwsh -NoProfile -File scripts/soak/soak.ps1 -ProcessName notepad -DataDirectory $env:TEMP\qt-soak-manual -Hours 0.1 -IntervalSeconds 5`（共 6 分钟）；
+3. 记事本启动后约 2 分钟，控制台应出现一次「当天日志文件 … 超过宽限仍不存在」的提示，之后不再重复（第 1 项）；
+4. 提示出现后关掉记事本，等脚本结束：汇总的自动可疑项里应有「进程不存在 1 段」和「结束时进程 notepad 不在运行，日志里也没有它正常退出的记录」（第 3 项），以及「进程 … 启动后，当天日志文件 … 超过 120 秒仍不存在」和「整轮没有读到任何日志文件」（第 1 项）；
+5. 不开记事本再跑一次（`-Hours 0.01`）：自动可疑项里应有「整轮没有看到进程 notepad」。

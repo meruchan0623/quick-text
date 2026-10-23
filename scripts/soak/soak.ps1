@@ -91,6 +91,15 @@ $script:MaxChunkBytes = 8MB
 $script:FingerprintBytes = 64
 $script:CheckpointMinutes = 10
 $script:ListLimit = 30
+# How long the day's log file may be missing while the process runs before it is
+# listed (A.8). tracing_appender creates the file when logging starts
+# (diagnostics/logging.rs file_writer), so a process started today should have
+# it at once; after UTC midnight the new day's file appears only with the first
+# line written, which an idle app may not write for a while.
+$script:LogStartupGraceSeconds = 120
+$script:LogRolloverGraceMinutes = 60
+# Pause before the one retry of a log the start-up replay could not read.
+$script:BaselineRetryDelayMs = 500
 
 # Log line head written by tracing_subscriber's default format (diagnostics/logging.rs):
 #   2026-10-23T08:12:34.567890Z  WARN <thread> <target>: <message> event="x.y" key=value ...
@@ -646,6 +655,7 @@ function Invoke-LogRead([string] $Path, [DateTime] $Now) {
     }
     if ($chunk.Status -eq 'error') { $script:LogReadErrors++ }
     if ($chunk.Status -eq 'oversized') { $script:LogOversized++ }
+    if ($chunk.Status -eq 'ok' -or $chunk.Status -eq 'oversized') { $script:LogReadableCount++ }
     $script:Cursors[$Path] = $chunk.Cursor
     $script:LogBytes += $chunk.Bytes
     foreach ($l in $chunk.Lines) { Invoke-LogLine $l $Now }
@@ -670,6 +680,64 @@ function Update-Logs([DateTime] $Now) {
     return (Invoke-LogRead $script:CurrentLog $Now)
 }
 
+# Follows stretches where the process runs but the day's log file $Path does not
+# exist ($Missing). Each stretch gets a grace counted from when the file should
+# have appeared:
+#   startup  - the process started on the current UTC day ($ProcStartUtc): from
+#              its start, $LogStartupGraceSeconds;
+#   rollover - it started before: from UTC midnight, $LogRolloverGraceMinutes;
+#   unknown  - start time not readable: from the first such sample, the
+#              rollover grace.
+# Returns $true on the sample where a stretch first exceeds its grace.
+function Update-LogCoverage([DateTime] $Now, [string] $Path, [bool] $Missing, $ProcStartUtc) {
+    $g = $script:LogGap
+    if ($null -ne $g -and (-not $Missing -or $g.Path -ne $Path)) {
+        $script:LogGaps.Add($g)
+        $script:LogGap = $null
+        $g = $null
+    }
+    if (-not $Missing) { return $false }
+    $nowUtc = $Now.ToUniversalTime()
+    if ($null -eq $g) {
+        $dayStart = [DateTime]::SpecifyKind($nowUtc.Date, [DateTimeKind]::Utc)
+        if ($null -ne $ProcStartUtc -and $ProcStartUtc -ge $dayStart) {
+            $kind = 'startup'; $ref = $ProcStartUtc; $grace = [double]$script:LogStartupGraceSeconds
+        } elseif ($null -ne $ProcStartUtc) {
+            $kind = 'rollover'; $ref = $dayStart; $grace = $script:LogRolloverGraceMinutes * 60.0
+        } else {
+            $kind = 'unknown'; $ref = $nowUtc; $grace = $script:LogRolloverGraceMinutes * 60.0
+        }
+        $g = [pscustomobject]@{
+            Path = $Path; Kind = $kind; Ref = $ref; Grace = $grace; First = $Now; Last = $Now; Over = $false
+        }
+        $script:LogGap = $g
+    }
+    $g.Last = $Now
+    if (-not $g.Over -and ($nowUtc - $g.Ref).TotalSeconds -ge $g.Grace) {
+        $g.Over = $true
+        return $true
+    }
+    return $false
+}
+
+# One file of the start-up replay, read from 0 up to $StopAt. A read error is
+# retried once; if it fails again the replay is marked incomplete.
+function Read-BaselineChunk([string] $Path, [long] $StopAt) {
+    $c = Read-LogChunk $Path $null $StopAt
+    if ($c.Status -eq 'error') {
+        Start-Sleep -Milliseconds $script:BaselineRetryDelayMs
+        $c = Read-LogChunk $Path $null $StopAt
+    }
+    if ($c.Status -eq 'error') {
+        $script:BaselineReadErrors++
+        $script:BaselineIncomplete = $true
+        $script:BaselineErrorFiles.Add([System.IO.Path]::GetFileName($Path))
+    } elseif ($c.Status -eq 'ok' -or $c.Status -eq 'oversized') {
+        $script:LogReadableCount++
+    }
+    return $c
+}
+
 # Replays yesterday's and today's log (UTC days) up to now to learn the state
 # the app is in when monitoring starts. Nothing is counted.
 function Invoke-Baseline([bool] $ProcessRunning) {
@@ -682,12 +750,18 @@ function Invoke-Baseline([bool] $ProcessRunning) {
         if ([System.IO.File]::Exists($today)) {
             try { $todayLen = ([System.IO.FileInfo]::new($today)).Length } catch { $todayLen = [long]0 }
         }
-        $c = Read-LogChunk $yesterday $null ([long]::MaxValue)
+        $c = Read-BaselineChunk $yesterday ([long]::MaxValue)
         foreach ($l in $c.Lines) { Invoke-LogLine $l $script:RunStart }
-        $c = Read-LogChunk $today $null $todayLen
+        $c = Read-BaselineChunk $today $todayLen
         foreach ($l in $c.Lines) { Invoke-LogLine $l $script:RunStart }
         $script:CurrentLog = $today
-        $script:Cursors[$today] = $c.Cursor
+        if ($c.Status -eq 'error') {
+            # Monitoring still starts at the end of what was there before the run,
+            # so history the replay could not read is not counted as new.
+            $script:Cursors[$today] = New-LogCursor ([Math]::Max($todayLen, [long]$c.Offset))
+        } else {
+            $script:Cursors[$today] = $c.Cursor
+        }
     } finally {
         $script:Baseline = $false
     }
@@ -708,6 +782,10 @@ function Invoke-Baseline([bool] $ProcessRunning) {
             $script:InputLost.Clear()
         }
         $script:LastProcessEvent = 'start'
+    }
+    if ($script:BaselineIncomplete) {
+        $note = '基线不完整：回放 ' + [string]::Join('、', $script:BaselineErrorFiles.ToArray()) + ' 出错'
+        if ($script:BaselineHealthVia) { $script:BaselineHealthVia += '；' + $note } else { $script:BaselineHealthVia = $note }
     }
     if ($script:SafeTracker.IsOpen) { $script:SafeTracker.Since = $script:RunStart }
     foreach ($k in @($script:InputLost.Keys)) { $script:InputLost[$k].From = $script:RunStart }
@@ -771,6 +849,16 @@ function Register-ProcessSeen([int] $ProcId, [DateTime] $Now) {
     return $changed
 }
 
+# The start-up check: picks the process to follow among $Procs and records it as
+# seen, so one that is gone by the first sample counts as gone. Returns whether
+# one was running.
+function Register-StartupProcess([object[]] $Procs) {
+    $chosen = Select-TrackedProcess $Procs $null
+    if ($null -eq $chosen) { return $false }
+    $null = Register-ProcessSeen $chosen.Id $script:RunStart
+    return $true
+}
+
 # No process found at $Now. Counts only once the process has been seen.
 function Set-ProcessAbsent([DateTime] $Now) {
     if ($script:ProcessEverSeen) {
@@ -800,6 +888,7 @@ function Invoke-Sample {
     if ($count -gt 1) { $script:MultiProcessSamples++ }
 
     $chosen = Select-TrackedProcess $procs $script:TrackedPid
+    $procStartUtc = $null
 
     $s = [pscustomobject]@{
         Time = $now; Exists = $false; ProcId = $null; PidChanged = $false; Count = $count
@@ -814,6 +903,7 @@ function Invoke-Sample {
         $s.Exists = $true
         $s.ProcId = $procId
         $s.PidChanged = Register-ProcessSeen $procId $now
+        try { $procStartUtc = $chosen.StartTime.ToUniversalTime() } catch { $procStartUtc = $null }
         try { $s.WS = [double]$chosen.WorkingSet64 } catch { }
         try { $s.PB = [double]$chosen.PrivateMemorySize64 } catch { }
         try { $s.Handles = [double]$chosen.HandleCount } catch { }
@@ -845,6 +935,12 @@ function Invoke-Sample {
         Set-ProcessAbsent $now
     }
     foreach ($p in $procs) { try { $p.Dispose() } catch { } }
+    $logMissing = $s.Exists -and $logDirExists -and $logStatus -eq 'missing'
+    if (Update-LogCoverage $now $script:CurrentLog $logMissing $procStartUtc) {
+        Write-Line ('注意：进程在运行，当天日志文件 ' + [System.IO.Path]::GetFileName([string]$script:CurrentLog) +
+            ' 超过宽限仍不存在。应用一直空闲时，可在「运行状态与恢复」里点一次「导出诊断包」让它写一条日志（diagnostics.export）；' +
+            '文件仍不出现请检查 -DataDirectory。')
+    }
 
     if ($script:NativeOk) {
         try {
@@ -1096,6 +1192,55 @@ function Format-ResetKinds {
     return [string]::Join('、', $parts.ToArray())
 }
 
+# The A item for how the run ended on the process side, or ''. $LastExists is
+# the last sample's (the start-up check's when there was no sample).
+function Get-EndProcessFinding([bool] $LastExists, [bool] $EverSeen, [string] $LastProcessEvent) {
+    if (-not $EverSeen) {
+        return '整轮没有看到进程 ' + $ProcessName + '（启动时的检查和每次采样都没有）：这一轮没有监视到应用，不能算浸泡。' +
+            '请先启动应用，或检查 -ProcessName。'
+    }
+    if (-not $LastExists -and $LastProcessEvent -ne 'exit') {
+        return '结束时进程 ' + $ProcessName + ' 不在运行，日志里也没有它正常退出的记录（最后一次 app.start 之后没有 app.exit）：' +
+            '进程可能崩溃或被结束，请看「进程」一节和数据目录里的崩溃记录。'
+    }
+    return ''
+}
+
+# A items for stretches where the process ran but the day's log file stayed
+# missing past its grace (Update-LogCoverage).
+function Get-LogGapFindings {
+    $all = [System.Collections.Generic.List[object]]::new()
+    foreach ($g in $script:LogGaps) { $all.Add($g) }
+    if ($null -ne $script:LogGap) { $all.Add($script:LogGap) }
+    $items = [System.Collections.Generic.List[string]]::new()
+    foreach ($g in $all) {
+        if (-not $g.Over) { continue }
+        $name = [System.IO.Path]::GetFileName([string]$g.Path)
+        $tail = ''
+        if ([object]::ReferenceEquals($g, $script:LogGap)) { $tail = '，到结束仍不存在' }
+        $seen = '采样 ' + (Format-Stamp $g.First) + ' 到 ' + (Format-Stamp $g.Last) + $tail
+        $lost = '这段时间的日志脚本看不到。'
+        switch ($g.Kind) {
+            'startup' {
+                $items.Add('进程 ' + (Format-Stamp $g.Ref.ToLocalTime()) + ' 启动后，当天日志文件 ' + $name + ' 超过 ' +
+                    $script:LogStartupGraceSeconds + ' 秒仍不存在（' + $seen + '）：应用初始化日志时就会建当天的文件，' +
+                    '日志可能写到了别的数据目录（-DataDirectory），或应用没能打开日志文件（log.file_unavailable 只写到 stderr）。' + $lost)
+            }
+            'rollover' {
+                $items.Add('UTC 零点（本地 ' + (Format-Stamp $g.Ref.ToLocalTime()) + '）之后，当天日志文件 ' + $name + ' 超过 ' +
+                    $script:LogRolloverGraceMinutes + ' 分钟仍不存在（' + $seen + '）：应用在零点后写第一行日志时才建新文件，' +
+                    '一直空闲时也可能不写；这段时间若有暂停、恢复、导出诊断包或注入故障而文件仍没出现，说明日志没写出来，' +
+                    '健康和监听状态停在零点前的推断上。')
+            }
+            default {
+                $items.Add('当天日志文件 ' + $name + ' 超过 ' + $script:LogRolloverGraceMinutes + ' 分钟仍不存在（' + $seen +
+                    '；读不到进程启动时间，按跨日宽限从第一次发现算）：日志可能写到了别的数据目录，或应用没能写日志。' + $lost)
+            }
+        }
+    }
+    return $items.ToArray()
+}
+
 function Build-Summary([string] $Status) {
     $end = [DateTime]::Now
     if ($script:HealthTransitions.Count -eq 0) {
@@ -1178,10 +1323,15 @@ function Build-Summary([string] $Status) {
         if ($p.Open) { $tail = '（到结束仍不存在）' }
         $absentLines.Add((Format-Stamp $p.From) + ' 到 ' + (Format-Stamp $p.To) + '，' + (Format-Dur $sec) + $tail)
     }
-    $o.Add('进程不存在的时段（首次看到进程之后，按采样）：' + $absent.Length + ' 段，合计 ' + (Format-Dur $absentSec))
+    $o.Add('进程不存在的时段（启动时的检查或采样第一次看到进程之后，按采样）：' + $absent.Length + ' 段，合计 ' + (Format-Dur $absentSec))
     Add-Limited $o $absentLines '  '
+    $lastExists = $script:ProcessEverSeen
+    if ($samples.Length -gt 0) { $lastExists = [bool]$samples[$samples.Length - 1].Exists }
+    if ($lastExists) { $o.Add('结束时进程：在运行') } else { $o.Add('结束时进程：不在运行') }
     $o.Add('日志：app.start ' + $script:AppStarts + ' 次（其中前面没有 app.exit 的 ' + $script:UncleanStarts + ' 次），app.exit ' +
         (Get-EventCount 'app.exit') + ' 次，app.panic ' + (Get-EventCount 'app.panic') + ' 次')
+    $endFinding = Get-EndProcessFinding $lastExists $script:ProcessEverSeen $script:LastProcessEvent
+    if ($endFinding) { $auto.Add($endFinding) }
     if ($restarts -gt 0) { $auto.Add('进程重启 ' + $restarts + ' 次（PID：' + [string]::Join('、', $pidList.ToArray()) + '）。') }
     if ($absent.Length -gt 0) { $auto.Add('进程不存在 ' + $absent.Length + ' 段，合计 ' + (Format-Dur $absentSec) + '（见「进程」一节）。') }
     if ($script:UncleanStarts -gt 0) { $auto.Add('有 ' + $script:UncleanStarts + ' 次启动前面没有 app.exit（上一个进程没有正常退出）。') }
@@ -1346,6 +1496,16 @@ function Build-Summary([string] $Status) {
     if ($script:LogDirMissingSamples -gt 0) {
         $auto.Add('进程在运行但日志目录不存在（' + $script:LogDirMissingSamples + ' 次采样）：数据目录可能不对（-DataDirectory），或应用没能写日志（log.file_unavailable 只写到 stderr）。')
     }
+    foreach ($i in @(Get-LogGapFindings)) { $auto.Add([string]$i) }
+    if ($script:LogReadableCount -eq 0) {
+        $auto.Add('整轮没有读到任何日志文件（含启动时的回放；日志目录 ' + $script:LogDirectory + '）：健康、监听和事件都无从推断，' +
+            '这一轮的日志部分不能用。请检查 -DataDirectory，并确认应用在写日志。')
+    }
+    if ($script:BaselineReadErrors -gt 0) {
+        $auto.Add('启动时回放日志出错 ' + $script:BaselineReadErrors + ' 次（' + [string]::Join('、', $script:BaselineErrorFiles.ToArray()) +
+            '，各重试一次后仍失败）：起始的健康、监听、安全模式和输入源状态可能不对（「健康」一节的起始依据标了「基线不完整」）；' +
+            '监视期间的新增日志从脚本启动时的文件末尾读起，计数不受影响。')
+    }
     if ($script:LogReadErrors -gt 0) { $auto.Add('日志读取出错 ' + $script:LogReadErrors + ' 次，统计可能不全。') }
     if ($script:LogResets -gt 0) {
         $auto.Add('日志文件从头重读 ' + $script:LogResets + ' 次（' + (Format-ResetKinds) +
@@ -1369,10 +1529,14 @@ function Build-Summary([string] $Status) {
     $o.Add('     4. 输入源丢失（input.check result=lost / window_missing / unregistered）后 ' + $UnhealthySuspectSeconds +
         ' 秒内没有同一组件 input.reattach ok=true（或 supervisor.recovered state=Healthy）；或 input.reattach ok=false。')
     $o.Add('     5. input.refused reason=hook_missing、input.queue_full、runtime.events_dropped 出现过。')
-    $o.Add('     6. 进程重启、进程不存在、启动前没有 app.exit、app.panic。')
+    $o.Add('     6. 进程重启、进程不存在（启动时的检查看到过就算）、启动前没有 app.exit、app.panic；')
+    $o.Add('        结束时进程不在运行且最后一次 app.start 之后没有 app.exit；整轮没有看到进程。')
     $o.Add('     7. 暂停（engine.manual_pause paused=true、安全模式、self_test.startup outcome=auto_listen_off / failed / refused 等）连续 ≥ ' +
         $PauseSuspectSeconds + ' 秒。')
-    $o.Add('     8. 出现 ERROR 级日志；进程在运行但日志目录不存在；日志读取或采样出错；日志文件被截断或替换后从头重读。')
+    $o.Add('     8. 出现 ERROR 级日志；进程在运行但日志目录不存在；日志读取或采样出错；日志文件被截断或替换后从头重读；')
+    $o.Add('        进程在运行而当天日志文件超过宽限仍不存在（当天启动的进程从启动算 ' + $script:LogStartupGraceSeconds +
+        ' 秒，跨日从 UTC 零点算 ' + $script:LogRolloverGraceMinutes + ' 分钟）；')
+    $o.Add('        整轮没有读到任何日志文件；启动时回放日志出错（重试一次后仍失败，起始状态标「基线不完整」）。')
     $o.Add('  B. 人工复核项：')
     $o.Add('     1. 输入活动与上面的不可用时段重叠。输入活动 = 采样时 GetLastInputInfo 的空闲时间 < 采样间隔，')
     $o.Add('        不区分键盘和鼠标，外部注入的输入也算；只说明「有人在操作」，不说明打了触发词。')
@@ -1408,8 +1572,13 @@ function Build-Summary([string] $Status) {
     if ($script:LogResets -gt 0) { $resetText = [string]$script:LogResets + ' 次（' + (Format-ResetKinds) + '）' }
     $o.Add('跨日换文件 ' + $script:LogRollovers + ' 次；文件被截断或替换后从头重读 ' + $resetText + '；超长行跳过 ' + $script:LogOversized +
         ' 次；读取出错 ' + $script:LogReadErrors + ' 次')
-    $o.Add('进程在运行而当天日志文件尚不存在的采样 ' + $script:LogMissingSamples + ' 次（UTC 零点后应用还没写日志时属正常）；日志目录不存在的采样 ' +
-        $script:LogDirMissingSamples + ' 次')
+    $gapCount = $script:LogGaps.Count
+    if ($null -ne $script:LogGap) { $gapCount++ }
+    $gapOver = @(Get-LogGapFindings).Length
+    $o.Add('进程在运行而当天日志文件尚不存在的采样 ' + $script:LogMissingSamples + ' 次，' + $gapCount + ' 段，其中超过宽限的 ' + $gapOver +
+        ' 段（宽限：当天启动的进程 ' + $script:LogStartupGraceSeconds + ' 秒，跨日 ' + $script:LogRolloverGraceMinutes +
+        ' 分钟）；日志目录不存在的采样 ' + $script:LogDirMissingSamples + ' 次')
+    $o.Add('读到日志文件 ' + $script:LogReadableCount + ' 次（含启动时的回放）；启动时回放出错 ' + $script:BaselineReadErrors + ' 次')
     $o.Add('隐私：本汇总和 events.csv 只含事件名、白名单字段值、计数和时间戳，不含日志原文。')
     return [string]::Join("`r`n", $o.ToArray()) + "`r`n"
 }
@@ -1454,6 +1623,12 @@ function Initialize-SoakState {
     $script:LogDirMissingSamples = 0
     $script:LogReadErrors = 0
     $script:LogOversized = 0
+    $script:LogReadableCount = 0
+    $script:LogGap = $null
+    $script:LogGaps = [System.Collections.Generic.List[object]]::new()
+    $script:BaselineReadErrors = 0
+    $script:BaselineIncomplete = $false
+    $script:BaselineErrorFiles = [System.Collections.Generic.List[string]]::new()
     $script:TickLines = 0
     $script:TickEvents = 0
     $script:TickErrors = 0
@@ -1591,14 +1766,20 @@ try {
     $script:EventsWriter.AutoFlush = $true
     $script:EventsWriter.WriteLine('TimeLocal,TimeUtc,Level,Event,Detail')
 
-    $running = $false
-    try { $running = ([System.Diagnostics.Process]::GetProcessesByName($ProcessName)).Length -gt 0 } catch { $running = $false }
+    $startProcs = @()
+    try { $startProcs = @([System.Diagnostics.Process]::GetProcessesByName($ProcessName)) } catch { $startProcs = @() }
+    $running = Register-StartupProcess $startProcs
+    foreach ($p in $startProcs) { try { $p.Dispose() } catch { } }
     Invoke-Baseline $running
 
     Write-Line 'Quicker Text 浸泡监视（只读：只查询进程、只读日志，不写数据目录，不产生输入）'
     Write-Line ('进程名 ' + $ProcessName + '；数据目录 ' + $DataDirectory)
     Write-Line ('时长 ' + (Format-Dur ($Hours * 3600)) + '，间隔 ' + $IntervalSeconds + ' 秒；输出 ' + $script:OutDir)
     Write-Line ('起始健康（日志推断）：' + (Get-Label $script:HealthLabel $script:Health) + '（' + $script:BaselineHealthVia + '）')
+    if ($script:BaselineIncomplete) {
+        Write-Line ('注意：启动时回放日志出错（' + [string]::Join('、', $script:BaselineErrorFiles.ToArray()) +
+            '，已重试一次），起始状态可能不对；汇总会列为自动可疑项。')
+    }
     if (-not [System.IO.Directory]::Exists($script:LogDirectory)) {
         Write-Line ('注意：日志目录不存在：' + $script:LogDirectory + '。数据目录不对时请用 -DataDirectory 指定。')
     }

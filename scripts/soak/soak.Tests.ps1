@@ -173,8 +173,30 @@ function Get-AutoItems([string] $Text) {
     return , $items.ToArray()
 }
 
+# A sample with the properties Invoke-Sample gives it.
+function New-FakeSample([DateTime] $Time, [bool] $Exists, $ProcId) {
+    $count = 0
+    if ($Exists) { $count = 1 }
+    return [pscustomobject]@{
+        Time = $Time; Exists = $Exists; ProcId = $ProcId; PidChanged = $false; Count = $count
+        WS = $null; PB = $null; Handles = $null; Threads = $null; Gdi = $null; User = $null
+        CpuMs = $null; CpuPct = $null; IdleSec = $null
+        Health = $script:Health; Listen = $script:Listen; Safe = $false; Lost = ''; Unavail = ''
+        Lines = 0; Events = 0; Errors = 0; LogFound = $false
+    }
+}
+
+# Stand-ins for System.Diagnostics.Process: Select-TrackedProcess reads only
+# .Id and .StartTime.
+function New-FakeProcess([int] $Id, [DateTime] $Start) {
+    return [pscustomobject]@{ Id = $Id; StartTime = $Start }
+}
+
 $Bom = [byte[]](0xEF, 0xBB, 0xBF)
 $T0 = [DateTime]::UtcNow.AddHours(-2)
+# A fixed UTC noon, so grace checks do not depend on when the tests run.
+$Noon = [DateTime]::SpecifyKind([DateTime]::new(2026, 10, 23, 12, 0, 0), [DateTimeKind]::Utc)
+$Midnight = [DateTime]::SpecifyKind([DateTime]::new(2026, 10, 23, 0, 0, 0), [DateTimeKind]::Utc)
 
 # ---------------------------------------------------------------------------
 # Item 5: a UTF-8 BOM at the start of a file
@@ -291,6 +313,214 @@ Invoke-TestCase '2d 文件变短：按「变短」从头重读' {
     $null = Invoke-LogRead $p ([DateTime]::Now)
     Assert-Equal 1 $script:LogResetKinds['shrunk'] '复位原因：变短'
     Assert-Equal 1 (Get-EventCount 'test.y') '变短后的事件'
+}
+
+# ---------------------------------------------------------------------------
+# Item 1: the day's log file missing while the process runs
+# ---------------------------------------------------------------------------
+
+Invoke-TestCase '1a 当天启动的进程：日志文件缺失超过 120 秒列 A 类，宽限内不列' {
+    $p = Get-LogPathForUtc $Noon
+    $start = $Noon.AddSeconds(-10)
+    Assert-Equal $false (Update-LogCoverage $Noon.ToLocalTime() $p $true $start) '启动后 10 秒'
+    Assert-Equal $false (Update-LogCoverage $Noon.AddSeconds(100).ToLocalTime() $p $true $start) '启动后 110 秒'
+    Assert-Equal 0 @(Get-LogGapFindings).Length '宽限内没有可疑项'
+    Assert-Equal $true (Update-LogCoverage $Noon.AddSeconds(115).ToLocalTime() $p $true $start) '启动后 125 秒：第一次超过宽限'
+    Assert-Equal $false (Update-LogCoverage $Noon.AddSeconds(130).ToLocalTime() $p $true $start) '只在第一次超过时返回 true'
+    Assert-Equal 'startup' $script:LogGap.Kind '宽限种类'
+    $auto = Get-AutoItems (Build-Summary '测试')
+    Assert-AnyContains $auto ('当天日志文件 ' + [System.IO.Path]::GetFileName($p) + ' 超过 120 秒仍不存在') '汇总列出'
+    Assert-AnyContains $auto '到结束仍不存在' '到结束仍缺失'
+    # The file appears: the stretch closes and stays listed.
+    Assert-Equal $false (Update-LogCoverage $Noon.AddSeconds(140).ToLocalTime() $p $false $start) '文件出现'
+    Assert-True ($null -eq $script:LogGap) '缺失段已结束'
+    Assert-Equal 1 $script:LogGaps.Count '记下一段'
+    $auto = Get-AutoItems (Build-Summary '测试')
+    Assert-AnyContains $auto '超过 120 秒仍不存在' '结束后的缺失段照样列出'
+    Assert-NoneContains $auto '到结束仍不存在' '已结束的段不写「到结束」'
+}
+
+Invoke-TestCase '1b 宽限内文件出现：不列' {
+    $p = Get-LogPathForUtc $Noon
+    $start = $Noon.AddSeconds(-5)
+    $null = Update-LogCoverage $Noon.ToLocalTime() $p $true $start
+    $null = Update-LogCoverage $Noon.AddSeconds(60).ToLocalTime() $p $true $start
+    $null = Update-LogCoverage $Noon.AddSeconds(70).ToLocalTime() $p $false $start
+    $auto = Get-AutoItems (Build-Summary '测试')
+    Assert-NoneContains $auto '当天日志文件' '宽限内的缺失不列'
+}
+
+Invoke-TestCase '1c 跨日：从 UTC 零点算 60 分钟，50 分钟不列，61 分钟列' {
+    $p = Get-LogPathForUtc $Midnight
+    $start = $Midnight.AddDays(-1)
+    Assert-Equal $false (Update-LogCoverage $Midnight.AddMinutes(30).ToLocalTime() $p $true $start) '零点后 30 分钟'
+    Assert-Equal $false (Update-LogCoverage $Midnight.AddMinutes(50).ToLocalTime() $p $true $start) '零点后 50 分钟'
+    Assert-Equal 'rollover' $script:LogGap.Kind '宽限种类'
+    Assert-Equal 0 @(Get-LogGapFindings).Length '50 分钟时没有可疑项'
+    Assert-Equal $true (Update-LogCoverage $Midnight.AddMinutes(61).ToLocalTime() $p $true $start) '零点后 61 分钟'
+    $auto = Get-AutoItems (Build-Summary '测试')
+    Assert-AnyContains $auto '超过 60 分钟仍不存在' '汇总列出'
+    Assert-AnyContains $auto 'UTC 零点' '说明是跨日'
+}
+
+Invoke-TestCase '1d 读不到进程启动时间：从第一次发现算跨日宽限' {
+    $p = Get-LogPathForUtc $Noon
+    Assert-Equal $false (Update-LogCoverage $Noon.ToLocalTime() $p $true $null) '第一次发现'
+    Assert-Equal $false (Update-LogCoverage $Noon.AddMinutes(59).ToLocalTime() $p $true $null) '59 分钟'
+    Assert-Equal $true (Update-LogCoverage $Noon.AddMinutes(61).ToLocalTime() $p $true $null) '61 分钟'
+    Assert-Equal 'unknown' $script:LogGap.Kind '宽限种类'
+}
+
+Invoke-TestCase '1e 换了日志文件：上一段结束，新文件另起一段' {
+    $a = Get-LogPathForUtc $Midnight.AddDays(-1)
+    $b = Get-LogPathForUtc $Midnight
+    $start = $Midnight.AddDays(-2)
+    $null = Update-LogCoverage $Midnight.AddMinutes(-1).ToLocalTime() $a $true $start
+    $null = Update-LogCoverage $Midnight.AddMinutes(1).ToLocalTime() $b $true $start
+    Assert-Equal 1 $script:LogGaps.Count '上一段结束'
+    Assert-Equal $b $script:LogGap.Path '新的一段对应新文件'
+}
+
+Invoke-TestCase '1f 整轮没有读到任何日志：列 A 类；读到过一次就不列' {
+    $auto = Get-AutoItems (Build-Summary '测试')
+    Assert-AnyContains $auto '整轮没有读到任何日志文件' '没读到时列出'
+    $p = Join-Path $script:LogDirectory 'present.log'
+    Assert-Equal 'missing' (Invoke-LogRead $p ([DateTime]::Now)) '不存在的文件'
+    Assert-Equal 0 $script:LogReadableCount '不存在的文件不算读到'
+    Add-TestBytes $p (ConvertTo-TestBytes @((New-TestLine $T0 'INFO' 'test.one' '')))
+    $null = Invoke-LogRead $p ([DateTime]::Now)
+    Assert-Equal 1 $script:LogReadableCount '读到一次'
+    $auto = Get-AutoItems (Build-Summary '测试')
+    Assert-NoneContains $auto '整轮没有读到任何日志文件' '读到过就不列'
+}
+
+# ---------------------------------------------------------------------------
+# Item 3: a process gone before the first sample
+# ---------------------------------------------------------------------------
+
+Invoke-TestCase '3a 启动检查看到、第一次采样前就没了：算进程不存在，结束时没有 app.exit 列 A 类' {
+    $now = [DateTime]::Now
+    $procs = @((New-FakeProcess 4243 $now.AddMinutes(-3)), (New-FakeProcess 4242 $now.AddMinutes(-5)))
+    Assert-Equal $true (Register-StartupProcess $procs) '启动检查看到进程'
+    Assert-Equal $true $script:ProcessEverSeen '算作已见过'
+    Assert-Equal 4242 $script:TrackedPid '跟踪最早启动的那个'
+    $script:Health = 'healthy'
+    $script:LastProcessEvent = 'start'
+    Set-ProcessAbsent $now
+    $script:Samples.Add((New-FakeSample $now $false $null))
+    Assert-True $script:AbsentTracker.IsOpen '进程不存在的时段已开始'
+    Assert-Equal 'exited' $script:Health '健康改为已退出'
+    $auto = Get-AutoItems (Build-Summary '测试')
+    Assert-AnyContains $auto '进程不存在 1 段' '列出进程不存在'
+    Assert-AnyContains $auto '结束时进程 ' '列出结束时不在且没有 app.exit'
+}
+
+Invoke-TestCase '3b 进程正常退出（读到 app.exit）：仍列进程不存在，但不列「没有正常退出」' {
+    $now = [DateTime]::Now
+    $null = Register-StartupProcess @((New-FakeProcess 4242 $now.AddMinutes(-5)))
+    $script:Health = 'healthy'
+    $script:LastProcessEvent = 'start'
+    $p = Join-Path $script:LogDirectory 'exit.log'
+    Add-TestBytes $p (ConvertTo-TestBytes @((New-TestLine $now.ToUniversalTime() 'INFO' 'app.exit' '')))
+    $null = Invoke-LogRead $p $now
+    Assert-Equal 'exit' $script:LastProcessEvent '读到 app.exit'
+    Set-ProcessAbsent $now
+    $script:Samples.Add((New-FakeSample $now $false $null))
+    $auto = Get-AutoItems (Build-Summary '测试')
+    Assert-AnyContains $auto '进程不存在 1 段' '进程不存在照样列出'
+    Assert-NoneContains $auto '结束时进程 ' '正常退出不列'
+}
+
+Invoke-TestCase '3c 整轮没有看到进程：列 A 类' {
+    Assert-Equal $false (Register-StartupProcess @()) '启动检查没看到'
+    Set-ProcessAbsent ([DateTime]::Now)
+    $script:Samples.Add((New-FakeSample ([DateTime]::Now) $false $null))
+    Assert-Equal $false $script:AbsentTracker.IsOpen '没见过就不记不存在的时段'
+    $auto = Get-AutoItems (Build-Summary '测试')
+    Assert-AnyContains $auto '整轮没有看到进程' '列出'
+}
+
+Invoke-TestCase '3d Get-EndProcessFinding 与启动检查后的 PID 判定' {
+    Assert-Equal '' (Get-EndProcessFinding $true $true 'start') '结束时在运行'
+    Assert-True ((Get-EndProcessFinding $false $true 'start') -ne '') '不在且最后是 app.start'
+    Assert-True ((Get-EndProcessFinding $false $true '') -ne '') '不在且日志里没有记录'
+    Assert-Equal '' (Get-EndProcessFinding $false $true 'exit') '不在但正常退出'
+    Assert-True ((Get-EndProcessFinding $false $false '').Contains('整轮没有看到进程')) '从没见过'
+    $null = Register-StartupProcess @((New-FakeProcess 4242 ([DateTime]::Now)))
+    Assert-Equal $false (Register-ProcessSeen 4242 ([DateTime]::Now)) '第一次采样是同一个 PID：不算重启'
+    Assert-Equal $true (Register-ProcessSeen 4244 ([DateTime]::Now)) '换了 PID：算重启'
+    Assert-Equal 2 $script:SeenPids.Count '两个 PID'
+}
+
+# ---------------------------------------------------------------------------
+# Item 4: read errors during the start-up replay
+# ---------------------------------------------------------------------------
+
+Invoke-TestCase '4a 回放时今天的日志被独占：重试一次仍失败，计数、标「基线不完整」、列 A 类，监视从文件末尾开始' {
+    $utc = [DateTime]::UtcNow
+    $yesterday = Get-LogPathForUtc $utc.AddDays(-1)
+    $today = Get-LogPathForUtc $utc
+    Add-TestBytes $yesterday (ConvertTo-TestBytes @(
+            (New-TestLine $utc.AddHours(-20) 'INFO' 'app.start' 'version="0.4.0"'),
+            (New-TestLine $utc.AddHours(-20).AddSeconds(1) 'INFO' 'self_test.startup' 'health=Healthy outcome="listening"')))
+    Add-TestBytes $today (ConvertTo-TestBytes @(
+            (New-TestLine $utc.AddMinutes(-30) 'WARN' 'test.history' ''),
+            (New-TestLine $utc.AddMinutes(-29) 'INFO' 'supervisor.recovering' '')))
+    $todayLen = ([System.IO.FileInfo]::new($today)).Length
+    $lock = [System.IO.FileStream]::new($today, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    try {
+        Invoke-Baseline $true
+    } finally {
+        $lock.Dispose()
+    }
+    Assert-Equal 1 $script:BaselineReadErrors '回放出错次数'
+    Assert-Equal $true $script:BaselineIncomplete '基线不完整'
+    Assert-Equal ([System.IO.Path]::GetFileName($today)) ($script:BaselineErrorFiles -join ',') '出错的文件'
+    Assert-True ($script:BaselineHealthVia.Contains('基线不完整')) '起始依据标了基线不完整'
+    Assert-Equal 'healthy' $script:Health '昨天的日志照样回放'
+    Assert-Equal $todayLen $script:Cursors[$today].Offset '今天的游标在启动时的文件末尾'
+    Assert-Equal 1 $script:LogReadableCount '昨天的文件算读到'
+    Add-TestBytes $today (ConvertTo-TestBytes @((New-TestLine $utc 'WARN' 'input.queue_full' 'source="hook"')))
+    $null = Invoke-LogRead $today ([DateTime]::Now)
+    Assert-Equal 1 (Get-EventCount 'input.queue_full') '监视期间的新增照样计数'
+    Assert-Equal 0 (Get-EventCount 'test.history') '启动前的历史不计入'
+    $auto = Get-AutoItems (Build-Summary '测试')
+    Assert-AnyContains $auto '启动时回放日志出错 1 次' '汇总列出'
+    $text = Build-Summary '测试'
+    Assert-True ($text.Contains('基线不完整')) '「健康」一节的起始依据带标记'
+}
+
+Invoke-TestCase '4b 回放第一次读失败、重试成功：不算出错' {
+    $utc = [DateTime]::UtcNow
+    $today = Get-LogPathForUtc $utc
+    Add-TestBytes $today (ConvertTo-TestBytes @(
+            (New-TestLine $utc.AddMinutes(-10) 'INFO' 'app.start' 'version="0.4.0"'),
+            (New-TestLine $utc.AddMinutes(-10).AddSeconds(1) 'INFO' 'self_test.startup' 'health=Healthy outcome="listening"')))
+    $todayLen = ([System.IO.FileInfo]::new($today)).Length
+    $real = ${function:Read-LogChunk}
+    $script:FailNext = 1
+    $script:FailName = [System.IO.Path]::GetFileName($today)
+    # Shadows Read-LogChunk for calls made from this case's scope (PowerShell
+    # resolves commands dynamically); gone when the case returns.
+    ${function:Read-LogChunk} = {
+        param([string] $Path, $Cursor, [long] $StopAt)
+        if ($script:FailNext -gt 0 -and $Path.EndsWith($script:FailName)) {
+            $script:FailNext--
+            return [pscustomobject]@{
+                Status = 'error'; Offset = [long]0; Reset = ''; Bytes = [long]0; Cursor = (New-LogCursor 0)
+                Lines  = ([System.Collections.Generic.List[string]]::new())
+            }
+        }
+        return (& $real $Path $Cursor $StopAt)
+    }
+    Invoke-Baseline $true
+    Assert-Equal 0 $script:FailNext '第一次读确实失败过'
+    Assert-Equal 0 $script:BaselineReadErrors '重试成功不计出错'
+    Assert-Equal $false $script:BaselineIncomplete '基线完整'
+    Assert-Equal 'healthy' $script:Health '重试读到的内容照样回放'
+    Assert-Equal $todayLen $script:Cursors[$today].Offset '游标在文件末尾'
+    $auto = Get-AutoItems (Build-Summary '测试')
+    Assert-NoneContains $auto '启动时回放日志出错' '不列'
 }
 
 # ---------------------------------------------------------------------------
