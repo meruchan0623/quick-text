@@ -379,6 +379,178 @@ fn no_valid_config_starts_empty_and_keeps_every_file() {
     assert_nothing_lost(&before, &files(&dir));
 }
 
+/// Ends a session the way a normal exit does: the run marker is cleared.
+fn clean_exit(store: Store, world: &World) {
+    store.meta.clear_run_marker();
+    drop(store);
+    world.advance(1_000);
+}
+fn assert_no_valid_config(store: &Store) {
+    let reason = SafeModeReason::NoValidConfig;
+    assert_eq!(store.safe_mode(), Some(reason));
+    assert_eq!(
+        store.startup_problems()[0].kind,
+        ProblemKind::SafeMode { reason }
+    );
+    assert_eq!(store.active, Config::default());
+    assert!(store.engine.paused.load(Ordering::SeqCst));
+}
+/// The quarantined files in `dir` with their content.
+fn quarantine_files(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    files(dir)
+        .into_iter()
+        .filter(|(path, _)| path.to_string_lossy().contains(".corrupt-"))
+        .collect()
+}
+
+/// F4-1: SafeMode(NoValidConfig) survives clean restarts. After the first
+/// launch the quarantined candidates are all that is left, so later ones
+/// find no candidate file; they must not take the profile for a new data
+/// directory. This is read from the directory, so it holds even when
+/// `store-meta.json` cannot be read.
+#[test]
+fn no_valid_config_survives_clean_restarts() {
+    let dir = TempDir::new();
+    let world = world();
+    write(&dir, "active.json", TRUNCATED);
+    write(&dir, "revisions/1.json", b"\xFF");
+    write(&dir, "previous.json", b"[]");
+    let before = files(&dir);
+    let store = Store::load_with(dir.path(), &env(&world));
+    assert_no_valid_config(&store);
+    let problems: Vec<_> = store.startup_problems().iter().map(|p| &p.kind).collect();
+    assert_eq!(quarantined(&problems).len(), 3);
+    clean_exit(store, &world);
+    let quarantine = quarantine_files(&dir);
+    assert_eq!(quarantine.len(), 3);
+
+    for _ in 0..2 {
+        let store = Store::load_with(dir.path(), &env(&world));
+        assert_no_valid_config(&store);
+        let problems: Vec<_> = store.startup_problems().iter().map(|p| &p.kind).collect();
+        assert!(quarantined(&problems).is_empty());
+        assert_eq!(quarantine_files(&dir), quarantine);
+        assert!(!dir.join("active.json").exists());
+        clean_exit(store, &world);
+    }
+
+    world.locked.lock().push(META_FILE);
+    let report = load_or_fallback(&dir, &env(&world));
+    let reason = SafeModeReason::NoValidConfig;
+    assert_eq!(report.outcome, LoadOutcome::SafeMode(reason));
+    assert!(!report.meta_writable);
+    assert_eq!(kinds(&report)[0], &ProblemKind::SafeMode { reason });
+    assert_nothing_lost(&before, &files(&dir));
+}
+
+/// F4-1: a draft that outlived every configuration stays protected on the
+/// launches after the first: it is loaded as it is, and every write that
+/// could replace it is refused with the safe mode.
+#[test]
+fn no_valid_config_keeps_protecting_a_surviving_draft() {
+    let dir = TempDir::new();
+    let world = world();
+    let drafted = metadata_config(&["drafted"]);
+    for name in ["active.json", "previous.json", "revisions/1.json"] {
+        write(&dir, name, TRUNCATED);
+    }
+    write(&dir, "draft.json", &bytes(&drafted));
+    let draft_bytes = fs::read(dir.join("draft.json")).unwrap();
+    let store = Store::load_with(dir.path(), &env(&world));
+    assert_no_valid_config(&store);
+    assert_eq!(store.draft, drafted);
+    clean_exit(store, &world);
+
+    let refused = |result: Result<(), CommandError>| {
+        assert!(
+            matches!(
+                result,
+                Err(CommandError::SafeMode {
+                    reason: SafeModeReason::NoValidConfig
+                })
+            ),
+            "{result:?}"
+        );
+    };
+    for _ in 0..2 {
+        let mut store = Store::load_with(dir.path(), &env(&world));
+        assert_no_valid_config(&store);
+        assert_eq!(store.draft, drafted);
+        refused(store.discard());
+        refused(store.save(metadata_config(&["edited"])));
+        refused(store.publish(store.draft.clone()));
+        refused(store.rollback_previous());
+        refused(store.mark_last_good(1));
+        refused(store.ensure_writable());
+        refused(store.set_manual_pause(false, || true));
+        assert_eq!(fs::read(dir.join("draft.json")).unwrap(), draft_bytes);
+        assert!(!dir.join("active.json").exists());
+        clean_exit(store, &world);
+    }
+}
+
+/// F4-1: publishing an import, also on a later launch, is the way out of
+/// SafeMode(NoValidConfig). It writes `active.json`, so the launches after
+/// it are Normal. An empty import starts from a blank configuration.
+#[test]
+fn published_import_ends_no_valid_config_for_good() {
+    for imported in [metadata_config(&["imported"]), Config::default()] {
+        let dir = TempDir::new();
+        let world = world();
+        write(&dir, "active.json", TRUNCATED);
+        write(&dir, "revisions/1.json", TRUNCATED);
+        let store = Store::load_with(dir.path(), &env(&world));
+        assert_no_valid_config(&store);
+        clean_exit(store, &world);
+
+        let mut store = Store::load_with(dir.path(), &env(&world));
+        assert_no_valid_config(&store);
+        store.pending_import = Some((imported.clone(), vec![]));
+        store.save(imported.clone()).unwrap();
+        store.publish(store.draft.clone()).unwrap();
+        assert_eq!(store.safe_mode(), None);
+        assert!(dir.join("active.json").exists());
+        clean_exit(store, &world);
+
+        for _ in 0..2 {
+            let store = Store::load_with(dir.path(), &env(&world));
+            assert_eq!(store.safe_mode(), None);
+            assert_eq!(store.active.rules, imported.rules);
+            assert!(store
+                .startup_problems()
+                .iter()
+                .all(|p| !matches!(p.kind, ProblemKind::SafeMode { .. })));
+            clean_exit(store, &world);
+        }
+        assert_eq!(
+            load_or_fallback(&dir, &env(&world)).outcome,
+            LoadOutcome::Normal
+        );
+    }
+}
+
+/// F4-1: a new data directory is Normal, also next to quarantines that are
+/// not configuration candidates (a draft, `store-meta.json`, prefs).
+#[test]
+fn new_data_directory_is_normal() {
+    let dir = TempDir::new();
+    let world = world();
+    let report = load_or_fallback(&dir, &env(&world));
+    assert_eq!(report.outcome, LoadOutcome::Normal);
+    assert!(report.problems.is_empty());
+    for name in ["draft", "store-meta", "prefs"] {
+        write(
+            &dir,
+            &format!("{name}.corrupt-20261001-000000.json"),
+            TRUNCATED,
+        );
+    }
+    world.advance(10 * 60 * 1000);
+    let store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.safe_mode(), None);
+    assert!(store.startup_problems().is_empty());
+}
+
 /// Fallback order: last-known-good, other revisions newest first, then
 /// `previous.json`; publishing afterwards never reuses a revision number.
 #[test]

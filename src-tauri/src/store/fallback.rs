@@ -133,8 +133,9 @@ impl LoadReport {
 ///    SafeMode(Locked). A newer schema is SafeMode(NewerSchema): read-only.
 /// 4. The chosen configuration is read leniently and compiled rule by rule.
 ///    No usable candidate at all is SafeMode(NoValidConfig) with an empty
-///    configuration; two or more consecutive crashes are SafeMode(CrashLoop)
-///    with the data loaded for viewing.
+///    configuration, also on later launches while the candidates an earlier
+///    one quarantined are all that is left; two or more consecutive crashes
+///    are SafeMode(CrashLoop) with the data loaded for viewing.
 /// 5. Outside the read-only safe modes `store-meta.json` gets the new run
 ///    marker. One that did not parse is quarantined first; when that rename
 ///    fails, or the file could not be read, it is not written this session
@@ -199,6 +200,22 @@ pub fn load_or_fallback(dir: &Path, env: &StoreEnv) -> LoadReport {
                 config: Config::default(),
                 diagnostics: vec![],
             };
+            // F4-1: candidates an earlier launch quarantined still count, so
+            // SafeMode(NoValidConfig) lasts until an import is published
+            // (which writes active.json). Derived from the directory, not
+            // from a flag in store-meta.json, which may be unreadable or
+            // left unwritten this session.
+            if !any_candidate {
+                let quarantined = quarantined_candidates(dir);
+                if quarantined > 0 {
+                    tracing::warn!(
+                        event = "store.no_valid_config_kept",
+                        quarantined,
+                        "no configuration to load; candidates quarantined by an earlier launch"
+                    );
+                    any_candidate = true;
+                }
+            }
             if any_candidate {
                 (stored, LoadOutcome::SafeMode(SafeModeReason::NoValidConfig))
             } else {
@@ -610,6 +627,47 @@ fn quarantine_target(path: &Path, wall_ms: i64) -> PathBuf {
     target
 }
 
+/// How many configuration candidates an earlier launch quarantined (F4-1):
+/// `active` and `previous` beside `store-meta.json`, `revisions/<n>` below
+/// it, renamed by [`quarantine_target`]. The quarantines of `draft.json`,
+/// `store-meta.json` and `prefs.json` are not candidates.
+fn quarantined_candidates(dir: &Path) -> usize {
+    let names = |dir: &Path| -> Vec<String> {
+        fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let top = names(dir)
+        .iter()
+        .filter(|name| matches!(quarantined_stem(name), Some("active" | "previous")))
+        .count();
+    let revisions = names(&dir.join("revisions"))
+        .iter()
+        .filter(|name| {
+            quarantined_stem(name)
+                .is_some_and(|stem| !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .count();
+    top + revisions
+}
+
+/// The stem of a name [`quarantine_target`] produces,
+/// `<stem>.corrupt-<yyyymmdd-hhmmss>[-<n>].json`; `None` for any other name.
+fn quarantined_stem(name: &str) -> Option<&str> {
+    let (stem, rest) = name.strip_suffix(".json")?.split_once(".corrupt-")?;
+    let digits = |bytes: &[u8]| !bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit);
+    let rest = rest.as_bytes();
+    let stamp = rest.len() >= 15 && digits(&rest[..8]) && rest[8] == b'-' && digits(&rest[9..15]);
+    let suffix = &rest[rest.len().min(15)..];
+    let suffix = suffix.is_empty() || suffix.strip_prefix(b"-").is_some_and(digits);
+    (stamp && suffix).then_some(stem)
+}
+
 /// `yyyymmdd-hhmmss` in UTC (same format as the prefs quarantine).
 fn utc_stamp(wall_ms: i64) -> String {
     let secs = wall_ms.div_euclid(1000);
@@ -630,4 +688,49 @@ fn utc_stamp(wall_ms: i64) -> String {
         rem % 3600 / 60,
         rem % 60
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F4-1: every name `quarantine_target` produces for a candidate is
+    /// recognised, collision suffix included; other names are not.
+    #[test]
+    fn quarantined_candidates_match_the_quarantine_names() {
+        let dir = std::env::temp_dir().join(format!("quicker-quarantine-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(dir.join("revisions")).unwrap();
+        assert_eq!(quarantined_candidates(&dir), 0);
+        // Not candidates, or not names the quarantine produces.
+        for name in [
+            "active.json",
+            "draft.corrupt-20261001-000000.json",
+            "store-meta.corrupt-20261001-000000.json",
+            "prefs.corrupt-20261001-000000.json",
+            "active.corrupt-.json",
+            "active.corrupt-2026-01-01.json",
+            "active.corrupt-20261001-000000-.json",
+            "active.corrupt-20261001-000000-x.json",
+            "active.corrupt-20261001-000000.txt",
+            "revisions/1.json",
+            "revisions/1.metadata.json",
+            "revisions/x.corrupt-20261001-000000.json",
+        ] {
+            fs::write(dir.join(name), "x").unwrap();
+        }
+        assert_eq!(quarantined_candidates(&dir), 0);
+        let wall_ms = 1_800_000_000_000;
+        for (n, name) in ["active.json", "previous.json", "revisions/12.json"]
+            .into_iter()
+            .enumerate()
+        {
+            for _ in 0..2 {
+                // The second one gets the `-1` suffix.
+                let target = quarantine_target(&dir.join(name), wall_ms);
+                fs::write(&target, "x").unwrap();
+            }
+            assert_eq!(quarantined_candidates(&dir), 2 * (n + 1), "{name}");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
