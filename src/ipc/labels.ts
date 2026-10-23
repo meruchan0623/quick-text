@@ -174,7 +174,8 @@ export const triggerNames: Readonly<Record<string, string>> = {
 
 export const selfTestNames: Readonly<Record<string, string>> = {
   raw_input: '原始键盘输入',
-  hook_heartbeat: '键盘监听心跳',
+  // The heartbeat covers both hooks; same name as the backend's startup notice (startup.rs).
+  hook_heartbeat: '键盘鼠标监听',
   foreground: '前台窗口识别',
   clipboard: '剪贴板',
 };
