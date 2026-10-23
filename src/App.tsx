@@ -911,12 +911,15 @@ export default function App() {
       if (!p?.length) return;
       const strategy = await askValue({
         title: '遇到重复的指令时怎么处理？',
+        detail:
+          '更新相同编号会替换对应指令并保留其他规则；替换全部会移除未包含在导入文件中的规则。',
         confirm: '导入',
         input: {
           label: '冲突策略',
           value: 'merge',
           options: [
             { value: 'merge', label: '保留现有（merge）' },
+            { value: 'overwrite', label: '更新相同编号（overwrite）' },
             { value: 'keep_both', label: '保留两份（keep_both）' },
             { value: 'replace', label: '替换全部（replace）' },
           ],
@@ -927,6 +930,15 @@ export default function App() {
       if (!r) return; // cancelled
       setDialog({ title: '导入预览 · 确认后写入草稿', data: r.report, importConfig: r.config });
       setMessage('请核对导入报告后确认');
+    });
+  const exportExcelTemplate = () =>
+    run(async () => {
+      requireReady();
+      const path = await call<string | null>('export_excel_template');
+      if (path)
+        setMessage(
+          `Excel 填写模板已导出：${path}；在 Excel 中填写后，点击「导入」导回，核对预览并应用设置。`,
+        );
     });
   // 关闭, ✕ and Esc; ignored while the import's save is in flight (`importing`).
   const closeReport = () => {
@@ -1127,6 +1139,13 @@ export default function App() {
               </button>
               <button disabled={!ready || changing} onClick={exportData}>
                 导出
+              </button>
+              <button
+                disabled={!ready || changing || (safeMode !== null && safeMode !== 'crash_loop')}
+                title="导出空白 .xlsx 填写模板；填写后用「导入」导回。当前配置备份请用「导出」。"
+                onClick={exportExcelTemplate}
+              >
+                Excel 填写模板
               </button>
             </div>
             <div className="group-tabs">

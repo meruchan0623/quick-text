@@ -380,8 +380,25 @@ describe('mock backend commands', () => {
   it('returns null when a dialog is cancelled', async () => {
     use(new MockBackend({ rules: 0, dialog: 'cancel' }));
     expect(await invoke('export_config')).toBeNull();
+    expect(await invoke('export_excel_template')).toBeNull();
     expect(await invoke('choose_file', { kind: 'import' })).toBeNull();
     expect(await invoke('export_diagnostics', { redaction: 'full' })).toBeNull();
+  });
+
+  it('exports Excel templates only where configuration exports are safe', async () => {
+    for (const safeMode of [
+      'locked',
+      'newer_schema',
+      'no_valid_config',
+      'crash_loop',
+      null,
+    ] as const) {
+      use(new MockBackend({ rules: 0, safeMode }));
+      if (safeMode === null || safeMode === 'crash_loop')
+        expect(await invoke('export_excel_template')).toBe('mock://quicktext-template.xlsx');
+      else
+        await expect(invoke('export_excel_template')).rejects.toMatchObject({ code: 'safe_mode' });
+    }
   });
 
   it('rejects unknown commands like Tauri does', async () => {

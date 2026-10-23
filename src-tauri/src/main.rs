@@ -5,6 +5,7 @@ mod commands;
 mod diagnostics;
 mod error;
 mod events;
+mod excel;
 mod faults;
 mod lkg;
 mod startup;
@@ -137,6 +138,7 @@ fn main() {
             commands::legacy::get_foreground,
             commands::import_export::choose_file,
             commands::legacy::export_config,
+            commands::import_export::export_excel_template,
             commands::legacy::import_config,
             commands::runtime::start_recording,
             commands::runtime::stop_recording,

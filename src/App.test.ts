@@ -672,6 +672,102 @@ describe('rule list, editor and settings (F-04)', () => {
     });
   });
 
+  it('exports a blank Excel template without saving edits or exporting JSON', async () => {
+    const mounted = await mount();
+    await click(mounted, '文本指令参数设置');
+    await type(mounted, field(mounted.container, '黑名单程序'), 'unsaved.exe');
+    await click(mounted, '文本指令管理');
+    await click(mounted, 'Excel 填写模板');
+    await waitFor(mounted, () => {
+      expect(statusText(mounted.container)).toContain('mock://quicktext-template.xlsx');
+    });
+    expect(statusText(mounted.container)).toContain('导入');
+    expect(callsOf(mounted.backend, 'save_draft')).toHaveLength(0);
+    expect(callsOf(mounted.backend, 'export_config')).toHaveLength(0);
+  });
+
+  it('leaves the status unchanged when the Excel save dialog is cancelled', async () => {
+    const mounted = await mount({ dialog: 'cancel' });
+    const before = statusText(mounted.container);
+    await click(mounted, 'Excel 填写模板');
+    await waitFor(mounted, () => {
+      expect(callsOf(mounted.backend, 'export_excel_template')).toHaveLength(1);
+    });
+    expect(statusText(mounted.container)).toBe(before);
+    expect(mounted.container.querySelector('.alert.error')).toBeNull();
+  });
+
+  it.each(['locked', 'newer_schema', 'no_valid_config'] as const)(
+    'disables Excel template export in %s safe mode',
+    async (safeMode) => {
+      const mounted = await mount({ safeMode });
+      expect(button(mounted.container, 'Excel 填写模板')?.disabled).toBe(true);
+      await click(mounted, 'Excel 填写模板');
+      expect(callsOf(mounted.backend, 'export_excel_template')).toHaveLength(0);
+    },
+  );
+
+  it.each(['json', 'xlsx'] as const)(
+    'previews %s before confirming the imported draft',
+    async (importFormat) => {
+      const mounted = await mount({ importFormat });
+      await click(mounted, '导入');
+      await waitFor(mounted, () => {
+        expect(dialog(mounted.container, '遇到重复的指令时怎么处理？')).not.toBeNull();
+      });
+      await clickIn(mounted, dialog(mounted.container, '遇到重复的指令时怎么处理？'), '导入');
+      await waitFor(mounted, () => {
+        expect(button(mounted.container, '确认导入草稿')).toBeDefined();
+      });
+      expect(callsOf(mounted.backend, 'import_config')[0]?.args.path).toContain(`.${importFormat}`);
+      expect(callsOf(mounted.backend, 'save_draft')).toHaveLength(0);
+      await click(mounted, '确认导入草稿');
+      await waitFor(mounted, () => {
+        expect(callsOf(mounted.backend, 'save_draft')).toHaveLength(1);
+      });
+      expect(callsOf(mounted.backend, 'apply_settings')).toHaveLength(0);
+    },
+  );
+
+  it.each(['json', 'xlsx'] as const)(
+    'offers overwrite for %s while keeping unrelated rules',
+    async (importFormat) => {
+      const mounted = await mount({ importFormat }, (backend) => {
+        const first = backend.draft.rules[0] as { id: string; description: string };
+        first.id = 'mock-import-1';
+        first.description = '将被更新的旧内容';
+      });
+      await click(mounted, '导入');
+      await waitFor(mounted, () => {
+        expect(dialog(mounted.container, '遇到重复的指令时怎么处理？')).not.toBeNull();
+      });
+      const strategyDialog = dialog(mounted.container, '遇到重复的指令时怎么处理？');
+      expect(strategyDialog?.textContent).toContain('保留其他规则');
+      const select = strategyDialog?.querySelector('select');
+      if (!(select instanceof HTMLSelectElement)) throw new Error('no import strategy');
+      expect(select.value).toBe('merge');
+      expect(select.querySelector('option[value="overwrite"]')?.textContent).toBe(
+        '更新相同编号（overwrite）',
+      );
+      await mounted.act(() => {
+        select.value = 'overwrite';
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await clickIn(mounted, strategyDialog, '导入');
+      await waitFor(mounted, () => {
+        expect(button(mounted.container, '确认导入草稿')).toBeDefined();
+      });
+      expect(callsOf(mounted.backend, 'import_config')[0]?.args.strategy).toBe('overwrite');
+      expect(callsOf(mounted.backend, 'save_draft')).toHaveLength(0);
+      await click(mounted, '确认导入草稿');
+      await waitFor(mounted, () => {
+        expect(callsOf(mounted.backend, 'save_draft')).toHaveLength(1);
+      });
+      expect(mounted.backend.draft.rules).toHaveLength(4);
+      expect(mounted.backend.draft.rules[0]).not.toMatchObject({ description: '将被更新的旧内容' });
+    },
+  );
+
   it('shows the license notice and asks before 退出全部', async () => {
     const mounted = await mount();
     const { backend, container } = mounted;
@@ -893,6 +989,7 @@ describe('writes wait for the first load_state snapshot (review C2 follow-up)', 
     'set_auto_listen',
     'import_config',
     'export_config',
+    'export_excel_template',
     'choose_file',
     'get_foreground',
   ];
@@ -911,6 +1008,7 @@ describe('writes wait for the first load_state snapshot (review C2 follow-up)', 
         button(container, '＋ 添加指令'),
         button(container, '导入'),
         button(container, '导出'),
+        button(container, 'Excel 填写模板'),
         button(container, '应用设置'),
       ],
       settings: () => [
@@ -1012,7 +1110,7 @@ describe('writes wait for the first load_state snapshot (review C2 follow-up)', 
     expect(statusText(container)).toBe('未能读取当前配置');
     expect(container.querySelectorAll('tbody tr')).toHaveLength(0);
     expect(writeEntries(container, 'manage').map((entry) => entry?.disabled)).toEqual(
-      Array<boolean>(5).fill(true),
+      Array<boolean>(6).fill(true),
     );
 
     await click(mounted, '重试');
@@ -1023,7 +1121,7 @@ describe('writes wait for the first load_state snapshot (review C2 follow-up)', 
     expect(alerts(container)).not.toContain('未能读取当前配置');
     expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
     expect(writeEntries(container, 'manage').map((entry) => entry?.disabled)).toEqual(
-      Array<boolean>(5).fill(false),
+      Array<boolean>(6).fill(false),
     );
   });
 
@@ -1144,7 +1242,7 @@ describe('store revision and safe mode pushed with store-state', () => {
   it('reads a revision published elsewhere with load_state', async () => {
     const mounted = await mountReady();
     const { backend, container } = mounted;
-    expect(revisionText(container)).toContain('当前生效 v1');
+    expect(container.querySelector('.revision')).toBeNull();
     expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
     await mounted.act(() => {
       backend.publishExternally((config) => {
@@ -1152,7 +1250,7 @@ describe('store revision and safe mode pushed with store-state', () => {
       });
     });
     await waitFor(mounted, () => {
-      expect(revisionText(container)).toContain('当前生效 v2');
+      expect(container.querySelectorAll('tbody tr')).toHaveLength(2);
     });
     expect(container.querySelectorAll('tbody tr')).toHaveLength(2);
     expect(callsOf(backend, 'load_state')).toHaveLength(2);
@@ -1164,15 +1262,19 @@ describe('store revision and safe mode pushed with store-state', () => {
   it('reads nothing again for the store-state of its own apply_settings and rollback', async () => {
     const mounted = await mountReady();
     const { backend, container } = mounted;
+    await click(mounted, '文本指令参数设置');
+    const before = field(container, '词分隔符').value;
+    await type(mounted, field(container, '词分隔符'), ',');
     await click(mounted, '应用设置');
     await waitFor(mounted, () => {
-      expect(revisionText(container)).toContain('当前生效 v2');
+      expect(statusText(container)).toBe('设置已应用，生效版本已更新');
     });
     await click(mounted, '运行状态与恢复');
     await click(mounted, '恢复上一个版本');
     await clickIn(mounted, dialog(container, '回滚到上一个生效版本？'), '回滚');
+    await click(mounted, '文本指令参数设置');
     await waitFor(mounted, () => {
-      expect(revisionText(container)).toContain('当前生效 v3');
+      expect(field(container, '词分隔符').value).toBe(before);
     });
     await settle(mounted);
     // The mock pushes each store-state before the answer, the earliest it can arrive.
@@ -1197,7 +1299,7 @@ describe('store revision and safe mode pushed with store-state', () => {
     });
     expect(callsOf(backend, 'load_state')).toHaveLength(2);
     expect(field(container, '词分隔符').value).toBe(' ;');
-    expect(revisionText(container)).toContain('当前生效 v2');
+    expect(revisionText(container)).toBe('草稿待应用');
     // Keep: the notice goes and the edit stays; saving it overwrites the newer draft.
     await click(mounted, '保留我的修改');
     expect(notice(container)).toBe('');
@@ -1253,7 +1355,7 @@ describe('store revision and safe mode pushed with store-state', () => {
       });
     });
     await waitFor(mounted, () => {
-      expect(revisionText(container)).toContain('当前生效 v2');
+      expect(checkbox(container, '启用文本指令')?.checked).toBe(false);
     });
     expect(callsOf(backend, 'load_state')).toHaveLength(2);
     expect(dialog(container, '编辑文本指令')).not.toBeNull();
@@ -1290,7 +1392,7 @@ describe('store revision and safe mode pushed with store-state', () => {
     expect(checkbox(container, '启动时自动开始监听')?.disabled).toBe(false);
     expect(field(container, '词分隔符').matches(':disabled')).toBe(true);
     // Locked serves a placeholder, not the store (src-tauri store/fallback.rs `read_only`).
-    expect(revisionText(container)).toContain('当前生效 v0');
+    expect(container.querySelector('.revision')).toBeNull();
     await click(mounted, '文本指令管理');
     expect(container.querySelectorAll('tbody tr')).toHaveLength(0);
     // The backend's Locked retry succeeds: store-state says so, and the banner goes at once; the
@@ -1303,7 +1405,7 @@ describe('store revision and safe mode pushed with store-state', () => {
       expect(manage()).toEqual([false, false]);
     });
     expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
-    expect(revisionText(container)).toContain('当前生效 v1');
+    expect(container.querySelector('.revision')).toBeNull();
     await click(mounted, '文本指令参数设置');
     expect(button(container, '保存参数草稿')?.disabled).toBe(false);
     expect(checkbox(container, '开机时启动')?.disabled).toBe(false);
@@ -1329,7 +1431,7 @@ describe('store revision and safe mode pushed with store-state', () => {
     });
     const { backend, container } = mounted;
     // Locked: the placeholder, revision 0 and no rules.
-    expect(revisionText(container)).toContain('当前生效 v0');
+    expect(container.querySelector('.revision')).toBeNull();
     expect(container.querySelectorAll('tbody tr')).toHaveLength(0);
     // The retry recovers the store: store-state says revision 0 again, with safe mode null. The
     // window keeps the focus: no focus event reads the state again.
@@ -1402,7 +1504,7 @@ describe('store revision and safe mode pushed with store-state', () => {
     await settle(mounted);
     expect(separators().value).toBe(placeholder);
     expect(field(container, '黑名单程序').value).toBe('');
-    expect(revisionText(container)).toContain('配置已同步');
+    expect(container.querySelector('.revision')).toBeNull();
     // The store read when the Locked retry recovers it is taken in whole, nothing kept over it.
     await mounted.act(() => {
       backend.endSafeMode();
@@ -1412,7 +1514,7 @@ describe('store revision and safe mode pushed with store-state', () => {
     });
     expect(separators().matches(':disabled')).toBe(false);
     expect(field(container, '黑名单程序').value).toBe('');
-    expect(revisionText(container)).toContain('配置已同步');
+    expect(container.querySelector('.revision')).toBeNull();
     expect(notice(container)).toBe('');
     expect(callsOf(backend, 'save_draft')).toHaveLength(0);
   });
@@ -1436,7 +1538,7 @@ describe('store revision and safe mode pushed with store-state', () => {
     expect(container.querySelector('.alert.error')).toBeNull();
     await click(mounted, '应用设置');
     await waitFor(mounted, () => {
-      expect(revisionText(container)).toContain('当前生效 v2');
+      expect(statusText(container)).toBe('设置已应用，生效版本已更新');
     });
     await settle(mounted);
     expect(container.querySelector('.alert.error')).toBeNull();
@@ -1507,7 +1609,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
     await waitFor(mounted, () => {
       expect(separators(container)).toBe(',');
     });
-    expect(revisionText(container)).toContain('当前生效 v2');
+    expect(container.querySelector('.revision')).toBeNull();
     // The first load, the read that failed, the retry.
     expect(callsOf(backend, 'load_state')).toHaveLength(3);
     expect(notices(container)).toBe('');
@@ -1530,7 +1632,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
     expect(notices(container)).toContain('此时保存会以编辑器中的配置覆盖后台较新的配置');
     expect(callsOf(backend, 'load_state')).toHaveLength(4);
     expect(separators(container)).toBe(before);
-    expect(revisionText(container)).toContain('当前生效 v1');
+    expect(container.querySelector('.revision')).toBeNull();
     // Not blocking: saving stays possible. And no more reads by themselves.
     expect(button(container, '保存参数草稿')?.disabled).toBe(false);
     await outwait(mounted);
@@ -1540,7 +1642,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       expect(separators(container)).toBe(',');
     });
     expect(notices(container)).toBe('');
-    expect(revisionText(container)).toContain('当前生效 v2');
+    expect(container.querySelector('.revision')).toBeNull();
     expect(callsOf(backend, 'load_state')).toHaveLength(5);
     // Said of the button pressed (review C6).
     await waitFor(mounted, () => {
@@ -1587,7 +1689,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
     await waitFor(mounted, () => {
       expect(separators(container)).toBe('|');
     });
-    expect(revisionText(container)).toContain('当前生效 v3');
+    expect(notices(container)).toBe('');
     expect(callsOf(backend, 'load_state')).toHaveLength(3);
   });
 
@@ -1607,11 +1709,11 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
     await waitFor(mounted, () => {
       expect(separators(container)).toBe('|');
     });
-    expect(revisionText(container)).toContain('当前生效 v3');
+    expect(notices(container)).toBe('');
     await answerHeld(mounted, hold, 0);
     await settle(mounted);
     expect(separators(container)).toBe('|');
-    expect(revisionText(container)).toContain('当前生效 v3');
+    expect(container.querySelector('.revision')).toBeNull();
     expect(callsOf(backend, 'load_state')).toHaveLength(3);
     expect(notices(container)).toBe('');
   });
@@ -1634,7 +1736,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
     await answerHeld(mounted, hold, 0);
     await settle(mounted);
     expect(separators(container)).toBe(',');
-    expect(revisionText(container)).toContain('当前生效 v2');
+    expect(notices(container)).toBe('');
     expect(callsOf(backend, 'load_state')).toHaveLength(3);
   });
 
@@ -1719,9 +1821,10 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
         expect(hold.held[0]?.read).toBe(true);
       });
       await publish(mounted, ',');
+      await click(mounted, '文本指令参数设置');
       await focus(mounted);
       await waitFor(mounted, () => {
-        expect(revisionText(container)).toContain('当前生效 v2');
+        expect(separators(container)).toBe(',');
       });
       expect(callsOf(backend, 'load_state')).toHaveLength(2);
       expect(statusText(container)).toBe('正在处理…');
@@ -1736,7 +1839,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       // Long enough for a read the late answer would have caused.
       await outwait(mounted);
       expect(separators(container)).toBe(',');
-      expect(revisionText(container)).toContain('当前生效 v2');
+      expect(container.querySelector('.revision')).toBeNull();
       expect(notices(container)).toBe('');
       // Nothing to read again: v2 was never replaced by v1.
       expect(callsOf(backend, 'load_state')).toHaveLength(2);
@@ -1753,7 +1856,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       await waitFor(mounted, () => {
         expect(separators(container)).toBe('|');
       });
-      expect(revisionText(container)).toContain('当前生效 v3');
+      expect(notices(container)).toBe('');
     });
 
     it('says a save sent at v1 overwrote v2, though a load showed v2 before it answered', async () => {
@@ -1781,12 +1884,12 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       });
       await focus(mounted);
       await waitFor(mounted, () => {
-        expect(revisionText(container)).toContain('当前生效 v2');
+        expect(checkbox(container, '启用文本指令')?.checked).toBe(false);
       });
       await answerHeld(mounted, hold, 0);
       // The editor's config was of v1 when the save was sent: it replaced the draft of v2.
       expect(notices(container)).toContain(OVERWRITTEN);
-      expect(revisionText(container)).toContain('当前生效 v2');
+      expect(revisionText(container)).toBe('草稿待应用');
     });
 
     it('shows the later of two saves of one revision when the earlier one answers last', async () => {
@@ -1810,7 +1913,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       await answerHeld(mounted, hold, 0);
       expect(separators(container)).toBe(' |');
       expect(backend.draft.globals.word_separators).toBe(' |');
-      expect(revisionText(container)).toContain('当前生效 v1');
+      expect(revisionText(container)).toBe('草稿待应用');
       expect(statusText(container)).toBe('参数已保存到草稿');
       expect(notices(container)).toBe('');
     });
@@ -1950,7 +2053,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       await type(mounted, field(container, '词分隔符'), ' ;');
       await dropAnswer(mounted, hold, DISCARD);
       expect(separators(container)).toBe(before);
-      expect(revisionText(container)).toContain('配置已同步');
+      expect(container.querySelector('.revision')).toBeNull();
       // Saving does not bring the discarded edit back.
       await saveSettings(mounted);
       expect(sentSeparators(backend)).toBe(stored);
@@ -1972,8 +2075,8 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       await type(mounted, field(container, '词分隔符'), ' ;');
       await dropAnswer(mounted, hold, ROLLBACK);
       expect(separators(container)).toBe(before);
-      expect(revisionText(container)).toContain('当前生效 v3');
-      expect(revisionText(container)).toContain('配置已同步');
+      expect(statusText(container)).not.toBe('正在处理…');
+      expect(container.querySelector('.revision')).toBeNull();
       // The load said v3 was newer than the edit; the editor has v3 now.
       expect(notices(container)).toBe('');
       // Taken from the view shown, not an earlier one: nothing to read again.
@@ -2001,7 +2104,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       // Nothing left to save: 应用设置 applies at once.
       await click(mounted, '应用设置');
       await waitFor(mounted, () => {
-        expect(revisionText(container)).toContain('当前生效 v2');
+        expect(statusText(container)).toBe('设置已应用，生效版本已更新');
       });
       expect(callsOf(backend, 'save_draft')).toHaveLength(1);
       expect(backend.active.globals.word_separators).toBe(' ;');
@@ -2047,7 +2150,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       // Installed: v3 is newer than anything shown.
       await answerHeld(mounted, hold, 0);
       expect(separators(container)).toBe(' |');
-      expect(revisionText(container)).toContain('当前生效 v3');
+      expect(revisionText(container)).toBe('草稿待应用');
       // This window made v3: not said to come from 「后台」.
       expect(notices(container)).toContain(
         '配置已更新为 v3（恢复上一个版本）。编辑器中未保存的修改仍然保留',
@@ -2072,7 +2175,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       await type(mounted, field(container, '词分隔符'), ' |');
       await answerHeld(mounted, hold, 0);
       await waitFor(mounted, () => {
-        expect(revisionText(container)).toContain('当前生效 v2');
+        expect(statusText(container)).toBe('设置已应用，生效版本已更新');
       });
       await settle(mounted);
       // What was saved is applied; the later edit stays in the editor, still to be saved.
@@ -2126,7 +2229,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       await focusLoad(mounted);
       await answerHeld(mounted, hold, 0);
       expect(backend.active.globals.word_separators).toBe(' ;');
-      expect(revisionText(container)).toContain('当前生效 v2');
+      expect(statusText(container)).toBe('设置已应用，生效版本已更新');
       // As had the answer come first: the later edit kept, over v2, which is this window's own.
       expect(separators(container)).toBe(' |');
       expect(revisionText(container)).toContain('草稿待应用');
@@ -2243,7 +2346,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       await answerHeld(mounted, hold, 0);
       // As had the answer come first: the save over v2 said, then v3 taken in, which makes both moot.
       expect(separators(container)).toBe('|');
-      expect(revisionText(container)).toContain('当前生效 v3');
+      expect(container.querySelector('.revision')).toBeNull();
       expect(notices(container)).toBe('');
     });
 
@@ -2733,10 +2836,12 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
           const before = await toggleHeld(mounted, hold);
           expect(checkbox(container, '启用文本指令')?.disabled).toBe(true);
           expect(button(container, '导出')?.disabled).toBe(true);
+          expect(button(container, 'Excel 填写模板')?.disabled).toBe(true);
           await answerHeld(mounted, hold, 0);
           expect(errorShown(container)).toContain(FAILURE);
           expect(checkbox(container, '启用文本指令')?.disabled).toBe(false);
           expect(button(container, '导出')?.disabled).toBe(false);
+          expect(button(container, 'Excel 填写模板')?.disabled).toBe(false);
           const saves = callsOf(backend, 'save_draft').length;
           await toggle(mounted);
           await waitFor(mounted, () => {

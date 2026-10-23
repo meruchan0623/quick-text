@@ -1637,6 +1637,31 @@ fn crash_loop_exports_outside_the_data_dir() {
     }
 }
 
+#[test]
+fn generated_bytes_share_export_safety_and_preserve_exact_content() {
+    let bytes = b"PK\x03\x04\x00\xffExcel";
+    for mode in ALL_MODES {
+        let (dir, _world, store) = store_in(mode);
+        let before = files(&dir);
+        assert!(store.export_bytes(&dir.join("active.json"), bytes).is_err());
+        assert_eq!(files(&dir), before);
+        let elsewhere = TempDir::new();
+        let target = elsewhere.join("template.xlsx");
+        fs::write(&target, b"previous").unwrap();
+        let result = store.export_bytes(&target, bytes);
+        match mode {
+            None | Some(SafeModeReason::CrashLoop) => {
+                result.unwrap();
+                assert_eq!(fs::read(&target).unwrap(), bytes);
+            }
+            Some(reason) => {
+                assert!(matches!(result, Err(CommandError::SafeMode { reason: r }) if r == reason));
+                assert_eq!(fs::read(&target).unwrap(), b"previous");
+            }
+        }
+    }
+}
+
 /// Other spellings of a path inside the data directory are refused too.
 #[test]
 fn export_refuses_other_spellings_of_the_data_dir() {

@@ -100,6 +100,8 @@ export interface MockOptions {
   problems?: StartupProblem[];
   /** How file dialogs answer. Default `accept`. */
   dialog?: 'accept' | 'cancel';
+  /** Format returned by the synthetic import picker. */
+  importFormat?: 'json' | 'xlsx';
   /** Mix in the B-43 sample (unreadable entries, unknown fields). Default false. */
   unreadable?: boolean;
 }
@@ -302,6 +304,7 @@ export class MockBackend {
       platform: options.platform ?? 'windows',
       health: options.health ?? 'healthy',
       dialog: options.dialog ?? 'accept',
+      importFormat: options.importFormat ?? 'json',
       unreadable: options.unreadable ?? false,
     };
     const config: MockConfig = {
@@ -592,7 +595,9 @@ export class MockBackend {
     }),
     choose_file: (args) => {
       if (this.options.dialog === 'cancel') return null;
-      return args.kind === 'image' ? ['mock://示例图片.png'] : ['mock://示例文件.json'];
+      return args.kind === 'image'
+        ? ['mock://示例图片.png']
+        : [`mock://示例文件.${args.kind === 'import' ? this.options.importFormat : 'json'}`];
     },
     export_config: () => {
       if (this.options.dialog === 'cancel') {
@@ -600,6 +605,12 @@ export class MockBackend {
         return null;
       }
       return 'mock://quicktext-package.json';
+    },
+    export_excel_template: () => {
+      if (this.options.dialog === 'cancel') return null;
+      if (this.safeMode && this.safeMode !== 'crash_loop')
+        this.#fail({ code: 'safe_mode', detail: { reason: this.safeMode } }, '');
+      return 'mock://quicktext-template.xlsx';
     },
     import_config: (args) => {
       const incoming = syntheticRules(2).map((rule, i) => ({
@@ -609,7 +620,15 @@ export class MockBackend {
       }));
       const config = clone(this.draft);
       if (args.strategy === 'replace') config.rules = incoming;
-      else for (const rule of incoming) config.rules.push(rule);
+      else if (args.strategy === 'overwrite') {
+        for (const rule of incoming) {
+          const index = config.rules.findIndex(
+            (existing) => isReadableRule(existing) && existing.id === rule.id,
+          );
+          if (index < 0) config.rules.push(rule);
+          else config.rules[index] = rule;
+        }
+      } else for (const rule of incoming) config.rules.push(rule);
       this.#pendingImport = JSON.stringify(config);
       return {
         config,
