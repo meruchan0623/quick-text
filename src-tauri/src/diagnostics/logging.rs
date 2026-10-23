@@ -136,6 +136,7 @@
 //! | `store.create_dir_failed` | warn | the data directory could not be created; error |
 //! | `store.diagnostic` | warn | a diagnostic on the stored configuration; code and the path inside the configuration (never the message, which may echo values) |
 //! | `store.last_good` | info | a last-known-good `revision` was recorded |
+//! | `store.list_failed` | warn | a store directory could not be listed (so without a usable configuration the launch is SafeMode(NoValidConfig)); directory name, error `kind`, `os_code` |
 //! | `store.locked_recovered` | info | the data directory is readable again after SafeMode(Locked); load outcome |
 //! | `store.locked_retry` | error | the SafeMode(Locked) retry thread did not start; error |
 //! | `store.meta_readonly` | warn | store-meta.json is left untouched; the run marker and crash count are kept in memory |

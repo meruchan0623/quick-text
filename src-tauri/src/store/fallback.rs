@@ -18,6 +18,7 @@ use quicker_platform::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
+    ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
     time::Duration,
@@ -32,6 +33,9 @@ const RETRY_DELAYS_MS: [u64; 4] = [100, 200, 400, 800];
 pub trait StoreIo: Send + Sync {
     fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    /// The names of the entries in `dir`. An entry that cannot be read fails
+    /// the whole listing, so a partial listing is never taken for complete.
+    fn list_dir(&self, dir: &Path) -> io::Result<Vec<OsString>>;
 }
 
 /// The real file system. `fs::read` opens with every share mode on Windows,
@@ -48,6 +52,11 @@ impl StoreIo for FsIo {
     }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         fs::rename(from, to)
+    }
+    fn list_dir(&self, dir: &Path) -> io::Result<Vec<OsString>> {
+        fs::read_dir(dir)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect()
     }
 }
 
@@ -139,7 +148,8 @@ impl LoadReport {
 /// 4. The chosen configuration is read leniently and compiled rule by rule.
 ///    No usable candidate at all is SafeMode(NoValidConfig) with an empty
 ///    configuration, also on later launches while the candidates an earlier
-///    one quarantined are all that is left; two or more consecutive crashes
+///    one quarantined are all that is left, or while a directory that could
+///    hold candidates cannot be listed; two or more consecutive crashes
 ///    are SafeMode(CrashLoop) with the data loaded for viewing.
 /// 5. Outside the read-only safe modes `store-meta.json` gets the new run
 ///    marker. One that did not parse is quarantined first; when that rename
@@ -176,7 +186,11 @@ pub fn load_or_fallback(dir: &Path, env: &StoreEnv) -> LoadReport {
         Candidate::Newer => return loader.read_only(SafeModeReason::NewerSchema, meta),
     }
     if found.is_none() {
-        for (path, from) in loader.fallback_candidates(meta.last_good_revision) {
+        let (candidates, listed) = loader.fallback_candidates(meta.last_good_revision);
+        // Revisions that could not be listed may hold candidates: like a
+        // candidate that could not be read, that is no new data directory.
+        any_candidate |= !listed;
+        for (path, from) in candidates {
             match loader.candidate(&path) {
                 Candidate::Loaded(stored, _) => {
                     let revision =
@@ -212,14 +226,20 @@ pub fn load_or_fallback(dir: &Path, env: &StoreEnv) -> LoadReport {
             // from a flag in store-meta.json, which may be unreadable or
             // left unwritten this session.
             if !any_candidate {
-                let quarantined = quarantined_candidates(dir);
-                if quarantined > 0 {
-                    tracing::warn!(
-                        event = "store.no_valid_config_kept",
-                        quarantined,
-                        "no configuration to load; candidates quarantined by an earlier launch"
-                    );
-                    any_candidate = true;
+                match loader.quarantined_candidates() {
+                    Ok(0) => {}
+                    Ok(quarantined) => {
+                        tracing::warn!(
+                            event = "store.no_valid_config_kept",
+                            quarantined,
+                            "no configuration to load; candidates quarantined by an earlier launch"
+                        );
+                        any_candidate = true;
+                    }
+                    // R2: evidence that could not be inspected (logged as
+                    // `store.list_failed`) fails closed, never as a new
+                    // data directory.
+                    Err(_) => any_candidate = true,
                 }
             }
             if any_candidate {
@@ -485,9 +505,36 @@ impl Loader<'_> {
         }
     }
 
+    /// The names in `dir`. A directory that does not exist is empty; any
+    /// other failure, of the listing or of one entry, is logged and returned.
+    fn list(&self, dir: &Path) -> io::Result<Vec<String>> {
+        match self.env.io.list_dir(dir) {
+            // Names that are not UTF-8 are no store file names.
+            Ok(names) => Ok(names
+                .into_iter()
+                .filter_map(|name| name.into_string().ok())
+                .collect()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(vec![]),
+            Err(e) => {
+                tracing::warn!(
+                    event = "store.list_failed",
+                    dir = %label(dir),
+                    kind = %e.kind(),
+                    os_code = ?e.raw_os_error(),
+                    "store directory could not be listed"
+                );
+                Err(e)
+            }
+        }
+    }
+
     /// The last-known-good revision, then the other revisions newest first,
-    /// then `previous.json`.
-    fn fallback_candidates(&self, last_good: Option<u64>) -> Vec<(PathBuf, RecoverySource)> {
+    /// then `previous.json`; false when `revisions` could not be listed, so
+    /// the list may miss some.
+    fn fallback_candidates(
+        &self,
+        last_good: Option<u64>,
+    ) -> (Vec<(PathBuf, RecoverySource)>, bool) {
         let revisions = self.dir.join("revisions");
         let mut candidates = vec![];
         if let Some(n) = last_good {
@@ -496,7 +543,13 @@ impl Loader<'_> {
                 RecoverySource::LastGood,
             ));
         }
-        let mut numbers = revision_numbers(self.dir);
+        let listing = self.list(&revisions);
+        let listed = listing.is_ok();
+        let mut numbers: Vec<u64> = listing
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|name| revision_number(name))
+            .collect();
         numbers.sort_unstable_by(|a, b| b.cmp(a));
         candidates.extend(
             numbers
@@ -510,7 +563,27 @@ impl Loader<'_> {
                 }),
         );
         candidates.push((self.dir.join("previous.json"), RecoverySource::Previous));
-        candidates
+        (candidates, listed)
+    }
+
+    /// How many configuration candidates an earlier launch quarantined (F4-1):
+    /// `active` and `previous` beside `store-meta.json`, `revisions/<n>` below
+    /// it, renamed by [`quarantine_target`]. The quarantines of `draft.json`,
+    /// `store-meta.json` and `prefs.json` are not candidates. An error when
+    /// the directories cannot be listed (R2): the caller must not read it as
+    /// "none".
+    fn quarantined_candidates(&self) -> io::Result<usize> {
+        let top = self
+            .list(self.dir)?
+            .iter()
+            .filter(|name| matches!(quarantined_stem(name), Some("active" | "previous")))
+            .count();
+        let revisions = self
+            .list(&self.dir.join("revisions"))?
+            .iter()
+            .filter(|name| quarantined_stem(name).is_some_and(is_revision_stem))
+            .count();
+        Ok(top + revisions)
     }
 
     /// The configuration `rollback` returns to. Not a fallback candidate: a
@@ -609,15 +682,21 @@ pub(super) fn revision_numbers(dir: &Path) -> Vec<u64> {
     };
     entries
         .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let stem = name.to_str()?.strip_suffix(".json")?;
-            if stem.is_empty() || !stem.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            stem.parse().ok()
-        })
+        .filter_map(|entry| revision_number(entry.file_name().to_str()?))
         .collect()
+}
+
+/// `n` for the name `<n>.json` of a revision snapshot.
+fn revision_number(name: &str) -> Option<u64> {
+    let stem = name.strip_suffix(".json")?;
+    if !is_revision_stem(stem) {
+        return None;
+    }
+    stem.parse().ok()
+}
+
+fn is_revision_stem(stem: &str) -> bool {
+    !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn quarantine_target(path: &Path, wall_ms: i64) -> PathBuf {
@@ -633,35 +712,6 @@ fn quarantine_target(path: &Path, wall_ms: i64) -> PathBuf {
         n += 1;
     }
     target
-}
-
-/// How many configuration candidates an earlier launch quarantined (F4-1):
-/// `active` and `previous` beside `store-meta.json`, `revisions/<n>` below
-/// it, renamed by [`quarantine_target`]. The quarantines of `draft.json`,
-/// `store-meta.json` and `prefs.json` are not candidates.
-fn quarantined_candidates(dir: &Path) -> usize {
-    let names = |dir: &Path| -> Vec<String> {
-        fs::read_dir(dir)
-            .map(|entries| {
-                entries
-                    .filter_map(Result::ok)
-                    .filter_map(|entry| entry.file_name().into_string().ok())
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let top = names(dir)
-        .iter()
-        .filter(|name| matches!(quarantined_stem(name), Some("active" | "previous")))
-        .count();
-    let revisions = names(&dir.join("revisions"))
-        .iter()
-        .filter(|name| {
-            quarantined_stem(name)
-                .is_some_and(|stem| !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit()))
-        })
-        .count();
-    top + revisions
 }
 
 /// The stem of a name [`quarantine_target`] produces,
@@ -707,6 +757,18 @@ mod tests {
     #[test]
     fn quarantined_candidates_match_the_quarantine_names() {
         let dir = std::env::temp_dir().join(format!("quicker-quarantine-{}", uuid::Uuid::new_v4()));
+        let env = StoreEnv::system();
+        let quarantined_candidates = |dir: &Path| {
+            Loader {
+                dir,
+                env: &env,
+                problems: vec![],
+            }
+            .quarantined_candidates()
+            .unwrap()
+        };
+        // A directory that does not exist (yet) is empty (R2).
+        assert_eq!(quarantined_candidates(&dir), 0);
         fs::create_dir_all(dir.join("revisions")).unwrap();
         assert_eq!(quarantined_candidates(&dir), 0);
         // Not candidates, or not names the quarantine produces.

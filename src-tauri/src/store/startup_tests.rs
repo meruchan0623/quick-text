@@ -67,6 +67,8 @@ struct World {
     /// File names whose reads fail with an I/O error (another process holds them).
     locked: parking_lot::Mutex<Vec<&'static str>>,
     rename_fails: AtomicBool,
+    /// Directories whose listing fails, with the OS error code it fails with.
+    unlisted: parking_lot::Mutex<Vec<(PathBuf, i32)>>,
 }
 fn world() -> Arc<World> {
     Arc::new(World {
@@ -74,6 +76,7 @@ fn world() -> Arc<World> {
         sleeps: parking_lot::Mutex::new(vec![]),
         locked: parking_lot::Mutex::new(vec![]),
         rename_fails: AtomicBool::new(false),
+        unlisted: parking_lot::Mutex::new(vec![]),
     })
 }
 impl World {
@@ -95,6 +98,15 @@ impl StoreIo for FakeIo {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
         fs::rename(from, to)
+    }
+    fn list_dir(&self, dir: &Path) -> io::Result<Vec<std::ffi::OsString>> {
+        let unlisted = self.0.unlisted.lock();
+        if let Some((_, code)) = unlisted.iter().find(|(path, _)| path == dir) {
+            return Err(io::Error::from_raw_os_error(*code));
+        }
+        fs::read_dir(dir)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect()
     }
 }
 struct FakeClock(Arc<World>);
@@ -677,6 +689,139 @@ fn publish_backs_up_only_configurations_that_were_on_disk() {
         one.rules
     );
     assert_eq!(store.meta.get().last_good_revision, Some(3));
+}
+
+/// OS error codes for a listing that fails: access denied on Windows (EIO
+/// elsewhere), and "not found" on both.
+const LIST_DENIED: i32 = 5;
+const LIST_NOT_FOUND: i32 = 2;
+
+/// F4-1 review R2: when the directories that hold the quarantine evidence
+/// cannot be listed and no candidate is usable, the launch fails closed to
+/// SafeMode(NoValidConfig), never to a new data directory: the surviving
+/// draft stays protected and every write that could replace it is refused.
+/// Covered for `revisions` and for the data directory itself.
+#[test]
+fn unlistable_evidence_keeps_no_valid_config_and_the_draft() {
+    assert_ne!(
+        io::Error::from_raw_os_error(LIST_DENIED).kind(),
+        io::ErrorKind::NotFound
+    );
+    let drafted = metadata_config(&["drafted"]);
+    // The candidate the first launch quarantines, and the directory that
+    // later cannot be listed.
+    for (candidate, unlisted) in [("revisions/1.json", "revisions"), ("active.json", "")] {
+        let dir = TempDir::new();
+        let world = world();
+        write(&dir, candidate, TRUNCATED);
+        write(&dir, "draft.json", &bytes(&drafted));
+        let draft_bytes = fs::read(dir.join("draft.json")).unwrap();
+        let store = Store::load_with(dir.path(), &env(&world));
+        assert_no_valid_config(&store);
+        clean_exit(store, &world);
+        assert_eq!(quarantine_files(&dir).len(), 1, "{candidate}");
+
+        let unlisted = if unlisted.is_empty() {
+            dir.path()
+        } else {
+            dir.join(unlisted)
+        };
+        world.unlisted.lock().push((unlisted, LIST_DENIED));
+        for _ in 0..2 {
+            let mut store = Store::load_with(dir.path(), &env(&world));
+            assert_no_valid_config(&store);
+            assert_eq!(store.draft, drafted, "{candidate}");
+            refused_no_valid_config(store.discard());
+            refused_no_valid_config(store.save(Config::default()));
+            refused_no_valid_config(store.rollback_previous());
+            refused_no_valid_config(store.set_manual_pause(false, || true));
+            assert_eq!(fs::read(dir.join("draft.json")).unwrap(), draft_bytes);
+            assert!(!dir.join("active.json").exists());
+            clean_exit(store, &world);
+        }
+        // Unlisted, the data directory of a new profile is no exception.
+        let dir = TempDir::new();
+        world.unlisted.lock().push((dir.path(), LIST_DENIED));
+        assert_eq!(
+            load_or_fallback(&dir, &env(&world)).outcome,
+            LoadOutcome::SafeMode(SafeModeReason::NoValidConfig)
+        );
+    }
+}
+
+/// F4-1 review R2: a listing error does not change the outcome when a
+/// candidate is usable: `active.json`, or a fallback found without the
+/// listing (last-known-good, `previous.json`).
+#[test]
+fn listing_errors_do_not_matter_when_a_candidate_is_usable() {
+    let deny_all = |world: &World, dir: &Path| {
+        let mut unlisted = world.unlisted.lock();
+        unlisted.push((dir.to_path_buf(), LIST_DENIED));
+        unlisted.push((dir.join("revisions"), LIST_DENIED));
+    };
+    let dir = TempDir::new();
+    let world = world();
+    write(&dir, "active.json", &bytes(&config_at(1)));
+    deny_all(&world, &dir);
+    let report = load_or_fallback(&dir, &env(&world));
+    assert_eq!(report.outcome, LoadOutcome::Normal);
+    assert!(report.problems.is_empty());
+    assert_eq!(report.active, config_at(1));
+
+    let dir = TempDir::new();
+    write(&dir, "active.json", TRUNCATED);
+    write(&dir, "revisions/1.json", &bytes(&config_at(1)));
+    let meta = StoreMeta {
+        last_good_revision: Some(1),
+        ..StoreMeta::default()
+    };
+    atomic_json(&dir.join(META_FILE), &meta).unwrap();
+    deny_all(&world, &dir);
+    let report = load_or_fallback(&dir, &env(&world));
+    assert_eq!(
+        report.outcome,
+        LoadOutcome::Recovered {
+            from: RecoverySource::LastGood,
+            revision: Some(1)
+        }
+    );
+
+    let dir = TempDir::new();
+    write(&dir, "active.json", TRUNCATED);
+    write(&dir, "previous.json", &bytes(&config_at(4)));
+    deny_all(&world, &dir);
+    let report = load_or_fallback(&dir, &env(&world));
+    assert_eq!(
+        report.outcome,
+        LoadOutcome::Recovered {
+            from: RecoverySource::Previous,
+            revision: None
+        }
+    );
+    assert_eq!(report.active, config_at(4));
+}
+
+/// F4-1 review R2: a directory that is not found is empty, so a new data
+/// directory stays Normal.
+#[test]
+fn directories_not_found_are_empty() {
+    assert_eq!(
+        io::Error::from_raw_os_error(LIST_NOT_FOUND).kind(),
+        io::ErrorKind::NotFound
+    );
+    let dir = TempDir::new();
+    let world = world();
+    world
+        .unlisted
+        .lock()
+        .extend([dir.path(), dir.join("revisions")].map(|d| (d, LIST_NOT_FOUND)));
+    let report = load_or_fallback(&dir, &env(&world));
+    assert_eq!(report.outcome, LoadOutcome::Normal);
+    assert!(report.problems.is_empty());
+    world.advance(10 * 60 * 1000);
+    let store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.safe_mode(), None);
+    assert!(store.startup_problems().is_empty());
 }
 
 /// Fallback order: last-known-good, other revisions newest first, then
