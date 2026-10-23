@@ -50,6 +50,8 @@
 //! | `clipboard.slow` | warn | the clipboard was held open past its budget; `held_ms`, `budget_ms` |
 //! | `clipboard.unreadable` | warn | an enumerated clipboard format gave no data or unreadable memory; the backup is refused; format id |
 //! | `clipboard.worker_failed` | warn | the clipboard backup worker thread did not start; error |
+//! | `command.execute_failed` | warn / error | a manual run (`execute_action`) failed: fenced or refused by the send exclusion (`category` `stalled`, warn, with the `health` returned), or otherwise (`run_failed`, error, with its `trace_id`); the run's reason code, never the run's text; or a thread of the run did not start (`spawn_failed`, error: the `thread` name, the OS error's `kind` and `os_code`, the `trace_id`) |
+//! | `command.execute_refused` | warn | a manual run (`execute_action`) refused before it started because earlier runs' jobs have not ended (`reason` `jobs_exhausted`, the `limit`, the `health` read); no content |
 //! | `command.internal` | error | `CommandError::Internal`; `trace_id` and the original error |
 //! | `command.io` | warn | `CommandError::Io`; operation, file name, OS error |
 //! | `diagnostics.export` | info | a bundle was written; redaction, entry count, `elapsed_ms` |
@@ -63,19 +65,19 @@
 //! | `executor.clipboard_probe_cached` | debug | the clipboard health could not be read without waiting; the status last read is reported |
 //! | `executor.budget_skipped` | debug | a stall-check round was skipped: a lock it needs is held elsewhere; which lock (`held`) |
 //! | `executor.clipboard_busy` | warn | a paste was refused: the clipboard is held by a stalled task |
-//! | `executor.fenced` | warn | a stalled task was fenced: its thread may send nothing more and its key-ups are owed; the new `epoch`, `in_flight` |
-//! | `executor.manual_send_refused` | warn | manual input was not sent; refusal reason |
-//! | `executor.panic` | error | an executor task panicked and the worker keeps serving; stage, payload kind (`str` / `string` / `other`, never the payload), `epoch` |
+//! | `executor.fenced` | warn | a stalled task was fenced: its thread may send nothing more and its key-ups are owed; the new `epoch`, `in_flight`, whether it was a `manual` run |
+//! | `executor.manual_send_refused` | warn | manual input was not sent; refusal reason (`send_lock_busy`, `release_owed`, `fenced`, `unclaimed`), `epoch` |
+//! | `executor.panic` | error | an executor task panicked and the worker keeps serving; stage, payload kind (`str` / `string` / `other`, never the payload), `epoch`, whether it was a `manual` run |
 //! | `executor.probe_cached` | debug | the executor health could not be read without waiting; the status last read is reported |
 //! | `executor.rebuild_refused` | warn | an executor rebuild was refused: the send lock stayed held; `epoch` |
 //! | `executor.rebuilt` | info | the executor was rebuilt; `epoch`, whether the live worker was `reused` |
 //! | `executor.release_deferred` | warn | owed key-ups were not paid yet: the send lock stayed held; `epoch` |
 //! | `executor.release_failed` | warn | a key-up was refused while releasing held keys; the key class only (modifier name, `mouse` or `other`), never the key code |
-//! | `executor.release_owed` | warn | key-ups were refused: they stay owed and input stays refused; `released`, `refused`, `epoch` |
+//! | `executor.release_owed` | warn | key-ups were refused, or a fence stopped the release: they stay owed and input stays refused; `released`, `refused`, `stopped`, `epoch` |
 //! | `executor.release_paid` | info | owed key-ups were paid; `released`, `epoch` |
 //! | `executor.retired` | info | a fenced worker stopped serving; its `epoch` |
 //! | `executor.send_refused` | warn | nothing was sent: the send lock is held by a stuck send; `epoch` |
-//! | `executor.stalled` | warn | a task ran past its stall budget and is retired; `stalled_ms`, `budget_ms` |
+//! | `executor.stalled` | warn | a task ran past its stall budget and is retired; `stalled_ms`, `budget_ms`, whether it was a `manual` run |
 //! | `executor.start_failed` | error | the executor did not start; error |
 //! | `executor.unwound` | error | a task unwound without settling; its held keys were released; `epoch`, `released` |
 //! | `export.refused_data_dir` | warn | an export target inside the data directory was refused; file name and the check that caught it (`stage`) |

@@ -283,12 +283,13 @@ pub(super) fn vk(k: &Key) -> Result<u16, String> {
                 "MEDIAPREVIOUSTRACK" => VK_MEDIA_PREV_TRACK,
                 "BROWSERBACK" => VK_BROWSER_BACK,
                 "BROWSERFORWARD" => VK_BROWSER_FORWARD,
+                // Fixed texts (F5-1 H): never the rule's key name.
                 _ if n.starts_with('F') => {
                     let num = n[1..]
                         .parse::<u16>()
-                        .map_err(|_| format!("Unknown key {name}"))?;
+                        .map_err(|_| "Unknown key name".to_string())?;
                     if !(1..=24).contains(&num) {
-                        return Err(format!("Unknown key {name}"));
+                        return Err("Unknown key name".into());
                     }
                     VK_F1 + num - 1
                 }
@@ -298,7 +299,7 @@ pub(super) fn vk(k: &Key) -> Result<u16, String> {
                 _ if n.len() == 1 && n.as_bytes()[0].is_ascii_alphanumeric() => {
                     n.as_bytes()[0] as u16
                 }
-                _ => return Err(format!("Unknown native key {name}")),
+                _ => return Err("Unknown native key name".into()),
             };
             Ok(v)
         }

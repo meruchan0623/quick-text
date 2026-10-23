@@ -132,15 +132,18 @@ pub fn preflight(plan: &ActionPlan) -> Result<(), String> {
                     vk(k)?;
                 }
             }
+            // Fixed texts (F5-1 H): an error never echoes the rule's values
+            // (a path, a decoder's details), since it can reach a log.
             Operation::PasteFiles { paths } => {
-                for p in paths {
-                    if !std::path::Path::new(p).exists() {
-                        return Err(format!("File does not exist: {p}"));
-                    }
+                if paths.iter().any(|p| !std::path::Path::new(p).exists()) {
+                    return Err("A file to paste does not exist".into());
                 }
             }
             Operation::PasteImage { path } => {
-                image::open(path).map_err(|e| format!("Image preflight failed: {e}"))?;
+                image::open(path).map_err(|error| match error {
+                    image::ImageError::IoError(_) => "Image file could not be read",
+                    _ => "Image could not be decoded",
+                })?;
             }
             Operation::Open {
                 target,
@@ -191,11 +194,8 @@ fn common_keys(name: &str) -> Result<Vec<Key>, String> {
         "media_previous" => vec!["MEDIAPREVIOUSTRACK"],
         "browser_back" => vec!["BROWSERBACK"],
         "browser_forward" => vec!["BROWSERFORWARD"],
-        _ => {
-            return Err(format!(
-                "Common function {name} has no adapter; choose a supported function"
-            ))
-        }
+        // A fixed text (F5-1 H): never the rule's function name.
+        _ => return Err("Common function has no adapter; choose a supported function".into()),
     };
     Ok(names.into_iter().map(Key::named).collect())
 }
@@ -277,17 +277,36 @@ pub fn execute(
     terminator: Option<String>,
     speed: f64,
 ) -> Result<ExecutionResult, String> {
-    // Manual run (no rule): recorded in the history too (B-35).
-    let started = SystemClock.now();
-    begin_trace();
+    // Manual run (no rule), recorded in the history (B-35). A run of the
+    // command goes through its claim's `ManualTicket::execute` instead
+    // (F5-1): with an executor, a run that names no claim is refused
+    // without input, so this path only runs unsupervised before
+    // `start_engine`.
     let process = target.process.clone();
-    let report = if erase != 0 {
-        RunReport::text(Err("Automatic erasure requires observed text proof".into()))
-    } else {
-        execute_inner(s, plan, target, generation, None, terminator, speed)
-    };
-    super::executor::record_manual(&process, &report, started);
-    report.result
+    let core = super::executor::manual_core(&s);
+    let run = manual_run(s, plan, target, generation, erase, terminator, speed);
+    super::executor::run_manual(core, None, &process, run).map_err(|error| error.text)
+}
+
+/// A manual run's body (no rule), for [`execute`] and
+/// `ManualTicket::execute`: automatic erasure needs observed text proof, so
+/// a manual run never erases.
+pub(super) fn manual_run(
+    s: Arc<Shared>,
+    plan: ActionPlan,
+    target: Foreground,
+    generation: u64,
+    erase: usize,
+    terminator: Option<String>,
+    speed: f64,
+) -> impl FnOnce() -> RunReport {
+    move || {
+        if erase != 0 {
+            RunReport::text(Err("Automatic erasure requires observed text proof".into()))
+        } else {
+            execute_inner(s, plan, target, generation, None, terminator, speed)
+        }
+    }
 }
 pub(super) fn execute_inner(
     s: Arc<Shared>,
@@ -300,11 +319,13 @@ pub(super) fn execute_inner(
 ) -> RunReport {
     run_plan(
         &Ports {
-            // Manual output takes the executor's send lock too (S1).
+            // Manual output takes the executor's send lock too (S1), behind
+            // the supervised run's epoch fence (F5-1); its clipboard lease
+            // takes the run's clipboard claim.
             injector: &super::executor::serialized(&WinInjector),
             foreground: &WinForeground,
             clock: &SystemClock,
-            clipboard: WinClipboard::new,
+            clipboard: || super::executor::manual_clipboard(WinClipboard::new),
         },
         &s,
         plan,
@@ -783,9 +804,10 @@ where
         completed_steps: completed,
         side_effects: SENT_EFFECT.with(|flag| flag.get()) || completed > 0,
     };
-    // An executor task publishes its result itself, from its busy guard and
-    // only while it still owns the run (B-01); manual runs publish here.
-    if !super::executor::in_task() {
+    // An executor task, or a supervised manual run, publishes its result
+    // when it settles and only while it still owns the run (B-01, F5-1);
+    // unsupervised manual runs publish here.
+    if !super::executor::publishes_on_settle() {
         *s.last
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.clone());
