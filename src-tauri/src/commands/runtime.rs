@@ -12,7 +12,11 @@ use quicker_platform::{
 };
 use std::{
     fmt::Display,
-    sync::{atomic::Ordering, PoisonError},
+    sync::{
+        atomic::Ordering,
+        mpsc::{self, RecvTimeoutError, TryRecvError},
+        PoisonError,
+    },
     time::Duration,
 };
 use tauri::{Manager, State};
@@ -91,7 +95,12 @@ pub async fn execute_action(
     // free nothing (F5-1 C): a thread that never comes back cannot hold or
     // free `busy`; dropping the claim below is the only release.
     let ticket = busy.ticket();
+    let watch = busy.ticket();
+    let (done, finished) = mpsc::channel::<()>();
     let job = tauri::async_runtime::spawn_blocking(move || {
+        // Dropped when the job ends, returned or unwound, which ends the
+        // command's wait.
+        let _done = done;
         // Each checkpoint restarts the claim's stall budget, and stops the
         // run, sending nothing, once the claim was fenced (F5-1 B).
         let checkpoint = || ticket.progress().map_err(|_| RunError::Fenced);
@@ -124,14 +133,26 @@ pub async fn execute_action(
             .execute(plan, target, generation, 0, None, speed)
             .map_err(RunError::Failed)
     });
-    let joined = job.await;
-    drop(busy);
-    runtime.refresh_state();
-    if let Some(w) = window {
-        let _ = w.show();
-    }
-    conclude(Some(joined), runtime.health().state)
+    let joined = join_unless_fenced(
+        job,
+        finished,
+        move || watch.fenced(),
+        FENCE_POLL,
+        || {
+            drop(busy);
+            runtime.refresh_state();
+            if let Some(w) = window {
+                let _ = w.show();
+            }
+        },
+    )
+    .await;
+    conclude(joined, runtime.health().state)
 }
+
+/// How often [`execute_action`] looks at its claim's fence while the run
+/// goes on: the command returns this long after a fence at the latest.
+const FENCE_POLL: Duration = Duration::from_millis(250);
 
 /// Why the blocking job of a manual run ended without a result.
 enum RunError {
@@ -144,8 +165,62 @@ enum RunError {
     Failed(ManualFailure),
 }
 
-/// The command's answer for a manual run (F5-1 E, H), given the job's join
-/// (`None`: not joined) and the supervisor's health. Fenced or
+/// How the wait for a manual run's job ended.
+#[derive(Debug, PartialEq, Eq)]
+enum RunEnd {
+    /// The job is done (returned or unwound): its result can be joined.
+    Finished,
+    /// The claim was fenced while the job went on.
+    Fenced,
+}
+
+/// Waits until the job is done (its end of `done` sent or dropped) or its
+/// claim is fenced, looking at `fenced` every `poll`. A job that is done by
+/// the time the fence is seen counts as finished.
+fn wait_for_run(done: &mpsc::Receiver<()>, fenced: impl Fn() -> bool, poll: Duration) -> RunEnd {
+    loop {
+        match done.recv_timeout(poll) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => return RunEnd::Finished,
+            Err(RecvTimeoutError::Timeout) if fenced() => {
+                return match done.try_recv() {
+                    Err(TryRecvError::Empty) => RunEnd::Fenced,
+                    Ok(()) | Err(TryRecvError::Disconnected) => RunEnd::Finished,
+                };
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+/// The command's side of a manual run (F5-1 A): joins the job, but waits no
+/// longer than its claim stays unfenced (`fenced`, looked at every `poll`),
+/// then runs `restore` (the claim given back, the state announced, the
+/// window shown) once, whichever came first. `None`: the claim was fenced
+/// while the job went on. The job is left to itself, not waited for: its
+/// thread may never return, and if it does it sends nothing, writes no
+/// history, publishes nothing and touches no newer claim (the executor's
+/// epoch and claim checks).
+async fn join_unless_fenced<T: Send + 'static>(
+    job: tauri::async_runtime::JoinHandle<T>,
+    finished: mpsc::Receiver<()>,
+    fenced: impl Fn() -> bool + Send + 'static,
+    poll: Duration,
+    restore: impl FnOnce(),
+) -> Option<tauri::Result<T>> {
+    let end =
+        tauri::async_runtime::spawn_blocking(move || wait_for_run(&finished, fenced, poll)).await;
+    let joined = match end {
+        Ok(RunEnd::Finished) => Some(job.await),
+        Ok(RunEnd::Fenced) => None,
+        // The wait itself failed; the job is not waited for either.
+        Err(e) => Some(Err(e)),
+    };
+    restore();
+    joined
+}
+
+/// The command's answer for a manual run (F5-1 A, E, H), given what
+/// [`join_unless_fenced`] got and the supervisor's health. Fenced or
 /// refused by the send exclusion: `EngineUnavailable`. A failed run:
 /// `Internal`, logged by its reason code and trace id only. Nothing the
 /// run's text says reaches the log or the frontend.
@@ -253,7 +328,13 @@ fn sync_recording_reason(runtime: &Runtime, engine: &Shared) {
 mod tests {
     use super::*;
     use quicker_platform::traits::SystemClock;
-    use std::sync::Arc;
+    use std::{
+        sync::{
+            atomic::{AtomicBool, AtomicUsize},
+            Arc,
+        },
+        time::Instant,
+    };
 
     #[test]
     fn the_recording_reason_follows_the_open_session() {
@@ -288,15 +369,122 @@ mod tests {
         }
     }
 
-    /// F5-1 E: a run that finished is returned as is. A checkpoint that
-    /// found the claim fenced, and a run refused as fenced or by the send
-    /// exclusion, are `engine_unavailable` with the health the supervisor is
-    /// heading to; a run that was never joined is the same.
+    /// F5-1 A: a worker that hangs after its claim was fenced does not hold
+    /// the command. It returns within a poll of the fence, restores the
+    /// window once, and maps to `engine_unavailable`; the hung thread is
+    /// left behind and its late result is never seen.
     #[test]
-    fn a_run_concludes_by_its_reason_code() {
-        let result = conclude::<tauri::Error>(Some(Ok(Ok(succeeded()))), HealthState::Healthy)
-            .expect("the run succeeded");
+    fn a_fenced_run_returns_at_once_and_restores_the_window_while_its_thread_hangs() {
+        let fenced = Arc::new(AtomicBool::new(false));
+        let (wake, hang) = mpsc::channel::<()>();
+        let (done, finished) = mpsc::channel::<()>();
+        let job = tauri::async_runtime::spawn_blocking(move || {
+            let _done = done;
+            // Hangs well past the fence; the timeout only keeps a broken
+            // race from hanging the test run.
+            let _ = hang.recv_timeout(Duration::from_secs(5));
+            Ok::<_, RunError>(succeeded())
+        });
+        let fence = {
+            let fenced = Arc::clone(&fenced);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                fenced.store(true, Ordering::SeqCst);
+                Instant::now()
+            })
+        };
+        let restored = AtomicUsize::new(0);
+        let joined = tauri::async_runtime::block_on(join_unless_fenced(
+            job,
+            finished,
+            {
+                let fenced = Arc::clone(&fenced);
+                move || fenced.load(Ordering::SeqCst)
+            },
+            FENCE_POLL,
+            || {
+                restored.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+        let returned = Instant::now();
+        let fenced_at = fence.join().unwrap();
+        assert!(joined.is_none(), "the hung job is not waited for");
+        assert!(
+            returned.duration_since(fenced_at) < Duration::from_secs(1),
+            "returned {:?} after the fence",
+            returned.duration_since(fenced_at)
+        );
+        assert_eq!(restored.load(Ordering::SeqCst), 1, "the window is restored");
+        // Typed: the frontend's `engine_unavailable`, with the health the
+        // supervisor is heading to.
+        assert!(matches!(
+            conclude::<tauri::Error>(None, HealthState::Healthy),
+            Err(CommandError::EngineUnavailable {
+                health: HealthState::Recovering
+            })
+        ));
+        assert!(matches!(
+            conclude::<tauri::Error>(None, HealthState::Failed),
+            Err(CommandError::EngineUnavailable {
+                health: HealthState::Failed
+            })
+        ));
+        let _ = wake.send(());
+    }
+
+    /// The other ends of the wait: a run that finishes is joined and its
+    /// result returned; one that unwinds ends the wait too (its end of the
+    /// channel drops) and is an internal error. Either way the window is
+    /// restored once. A checkpoint that found the claim fenced, and a run
+    /// refused as fenced or by the send exclusion, are `engine_unavailable`.
+    #[test]
+    fn a_finished_or_unwound_run_is_joined_and_restores_the_window() {
+        let restored = AtomicUsize::new(0);
+        let (done, finished) = mpsc::channel::<()>();
+        let job = tauri::async_runtime::spawn_blocking(move || {
+            let _done = done;
+            Ok::<_, RunError>(succeeded())
+        });
+        let joined = tauri::async_runtime::block_on(join_unless_fenced(
+            job,
+            finished,
+            || false,
+            FENCE_POLL,
+            || {
+                restored.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+        assert_eq!(restored.load(Ordering::SeqCst), 1);
+        let result = conclude(joined, HealthState::Healthy).expect("the run succeeded");
         assert_eq!(result.id, "run");
+
+        let (done, finished) = mpsc::channel::<()>();
+        let job = tauri::async_runtime::spawn_blocking(move || {
+            let _done = done;
+            if true {
+                panic!("the job unwinds");
+            }
+            Ok::<_, RunError>(succeeded())
+        });
+        let joined = tauri::async_runtime::block_on(join_unless_fenced(
+            job,
+            finished,
+            || false,
+            FENCE_POLL,
+            || {
+                restored.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+        assert_eq!(restored.load(Ordering::SeqCst), 2);
+        assert!(
+            matches!(joined, Some(Err(_))),
+            "the join reports the unwind"
+        );
+        assert!(matches!(
+            conclude(joined, HealthState::Healthy),
+            Err(CommandError::Internal { .. })
+        ));
+
         for refused in [
             Err(RunError::Fenced),
             Err(RunError::Failed(ManualFailure {
@@ -310,12 +498,6 @@ mod tests {
                 })
             ));
         }
-        assert!(matches!(
-            conclude::<tauri::Error>(None, HealthState::Failed),
-            Err(CommandError::EngineUnavailable {
-                health: HealthState::Failed
-            })
-        ));
     }
 
     /// F5-1 H: a manual run whose rule carries a private value (an unknown
