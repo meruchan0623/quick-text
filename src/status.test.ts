@@ -171,9 +171,36 @@ describe('problemText', () => {
       ],
       ['log_level_elevated', { level: 'debug', until_ms: null }, '日志已临时调为「调试」级别。'],
       ['store_meta_reset', {}, '启动记录文件无法读取，已重新建立；连续启动失败的计数已清零。'],
+      [
+        'backup_failed',
+        { backup: 'backup-pre-0.4' },
+        '升级前备份失败，暂时不能保存，已有配置照常生效。',
+      ],
     ];
     for (const [kind, args, text] of cases)
       expect(problemText({ kind, severity: 'warning', args })).toBe(text);
+  });
+
+  it('words the safe-mode banner by reason', () => {
+    const text = (reason: string) =>
+      problemText({ kind: 'safe_mode', severity: 'error', args: { reason } });
+    // Import is the way out of these two.
+    expect(text('no_valid_config')).toBe(
+      '已进入安全模式：没有找到可用的配置。输入监听已暂停，设置暂时不能修改；可以导入配置或打开数据目录检查。',
+    );
+    // Locked: retried in the background, nothing written meanwhile, no import.
+    expect(text('locked')).toBe(
+      '已进入安全模式：配置文件被其他程序占用。输入监听已暂停，期间不会写入任何文件；占用解除后会自动退出安全模式，之后点「恢复监听」即可继续。也可以打开数据目录检查。',
+    );
+    // NewerSchema: read-only, never overwritten, no import.
+    expect(text('newer_schema')).toBe(
+      '已进入安全模式：配置文件来自更新的版本。当前版本以只读方式打开，不会修改或覆盖它，输入监听已暂停；请改用更新版本的 Quicker Text，或打开数据目录检查。',
+    );
+    for (const reason of ['locked', 'newer_schema']) expect(text(reason)).not.toMatch(/导入/);
+    // A reason newer than this frontend keeps the generic sentence.
+    expect(text('solar_flare')).toBe(
+      '已进入安全模式：其他（solar_flare）。输入监听已暂停，设置暂时不能修改；可以导入配置或打开数据目录检查。',
+    );
   });
 
   it('formats the log level deadline as local time', () => {
@@ -270,6 +297,7 @@ describe('bannerItems', () => {
       ['autostart_repaired', 'info'],
     ]);
     expect(new Set(items.map((i) => i.key)).size).toBe(items.length);
+    expect(items[0]?.text).toMatch(/占用解除后会自动退出安全模式/);
   });
 
   it('keeps a safe_mode problem when the snapshot has no safe mode yet', () => {
