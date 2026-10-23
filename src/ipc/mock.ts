@@ -10,6 +10,7 @@
 // In the preview the backend is also reachable as `globalThis.quickerMock` for manual pokes
 // (e.g. `quickerMock.recordExecution({ outcome: 'dropped_busy' })`).
 import { isReadableRule } from '../lib/rules';
+import { DEFAULT_TERMINATORS } from '../lib/terminators';
 import type { CommandError } from './errors';
 import type { CommandArgs, Transport, Unlisten } from './transport';
 import type {
@@ -244,6 +245,20 @@ const blankTimings = () => ({
 const notFound = (command: string) => `Command ${command} not found`;
 const clone = <T>(value: T): T => structuredClone(value);
 
+/** What the backend serves in Locked and NewerSchema: `Config::default()`, revision 0, no rules. */
+const placeholderConfig = (): MockConfig => ({
+  version: 1,
+  revision: 0,
+  enabled: true,
+  globals: {
+    terminators: [...DEFAULT_TERMINATORS],
+    word_separators: ' \t\n',
+    blacklist: [],
+    ime_erasure: 'escape',
+  },
+  rules: [],
+});
+
 export class MockBackend {
   readonly options: Required<Omit<MockOptions, 'safeMode' | 'problems'>>;
   /** Every command received, in order (tests assert on it). */
@@ -253,6 +268,13 @@ export class MockBackend {
 
   draft: MockConfig;
   active: MockConfig;
+  /**
+   * In Locked and NewerSchema, the store on disk, which the backend did not load: it serves an
+   * empty revision-0 placeholder as active and draft instead (src-tauri store/fallback.rs
+   * `read_only`). The Locked retry that succeeds installs this (`endSafeMode`). Tests may replace
+   * it before that.
+   */
+  disk: { active: MockConfig; draft: MockConfig } | null = null;
   previous: MockConfig[] = [];
   health: HealthSnapshot;
   engine: EngineState;
@@ -295,9 +317,12 @@ export class MockBackend {
       rules: syntheticRules(this.options.rules),
     };
     if (this.options.unreadable) addTolerantSample(config);
-    this.active = config;
-    this.draft = clone(config);
     this.safeMode = options.safeMode ?? null;
+    if (this.safeMode === 'locked' || this.safeMode === 'newer_schema') {
+      this.disk = { active: config, draft: clone(config) };
+      this.active = placeholderConfig();
+    } else this.active = config;
+    this.draft = clone(this.active);
     this.health = this.#healthOf(this.options.health);
     this.engine = {
       listening: false,
@@ -393,8 +418,17 @@ export class MockBackend {
    * Safe mode ends without a command, as when the backend's SafeMode(Locked) retry succeeds: the
    * store is read again (at `revision`, when given), the safe_mode pause and problem go, and the
    * changes are pushed. A problem going is never pushed (contract §3).
+   *
+   * From Locked, the store read replaces the placeholder active and draft with the ones on disk
+   * (src-tauri store/load.rs `install`), whose revision may be the placeholder's: store-state then
+   * says the same revision, with safe mode null (review I6).
    */
   endSafeMode(revision?: number): void {
+    if (this.disk !== null) {
+      this.active = this.disk.active;
+      this.draft = this.disk.draft;
+      this.disk = null;
+    }
     if (revision !== undefined && revision !== this.active.revision) {
       this.active = { ...clone(this.active), revision };
       this.draft = clone(this.active);

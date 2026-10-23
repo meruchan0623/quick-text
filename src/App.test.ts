@@ -1128,8 +1128,11 @@ describe('store revision and safe mode pushed with store-state', () => {
     container.querySelector('.alert.notice')?.textContent ?? '';
 
   /** Mount and wait until the config is read and the runtime view follows the events. */
-  async function mountReady(options: MockOptions = {}): Promise<Mounted> {
-    const mounted = await mount(options);
+  async function mountReady(
+    options: MockOptions = {},
+    setup?: (backend: MockBackend) => void,
+  ): Promise<Mounted> {
+    const mounted = await mount(options, setup);
     await waitFor(mounted, () => {
       expect(statusText(mounted.container)).toContain('已连接');
       expect(callsOf(mounted.backend, 'startup_problems')).toHaveLength(1);
@@ -1268,7 +1271,7 @@ describe('store revision and safe mode pushed with store-state', () => {
     expect(saved.rules.map((r) => r.description)).toContain('改过的说明');
   });
 
-  it('disables the writes safe mode refuses and enables them as soon as it ends', async () => {
+  it('disables the writes safe mode refuses and enables them when it ends, the store read again', async () => {
     const mounted = await mountReady({ safeMode: 'locked' });
     const { backend, container } = mounted;
     const manage = () =>
@@ -1286,21 +1289,132 @@ describe('store revision and safe mode pushed with store-state', () => {
     // Not a write safe mode refuses (ipc-contract §5 set_auto_listen).
     expect(checkbox(container, '启动时自动开始监听')?.disabled).toBe(false);
     expect(field(container, '词分隔符').matches(':disabled')).toBe(true);
-    // The backend's Locked retry succeeds: store-state says so, and the page follows at once.
+    // Locked serves a placeholder, not the store (src-tauri store/fallback.rs `read_only`).
+    expect(revisionText(container)).toContain('当前生效 v0');
+    await click(mounted, '文本指令管理');
+    expect(container.querySelectorAll('tbody tr')).toHaveLength(0);
+    // The backend's Locked retry succeeds: store-state says so, and the banner goes at once; the
+    // writes come back with the store, read again (review I6).
     await mounted.act(() => {
       backend.endSafeMode();
     });
     expect(container.querySelector('.banner')).toBeNull();
+    await waitFor(mounted, () => {
+      expect(manage()).toEqual([false, false]);
+    });
+    expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
+    expect(revisionText(container)).toContain('当前生效 v1');
+    await click(mounted, '文本指令参数设置');
     expect(button(container, '保存参数草稿')?.disabled).toBe(false);
     expect(checkbox(container, '登录后自动启动')?.disabled).toBe(false);
     expect(checkbox(container, '启动时自动开始监听')?.disabled).toBe(false);
     expect(field(container, '词分隔符').matches(':disabled')).toBe(false);
-    await click(mounted, '文本指令管理');
-    expect(manage()).toEqual([false, false]);
     await settle(mounted);
-    // Same revision: nothing to load. The problems, which go unannounced, are read again.
-    expect(callsOf(backend, 'load_state')).toHaveLength(1);
+    // The store read once more; the problems, which go unannounced, are read again.
+    expect(callsOf(backend, 'load_state')).toHaveLength(2);
     expect(callsOf(backend, 'startup_problems')).toHaveLength(2);
+  });
+
+  it('reads the store again when the Locked retry recovers it at the same revision (review I6)', async () => {
+    const hold = holdLoads();
+    const mounted = await mountReady({ safeMode: 'locked' }, (backend) => {
+      // A new profile: rules saved to the draft, never applied (active revision 0, no rules).
+      const disk = backend.disk;
+      if (disk === null) throw new Error('Locked keeps the store on disk');
+      backend.disk = {
+        active: { ...disk.active, revision: 0, rules: [] },
+        draft: { ...disk.draft, revision: 0 },
+      };
+      hold.attach(backend);
+    });
+    const { backend, container } = mounted;
+    // Locked: the placeholder, revision 0 and no rules.
+    expect(revisionText(container)).toContain('当前生效 v0');
+    expect(container.querySelectorAll('tbody tr')).toHaveLength(0);
+    // The retry recovers the store: store-state says revision 0 again, with safe mode null. The
+    // window keeps the focus: no focus event reads the state again.
+    const pushed: unknown[] = [];
+    backend.on('store-state', (payload) => pushed.push(payload));
+    hold.arm();
+    await mounted.act(() => {
+      backend.endSafeMode();
+    });
+    await settle(mounted);
+    expect(pushed).toEqual([{ seq: backend.seq, revision: 0, safe_mode: null }]);
+    expect(container.querySelector('.banner')).toBeNull();
+    // The read it causes is on its way: until it is installed, the editor holds the placeholder,
+    // and no entry sends a config write.
+    expect(hold.held).toHaveLength(1);
+    expect(button(container, '＋ 添加指令')?.disabled).toBe(true);
+    expect(checkbox(container, '启用文本指令')?.disabled).toBe(true);
+    expect(button(container, '应用设置')?.disabled).toBe(true);
+    await click(mounted, '文本指令参数设置');
+    expect(button(container, '保存参数草稿')?.disabled).toBe(true);
+    expect(field(container, '词分隔符').matches(':disabled')).toBe(true);
+    // Nor do the handlers themselves.
+    await callHandler(mounted, button(container, '保存参数草稿'), 'onClick');
+    await settle(mounted);
+    expect(callsOf(backend, 'save_draft')).toHaveLength(0);
+    expect(container.querySelector('.alert.error')?.textContent).toContain('安全模式状态已变化');
+    await callHandler(mounted, button(container, '应用设置'), 'onClick');
+    await settle(mounted);
+    expect(callsOf(backend, 'apply_settings')).toHaveLength(0);
+    // The read installs the recovered store: its rules are in the editor, and the writes are back.
+    await answerHeld(mounted, hold, 0);
+    expect(button(container, '保存参数草稿')?.disabled).toBe(false);
+    expect(button(container, '应用设置')?.disabled).toBe(false);
+    await click(mounted, '文本指令管理');
+    expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
+    // Saving the parameters keeps the rules.
+    await click(mounted, '文本指令参数设置');
+    await type(mounted, field(container, '词分隔符'), ' ;');
+    await click(mounted, '保存参数草稿');
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+    });
+    const saved = callsOf(backend, 'save_draft')[0]?.args.config as {
+      rules: unknown[];
+      globals: { word_separators: string };
+    };
+    expect(saved.globals.word_separators).toBe(' ;');
+    expect(saved.rules).toHaveLength(3);
+    expect(backend.draft.rules).toHaveLength(3);
+    expect(callsOf(backend, 'load_state')).toHaveLength(2);
+  });
+
+  it('makes no local edit in safe mode, so the store read when it ends is taken in whole', async () => {
+    const mounted = await mountReady({ safeMode: 'locked' }, (backend) => {
+      const disk = backend.disk;
+      if (disk === null) throw new Error('Locked keeps the store on disk');
+      disk.active.globals.word_separators = ',';
+      disk.draft.globals.word_separators = ',';
+    });
+    const { backend, container } = mounted;
+    await click(mounted, '文本指令参数设置');
+    const separators = () => field(container, '词分隔符');
+    expect(separators().matches(':disabled')).toBe(true);
+    expect(button(container, '选择当前窗口加入黑名单')?.disabled).toBe(true);
+    const placeholder = separators().value;
+    // The disabled fieldset stops the user, not an input event, which React still hands to
+    // onChange; nor does the blacklist button's handler, called itself, edit anything.
+    await type(mounted, separators(), ' ;');
+    await callHandler(mounted, button(container, '选择当前窗口加入黑名单'), 'onClick');
+    await settle(mounted);
+    expect(separators().value).toBe(placeholder);
+    expect(field(container, '黑名单程序').value).toBe('');
+    expect(revisionText(container)).toContain('配置已同步');
+    // The store read when the Locked retry recovers it is taken in whole, nothing kept over it.
+    await mounted.act(() => {
+      backend.endSafeMode();
+    });
+    await waitFor(mounted, () => {
+      expect(separators().value).toBe(',');
+    });
+    expect(separators().matches(':disabled')).toBe(false);
+    expect(field(container, '黑名单程序').value).toBe('');
+    expect(revisionText(container)).toContain('配置已同步');
+    expect(notice(container)).toBe('');
+    expect(callsOf(backend, 'save_draft')).toHaveLength(0);
   });
 
   it('leaves crash_loop by importing and applying, without reading the state again', async () => {

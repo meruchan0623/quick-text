@@ -169,7 +169,8 @@ describe('RuntimeSync', () => {
     expect(view.health?.state).toBe('degraded');
     expect(view.engine?.paused_reasons).toEqual(['safe_mode']);
     expect(view.safeMode).toBe('locked');
-    expect(view.revision).toBe(1);
+    // Locked serves an empty revision-0 placeholder, not the store (src-tauri store/fallback.rs).
+    expect(view.revision).toBe(0);
     expect(view.problems).toEqual([
       { kind: 'safe_mode', severity: 'error', args: { reason: 'locked' } },
     ]);

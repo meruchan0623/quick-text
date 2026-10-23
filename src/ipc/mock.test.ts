@@ -304,6 +304,34 @@ describe('mock backend commands', () => {
     expect(error).toEqual({ code: 'safe_mode', detail: { reason: 'locked' } });
   });
 
+  it('serves a placeholder in Locked and installs the store on disk when the retry succeeds', async () => {
+    const backend = new MockBackend({ rules: 2, safeMode: 'locked' });
+    use(backend);
+    // src-tauri store/fallback.rs `read_only`: an empty revision-0 config, not the store.
+    const locked = await invoke<LegacyState & { active: MockConfig }>('load_state');
+    expect(locked.revision).toBe(0);
+    expect(locked.active.rules).toEqual([]);
+    expect(locked.draft.rules).toEqual([]);
+    // A store whose active revision is 0 too (rules saved, never applied): the retry's store-state
+    // says the same revision, with safe mode null (store/load.rs `install`, review I6).
+    const disk = backend.disk;
+    if (disk === null) throw new Error('Locked keeps the store on disk');
+    backend.disk = {
+      active: { ...disk.active, revision: 0, rules: [] },
+      draft: { ...disk.draft, revision: 0 },
+    };
+    const pushed: unknown[] = [];
+    backend.on('store-state', (payload) => pushed.push(payload));
+    backend.endSafeMode();
+    expect(pushed).toEqual([{ seq: backend.seq, revision: 0, safe_mode: null }]);
+    expect(backend.disk).toBeNull();
+    const recovered = await invoke<LegacyState & { active: MockConfig }>('load_state');
+    expect(recovered.revision).toBe(0);
+    expect(recovered.active.rules).toEqual([]);
+    expect(recovered.draft.rules).toHaveLength(2);
+    expect(recovered.safe_mode).toBeNull();
+  });
+
   it('pushes store-state when the revision or safe mode changes, and only then', async () => {
     const backend = new MockBackend({ rules: 0 });
     use(backend);

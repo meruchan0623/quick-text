@@ -58,6 +58,7 @@ const REFRESHED = {
 } as const;
 const NOT_READY = '还没有读取到当前配置，暂时不能修改指令和设置。';
 const SAVE_PENDING = '上一次保存尚未完成，请稍候。';
+const SAFE_MODE_CHANGED = '安全模式状态已变化，正在重新读取当前配置；读取完成前暂时不能修改。';
 // A store revision this window has not read yet is read this many times in all, the retries
 // RECONCILE_RETRY_MS apart and doubling, before a notice offers 「重新读取」 (review C5).
 const RECONCILE_ATTEMPTS = 3;
@@ -337,12 +338,34 @@ export default function App() {
   // revision, but the editor has not taken its config in, so a revision published elsewhere would
   // pass as read. Only installed answers count, and the installed revision never goes down, so
   // neither does this; should a view older than it ever be shown, `behind` reads again.
+  //
+  // Review I6: with the revision, the safe mode of the view caught up with (`reconciledSafe`). A
+  // view read in Locked or NewerSchema is a placeholder (an empty revision-0 config), not the
+  // store's; the Locked retry that recovers installs the real config at the same revision, which
+  // may be 0. So a change of safe mode makes the view stale whatever the revision: `behind` reads
+  // again until a view of the runtime's safe mode is caught up with, and no config write is sent
+  // meanwhile (`editable`, `write`). Called in install order, so at an equal revision the later
+  // view's safe mode stands.
   const [reconciled, setReconciled] = useState<number | null>(null);
   const reconciledRef = useRef<number | null>(null);
-  const reconcileTo = (revision: number) => {
-    if (reconciledRef.current !== null && reconciledRef.current >= revision) return;
+  const [reconciledSafe, setReconciledSafe] = useState<SafeModeReason | null>(null);
+  const reconciledSafeRef = useRef<SafeModeReason | null>(null);
+  const reconcileTo = (revision: number, safeMode: SafeModeReason | null) => {
+    const caught = reconciledRef.current;
+    if (caught !== null && caught > revision) return;
+    reconciledSafeRef.current = safeMode;
+    setReconciledSafe(safeMode);
+    if (caught === revision) return;
     reconciledRef.current = revision;
     setReconciled(revision);
+  };
+  /**
+   * The safe mode now, read as `safeMode` below is but from the sync view and the ref, which are
+   * never behind: the handlers check it against `reconciledSafeRef` (review I6).
+   */
+  const currentSafeMode = (): SafeModeReason | null => {
+    const view = sync.getView();
+    return view.status === 'ready' ? view.safeMode : (shown.current?.safe_mode ?? null);
   };
   // This window's writes of the store in flight. The store-state a write causes may arrive before
   // its answer; the answer carries the new revision, so no reload is needed for it (see below).
@@ -430,6 +453,10 @@ export default function App() {
    */
   const write = async (command: StoreWrite, args?: Record<string, unknown>, op?: Change) => {
     if (changePending.current) throw new Error(SAVE_PENDING);
+    // Review I6: the editor holds a view of another safe mode (Locked's placeholder, say) until the
+    // read `behind` sends installs one of this; a config sent meanwhile would be made of it. The
+    // entries are disabled; this refuses again, from the refs.
+    if (reconciledSafeRef.current !== currentSafeMode()) throw new Error(SAFE_MODE_CHANGED);
     if (op) {
       changePending.current = true;
       setChanging(true);
@@ -448,7 +475,7 @@ export default function App() {
       if (view !== null) {
         show(view);
         // Not save_draft's: its config is not the editor's yet (see `reconciled`).
-        if (command !== 'save_draft') reconcileTo(s.revision);
+        if (command !== 'save_draft') reconcileTo(s.revision, s.safe_mode ?? null);
       }
       if (command === 'rollback' || command === 'apply_settings') {
         made.current.set(s.revision, command);
@@ -503,13 +530,18 @@ export default function App() {
   // publishing an import is the way out of CrashLoop and NoValidConfig; so does 导出 (allowed in
   // CrashLoop). The backend decides: the handlers do not check safe mode, and a write made before
   // the event arrives is refused there with the reason.
-  const editable = ready && safeMode === null;
+  // Review I6: a change of safe mode makes the editor's view stale (see `reconciledSafe`). Until
+  // the read it causes installs a view of the safe mode now, every config write stays disabled,
+  // those safe mode allows too (`safeModeRead`), and `write` refuses; an edit needs a view read
+  // outside safe mode as well.
+  const safeModeRead = reconciledSafe === safeMode;
+  const editable = ready && safeMode === null && reconciledSafe === null;
   // The entries that send a store write: not while a save's change is in flight (`changePending`).
   // 导入 and the rule editor only open; what they save is sent by an entry disabled meanwhile.
   const writable = editable && !changing;
   /** Apply a load_state snapshot; the first one initializes the editor and unlocks the writes. */
   const applySnapshot = (s: State) => {
-    reconcileTo(s.revision);
+    reconcileTo(s.revision, s.safe_mode ?? null);
     if (loaded.current) {
       if (!edited.current) {
         receive(s);
@@ -617,11 +649,21 @@ export default function App() {
   // a target and either reaches it or counts as failed. A backend without store-state moves
   // runtime.revision only with a snapshot. A view older than `reconciled` (the install rule never
   // shows one) counts as behind too: read again, and say so if that fails, never silently (C6).
+  //
+  // Review I6: the target is the runtime's safe mode as well. A view caught up with at the target
+  // revision but read in another safe mode (Locked's placeholder, then the recovered config at the
+  // same revision) is behind too, and a read reaches the target only with the safe mode. Compared
+  // at the target revision alone: while the runtime has not yet seen a revision this window's own
+  // write made, its safe mode is of an earlier one, and is compared when the runtime catches up.
   const target = runtime.revision;
+  const targetSafe = runtime.status === 'ready' ? runtime.safeMode : null;
   const behind =
     ready &&
     target !== null &&
-    (reconciled === null || reconciled < target || stale(state?.revision, reconciled));
+    (reconciled === null ||
+      reconciled < target ||
+      (reconciled === target && reconciledSafe !== targetSafe) ||
+      stale(state?.revision, reconciled));
   // Why the last read for the target failed, once the retries ran out; cleared when caught up.
   const [readFailure, setReadFailure] = useState<string | null>(null);
   if (readFailure !== null && !behind) setReadFailure(null);
@@ -650,7 +692,10 @@ export default function App() {
         r.reading = false;
         const caught = reconciledRef.current;
         const reached =
-          caught !== null && caught >= target && !stale(installed.current.revision, caught);
+          caught !== null &&
+          caught >= target &&
+          !(caught === target && reconciledSafeRef.current !== targetSafe) &&
+          !stale(installed.current.revision, caught);
         if (failure === null && reached) r.failures = 0;
         else {
           r.failures += 1;
@@ -667,7 +712,7 @@ export default function App() {
         // Look again: the target may have moved on, or not been reached.
         setReconcileTick((t) => t + 1);
       });
-  }, [behind, target, writing, reconcileTick]);
+  }, [behind, target, targetSafe, writing, reconcileTick]);
   useEffect(() => {
     const r = reconciling.current;
     return () => clearTimeout(r.retry);
@@ -764,8 +809,10 @@ export default function App() {
   // replay through again.
   const change = (globals: Config['globals']) => {
     // The settings fields are disabled through their fieldset, which React does not see: an input
-    // event still reaches onChange. Before the first snapshot there is nothing to edit yet.
-    if (!loaded.current) return;
+    // event still reaches onChange. Before the first snapshot there is nothing to edit yet; nor in
+    // safe mode, or on a view read in it (review I6): no edit is made then, so the view read when
+    // it ends is taken in whole (`applySnapshot`, the editor not `edited`).
+    if (!loaded.current || reconciledSafeRef.current !== null || currentSafeMode() !== null) return;
     putConfig({ ...editorConfig.current, globals });
     setLocalDirty(true);
     edited.current = true;
@@ -1498,7 +1545,7 @@ export default function App() {
           {busy ? '正在处理…' : message}
         </span>
         <button
-          disabled={busy || !ready || changing}
+          disabled={busy || !ready || changing || !safeModeRead}
           className="primary"
           onClick={() =>
             run(async () => {
@@ -1831,7 +1878,7 @@ export default function App() {
               {dialog.importConfig && (
                 <button
                   className="primary"
-                  disabled={changing}
+                  disabled={changing || !safeModeRead}
                   onClick={() => {
                     const imported = dialog.importConfig;
                     if (!imported) return;
