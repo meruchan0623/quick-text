@@ -143,6 +143,12 @@ mod no_executor {
                 shared: Arc::clone(shared),
             })
         }
+        /// The ticket the blocking thread acts with (F5-1); it frees nothing.
+        pub fn ticket(&self) -> ManualTicket {
+            ManualTicket {
+                shared: Arc::clone(&self.shared),
+            }
+        }
     }
     impl Drop for ManualBusy {
         fn drop(&mut self) {
@@ -151,6 +157,53 @@ mod no_executor {
                     .busy
                     .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst);
         }
+    }
+    /// The Windows executor's ticket where there is no executor: nothing is
+    /// supervised, so every check passes and the run is the plain
+    /// [`execute`].
+    #[derive(Clone)]
+    pub struct ManualTicket {
+        shared: Arc<Shared>,
+    }
+    impl ManualTicket {
+        /// A progress checkpoint: always Ok, there is no stall check.
+        pub fn progress(&self) -> Result<(), String> {
+            Ok(())
+        }
+        /// Never fenced: there is no fence.
+        pub fn fenced(&self) -> bool {
+            false
+        }
+        /// Runs the manual action. A failure carries no text, which may
+        /// echo the rule's content (F5-1 H); the platform's text is dropped
+        /// and the reason is `Internal`.
+        pub fn execute(
+            &self,
+            plan: ActionPlan,
+            target: Foreground,
+            generation: u64,
+            erase: usize,
+            terminator: Option<String>,
+            speed: f64,
+        ) -> Result<ExecutionResult, ManualFailure> {
+            execute(
+                Arc::clone(&self.shared),
+                plan,
+                target,
+                generation,
+                erase,
+                terminator,
+                speed,
+            )
+            .map_err(|_| ManualFailure {
+                reason: health::ReasonCode::Internal,
+            })
+        }
+    }
+    /// A manual run that failed: its reason code only, never its text.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ManualFailure {
+        pub reason: health::ReasonCode,
     }
     /// The executor as the supervisor drives it, for `Supervisor::new`:
     /// always `None`, there is no executor service on this platform.

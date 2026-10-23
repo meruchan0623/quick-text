@@ -584,7 +584,10 @@ pub(super) fn clipboard_formats(op: &Operation) -> Result<Option<ClipboardFormat
             vec![(15, b)]
         }
         Operation::PasteImage { path } => {
-            let img = image::open(path).map_err(|e| e.to_string())?.to_rgba8();
+            // A fixed text (F5-1 H): never the decoder's details.
+            let img = image::open(path)
+                .map_err(|_| "Image could not be decoded".to_string())?
+                .to_rgba8();
             let (w, h) = img.dimensions();
             let mut b = vec![0u8; 40];
             b[..4].copy_from_slice(&40u32.to_le_bytes());

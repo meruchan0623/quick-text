@@ -7,15 +7,26 @@
 //! nothing, records nothing and publishes nothing. Faults come from the
 //! same `fault-injection` points as the automatic path (`ExecutorHang`,
 //! `ExecutorPanic`).
+//!
+//! The blocking thread acts with the claim's [`ManualTicket`]; the claim
+//! itself ([`ManualBusy`]) stays with whoever made it, as it stays with the
+//! command in production.
 #![cfg_attr(
     not(feature = "fault-injection"),
     allow(dead_code, reason = "helpers of the fault-injection tests")
 )]
+use super::executor::ManualError;
 use super::*;
 use std::thread::JoinHandle;
 
 /// The fence's text, which a fenced manual run returns.
 const FENCED_TEXT: &str = "Executor task was fenced after a stall; stopped without further input";
+
+/// The text of a manual run's failure. It stays inside the crate: what
+/// leaves it is [`ManualFailure`], the reason code only.
+fn failure_text(result: Result<ExecutionResult, ManualError>) -> Option<String> {
+    result.err().map(|error| error.text)
+}
 
 fn plan(operations: Vec<Operation>) -> ActionPlan {
     ActionPlan {
@@ -80,12 +91,12 @@ impl ManualPorts {
         ManualBusy::claim_on(Some(Arc::clone(&self.core)), &self.shared)
     }
 
-    /// `actions::execute` on the mock ports: the supervised run
-    /// (`run_manual`) whose injector and clipboard port are made inside the
+    /// `ManualTicket::execute` on the mock ports: the supervised run of the
+    /// ticket's claim, whose injector and clipboard port are made inside the
     /// run, as `execute_inner` makes them.
-    fn run(&self, plan: ActionPlan) -> Result<ExecutionResult, String> {
+    fn run(&self, ticket: &ManualTicket, plan: ActionPlan) -> Result<ExecutionResult, ManualError> {
         let generation = self.shared.generation.load(Ordering::SeqCst);
-        super::executor::run_manual(Some(Arc::clone(&self.core)), APP, || {
+        ticket.run(APP, || {
             let injector = Serialized::new(&*self.injector, Some(Arc::clone(&self.core)));
             let clipboard = self.clipboard.clone();
             super::actions::run_plan(
@@ -106,22 +117,46 @@ impl ManualPorts {
         })
     }
 
-    /// Claims `busy` here, then runs `plan` on a thread of its own, which
-    /// gives the claim back once the run returned (as `execute_action`
-    /// drops it after its blocking task).
-    fn spawn(&self, plan: ActionPlan) -> JoinHandle<Result<ExecutionResult, String>> {
+    /// Claims `busy` here, then runs `plan` with the claim's ticket on a
+    /// thread of its own, which gives the claim back once the run returned
+    /// (as `execute_action` drops it once its blocking task returned).
+    fn spawn(&self, plan: ActionPlan) -> JoinHandle<Result<ExecutionResult, ManualError>> {
         let claim = self.claim().expect("busy is free");
+        let ticket = claim.ticket();
         let ports = self.clone();
         std::thread::Builder::new()
             .name("qt-manual".into())
             .spawn(move || {
                 let _track = keystate::track_own_input(ports.own);
-                let result = ports.run(plan);
+                let result = ports.run(&ticket, plan);
                 drop(claim);
                 result
             })
             .expect("the manual thread starts")
     }
+}
+
+/// Holds the thread `name` at the executor's pause point `at` until the
+/// returned hold is dropped.
+fn hold_at(rig: &ExecRig, at: Pause, name: &'static str) -> Hold {
+    let hold = Hold::new();
+    let wait = hold.waiter();
+    rig.core.on_pause(move |point| {
+        if point == at && is_thread(name) {
+            wait();
+        }
+    });
+    hold
+}
+
+/// Rebuilds the fenced executor through the supervisor (Recovering, then
+/// Healthy after the first backoff).
+fn recover(rig: &ExecRig) {
+    rig.supervisor.tick();
+    assert_eq!(rig.state(), HealthState::Recovering);
+    rig.clock.advance(BACKOFF[0]);
+    rig.supervisor.tick();
+    assert_eq!(rig.state(), HealthState::Healthy);
 }
 
 /// F5-1, the model case: a manual run stuck in a send is fenced like a
@@ -197,7 +232,7 @@ fn hung_manual_run_is_fenced_and_automatic_runs_take_over() {
     assert!(!rig.core.release_owed());
 
     let returned = run.join().expect("the manual thread returns");
-    assert_eq!(returned.err().as_deref(), Some(FENCED_TEXT));
+    assert_eq!(failure_text(returned).as_deref(), Some(FENCED_TEXT));
     assert_eq!(rig.injector.calls(), paid, "the woken thread sent nothing");
     assert_eq!(rig.history().len(), 1, "the woken thread recorded nothing");
     assert!(published(&rig).is_none(), "and published nothing");
@@ -250,7 +285,7 @@ fn a_manual_run_returning_after_its_fence_records_no_success() {
 
     drop(in_send);
     let returned = run.join().expect("the manual thread returns");
-    assert_eq!(returned.err().as_deref(), Some(FENCED_TEXT));
+    assert_eq!(failure_text(returned).as_deref(), Some(FENCED_TEXT));
     assert_eq!(
         rig.injector.calls(),
         vec![InjectCall::Text("x".into())],
@@ -291,10 +326,12 @@ fn a_manual_run_that_panics_releases_its_keys_and_reports_down() {
     });
 
     let claim = manual.claim().expect("busy is free");
-    let returned = manual.run(hold_a_plan());
+    let returned = manual
+        .run(&claim.ticket(), hold_a_plan())
+        .expect_err("the run panicked");
     assert_eq!(
-        returned.err().as_deref(),
-        Some("Executor task panicked; stopped")
+        (returned.reason, returned.text.as_str()),
+        (ReasonCode::ExecutorPanic, "Executor task panicked; stopped")
     );
     assert_eq!(rig.history().len(), 1);
     let entry = rig.last_entry();
@@ -354,7 +391,9 @@ fn a_manual_run_in_time_records_its_outcome_once() {
     rig.supervisor.tick();
     assert_eq!(rig.core.epoch(), epoch, "within the budget since the claim");
 
-    let result = manual.run(plan(vec![text(BODY)])).expect("the plan ran");
+    let result = manual
+        .run(&claim.ticket(), plan(vec![text(BODY)]))
+        .expect("the plan ran");
     assert_eq!(result.status, "unknown", "{}", result.message);
     assert_eq!(rig.injector.typed(), BODY);
     let history = rig.history();
@@ -387,10 +426,11 @@ fn a_manual_run_in_time_records_its_outcome_once() {
 /// F5-1: a claim whose run has not started yet (`execute_action`'s delay
 /// and selection capture) is supervised from the claim on: past the budget
 /// the fence frees `busy` and records the manual run as timed out, with no
-/// side effects. The claim stays as a fenced marker until it is given back:
-/// its late run is refused before its plan, without input and without a
-/// second entry; a new manual claim waits for the marker, automatic runs do
-/// not.
+/// side effects, and the claim leaves the executor with it. Its ticket
+/// reports the fence; a new manual claim is granted at once; the old
+/// ticket's late run is refused before its plan, without input and without
+/// a second entry; giving the old claim back frees nothing (the newer claim
+/// keeps `busy`), and the newer claim runs once the executor is rebuilt.
 #[test]
 fn a_claim_fenced_before_its_run_refuses_that_run_without_input() {
     let mut rig = ExecRig::new(vec![text_rule("kw", OutputMethod::Keys, TYPED)]);
@@ -424,29 +464,41 @@ fn a_claim_fenced_before_its_run_refuses_that_run_without_input() {
         Status::Down(ReasonCode::ExecutorTimeout)
     ));
     assert_eq!(rig.state(), HealthState::Recovering);
-    assert!(manual.claim().is_none(), "the marker holds off a new claim");
+    let ticket = claim.ticket();
+    assert!(ticket.fenced());
+    assert_eq!(ticket.progress().err().as_deref(), Some(FENCED_TEXT));
+    let newer = manual
+        .claim()
+        .expect("a fenced claim never holds off a new one");
+    assert!(busy(&rig));
 
     let ran = AtomicBool::new(false);
-    let late = super::executor::run_manual(Some(Arc::clone(&rig.core)), APP, || {
+    let late = ticket.run(APP, || {
         ran.store(true, Ordering::SeqCst);
         RunReport::text(Err("the plan must not run".into()))
     });
-    assert_eq!(late.err().as_deref(), Some(FENCED_TEXT));
+    assert_eq!(failure_text(late).as_deref(), Some(FENCED_TEXT));
     assert!(!ran.load(Ordering::SeqCst), "the plan never started");
     assert!(rig.injector.calls().is_empty(), "nothing was sent");
     assert_eq!(rig.history().len(), 1, "the fence wrote the only entry");
-
-    rig.clock.advance(BACKOFF[0]);
-    rig.supervisor.tick();
-    assert_eq!(rig.state(), HealthState::Healthy);
-    let result = rig.run("kw");
-    assert_eq!(result.status, "unknown", "{}", result.message);
     drop(claim);
-    assert!(!busy(&rig), "the marker's end leaves busy alone");
-    let again = manual.claim().expect("the marker is gone");
-    assert!(busy(&rig));
-    drop(again);
+    assert!(
+        busy(&rig),
+        "the old claim's end leaves the newer one's busy"
+    );
+
+    recover(&rig);
+    let result = manual
+        .run(&newer.ticket(), plan(vec![text(BODY)]))
+        .expect("the newer claim runs");
+    assert_eq!(result.status, "unknown", "{}", result.message);
+    assert_eq!(rig.injector.typed(), BODY);
+    assert_eq!(rig.history().len(), 2);
+    assert_eq!(rig.last_entry().outcome, Outcome::Succeeded);
+    drop(newer);
     assert!(!busy(&rig));
+    let auto = rig.run("kw");
+    assert_eq!(auto.status, "unknown", "{}", auto.message);
 }
 
 /// F5-1: a supervised run that finds no claim of its own to adopt is
@@ -457,13 +509,17 @@ fn a_manual_run_without_a_claim_is_refused_and_recorded() {
     let rig = ExecRig::new(vec![]);
     let epoch = rig.core.epoch();
     let ran = AtomicBool::new(false);
-    let refused = super::executor::run_manual(Some(Arc::clone(&rig.core)), APP, || {
+    let refused = super::executor::run_manual(Some(Arc::clone(&rig.core)), None, APP, || {
         ran.store(true, Ordering::SeqCst);
         RunReport::text(Err("the plan must not run".into()))
-    });
+    })
+    .expect_err("refused");
     assert_eq!(
-        refused.err().as_deref(),
-        Some("Manual run holds no claim on the executor; refused without input")
+        (refused.reason, refused.text.as_str()),
+        (
+            ReasonCode::Internal,
+            "Manual run holds no claim on the executor; refused without input"
+        )
     );
     assert!(!ran.load(Ordering::SeqCst), "the plan never started");
     assert!(rig.injector.calls().is_empty());
@@ -550,7 +606,7 @@ fn clipboard_held_by_a_fenced_manual_run_refuses_paste_without_typing() {
 
     let sent = rig.injector.calls();
     let returned = run.join().expect("the manual thread returns");
-    assert_eq!(returned.err().as_deref(), Some(FENCED_TEXT));
+    assert_eq!(failure_text(returned).as_deref(), Some(FENCED_TEXT));
     assert_eq!(rig.injector.calls(), sent, "the woken run sent nothing");
     assert_eq!(
         rig.clipboard.content(),
@@ -561,4 +617,372 @@ fn clipboard_held_by_a_fenced_manual_run_refuses_paste_without_typing() {
     assert_eq!(rig.state(), HealthState::Healthy);
     let pasted = rig.run("btw");
     assert_eq!(pasted.status, "unknown", "{}", pasted.message);
+}
+
+/// F5-1 B: the preparation's progress checkpoints (`execute_action`'s
+/// delay, clipboard read and selection capture) restart the claim's
+/// heartbeat. Three phases, each shorter than the budget and together far
+/// longer, are never fenced, and the run that follows records its outcome.
+#[test]
+fn a_preparation_that_checks_in_is_never_fenced_however_long_it_takes() {
+    let rig = ExecRig::new(vec![]);
+    let manual = ManualPorts::of(&rig);
+    let epoch = rig.core.epoch();
+    let claim = manual.claim().expect("busy is free");
+    let ticket = claim.ticket();
+    let phase = STALL_BUDGET - Duration::from_secs(2);
+    for name in ["delay", "clipboard read", "selection capture"] {
+        rig.clock.advance(phase);
+        rig.supervisor.tick();
+        assert_eq!(rig.core.epoch(), epoch, "{name}: within the budget");
+        ticket
+            .progress()
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+    }
+    rig.clock.advance(phase);
+    rig.supervisor.tick();
+    assert_eq!(rig.core.epoch(), epoch, "the run's start is within it too");
+    assert!(!ticket.fenced());
+    assert_eq!(rig.state(), HealthState::Healthy);
+
+    let result = manual
+        .run(&ticket, plan(vec![text(BODY)]))
+        .expect("the plan ran");
+    assert_eq!(result.status, "unknown", "{}", result.message);
+    assert_eq!(rig.injector.typed(), BODY);
+    let history = rig.history();
+    assert_eq!(history.len(), 1, "one entry");
+    assert_eq!(
+        (history[0].trigger, history[0].outcome),
+        (TriggerKind::Manual, Outcome::Succeeded)
+    );
+    drop(claim);
+    assert!(!busy(&rig));
+}
+
+/// F5-1 C: a claim whose preparation never checks in again (stuck before
+/// its run, say in a clipboard read) is fenced past the budget and leaves
+/// the executor with the fence: once the executor is rebuilt, a new manual
+/// claim is granted and runs. The stuck caller, woken afterwards, finds its
+/// claim fenced at its checkpoint and at its run: refused, nothing sent,
+/// nothing recorded, nothing published, and the newer claim (its `busy`,
+/// its adoption) left alone.
+#[test]
+fn a_claim_stuck_in_its_preparation_never_holds_off_the_next_manual_run() {
+    let mut rig = ExecRig::new(vec![text_rule("kw", OutputMethod::Keys, TYPED)]);
+    let manual = ManualPorts::of(&rig);
+    let epoch = rig.core.epoch();
+    let claim = manual.claim().expect("busy is free");
+    let ticket = claim.ticket();
+    let (wake, woken) = std::sync::mpsc::channel::<()>();
+    let ports = manual.clone();
+    let stuck = std::thread::Builder::new()
+        .name("qt-manual".into())
+        .spawn(move || {
+            let _track = keystate::track_own_input(ports.own);
+            // Stuck in the preparation until the test wakes it.
+            let _ = woken.recv();
+            let progress = ticket.progress();
+            let run = ports.run(&ticket, plan(vec![text(BODY)]));
+            (progress, run)
+        })
+        .expect("the manual thread starts");
+
+    rig.clock.advance(STALL_BUDGET + Duration::from_secs(1));
+    rig.supervisor.tick();
+    assert_eq!(rig.core.epoch(), epoch + 1, "fenced");
+    assert!(!busy(&rig), "the fence freed busy");
+    assert!(claim.ticket().fenced());
+    let entry = rig.last_entry();
+    assert_eq!(
+        (
+            entry.trigger,
+            entry.outcome,
+            entry.reason,
+            entry.side_effects
+        ),
+        (
+            TriggerKind::Manual,
+            Outcome::Failed,
+            ReasonCode::ExecutorTimeout,
+            false
+        )
+    );
+    // The command gives its claim back once it timed out: nothing to free.
+    drop(claim);
+    assert!(!busy(&rig));
+    rig.clock.advance(BACKOFF[0]);
+    rig.supervisor.tick();
+    assert_eq!(rig.state(), HealthState::Healthy);
+
+    let next = manual
+        .claim()
+        .expect("the stuck claim holds off no new one");
+    wake.send(()).expect("the stuck thread waits");
+    let (progress, late) = stuck.join().expect("the stuck thread returns");
+    assert_eq!(progress.err().as_deref(), Some(FENCED_TEXT));
+    assert_eq!(failure_text(late).as_deref(), Some(FENCED_TEXT));
+    assert!(
+        rig.injector.calls().is_empty(),
+        "the stuck caller sent nothing"
+    );
+    assert_eq!(rig.history().len(), 1, "and recorded nothing");
+    assert!(published(&rig).is_none(), "and published nothing");
+    assert!(busy(&rig), "the newer claim keeps busy");
+    next.ticket()
+        .progress()
+        .expect("the newer claim is still in force");
+
+    let result = manual
+        .run(&next.ticket(), plan(vec![text(TYPED)]))
+        .expect("the newer claim runs");
+    assert_eq!(result.status, "unknown", "{}", result.message);
+    assert_eq!(rig.injector.typed(), TYPED);
+    assert_eq!(rig.history().len(), 2);
+    assert_eq!(rig.last_entry().outcome, Outcome::Succeeded);
+    drop(next);
+    assert!(!busy(&rig));
+    let auto = rig.run("kw");
+    assert_eq!(auto.status, "unknown", "{}", auto.message);
+}
+
+/// Arms a panic of the run's next send once the task port took `after`.
+#[cfg(feature = "fault-injection")]
+fn panic_after(rig: &ExecRig, after: InjectCall) {
+    let armed = AtomicBool::new(false);
+    rig.injector.on_call(move |call| {
+        if *call == after && !armed.swap(true, Ordering::SeqCst) {
+            fault::debug_inject_fault(fault::FaultPoint::ExecutorPanic, 0);
+        }
+    });
+}
+
+/// F5-1 D: the end of a manual run releases the keys it left pressed one
+/// by one and checks its epoch before each call into the OS. Fenced while
+/// its first key-up (A) is inside `SendInput`, it sends no further key-up:
+/// B stays in the bitmap, owed, and the rebuild pays it (#6).
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_fence_during_a_manual_runs_release_stops_it_and_keeps_the_rest_owed() {
+    let rig = ExecRig::with_release(vec![]);
+    let manual = ManualPorts::of(&rig);
+    let epoch = rig.core.epoch();
+    // A and B pressed, then the run panics: its end releases both.
+    panic_after(&rig, key_down(KEY_B));
+    let in_release = hold_first_send(&rig.release);
+    let run = manual.spawn(plan(vec![
+        Operation::KeyDown { key: code(KEY_A) },
+        Operation::KeyDown { key: code(KEY_B) },
+        Operation::KeyPress { key: code(KEY_C) },
+        Operation::KeyUp { key: code(KEY_B) },
+        Operation::KeyUp { key: code(KEY_A) },
+    ]));
+    in_release.wait_arrived("the run's first key-up");
+    assert!(rig.core.fence(epoch));
+    drop(in_release);
+    let returned = run.join().expect("the manual thread returns");
+    assert_eq!(failure_text(returned).as_deref(), Some(FENCED_TEXT));
+    assert_eq!(
+        rig.release.calls(),
+        vec![key_up(KEY_A)],
+        "no key-up after the fence"
+    );
+    assert_eq!(rig.core.held_keys(), vec![KEY_B], "B stays owed");
+    assert!(rig.core.release_owed());
+    assert_eq!(rig.history().len(), 1, "the fence wrote the only entry");
+
+    recover(&rig);
+    assert_eq!(ups(&rig.release, KEY_B), 1, "the rebuild paid B");
+    assert_eq!(ups(&rig.release, KEY_A), 1, "and A only once");
+    assert!(rig.core.held_keys().is_empty());
+    assert!(!rig.core.release_owed());
+}
+
+/// F5-1 D, the task path: a task's busy guard releases the keys it left
+/// pressed one by one and checks its epoch before each. Fenced while its
+/// first key-up (A) is inside `SendInput`, it sends no further key-up: B
+/// stays owed and the rebuild pays it (#6).
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_fence_during_a_tasks_key_release_stops_it_and_keeps_the_rest_owed() {
+    let mut rig = ExecRig::with_release(vec![hold_a_and_b()]);
+    let epoch = rig.core.epoch();
+    panic_after(&rig, key_down(KEY_B));
+    let in_release = hold_first_send(&rig.release);
+    assert!(rig.trigger("hold"));
+    in_release.wait_arrived("the task's first key-up");
+    assert!(rig.core.fence(epoch));
+    drop(in_release);
+    assert!(rig.core.join_retired(Duration::from_secs(5)));
+    assert_eq!(
+        rig.release.calls(),
+        vec![key_up(KEY_A)],
+        "no key-up after the fence"
+    );
+    assert_eq!(rig.core.held_keys(), vec![KEY_B], "B stays owed");
+    assert!(rig.core.release_owed());
+
+    recover(&rig);
+    assert_eq!(ups(&rig.release, KEY_B), 1, "the rebuild paid B");
+    assert_eq!(ups(&rig.release, KEY_A), 1, "and A only once");
+    assert!(rig.core.held_keys().is_empty());
+    assert!(!rig.core.release_owed());
+}
+
+/// F5-1 G: a manual send held right after its first epoch check, before
+/// the send lock. Fenced there, it sends nothing once it resumes: the check
+/// is made again in the lock's hold. The fence writes the only entry,
+/// without side effects; nothing is published and the rebuilt executor
+/// serves.
+#[test]
+fn a_manual_send_held_after_its_first_check_sends_nothing_once_fenced() {
+    let mut rig = ExecRig::new(vec![text_rule("kw", OutputMethod::Keys, TYPED)]);
+    let manual = ManualPorts::of(&rig);
+    let epoch = rig.core.epoch();
+    let checked = hold_at(&rig, Pause::BeforeSend, "qt-manual");
+    let run = manual.spawn(plan(vec![text(BODY)]));
+    checked.wait_arrived("the manual send, its first check made");
+    assert!(rig.core.fence(epoch));
+    drop(checked);
+    let returned = run.join().expect("the manual thread returns");
+    assert_eq!(failure_text(returned).as_deref(), Some(FENCED_TEXT));
+    assert!(rig.injector.calls().is_empty(), "nothing was sent");
+    let history = rig.history();
+    assert_eq!(history.len(), 1, "the fence wrote the only entry");
+    assert_eq!(
+        (
+            history[0].trigger,
+            history[0].outcome,
+            history[0].reason,
+            history[0].side_effects
+        ),
+        (
+            TriggerKind::Manual,
+            Outcome::Failed,
+            ReasonCode::ExecutorTimeout,
+            false
+        )
+    );
+    assert!(published(&rig).is_none());
+    assert!(!busy(&rig));
+
+    recover(&rig);
+    let auto = rig.run("kw");
+    assert_eq!(auto.status, "unknown", "{}", auto.message);
+    assert_eq!(rig.injector.typed(), TYPED);
+}
+
+/// F5-1 G: a fenced manual run held right before it settles, while a newer
+/// claim was granted meanwhile. Once it resumes it settles nothing (no
+/// history, no `last`) and leaves the newer claim and its `busy` alone; the
+/// newer claim runs once the executor is rebuilt.
+#[test]
+fn a_fenced_run_settling_after_a_newer_claim_leaves_it_alone() {
+    let rig = ExecRig::new(vec![]);
+    let manual = ManualPorts::of(&rig);
+    let epoch = rig.core.epoch();
+    let settling = hold_at(&rig, Pause::ManualBeforeSettle, "qt-manual");
+    let run = manual.spawn(plan(vec![text(BODY)]));
+    settling.wait_arrived("the manual run, about to settle");
+    assert_eq!(rig.injector.typed(), BODY);
+    assert!(rig.core.fence(epoch));
+    let entry = rig.last_entry();
+    assert_eq!(
+        (
+            entry.trigger,
+            entry.outcome,
+            entry.reason,
+            entry.side_effects
+        ),
+        (
+            TriggerKind::Manual,
+            Outcome::Failed,
+            ReasonCode::ExecutorTimeout,
+            true
+        )
+    );
+    let newer = manual
+        .claim()
+        .expect("the fenced claim holds off no new one");
+    drop(settling);
+    let returned = run.join().expect("the manual thread returns");
+    assert_eq!(failure_text(returned).as_deref(), Some(FENCED_TEXT));
+    assert_eq!(rig.history().len(), 1, "the late run recorded nothing");
+    assert!(published(&rig).is_none(), "and published nothing");
+    assert!(busy(&rig), "the newer claim keeps busy");
+
+    recover(&rig);
+    let result = manual
+        .run(&newer.ticket(), plan(vec![text(TYPED)]))
+        .expect("the newer claim runs");
+    assert_eq!(result.status, "unknown", "{}", result.message);
+    assert_eq!(rig.history().len(), 2);
+    assert_eq!(rig.last_entry().outcome, Outcome::Succeeded);
+    assert!(published(&rig).is_some());
+    drop(newer);
+    assert!(!busy(&rig));
+}
+
+/// F5-1 H: a manual run's failure never echoes the rule's values. Plans
+/// naming a sentinel (an unknown common function, a missing image, a
+/// missing file, an unknown key name) fail in preflight with fixed texts
+/// and the reason `PreflightFailed`; nothing is sent, and the sentinel
+/// reaches neither the history nor the log. What leaves the crate is the
+/// reason alone ([`ManualFailure`]).
+#[test]
+fn a_manual_runs_failure_never_echoes_the_rules_values() {
+    const SENTINEL: &str = "SENTINEL-private-3c9e";
+    assert!(
+        capture::install(),
+        "test collector is the global subscriber"
+    );
+    let rig = ExecRig::new(vec![]);
+    let manual = ManualPorts::of(&rig);
+    let mark = capture::mark();
+    let missing = std::env::temp_dir()
+        .join(format!("qt-missing-{SENTINEL}"))
+        .to_string_lossy()
+        .into_owned();
+    let operations = [
+        Operation::Common {
+            function: SENTINEL.into(),
+        },
+        Operation::PasteImage {
+            path: format!("{missing}.png"),
+        },
+        Operation::PasteFiles {
+            paths: vec![format!("{missing}.txt")],
+        },
+        Operation::KeyPress {
+            key: Key::named(SENTINEL),
+        },
+    ];
+    for (index, operation) in operations.into_iter().enumerate() {
+        let claim = manual.claim().expect("busy is free");
+        let failure = manual
+            .run(&claim.ticket(), plan(vec![operation]))
+            .expect_err("preflight refuses the plan");
+        assert!(
+            !failure.text.contains(SENTINEL),
+            "operation {index}: {}",
+            failure.text
+        );
+        assert_eq!(
+            failure.reason,
+            ReasonCode::PreflightFailed,
+            "operation {index}: {}",
+            failure.text
+        );
+        drop(claim);
+    }
+    assert!(rig.injector.calls().is_empty(), "nothing was sent");
+    let history = rig.history();
+    assert_eq!(history.len(), 4);
+    assert!(history
+        .iter()
+        .all(|entry| entry.reason == ReasonCode::PreflightFailed && !entry.side_effects));
+    let serialized = serde_json::to_string(&history).expect("the history serializes");
+    assert!(!serialized.contains(SENTINEL), "{serialized}");
+    let events = capture::since(mark);
+    assert!(events.iter().all(|event| !event.mentions(SENTINEL)));
 }

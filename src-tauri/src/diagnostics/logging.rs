@@ -50,6 +50,7 @@
 //! | `clipboard.slow` | warn | the clipboard was held open past its budget; `held_ms`, `budget_ms` |
 //! | `clipboard.unreadable` | warn | an enumerated clipboard format gave no data or unreadable memory; the backup is refused; format id |
 //! | `clipboard.worker_failed` | warn | the clipboard backup worker thread did not start; error |
+//! | `command.execute_failed` | warn / error | a manual run (`execute_action`) failed: fenced or refused by the send exclusion (`category` `stalled`, warn, with the `health` returned), or otherwise (`run_failed`, error, with its `trace_id`); the run's reason code, never the run's text |
 //! | `command.internal` | error | `CommandError::Internal`; `trace_id` and the original error |
 //! | `command.io` | warn | `CommandError::Io`; operation, file name, OS error |
 //! | `diagnostics.export` | info | a bundle was written; redaction, entry count, `elapsed_ms` |
@@ -71,7 +72,7 @@
 //! | `executor.rebuilt` | info | the executor was rebuilt; `epoch`, whether the live worker was `reused` |
 //! | `executor.release_deferred` | warn | owed key-ups were not paid yet: the send lock stayed held; `epoch` |
 //! | `executor.release_failed` | warn | a key-up was refused while releasing held keys; the key class only (modifier name, `mouse` or `other`), never the key code |
-//! | `executor.release_owed` | warn | key-ups were refused: they stay owed and input stays refused; `released`, `refused`, `epoch` |
+//! | `executor.release_owed` | warn | key-ups were refused, or a fence stopped the release: they stay owed and input stays refused; `released`, `refused`, `stopped`, `epoch` |
 //! | `executor.release_paid` | info | owed key-ups were paid; `released`, `epoch` |
 //! | `executor.retired` | info | a fenced worker stopped serving; its `epoch` |
 //! | `executor.send_refused` | warn | nothing was sent: the send lock is held by a stuck send; `epoch` |

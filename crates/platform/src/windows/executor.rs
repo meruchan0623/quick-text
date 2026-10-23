@@ -130,11 +130,17 @@
 //!   and guard finds the epoch moved on, its end pays no debt and sends no
 //!   key-up, and its settle (comparing first, like a task's) writes no
 //!   history and publishes no `last`; `execute` returns the fence's error,
-//!   never a success. A claim fenced before any run adopted it stays in
-//!   `life` as a marker until it is given back, so the late run is refused
-//!   without input and no newer claim is taken for it; meanwhile a new
-//!   manual claim is refused as busy. A run panic inside `execute` is
-//!   caught there, like a task's (`executor.panic`, Failed/ExecutorPanic).
+//!   never a success. Every step of a manual run names its claim
+//!   ([`ManualClaim`]: id and epoch, carried by the [`ManualTicket`] the
+//!   blocking thread holds): the preparation's progress checkpoints
+//!   ([`ManualTicket::progress`]) beat only for that claim, the run adopts
+//!   only that claim, and giving the claim back ends only that claim. The
+//!   fence removes the claim from `life` whether or not a run adopted it,
+//!   so a new manual claim can be taken at once; a late caller of the
+//!   fenced claim finds its epoch moved on and is refused without input,
+//!   and never adopts, beats for or frees a newer claim. A run panic
+//!   inside `execute` is caught there, like a task's (`executor.panic`,
+//!   Failed/ExecutorPanic).
 //! * While holding `life`: never call the injector or the clipboard, never
 //!   call a callback, never join a thread, never make a channel send that
 //!   can block, and never wait for `send_lock`. Only bounded leaf locks are
@@ -481,8 +487,9 @@ pub(super) fn stage_timings(
     }
 }
 
-/// Records one manual run (`execute`, no rule) in the process history.
-pub(super) fn record_manual(process: &str, report: &RunReport, started: Instant) {
+/// Records one manual run (`execute`, no rule) in the process history, and
+/// returns the reason code it was recorded with.
+pub(super) fn record_manual(process: &str, report: &RunReport, started: Instant) -> ReasonCode {
     let end = SystemClock.now();
     let sent = SENT_EFFECT.with(Cell::get);
     let verdict = if MANUAL_REFUSED.with(|refused| refused.replace(false)) {
@@ -492,11 +499,13 @@ pub(super) fn record_manual(process: &str, report: &RunReport, started: Instant)
     } else {
         classify(&report.result, report.reason, current_stage(), sent)
     };
+    let reason = verdict.reason;
     crate::runtime::current().record(Task::manual(process, started).record(
         verdict,
         report.skipped_formats.clone(),
         stage_timings(None, started, end, &stage_marks()),
     ));
+    reason
 }
 
 #[derive(Default)]
@@ -533,9 +542,41 @@ struct Running {
 #[derive(Default)]
 struct Life {
     running: Option<Running>,
-    /// The manual run's claim holding `busy` ([`ManualBusy`]), or the
-    /// marker a fence left of an unadopted one.
+    /// The manual run's claim holding `busy` ([`ManualBusy`]). The fence
+    /// takes it out, adopted or not.
     manual: Option<Manual>,
+}
+
+/// A manual claim as its holder names it (F5-1): the claim's id and the
+/// epoch it was made in. Whatever acts for a claim (the preparation's
+/// progress, the run adopting it, giving it back) passes this and is
+/// checked against `life`, so a caller of a fenced claim never acts on a
+/// newer one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ManualClaim {
+    id: u64,
+    epoch: u64,
+}
+
+/// A manual run that failed: the reason code its history entry carries,
+/// and its text. The text may echo the rule's content (a key name, a path),
+/// so it is never logged, and it does not leave the crate through
+/// [`ManualTicket`] (see [`ManualFailure`]); only `actions::execute` still
+/// returns it, as before.
+#[derive(Debug)]
+pub(super) struct ManualError {
+    pub(super) reason: ReasonCode,
+    pub(super) text: String,
+}
+
+impl ManualError {
+    /// The run's claim was fenced (F5-1).
+    fn fenced() -> Self {
+        Self {
+            reason: ReasonCode::ExecutorTimeout,
+            text: FENCED.into(),
+        }
+    }
 }
 
 /// A manual run's claim (F5-1), from [`ManualBusy`]'s claim until it is
@@ -551,9 +592,6 @@ struct Manual {
     claimed_at: Instant,
     /// Set when the run on the blocking thread adopted the claim.
     run: Option<ManualRun>,
-    /// A fence ended the claim before any run adopted it; it stays as a
-    /// marker (holding no `busy`) until it is given back.
-    fenced: bool,
     /// The run settled: its history entry is written.
     done: bool,
     /// The claim was given back while its run still ran: `busy` is freed
@@ -603,6 +641,10 @@ pub(super) enum Pause {
     /// In the stall check: the first look named a suspect run; the fencing
     /// hold of `life`, which confirms it again, comes next.
     StallCheck,
+    /// In a supervised manual run: its plan returned and its keys were
+    /// released; its settle (epoch and claim checked in one hold of `life`)
+    /// comes next.
+    ManualBeforeSettle,
 }
 
 /// Every executor status [`ExecutorCore::status`] reports, so the last one
@@ -686,7 +728,8 @@ pub(super) type SendTurn<'a> = PlMutexGuard<'a, ()>;
 enum Debt {
     /// Nothing owed: every owed key-up was accepted and its bit cleared.
     Settled,
-    /// At least one key-up was refused; it stays in the bitmap, owed.
+    /// At least one key-up was refused, or the payment stopped because the
+    /// epoch moved on; those keys stay in the bitmap, owed.
     Owed,
 }
 
@@ -937,21 +980,23 @@ impl ExecutorCore {
     /// elsewhere (`Busy`) or key-ups are still owed (`Owed`).
     fn lock_send(&self, wait: Duration) -> Result<SendTurn<'_>, Refusal> {
         let turn = self.send_lock.try_lock_for(wait).ok_or(Refusal::Busy)?;
-        match self.pay_release(&turn).debt {
+        match self.pay_release(&turn, self.epoch()).debt {
             Debt::Settled => Ok(turn),
             Debt::Owed => Err(Refusal::Owed),
         }
     }
 
-    /// Pays the owed key-ups, if any (S3).
-    fn pay_release(&self, turn: &SendTurn<'_>) -> Payment {
+    /// Pays the owed key-ups, if any (S3), for a payer of `epoch`: the
+    /// payment stops before its next key-up once the epoch moved on (see
+    /// [`release_all`](Self::release_all)).
+    fn pay_release(&self, turn: &SendTurn<'_>, epoch: u64) -> Payment {
         if !self.release_owed.load(Ordering::SeqCst) {
             return Payment {
                 released: 0,
                 debt: Debt::Settled,
             };
         }
-        let payment = self.release_all(turn);
+        let payment = self.release_all(turn, epoch);
         if payment.debt == Debt::Settled {
             tracing::info!(
                 event = "executor.release_paid",
@@ -976,9 +1021,15 @@ impl ExecutorCore {
     /// cleanup releases. The hooks only clear bits, and never an in-flight
     /// mark, so a key a panicking send may have pressed stays owed until its
     /// key-up is accepted.
-    fn release_all(&self, turn: &SendTurn<'_>) -> Payment {
-        let (released, refused) = self.release_held(turn);
-        let debt = if refused == 0 {
+    ///
+    /// `epoch` is the epoch the releaser acts for (a run's own, or the one a
+    /// payer read in this hold). It is checked again before every key-up
+    /// (F5-1): once a fence moved it on, the release stops, sends nothing
+    /// more, and the keys left in the bitmap stay owed (the fence recorded
+    /// the debt; the rebuild or the next worker pays it).
+    fn release_all(&self, turn: &SendTurn<'_>, epoch: u64) -> Payment {
+        let (released, refused, stopped) = self.release_held(turn, epoch);
+        let debt = if refused == 0 && !stopped {
             Debt::Settled
         } else {
             Debt::Owed
@@ -990,8 +1041,9 @@ impl ExecutorCore {
                 event = "executor.release_owed",
                 released,
                 refused,
+                stopped,
                 epoch = self.epoch(),
-                "key-ups refused; they stay owed and input stays refused"
+                "key-ups refused or stopped by a fence; they stay owed and input stays refused"
             );
         }
         Payment { released, debt }
@@ -1004,7 +1056,7 @@ impl ExecutorCore {
             return Debt::Settled;
         }
         match self.send_lock.try_lock_for(SEND_LOCK_WAIT) {
-            Some(turn) => self.pay_release(&turn).debt,
+            Some(turn) => self.pay_release(&turn, self.epoch()).debt,
             None => {
                 tracing::warn!(event = "executor.release_deferred", epoch = self.epoch());
                 Debt::Owed
@@ -1137,9 +1189,10 @@ impl ExecutorCore {
     /// the claim is kept there so only this claim can give it back. The
     /// claim is supervised from here on (F5-1): its heartbeat starts in this
     /// hold, so a stall check that sees the claim sees its fresh deadline
-    /// (A1). `None` while a task or another manual run holds `busy`, or
-    /// while the marker of a fenced, unadopted claim is still in place.
-    fn claim_manual(&self) -> Option<u64> {
+    /// (A1). `None` while a task or another manual run holds `busy`. A
+    /// fenced claim is gone from `life` (see [`bump`](Self::bump)), so it
+    /// never blocks a new one.
+    fn claim_manual(&self) -> Option<ManualClaim> {
         let mut life = self.life.lock();
         if life.manual.is_some() {
             return None;
@@ -1148,63 +1201,101 @@ impl ExecutorCore {
             .busy
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .ok()?;
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        life.manual = Some(Manual {
-            id,
+        let claim = ManualClaim {
+            id: self.next_id.fetch_add(1, Ordering::SeqCst),
             epoch: self.epoch(),
+        };
+        life.manual = Some(Manual {
+            id: claim.id,
+            epoch: claim.epoch,
             claimed_at: self.clock.now(),
             run: None,
-            fenced: false,
             done: false,
             dropped: false,
         });
         self.beat();
-        Some(id)
+        Some(claim)
     }
 
     /// Gives a manual claim back: in one hold of the lifecycle lock, and
-    /// only while claim `id` still owns `busy`. A fence frees `busy` and
-    /// ends the claim with it (an unadopted one is left as a marker, which
-    /// this removes without touching `busy`), so a stale claim never frees
-    /// the `busy` of a run that started since. Given back while its adopted
-    /// run still runs, the claim keeps `busy` until that run settles.
-    fn end_manual(&self, id: u64) {
+    /// only while `claim` (its id) is still the one in `life`. A fence frees
+    /// `busy` and removes the claim with it, so a stale claim finds nothing
+    /// here and never frees the `busy` of a run that started since. Given
+    /// back while its adopted run still runs, the claim keeps `busy` until
+    /// that run settles.
+    fn end_manual(&self, claim: ManualClaim) {
         let mut life = self.life.lock();
-        let Some(manual) = life.manual.as_mut().filter(|manual| manual.id == id) else {
+        let Some(manual) = life.manual.as_mut().filter(|manual| manual.id == claim.id) else {
             return;
         };
         if manual.run.is_some() && !manual.done {
             manual.dropped = true;
             return;
         }
-        let fenced = manual.fenced;
         life.manual = None;
-        if !fenced {
-            let _ =
-                self.shared
-                    .busy
-                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst);
+        let _ = self
+            .shared
+            .busy
+            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// A progress checkpoint of a manual run's preparation (F5-1), for
+    /// `claim` only, in one hold of the lifecycle lock: while the epoch is
+    /// still the claim's and the claim is still the one in `life`, not
+    /// settled, the heartbeat restarts. Err: the claim was fenced (its
+    /// epoch moved on: [`FENCED`]) or is not in `life` (no beat for anyone
+    /// else: [`MANUAL_UNCLAIMED`]); the caller must stop and send nothing.
+    fn manual_progress(&self, claim: ManualClaim) -> Result<(), String> {
+        let life = self.life.lock();
+        if self.epoch() != claim.epoch {
+            return Err(FENCED.into());
         }
+        if life
+            .manual
+            .as_ref()
+            .is_some_and(|manual| manual.id == claim.id && !manual.done)
+        {
+            self.beat();
+            return Ok(());
+        }
+        Err(MANUAL_UNCLAIMED.into())
     }
 
     /// The run on the blocking thread (`execute`) takes the manual claim
-    /// over (F5-1), in one hold of the lifecycle lock: only a live claim of
-    /// the current epoch that no run adopted yet. Its heartbeat restarts in
-    /// this hold. Err: there is no such claim, so the run must send
-    /// nothing. A claim the fence ended first is refused with the fence's
-    /// text and no history (the fence wrote the entry); no claim at all is
-    /// recorded here as a failed manual run.
+    /// over (F5-1), in one hold of the lifecycle lock: only `claim` itself,
+    /// while its epoch is current, still in `life` and not yet adopted. Its
+    /// heartbeat restarts in this hold. Err: the run must send nothing. A
+    /// claim the fence ended first (its epoch moved on) is refused with the
+    /// fence's text and no history (the fence wrote the entry); a run with
+    /// no claim, or whose claim is not the one in `life`, is recorded here
+    /// as a failed manual run, and the claim in `life` (a newer one) is left
+    /// alone.
     fn adopt_manual(
         self: &Arc<Self>,
+        claim: Option<ManualClaim>,
         process: &str,
         started: Instant,
-    ) -> Result<Arc<ManualScope>, String> {
+    ) -> Result<Arc<ManualScope>, ManualError> {
         let mut life = self.life.lock();
         let epoch = self.epoch();
-        let fenced = match life.manual.as_mut() {
-            Some(claim) if claim.run.is_none() && !claim.fenced && claim.epoch == epoch => {
+        if let Some(claim) = claim {
+            if claim.epoch != epoch {
+                drop(life);
+                tracing::warn!(
+                    event = "executor.manual_send_refused",
+                    reason = "fenced",
+                    epoch,
+                    "manual run fenced before it started; nothing sent"
+                );
+                return Err(ManualError::fenced());
+            }
+            if let Some(manual) = life
+                .manual
+                .as_mut()
+                .filter(|manual| manual.id == claim.id && manual.run.is_none() && !manual.done)
+            {
                 let sent = Arc::new(AtomicBool::new(false));
-                claim.run = Some(ManualRun {
+                manual.run = Some(ManualRun {
                     task: Task::manual(process, started),
                     started_at: started,
                     sent: Arc::clone(&sent),
@@ -1219,18 +1310,6 @@ impl ExecutorCore {
                     clipboard_refused: AtomicBool::new(false),
                 }));
             }
-            Some(claim) => claim.fenced,
-            None => false,
-        };
-        if fenced {
-            drop(life);
-            tracing::warn!(
-                event = "executor.manual_send_refused",
-                reason = "fenced",
-                epoch,
-                "manual run fenced before it started; nothing sent"
-            );
-            return Err(FENCED.into());
         }
         self.runtime.record(Task::manual(process, started).record(
             Verdict::new(Outcome::Failed, ReasonCode::Internal, false),
@@ -1244,23 +1323,28 @@ impl ExecutorCore {
             epoch,
             "manual run without a claim of its own; nothing sent"
         );
-        Err(MANUAL_UNCLAIMED.into())
+        Err(ManualError {
+            reason: ReasonCode::Internal,
+            text: MANUAL_UNCLAIMED.into(),
+        })
     }
 
     /// Runs a supervised manual run (F5-1) on the calling (blocking)
-    /// thread, like [`run`](Self::run) runs a task: adopts the claim,
+    /// thread, like [`run`](Self::run) runs a task: adopts `claim`,
     /// installs the run's [`ManualScope`], catches a panic, releases what
     /// the run still holds ([`release_manual`](Self::release_manual)) and
     /// settles it ([`settle_manual`](Self::settle_manual)). A run the fence
     /// ended first returns the fence's error, whatever it produced: the
-    /// caller never sees a success the history contradicts.
+    /// caller never sees a success the history contradicts. A failure
+    /// carries the run's reason code next to its text.
     fn run_manual(
         self: &Arc<Self>,
+        claim: Option<ManualClaim>,
         process: &str,
         run: impl FnOnce() -> RunReport,
-    ) -> Result<ExecutionResult, String> {
+    ) -> Result<ExecutionResult, ManualError> {
         let started = self.clock.now();
-        let scope = self.adopt_manual(process, started)?;
+        let scope = self.adopt_manual(claim, process, started)?;
         let installed = ManualLease::install(Arc::clone(&scope));
         begin_trace();
         let outcome = catch_unwind(AssertUnwindSafe(run));
@@ -1308,10 +1392,12 @@ impl ExecutorCore {
             classify(&result, reported, stage, sent)
         };
         let last = result.as_ref().ok().cloned();
+        let reason = verdict.reason;
+        self.pause(Pause::ManualBeforeSettle);
         if self.settle_manual(&scope, verdict, skipped_formats, last, started, end) {
-            result
+            result.map_err(|text| ManualError { reason, text })
         } else {
-            Err(FENCED.into())
+            Err(ManualError::fenced())
         }
     }
 
@@ -1326,7 +1412,7 @@ impl ExecutorCore {
         if self.epoch() == epoch {
             match self.send_lock.try_lock_for(SEND_LOCK_WAIT) {
                 Some(turn) if self.epoch() == epoch => {
-                    self.release_all(&turn);
+                    self.release_all(&turn, epoch);
                 }
                 Some(_) => {}
                 None => self.fail_closed(epoch, true),
@@ -1437,7 +1523,7 @@ impl ExecutorCore {
                 "a send of a fenced task is still in flight; the executor stays closed".into(),
             );
         };
-        let payment = self.pay_release(&turn);
+        let payment = self.pay_release(&turn, self.epoch());
         self.spawn_worker(me, &turn)?;
         drop(turn);
         match payment.debt {
@@ -1512,9 +1598,12 @@ impl ExecutorCore {
     /// (with the epoch checked there): the epoch moves on, the debt is
     /// recorded, `busy` is freed (a manual claim on it, if any, ended with
     /// it), the queue closes, and taking `running` and a live manual claim
-    /// makes the fence the only writer of their history entries. A manual
-    /// claim no run adopted yet stays, fenced, as a marker until it is
-    /// given back (see [`adopt_manual`](Self::adopt_manual)).
+    /// makes the fence the only writer of their history entries. The
+    /// manual claim leaves `life` here whether a run adopted it or not
+    /// (F5-1), so a new manual claim can be taken at once; a late caller of
+    /// the fenced one finds its epoch moved on and is refused (see
+    /// [`adopt_manual`](Self::adopt_manual)), and its give-back finds
+    /// nothing to free.
     fn bump(
         &self,
         life: &mut Life,
@@ -1523,17 +1612,8 @@ impl ExecutorCore {
     ) -> Retired {
         self.epoch.fetch_add(1, Ordering::SeqCst);
         self.shared.busy.store(false, Ordering::SeqCst);
-        let manual = life.manual.take().and_then(|mut claim| {
-            if claim.run.is_some() {
-                // Adopted: ended here, and recorded unless it settled.
-                return (!claim.done).then_some(claim);
-            }
-            let live = !claim.fenced;
-            claim.fenced = true;
-            let ended = live.then(|| claim.clone());
-            life.manual = Some(claim);
-            ended
-        });
+        // Recorded by the fence unless its run settled.
+        let manual = life.manual.take().filter(|claim| !claim.done);
         worker.sender = None;
         *fault = Some(ReasonCode::ExecutorTimeout);
         self.release_owed.store(true, Ordering::SeqCst);
@@ -1603,7 +1683,7 @@ impl ExecutorCore {
         }
         life.manual
             .as_ref()
-            .filter(|claim| claim.epoch == epoch && !claim.fenced && !claim.done)
+            .filter(|claim| claim.epoch == epoch && !claim.done)
             .map(|claim| Suspect::Manual(claim.id))
     }
 
@@ -1669,12 +1749,21 @@ impl ExecutorCore {
     /// The key-ups bypass `inject.rs`, so they are bracketed here like every
     /// other injection (P1b H1): a resync sampling the asynchronous key state
     /// meanwhile, or before it caught up, is discarded and retried.
-    /// Returns (key-ups accepted, key-ups refused).
-    fn release_held(&self, _turn: &SendTurn<'_>) -> (usize, usize) {
+    ///
+    /// `epoch` is the releaser's (F5-1): it is checked again before every
+    /// call into the OS, and once a fence moved it on the release stops
+    /// there; the keys not yet released stay in the bitmap, owed, for the
+    /// rebuild or the next worker.
+    /// Returns (key-ups accepted, key-ups refused, stopped by a fence).
+    fn release_held(&self, _turn: &SendTurn<'_>, epoch: u64) -> (usize, usize, bool) {
         let held = self.held.held_snapshot();
         let _injecting = (!held.is_empty()).then(|| self.held.begin());
-        let (mut released, mut refused) = (0, 0);
+        let (mut released, mut refused, mut stopped) = (0, 0, false);
         for vk in held {
+            if self.epoch() != epoch {
+                stopped = true;
+                break;
+            }
             if physical(vk) {
                 // The user holds it now: releasing would desync the key.
                 // Their own key-up ends it, so stop tracking it.
@@ -1700,7 +1789,7 @@ impl ExecutorCore {
                 );
             }
         }
-        (released, refused)
+        (released, refused, stopped)
     }
 
     /// The components' status (`probe`). Never waits for a lock (A2): the
@@ -1984,8 +2073,12 @@ impl BusyGuard<'_> {
         let released = match core.send_lock.try_lock_for(SEND_LOCK_WAIT) {
             // Its epoch current: every held key, owed or its own. Fenced:
             // the fence owes its keys; pay that debt, nothing more.
-            Some(turn) if core.epoch() == self.epoch => core.release_all(&turn).released,
-            Some(turn) => core.pay_release(&turn).released,
+            // Either way the payment stops before its next key-up once the
+            // epoch it was started for moves on (F5-1).
+            Some(turn) if core.epoch() == self.epoch => {
+                core.release_all(&turn, self.epoch).released
+            }
+            Some(turn) => core.pay_release(&turn, core.epoch()).released,
             None => {
                 // A send is stuck holding the lock: owe the key-ups, never
                 // send them without it.
@@ -2215,7 +2308,8 @@ impl ManualScope {
         if self.check().is_err() {
             return 0;
         }
-        if core.pay_release(&turn).debt == Debt::Owed {
+        // The run's own epoch: a fence during the payment stops it.
+        if core.pay_release(&turn, self.epoch).debt == Debt::Owed {
             return self.refuse(Refusal::Owed);
         }
         // S1: the check that allows this send, in the same hold as the call.
@@ -2538,21 +2632,24 @@ pub(super) fn manual_core(shared: &Arc<Shared>) -> Option<Arc<ExecutorCore>> {
 /// (`core`, production once `start_engine` ran) the run is supervised like
 /// a task (F5-1, see the module doc): it adopts the caller's claim, its
 /// sends and guards stop once the stall check fenced it, a panic is caught,
-/// and a run the fence ended returns the fence's error. Without one the run
-/// is unsupervised, as before the executor existed.
+/// and a run the fence ended returns the fence's error. `claim` is the
+/// caller's own ([`ManualTicket`]); with an executor and no claim (or a claim
+/// that is not the one in `life`) the run is refused without input. Without
+/// an executor the run is unsupervised, as before the executor existed.
 pub(super) fn run_manual(
     core: Option<Arc<ExecutorCore>>,
+    claim: Option<ManualClaim>,
     process: &str,
     run: impl FnOnce() -> RunReport,
-) -> Result<ExecutionResult, String> {
+) -> Result<ExecutionResult, ManualError> {
     if let Some(core) = core {
-        return core.run_manual(process, run);
+        return core.run_manual(claim, process, run);
     }
     let started = SystemClock.now();
     begin_trace();
     let report = run();
-    record_manual(process, &report, started);
-    report.result
+    let reason = record_manual(process, &report, started);
+    report.result.map_err(|text| ManualError { reason, text })
 }
 
 /// A clipboard backend whose lease holds the task's clipboard claim; the
@@ -2805,11 +2902,17 @@ pub fn executor_control() -> Option<Arc<dyn ExecutorControl>> {
 /// this `shared` (before `start_engine`) there is no lock to take: the
 /// claim is a bare compare-and-set on `busy`, and nothing else writes
 /// `busy` meanwhile.
+///
+/// Ownership (F5-1): the claim stays with the caller that made it (the
+/// command), and only dropping it gives `busy` back. The blocking thread
+/// that prepares and runs the action gets a [`ManualTicket`] instead, which
+/// names the claim but never frees anything, so a thread that outlives its
+/// command (a fence, then a timeout) cannot free a newer claim's `busy`.
 #[must_use = "dropping the claim frees `busy` at once"]
 pub struct ManualBusy {
     shared: Arc<Shared>,
-    /// The executor that granted the claim, and the claim's id.
-    grant: Option<(Arc<ExecutorCore>, u64)>,
+    /// The executor that granted the claim, and the claim itself.
+    grant: Option<(Arc<ExecutorCore>, ManualClaim)>,
 }
 
 impl ManualBusy {
@@ -2823,8 +2926,8 @@ impl ManualBusy {
     pub(super) fn claim_on(core: Option<Arc<ExecutorCore>>, shared: &Arc<Shared>) -> Option<Self> {
         let grant = match core {
             Some(core) => {
-                let id = core.claim_manual()?;
-                Some((core, id))
+                let claim = core.claim_manual()?;
+                Some((core, claim))
             }
             None => {
                 shared
@@ -2839,12 +2942,21 @@ impl ManualBusy {
             grant,
         })
     }
+
+    /// The ticket the blocking thread acts with for this claim: its
+    /// progress checkpoints, its fence check and the run itself.
+    pub fn ticket(&self) -> ManualTicket {
+        ManualTicket {
+            shared: Arc::clone(&self.shared),
+            grant: self.grant.clone(),
+        }
+    }
 }
 
 impl Drop for ManualBusy {
     fn drop(&mut self) {
         match &self.grant {
-            Some((core, id)) => core.end_manual(*id),
+            Some((core, claim)) => core.end_manual(*claim),
             None => {
                 let _ = self.shared.busy.compare_exchange(
                     true,
@@ -2855,6 +2967,93 @@ impl Drop for ManualBusy {
             }
         }
     }
+}
+
+/// What the blocking thread of a manual run acts with (F5-1): it names the
+/// caller's claim ([`ManualBusy::ticket`]) but owns nothing, so dropping it,
+/// or keeping it forever on a thread that never returns, frees nothing.
+/// Every step it takes is checked against that claim: the preparation's
+/// [`progress`](Self::progress) checkpoints, and [`execute`](Self::execute),
+/// which adopts only that claim. Without an executor (before
+/// `start_engine`) every check passes and the run is unsupervised.
+#[derive(Clone)]
+pub struct ManualTicket {
+    shared: Arc<Shared>,
+    grant: Option<(Arc<ExecutorCore>, ManualClaim)>,
+}
+
+impl ManualTicket {
+    /// A progress checkpoint of the preparation (the delay, the clipboard
+    /// read, the selection capture): restarts the claim's heartbeat, so a
+    /// preparation whose phases each stay within [`STALL_BUDGET`] is never
+    /// fenced, however long it takes in total. Err: the claim was fenced, or
+    /// is no longer the one in force; stop, and send nothing. The text is
+    /// one of the executor's fixed texts.
+    pub fn progress(&self) -> Result<(), String> {
+        match &self.grant {
+            Some((core, claim)) => core.manual_progress(*claim),
+            None => Ok(()),
+        }
+    }
+
+    /// The claim was fenced (its epoch moved on). Lock-free: only the fence
+    /// moves the epoch on, and it always ends the claim with it.
+    pub fn fenced(&self) -> bool {
+        self.grant
+            .as_ref()
+            .is_some_and(|(core, claim)| core.epoch() != claim.epoch)
+    }
+
+    /// Runs the manual action for this claim, supervised (see
+    /// [`run_manual`]). A failure carries only the reason code of its
+    /// history entry, never the run's text, which may echo the rule's
+    /// content (H): callers log and show the code.
+    pub fn execute(
+        &self,
+        plan: ActionPlan,
+        target: Foreground,
+        generation: u64,
+        erase: usize,
+        terminator: Option<String>,
+        speed: f64,
+    ) -> Result<ExecutionResult, ManualFailure> {
+        let process = target.process.clone();
+        let run = super::actions::manual_run(
+            Arc::clone(&self.shared),
+            plan,
+            target,
+            generation,
+            erase,
+            terminator,
+            speed,
+        );
+        self.run(&process, run).map_err(|error| ManualFailure {
+            reason: error.reason,
+        })
+    }
+
+    /// [`execute`](Self::execute) with the run given, its failure's text
+    /// kept for the crate's own tests (which pass mock ports).
+    pub(super) fn run(
+        &self,
+        process: &str,
+        run: impl FnOnce() -> RunReport,
+    ) -> Result<ExecutionResult, ManualError> {
+        match &self.grant {
+            Some((core, claim)) => core.run_manual(Some(*claim), process, run),
+            None => run_manual(None, None, process, run),
+        }
+    }
+}
+
+/// A manual run that failed, as it leaves the platform crate
+/// ([`ManualTicket::execute`]): the reason code of its history entry, and
+/// nothing else (H). `ExecutorTimeout` means the run was fenced or refused
+/// by the send exclusion; no text of the run, which may echo the rule's
+/// content, ever comes with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ManualFailure {
+    pub reason: ReasonCode,
 }
 
 #[cfg(test)]

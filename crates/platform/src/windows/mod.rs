@@ -80,3 +80,5 @@ pub use input::try_input_health;
 // S-09/B-10: the self-test's Windows probes (runner in `crate::self_test`).
 mod self_test_probes;
 pub(crate) use self_test_probes::WinSelfTest;
+// F5-1: what the blocking thread of a manual run acts with, and its failure.
+pub use executor::{ManualFailure, ManualTicket};
