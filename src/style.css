@@ -479,18 +479,11 @@ header {
 }
 .revision {
   margin-left: auto;
-  color: var(--text-secondary);
   font-size: 12px;
-  display: flex;
-  align-items: center;
-}
-.revision em {
-  font-style: normal;
   background: var(--accent-soft);
   color: var(--accent-soft-text);
   padding: 3px 10px;
   border-radius: 999px;
-  margin-left: 10px;
   font-weight: 500;
 }
 

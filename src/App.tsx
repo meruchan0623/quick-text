@@ -1034,10 +1034,7 @@ export default function App() {
         <button className={tab === 'status' ? 'active' : ''} onClick={() => setTab('status')}>
           运行状态与恢复
         </button>
-        <span className="revision">
-          当前生效 v{state?.revision ?? 0}
-          <em>{state?.dirty || localDirty ? '草稿待应用' : '配置已同步'}</em>
-        </span>
+        {(state?.dirty || localDirty) && <span className="revision">草稿待应用</span>}
       </nav>
       <BannerStack view={runtime} onOpenDataDir={() => openDir('open_data_dir')} />
       {!ready && loadFailure && (
