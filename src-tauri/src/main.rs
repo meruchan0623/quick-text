@@ -74,7 +74,7 @@ fn main() {
                 // B-04: marks the active revision last-known-good once it
                 // has proven itself; runs on the bus thread.
                 let lkg = lkg::LkgTracker::new(
-                    runtime.clock().clone(),
+                    &runtime,
                     store.store_state(),
                     lkg::mark_in(app.handle().clone()),
                 );

@@ -64,6 +64,7 @@ use crate::{
 };
 use quicker_platform::{
     health::{EngineState, HealthSnapshot, HealthState, HistoryEntry, Outcome, TriggerKind},
+    runtime::Runtime,
     traits::Clock,
 };
 use std::{
@@ -96,11 +97,11 @@ pub struct LkgTracker {
 
 impl LkgTracker {
     /// `store` is the store state when the tracker starts (setup takes it
-    /// under the same store lock as the bus's baseline); `clock` should be
-    /// the runtime's.
-    pub fn new(clock: Arc<dyn Clock>, store: StoreState, mark: MarkFn) -> Self {
+    /// under the same store lock as the bus's baseline, before the engine
+    /// starts); the clock is `runtime`'s.
+    pub fn new(runtime: &Arc<Runtime>, store: StoreState, mark: MarkFn) -> Self {
         Self {
-            clock,
+            clock: runtime.clock().clone(),
             mark,
             store,
             healthy_since: None,
@@ -227,12 +228,7 @@ mod tests {
     };
     use parking_lot::Mutex;
     use quicker_domain::*;
-    use quicker_platform::{
-        health::{ReasonCode, StageTimings},
-        history::Record,
-        runtime::Runtime,
-        traits::SystemClock,
-    };
+    use quicker_platform::{health::ReasonCode, history::Record};
     use serde_json::Value;
     use std::{fs, path::PathBuf, sync::mpsc};
     use tracing::level_filters::LevelFilter;
@@ -283,115 +279,145 @@ mod tests {
         }
     }
 
-    fn run(trigger: TriggerKind, outcome: Outcome) -> HistoryEntry {
-        HistoryEntry {
-            seq: 1,
-            at_ms: 0,
-            rule_id: if trigger == TriggerKind::Manual {
-                String::new()
-            } else {
-                "rule".into()
-            },
-            trigger,
-            outcome,
-            reason: ReasonCode::Ok,
-            process: None,
-            completed_steps: 1,
-            side_effects: true,
-            skipped_formats: vec![],
-            timings: StageTimings::default(),
+    /// A run recorded in `runtime`'s history, which gives it its `seq`.
+    fn record(runtime: &Runtime, trigger: TriggerKind, outcome: Outcome) -> HistoryEntry {
+        let rule = if trigger == TriggerKind::Manual {
+            ""
+        } else {
+            "rule"
+        };
+        runtime.record(Record::new(rule, trigger, outcome, ReasonCode::Ok))
+    }
+
+    /// A tracker on its own runtime (on a fake clock), driven by hand the
+    /// way the bus drives it.
+    struct Rig {
+        clock: Arc<FakeClock>,
+        runtime: Arc<Runtime>,
+        tracker: LkgTracker,
+        marks: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl Rig {
+        /// Marks are accepted and listed in [`Rig::marks`].
+        fn new(at: StoreState) -> Self {
+            let marks = Arc::new(Mutex::new(vec![]));
+            let seen = Arc::clone(&marks);
+            let mut rig = Self::with(
+                at,
+                Box::new(move |revision| {
+                    seen.lock().push(revision);
+                    Ok(())
+                }),
+            );
+            rig.marks = marks;
+            rig
         }
-    }
 
-    fn success() -> HistoryEntry {
-        run(TriggerKind::Terminator, Outcome::Succeeded)
-    }
+        fn with(at: StoreState, mark: MarkFn) -> Self {
+            let clock = FakeClock::new();
+            let runtime = Arc::new(Runtime::new(clock.clone()));
+            let tracker = LkgTracker::new(&runtime, at, mark);
+            Self {
+                clock,
+                runtime,
+                tracker,
+                marks: Arc::default(),
+            }
+        }
 
-    /// A tracker whose marks are recorded (and accepted) in the returned
-    /// list.
-    fn tracker(clock: &Arc<FakeClock>, at: StoreState) -> (LkgTracker, Arc<Mutex<Vec<u64>>>) {
-        let marks = Arc::new(Mutex::new(vec![]));
-        let seen = Arc::clone(&marks);
-        let mark: MarkFn = Box::new(move |revision| {
-            seen.lock().push(revision);
-            Ok(())
-        });
-        (LkgTracker::new(clock.clone(), at, mark), marks)
-    }
+        fn marks(&self) -> Vec<u64> {
+            self.marks.lock().clone()
+        }
 
-    fn healthy(tracker: &mut LkgTracker) {
-        tracker.status(&health(HealthState::Healthy), &EngineState::default());
-    }
+        /// Health published by the supervisor and delivered by the bus at
+        /// once: the runtime and the tracker agree.
+        fn health(&mut self, state: HealthState) {
+            self.runtime.publish_health(health(state));
+            self.tracker.status(&health(state), &EngineState::default());
+        }
 
-    /// Moves the clock and gives the tracker the tick the bus would.
-    fn wait(tracker: &mut LkgTracker, clock: &FakeClock, by: Duration) {
-        clock.advance(by);
-        tracker.tick();
+        fn healthy(&mut self) {
+            self.health(HealthState::Healthy);
+        }
+
+        /// A run recorded and delivered at once.
+        fn run(&mut self, trigger: TriggerKind, outcome: Outcome) {
+            let entry = record(&self.runtime, trigger, outcome);
+            self.tracker.executed(&entry);
+        }
+
+        fn success(&mut self) {
+            self.run(TriggerKind::Terminator, Outcome::Succeeded);
+        }
+
+        fn store(&mut self, at: StoreState) {
+            self.tracker.store(at);
+        }
+
+        /// Moves the clock and gives the tracker the tick the bus would.
+        fn wait(&mut self, by: Duration) {
+            self.clock.advance(by);
+            self.tracker.tick();
+        }
+
+        fn due_in(&self) -> Option<Duration> {
+            self.tracker.due_in()
+        }
     }
 
     #[test]
     fn sixty_healthy_seconds_and_one_success_mark_the_revision_once() {
-        let clock = FakeClock::new();
-        let (mut tracker, marks) = tracker(&clock, store(1, None));
-        healthy(&mut tracker);
-        assert_eq!(
-            tracker.due_in(),
-            None,
-            "no success yet: nothing to wait for"
-        );
-        wait(&mut tracker, &clock, secs(10));
-        tracker.executed(&success());
-        assert_eq!(
-            tracker.due_in(),
-            Some(secs(50)),
-            "the bus sleeps until then"
-        );
-        wait(&mut tracker, &clock, secs(50) - Duration::from_millis(1));
-        assert!(marks.lock().is_empty(), "not before 60 s");
-        assert_eq!(tracker.due_in(), Some(Duration::from_millis(1)));
-        wait(&mut tracker, &clock, Duration::from_millis(1));
-        assert_eq!(*marks.lock(), [1]);
+        let mut rig = Rig::new(store(1, None));
+        rig.healthy();
+        assert_eq!(rig.due_in(), None, "no success yet: nothing to wait for");
+        rig.wait(secs(10));
+        rig.success();
+        assert_eq!(rig.due_in(), Some(secs(50)), "the bus sleeps until then");
+        rig.wait(secs(50) - Duration::from_millis(1));
+        assert!(rig.marks().is_empty(), "not before 60 s");
+        assert_eq!(rig.due_in(), Some(Duration::from_millis(1)));
+        rig.wait(Duration::from_millis(1));
+        assert_eq!(rig.marks(), [1]);
         // Exactly once: more successes, time and Health repeats change
         // nothing, and nothing is left to wait for.
-        assert_eq!(tracker.due_in(), None);
-        tracker.executed(&success());
-        healthy(&mut tracker);
-        tracker.store(store(1, None));
-        wait(&mut tracker, &clock, secs(600));
-        assert_eq!(*marks.lock(), [1]);
+        assert_eq!(rig.due_in(), None);
+        rig.success();
+        rig.healthy();
+        rig.store(store(1, None));
+        rig.wait(secs(600));
+        assert_eq!(rig.marks(), [1]);
     }
 
     #[test]
     fn health_leaving_healthy_at_59s_restarts_the_full_minute() {
-        let clock = FakeClock::new();
-        let (mut tracker, marks) = tracker(&clock, store(1, None));
-        healthy(&mut tracker);
-        tracker.executed(&success());
-        wait(&mut tracker, &clock, secs(59));
-        tracker.status(&health(HealthState::Degraded), &EngineState::default());
-        assert_eq!(tracker.due_in(), None, "no minute runs while not Healthy");
-        wait(&mut tracker, &clock, secs(30));
+        let mut rig = Rig::new(store(1, None));
+        rig.healthy();
+        rig.success();
+        rig.wait(secs(59));
+        rig.health(HealthState::Degraded);
+        assert_eq!(rig.due_in(), None, "no minute runs while not Healthy");
+        rig.wait(secs(30));
         // Recovering is not Healthy either.
-        tracker.status(&health(HealthState::Recovering), &EngineState::default());
-        wait(&mut tracker, &clock, secs(30));
-        assert!(marks.lock().is_empty());
+        rig.health(HealthState::Recovering);
+        rig.wait(secs(30));
+        assert!(rig.marks().is_empty());
         // Back to Healthy: a fresh 60 s, the success still counts.
-        healthy(&mut tracker);
-        assert_eq!(tracker.due_in(), Some(secs(60)));
-        wait(&mut tracker, &clock, secs(59));
+        rig.healthy();
+        assert_eq!(rig.due_in(), Some(secs(60)));
+        rig.wait(secs(59));
         assert!(
-            marks.lock().is_empty(),
+            rig.marks().is_empty(),
             "the 59 s before the dip do not add up"
         );
-        wait(&mut tracker, &clock, secs(1));
-        assert_eq!(*marks.lock(), [1]);
+        rig.wait(secs(1));
+        assert_eq!(rig.marks(), [1]);
     }
 
     #[test]
     fn without_a_trigger_path_success_nothing_is_marked() {
-        let clock = FakeClock::new();
-        let (mut tracker, marks) = tracker(&clock, store(1, None));
-        healthy(&mut tracker);
+        let mut rig = Rig::new(store(1, None));
+        rig.healthy();
         for outcome in [
             Outcome::Unknown,
             Outcome::Failed,
@@ -399,75 +425,69 @@ mod tests {
             Outcome::Cancelled,
             Outcome::DroppedBusy,
         ] {
-            tracker.executed(&run(TriggerKind::Immediate, outcome));
+            rig.run(TriggerKind::Immediate, outcome);
         }
         // Manual runs do not exercise the active revision.
-        tracker.executed(&run(TriggerKind::Manual, Outcome::Succeeded));
-        wait(&mut tracker, &clock, secs(600));
-        assert_eq!(tracker.due_in(), None);
-        assert!(marks.lock().is_empty());
+        rig.run(TriggerKind::Manual, Outcome::Succeeded);
+        rig.wait(secs(600));
+        assert_eq!(rig.due_in(), None);
+        assert!(rig.marks().is_empty());
         // The success may also come after the minute: it marks at once.
-        tracker.executed(&run(TriggerKind::Immediate, Outcome::Succeeded));
-        assert_eq!(*marks.lock(), [1]);
+        rig.run(TriggerKind::Immediate, Outcome::Succeeded);
+        assert_eq!(rig.marks(), [1]);
     }
 
     #[test]
     fn a_publish_restarts_the_minute_and_the_new_revision_is_marked_once_it_qualifies() {
-        let clock = FakeClock::new();
-        let (mut tracker, marks) = tracker(&clock, store(1, None));
-        healthy(&mut tracker);
-        tracker.executed(&success());
-        wait(&mut tracker, &clock, secs(40));
+        let mut rig = Rig::new(store(1, None));
+        rig.healthy();
+        rig.success();
+        rig.wait(secs(40));
         // Published at 40 s: revision 1 never qualified; its success and
         // its 40 s do not carry over.
-        tracker.store(store(2, None));
-        wait(&mut tracker, &clock, secs(30));
-        assert_eq!(tracker.due_in(), None, "no success on revision 2 yet");
-        tracker.executed(&success());
-        assert_eq!(tracker.due_in(), Some(secs(30)), "60 s from the publish");
-        wait(&mut tracker, &clock, secs(29));
-        assert!(marks.lock().is_empty());
-        wait(&mut tracker, &clock, secs(1));
-        assert_eq!(*marks.lock(), [2]);
+        rig.store(store(2, None));
+        rig.wait(secs(30));
+        assert_eq!(rig.due_in(), None, "no success on revision 2 yet");
+        rig.success();
+        assert_eq!(rig.due_in(), Some(secs(30)), "60 s from the publish");
+        rig.wait(secs(29));
+        assert!(rig.marks().is_empty());
+        rig.wait(secs(1));
+        assert_eq!(rig.marks(), [2]);
         // The next publish (or a rollback, which is a new revision too)
         // starts over and is marked once it qualifies in turn.
-        tracker.store(store(3, None));
-        tracker.executed(&success());
-        wait(&mut tracker, &clock, secs(59));
-        assert_eq!(*marks.lock(), [2]);
-        wait(&mut tracker, &clock, secs(1));
-        assert_eq!(*marks.lock(), [2, 3]);
+        rig.store(store(3, None));
+        rig.success();
+        rig.wait(secs(59));
+        assert_eq!(rig.marks(), [2]);
+        rig.wait(secs(1));
+        assert_eq!(rig.marks(), [2, 3]);
     }
 
     #[test]
     fn nothing_is_counted_or_marked_in_safe_mode() {
-        let clock = FakeClock::new();
         let crash_loop = Some(SafeModeReason::CrashLoop);
-        let (mut tracker, marks) = tracker(&clock, store(1, crash_loop));
-        healthy(&mut tracker);
-        tracker.executed(&success());
-        wait(&mut tracker, &clock, secs(600));
-        assert_eq!(tracker.due_in(), None);
-        assert!(marks.lock().is_empty());
+        let mut rig = Rig::new(store(1, crash_loop));
+        rig.healthy();
+        rig.success();
+        rig.wait(secs(600));
+        assert_eq!(rig.due_in(), None);
+        assert!(rig.marks().is_empty());
         // Safe mode ends at the same revision: what happened in it does
         // not count, the minute starts now.
-        tracker.store(store(1, None));
-        wait(&mut tracker, &clock, secs(600));
-        assert!(marks.lock().is_empty(), "the success was in safe mode");
-        tracker.executed(&success());
-        assert_eq!(
-            *marks.lock(),
-            [1],
-            "healthy for 600 s since safe mode ended"
-        );
-        assert_eq!(tracker.due_in(), None);
+        rig.store(store(1, None));
+        rig.wait(secs(600));
+        assert!(rig.marks().is_empty(), "the success was in safe mode");
+        rig.success();
+        assert_eq!(rig.marks(), [1], "healthy for 600 s since safe mode ended");
+        assert_eq!(rig.due_in(), None);
         // Entering safe mode just before a revision would qualify stops it.
-        tracker.store(store(2, None));
-        tracker.executed(&success());
-        wait(&mut tracker, &clock, secs(59));
-        tracker.store(store(2, Some(SafeModeReason::Locked)));
-        wait(&mut tracker, &clock, secs(600));
-        assert_eq!(*marks.lock(), [1]);
+        rig.store(store(2, None));
+        rig.success();
+        rig.wait(secs(59));
+        rig.store(store(2, Some(SafeModeReason::Locked)));
+        rig.wait(secs(600));
+        assert_eq!(rig.marks(), [1]);
     }
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -484,7 +504,6 @@ mod tests {
         let built = scoped(&dir, LevelFilter::DEBUG);
         let attempts = Arc::new(Mutex::new(vec![]));
         tracing::subscriber::with_default(built.subscriber, || {
-            let clock = FakeClock::new();
             let seen = Arc::clone(&attempts);
             let mark: MarkFn = Box::new(move |revision| {
                 seen.lock().push(revision);
@@ -499,14 +518,14 @@ mod tests {
                     _ => CommandError::RevisionConflict { current: 9 },
                 })
             });
-            let mut tracker = LkgTracker::new(clock.clone(), store(1, None), mark);
-            healthy(&mut tracker);
+            let mut rig = Rig::with(store(1, None), mark);
+            rig.healthy();
             for revision in 1..=3 {
-                tracker.store(store(revision, None));
+                rig.store(store(revision, None));
                 for _ in 0..3 {
-                    tracker.executed(&success());
-                    wait(&mut tracker, &clock, secs(60));
-                    assert_eq!(tracker.due_in(), None, "nothing left to wake up for");
+                    rig.success();
+                    rig.wait(secs(60));
+                    assert_eq!(rig.due_in(), None, "nothing left to wake up for");
                 }
             }
         });
@@ -579,33 +598,27 @@ mod tests {
         let two = managed.lock().active.clone();
         assert_eq!(two.revision, 2);
 
-        let clock = FakeClock::new();
         let target = Arc::clone(&managed);
-        let mut tracker = LkgTracker::new(
-            clock.clone(),
+        let mut rig = Rig::with(
             managed.lock().store_state(),
             Box::new(move |revision| mark_active(&target, revision)),
         );
-        healthy(&mut tracker);
-        tracker.executed(&success());
-        wait(
-            &mut tracker,
-            &clock,
-            QUALIFY_AFTER - Duration::from_millis(1),
-        );
+        rig.healthy();
+        rig.success();
+        rig.wait(QUALIFY_AFTER - Duration::from_millis(1));
         assert_eq!(last_good_on_disk(&dir), None);
-        wait(&mut tracker, &clock, Duration::from_millis(1));
+        rig.wait(Duration::from_millis(1));
         assert_eq!(last_good_on_disk(&dir), Some(2));
 
         for id in ["three", "four"] {
             managed.lock().publish(config(id)).unwrap();
             let state = managed.lock().store_state();
-            tracker.store(state);
-            wait(&mut tracker, &clock, secs(600));
+            rig.store(state);
+            rig.wait(secs(600));
         }
         assert_eq!(managed.lock().active.revision, 4);
         assert_eq!(last_good_on_disk(&dir), Some(2), "3 and 4 had no success");
-        drop(tracker);
+        drop(rig);
         drop(managed);
 
         fs::write(dir.join("active.json"), b"{\"revision\": 4, \"rul").unwrap();
@@ -636,41 +649,32 @@ mod tests {
         }
     }
 
+    /// A mark that only reports the revision.
+    fn reported(marked: mpsc::Sender<u64>) -> MarkFn {
+        Box::new(move |revision| {
+            let _ = marked.send(revision);
+            Ok(())
+        })
+    }
+
     /// Wired as in the app: the bus hands the tracker Health and history
     /// entries from the runtime and the store's reports, on its own thread.
     #[test]
     fn on_the_bus_runtime_health_and_history_reach_the_tracker() {
-        let runtime = Arc::new(Runtime::new(Arc::new(SystemClock)));
         let clock = FakeClock::new();
+        let runtime = Arc::new(Runtime::new(clock.clone()));
         let (mark_tx, marked) = mpsc::channel();
-        let mark: MarkFn = Box::new(move |revision| {
-            let _ = mark_tx.send(revision);
-            Ok(())
-        });
-        let tracker = LkgTracker::new(clock.clone(), store(1, None), mark);
+        let tracker = LkgTracker::new(&runtime, store(1, None), reported(mark_tx));
         let (tx, emitted) = mpsc::channel();
         let bus = EventBus::start(&runtime, store(1, None), Channel(tx), Box::new(tracker));
-        let record = |trigger| {
-            runtime.record(Record {
-                rule_id: "r".into(),
-                trigger,
-                outcome: Outcome::Succeeded,
-                reason: ReasonCode::Ok,
-                process: None,
-                completed_steps: 1,
-                side_effects: true,
-                skipped_formats: vec![],
-                timings: StageTimings::default(),
-            });
-        };
         // A publish reported before anything else: revision 2 is counted.
         bus.store_sink().report(store(2, None));
         runtime.publish_health(health(HealthState::Healthy));
         // Once the bus sent the Health, the tracker has it.
         while emitted.recv_timeout(secs(10)).unwrap() != ENGINE_HEALTH {}
         clock.advance(QUALIFY_AFTER);
-        record(TriggerKind::Manual);
-        record(TriggerKind::Immediate);
+        record(&runtime, TriggerKind::Manual, Outcome::Succeeded);
+        record(&runtime, TriggerKind::Immediate, Outcome::Succeeded);
         assert_eq!(marked.recv_timeout(secs(10)), Ok(2));
         assert!(marked.try_recv().is_err(), "marked once");
     }
