@@ -18,7 +18,8 @@
 #                                      text for THIRD-PARTY-LICENSES.txt (S-28); the release
 #                                      workflow generates the real file and fails the same way
 #   bench          nightly; push to    matching with 1000 rules (crates/domain/benches, B-53),
-#                  main; on demand     fails above 120% of the absolute budget
+#                  main; on demand     fails above 120% of the absolute budget, or when any of
+#                                      its seven cases is missing or not from this run
 #                                      (scripts/check-bench-budget.ps1); target/criterion is
 #                                      uploaded for the trend. Not a required check: it does
 #                                      not run on pull requests
@@ -255,11 +256,24 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Budget check self-test (B-53)
+        run: pwsh -NoProfile -File scripts/check-bench-budget.ps1 -SelfTest
+
+      # Codex review 2: judge only results of this run. Delete what the cache or an earlier
+      # attempt left in the group's directory and record when the run starts; the check then
+      # refuses a missing case and any result written before that time.
+      - name: Clear earlier matching results
+        run: |
+          $results = 'target/criterion/match_1000_rules'
+          if (Test-Path -LiteralPath $results) { Remove-Item -LiteralPath $results -Recurse -Force -ErrorAction Stop }
+          "BENCH_STARTED=$([DateTime]::UtcNow.ToString('o'))" >> $env:GITHUB_ENV
+
+      # No filter after `--`: the check needs all seven cases.
       - name: Matching benchmark (1000 rules)
         run: cargo bench -p quicker-domain --locked --bench matching
 
       - name: Within 120% of the matching budget (B-53)
-        run: pwsh -NoProfile -File scripts/check-bench-budget.ps1
+        run: pwsh -NoProfile -File scripts/check-bench-budget.ps1 -NotBefore $env:BENCH_STARTED
 
       - name: Upload criterion results
         if: ${{ !cancelled() }}

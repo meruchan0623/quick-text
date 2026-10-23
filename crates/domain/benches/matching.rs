@@ -349,6 +349,8 @@ fn matching(c: &mut Criterion) {
         stream.len()
     );
 
+    // scripts/check-bench-budget.ps1 lists these seven case names ($ExpectedBenches) and fails
+    // when one is missing or unknown: rename, add or remove a case there as well.
     let mut group = c.benchmark_group("match_1000_rules");
     // Flat: every sample runs the same number of iterations, so the per-sample means that
     // scripts/check-bench-budget.ps1 ranks are comparable with each other.

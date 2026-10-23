@@ -75,7 +75,7 @@
 
 ### 3.4 匹配基准（B-53）
 
-运行：`cargo bench -p quicker-domain --bench matching`，然后 `pwsh -NoProfile -File scripts/check-bench-budget.ps1`。纯计算，只调用 `quicker-domain`，不注入输入，不装钩子。
+运行：`cargo bench -p quicker-domain --bench matching`（`--` 后面不加过滤，判定要求 7 个用例齐全），然后 `pwsh -NoProfile -File scripts/check-bench-budget.ps1`。纯计算，只调用 `quicker-domain`，不注入输入，不装钩子。判定脚本的自测：`pwsh -NoProfile -File scripts/check-bench-budget.ps1 -SelfTest`，只用临时目录里的合成结果，不跑基准。
 
 - **数据**：固定种子生成的合成数据，每次运行、每台机器都相同，不读文件、时钟或环境。1000 条规则分成 40 组，每组 25 条共享一个 3–5 个字母的前缀：
   - 60% 是终止键模式的字面量；
@@ -96,6 +96,8 @@
   - `terminator_miss_full_buffer`：缓冲区已满 1024 个字符时的不命中；
   - `typing_stream`：逐键打一段夹有触发词的文字，循环进行。
 
+  判定脚本内置这 7 个用例名（`$ExpectedBenches`）。增加、删除或改名用例时，`matching.rs` 和脚本要一起改，否则判定直接退出 2。
+
   每个用例测量前先断言是否命中、哪条规则胜出，所以匹配逻辑的改动不会让「命中」用例悄悄变成「不命中」用例。
 - **统计口径（近似 p99）**：
   - criterion 不记录单次迭代。它的每个样本是连续 `iters` 次迭代的总时间，写在 `target/criterion/match_1000_rules/<用例>/new/sample.json` 里。
@@ -105,7 +107,16 @@
   - 这是「样本均值的 p99」，不是「单次按键的 p99」。偶发的慢按键会被同一样本里的其他迭代摊薄，所以真实的单键 p99 可能更高。反过来，调度抖动影响的是整个样本而不是一次按键，所以它比单键 p99 稳定。
   - 每个单一用例都只重复同一个按键，摊薄作用很小。`typing_stream` 的样本混合了便宜的字符键和昂贵的终止键，不能代表最慢的按键。看最慢的按键要看单一用例，尤其是 `terminator_miss` 和 `terminator_miss_full_buffer`。
   - 样本数少于 100 时脚本直接失败，不给 p99（第 1 节规则 5）。
-- **判定**：任一用例的上述 p99 超过 1.2 ms（预算 1 ms 的 120%，第 1 节规则 3）即失败。不与上一次结果比较。CI `bench` 任务的配置：
+- **判定**：任一用例的上述 p99 超过 1.2 ms（预算 1 ms 的 120%，第 1 节规则 3）即失败。不与上一次结果比较。
+- **只判定完整、同一次运行的结果**（Codex 复审 2）。以下情况脚本退出 2，不给结论：
+  - 缺任何一个用例，并列出缺了哪些。例如只跑 `-- char_miss` 时，不能只凭最便宜的用例通过；
+  - 结果目录里有清单之外的用例：可能是改名后留下的旧目录，也可能是新增用例忘了加进清单；
+  - 7 份 `new/sample.json` 的写入时间相差超过 `-MaxRunMinutes`（默认 20 分钟；完整跑一次约 1–2 分钟），说明有用例的结果是以前某次运行留下的；
+  - 给了 `-NotBefore` 时，有结果早于这个时间。
+- **CI `bench` 任务的配置**：
+  - 先跑判定脚本的自测；
+  - 再删除 `target/criterion/match_1000_rules`，因为缓存或上一次尝试可能留下结果；记下开始时间 `BENCH_STARTED`；
+  - 不加过滤运行基准，然后以 `-NotBefore $env:BENCH_STARTED` 判定；
   - 运行时机：windows-latest，每晚 02:41 UTC、推送 main 时、手动触发；
   - 产物：运行基准和脚本后，上传 `target/criterion` 作为 artifact（保留 90 天），供人工看趋势；
   - 不在 PR 上运行，不是必需检查。
