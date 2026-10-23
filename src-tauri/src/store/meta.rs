@@ -180,8 +180,9 @@ pub fn register_session_meta(meta: MetaHandle) {
 
 /// Clears the run marker so that a shutdown is not counted as a crash at the
 /// next start. Safe from any thread and without the store lock: it is called
-/// on `RunEvent::Exit` (which tao raises for `WM_ENDSESSION`), and a
-/// session-end listener (`WM_QUERYENDSESSION`, P1b) may call it as well.
+/// on `RunEvent::Exit` and by the session-end callback on the session window
+/// thread at `WM_ENDSESSION` (`startup::end_session`, R5), which does not
+/// depend on tao raising `RunEvent::Exit` for it.
 pub fn clear_run_marker_on_session_end() {
     let meta = SESSION_META.lock().clone();
     if let Some(meta) = meta {

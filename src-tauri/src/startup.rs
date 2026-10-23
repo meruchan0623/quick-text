@@ -159,13 +159,11 @@ pub fn defer_autostart_repair(
 /// Starting.
 pub fn start_engine(engine: Arc<Shared>, runtime: Arc<Runtime>) {
     // Registered before the session window exists; runs on it at
-    // WM_ENDSESSION, so it only sets the shutdown flag.
+    // WM_ENDSESSION (see [`end_session`]).
     #[cfg(windows)]
     {
         let runtime = Arc::clone(&runtime);
-        quicker_platform::on_session_end(Box::new(move || {
-            supervisor_wiring::begin_shutdown(&runtime);
-        }));
+        quicker_platform::on_session_end(Box::new(move || end_session(&runtime)));
     }
     let started = quicker_platform::start_engine(engine.clone());
     if let Err(message) = &started {
@@ -181,6 +179,21 @@ pub fn start_engine(engine: Arc<Shared>, runtime: Arc<Runtime>) {
     let (executor, inputs) = supervisor_wiring::platform_adapters(&started);
     let clock = Arc::clone(runtime.clock());
     supervisor_wiring::install_supervisor(clock, runtime, executor, inputs);
+}
+
+/// The session-end callback (R5): runs on the session window thread while
+/// it handles `WM_ENDSESSION`, real or replayed by the `session_end` fault,
+/// and Windows may end the process as soon as it returns. The engine stops,
+/// then the run marker is cleared, one small atomic write and no waiting.
+/// [`on_run_event`] clears it too, but only if tao turns the session end
+/// into `RunEvent::Exit` before the process dies (待实测), and the fault
+/// never reaches tao; a marker left behind would count the shutdown as a
+/// crash, and two of them in a row would end in SafeMode(CrashLoop).
+/// Clearing twice is a no-op.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn end_session(runtime: &Runtime) {
+    supervisor_wiring::begin_shutdown(runtime);
+    store::clear_run_marker_on_session_end();
 }
 
 /// What startup did once its self-test finished (B-10).

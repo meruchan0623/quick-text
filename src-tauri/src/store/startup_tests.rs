@@ -16,7 +16,7 @@ use super::{
 use crate::{
     autostart::LoginItem,
     error::{CommandError, EntityKind, SafeModeReason},
-    startup::{defer_autostart_repair, finish_self_test, ProblemKind, StartupListen},
+    startup::{defer_autostart_repair, end_session, finish_self_test, ProblemKind, StartupListen},
 };
 use quicker_domain::*;
 use quicker_platform::{
@@ -1102,10 +1102,15 @@ fn consecutive_crashes_enter_crash_loop() {
     assert_eq!(meta_on_disk(&dir).crash_count, 0);
 }
 
+/// Tests that go through the process-wide session meta
+/// (`register_session_meta`) run one at a time.
+static SESSION_META_TESTS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 /// S-04 acceptance: a session end (`WM_ENDSESSION` → `RunEvent::Exit`)
 /// followed by immediate restarts never reaches SafeMode(CrashLoop).
 #[test]
 fn session_end_restarts_are_not_crashes() {
+    let _one_at_a_time = SESSION_META_TESTS.lock();
     let dir = TempDir::new();
     let world = world();
     write(&dir, "active.json", &bytes(&config_at(1)));
@@ -1118,6 +1123,39 @@ fn session_end_restarts_are_not_crashes() {
         assert!(meta_on_disk(&dir).run_marker.is_none());
         world.advance(1_000);
     }
+}
+
+/// R5, plan B-04: the session-end callback (`WM_ENDSESSION`, or the
+/// `session_end` fault replaying it on the session window, which never
+/// reaches tao) stops the engine and clears the run marker itself. The
+/// process may then end without `RunEvent::Exit`; restarting right away,
+/// again and again, is not a crash loop.
+#[test]
+fn session_end_callback_clears_the_marker_without_exit() {
+    let _one_at_a_time = SESSION_META_TESTS.lock();
+    let dir = TempDir::new();
+    let world = world();
+    write(&dir, "active.json", &bytes(&config_at(1)));
+    for _ in 0..3 {
+        let store = Store::load_with(dir.path(), &env(&world));
+        assert_eq!(store.safe_mode(), None);
+        assert_eq!(meta_on_disk(&dir).crash_count, 0);
+        assert!(meta_on_disk(&dir).run_marker.is_some());
+        super::register_session_meta(&store);
+        end_session(&store.runtime);
+        assert!(store.runtime.shutting_down());
+        assert!(meta_on_disk(&dir).run_marker.is_none());
+        // The process ends: no RunEvent::Exit, nothing else clears.
+        drop(store);
+        world.advance(1_000);
+    }
+    // The same restarts without the callback are a crash loop.
+    for _ in 0..2 {
+        drop(Store::load_with(dir.path(), &env(&world)));
+        world.advance(1_000);
+    }
+    let store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.safe_mode(), Some(SafeModeReason::CrashLoop));
 }
 
 /// Plan §7.2: in safe mode every write command returns `SafeMode`; only an
