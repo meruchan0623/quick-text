@@ -756,6 +756,34 @@ function Select-TrackedProcess([object[]] $Procs, $TrackedPid) {
     return $chosen
 }
 
+# Records that the tracked process is $ProcId at $Now. Returns $true when it is
+# another PID than the one tracked so far (the process restarted).
+function Register-ProcessSeen([int] $ProcId, [DateTime] $Now) {
+    $changed = $false
+    if ($null -ne $script:TrackedPid -and $ProcId -ne $script:TrackedPid) {
+        $changed = $true
+        $script:PidChanges++
+    }
+    $script:TrackedPid = $ProcId
+    if (-not $script:SeenPids.Contains($ProcId)) { $script:SeenPids.Add($ProcId) }
+    $script:ProcessEverSeen = $true
+    Close-Period $script:AbsentTracker $Now
+    return $changed
+}
+
+# No process found at $Now. Counts only once the process has been seen.
+function Set-ProcessAbsent([DateTime] $Now) {
+    if ($script:ProcessEverSeen) {
+        Open-Period $script:AbsentTracker $Now ''
+        if ($script:Health -ne 'exited' -and $script:Health -ne 'notstarted') {
+            Set-Health 'exited' $Now '采样时进程不存在'
+            Set-Listen 'unknown' '采样时进程不存在' $Now
+            Close-Period $script:SafeTracker $Now
+            Close-AllInputLost $Now '采样时进程不存在'
+        }
+    }
+}
+
 function Invoke-Sample {
     $now = [DateTime]::Now
     $script:TickLines = 0
@@ -785,14 +813,7 @@ function Invoke-Sample {
         $procId = $chosen.Id
         $s.Exists = $true
         $s.ProcId = $procId
-        if ($null -ne $script:TrackedPid -and $procId -ne $script:TrackedPid) {
-            $s.PidChanged = $true
-            $script:PidChanges++
-        }
-        $script:TrackedPid = $procId
-        if (-not $script:SeenPids.Contains($procId)) { $script:SeenPids.Add($procId) }
-        $script:ProcessEverSeen = $true
-        Close-Period $script:AbsentTracker $now
+        $s.PidChanged = Register-ProcessSeen $procId $now
         try { $s.WS = [double]$chosen.WorkingSet64 } catch { }
         try { $s.PB = [double]$chosen.PrivateMemorySize64 } catch { }
         try { $s.Handles = [double]$chosen.HandleCount } catch { }
@@ -821,15 +842,7 @@ function Invoke-Sample {
         if (-not $logDirExists) { $script:LogDirMissingSamples++ }
         elseif ($logStatus -eq 'missing') { $script:LogMissingSamples++ }
     } else {
-        if ($script:ProcessEverSeen) {
-            Open-Period $script:AbsentTracker $now ''
-            if ($script:Health -ne 'exited' -and $script:Health -ne 'notstarted') {
-                Set-Health 'exited' $now '采样时进程不存在'
-                Set-Listen 'unknown' '采样时进程不存在' $now
-                Close-Period $script:SafeTracker $now
-                Close-AllInputLost $now '采样时进程不存在'
-            }
-        }
+        Set-ProcessAbsent $now
     }
     foreach ($p in $procs) { try { $p.Dispose() } catch { } }
 
