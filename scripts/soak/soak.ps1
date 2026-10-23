@@ -668,6 +668,24 @@ function Get-UnavailableReasons([bool] $Exists) {
     return [string]::Join('、', $why.ToArray())
 }
 
+# The process to follow among same-named ones: the one tracked so far, else the
+# earliest started.
+function Select-TrackedProcess([object[]] $Procs, $TrackedPid) {
+    $chosen = $null
+    if ($null -ne $TrackedPid) {
+        foreach ($p in $Procs) { if ($p.Id -eq $TrackedPid) { $chosen = $p; break } }
+    }
+    if ($null -eq $chosen) {
+        $bestStart = [DateTime]::MaxValue
+        foreach ($p in $Procs) {
+            $st = [DateTime]::MaxValue
+            try { $st = $p.StartTime } catch { }
+            if ($null -eq $chosen -or $st -lt $bestStart) { $chosen = $p; $bestStart = $st }
+        }
+    }
+    return $chosen
+}
+
 function Invoke-Sample {
     $now = [DateTime]::Now
     $script:TickLines = 0
@@ -683,18 +701,7 @@ function Invoke-Sample {
     if ($null -ne $procs) { $count = $procs.Length }
     if ($count -gt 1) { $script:MultiProcessSamples++ }
 
-    $chosen = $null
-    if ($null -ne $script:TrackedPid) {
-        foreach ($p in $procs) { if ($p.Id -eq $script:TrackedPid) { $chosen = $p; break } }
-    }
-    if ($null -eq $chosen) {
-        $bestStart = [DateTime]::MaxValue
-        foreach ($p in $procs) {
-            $st = [DateTime]::MaxValue
-            try { $st = $p.StartTime } catch { }
-            if ($null -eq $chosen -or $st -lt $bestStart) { $chosen = $p; $bestStart = $st }
-        }
-    }
+    $chosen = Select-TrackedProcess $procs $script:TrackedPid
 
     $s = [pscustomobject]@{
         Time = $now; Exists = $false; ProcId = $null; PidChanged = $false; Count = $count
@@ -1317,6 +1324,64 @@ function Write-SummaryFile([string] $Status) {
     return $text
 }
 
+# Run state, reset before a run (and by soak.Tests.ps1 before each case).
+function Initialize-SoakState {
+    $script:Samples = [System.Collections.Generic.List[object]]::new()
+    $script:TrackedPid = $null
+    $script:SeenPids = [System.Collections.Generic.List[int]]::new()
+    $script:PidChanges = 0
+    $script:MultiProcessSamples = 0
+    $script:ProcessEverSeen = $false
+    $script:AbsentTracker = New-Tracker
+    $script:LastCpu = $null
+    $script:LastCpuAt = [DateTime]::MinValue
+    $script:LastCpuPid = $null
+    $script:SampleFailures = 0
+    $script:LastSampleFailure = ''
+    $script:ActiveSampleCount = 0
+
+    $script:Baseline = $false
+    $script:CurrentLog = $null
+    $script:PreviousLog = $null
+    $script:Offsets = @{}
+    $script:LogLines = 0
+    $script:ContinuationLines = 0
+    $script:NoEventLines = 0
+    $script:LevelCounts = @{}
+    $script:LogBytes = [long]0
+    $script:LogResets = 0
+    $script:LogRollovers = 0
+    $script:LogMissingSamples = 0
+    $script:LogDirMissingSamples = 0
+    $script:LogReadErrors = 0
+    $script:LogOversized = 0
+    $script:TickLines = 0
+    $script:TickEvents = 0
+    $script:TickErrors = 0
+    $script:Events = @{}
+    $script:ErrorEvents = @{}
+
+    $script:Health = 'notstarted'
+    $script:BaselineHealthVia = ''
+    $script:HealthTransitions = [System.Collections.Generic.List[object]]::new()
+    $script:Listen = 'unknown'
+    $script:ListenWhy = ''
+    $script:ListenTransitions = [System.Collections.Generic.List[object]]::new()
+    $script:SafeTracker = New-Tracker
+    $script:InputLost = @{}
+    $script:InputLostPeriods = [System.Collections.Generic.List[object]]::new()
+    $script:ReattachFailed = 0
+    $script:AppStarts = 0
+    $script:UncleanStarts = 0
+    $script:LastProcessEvent = ''
+
+    $script:CsvWriter = $null
+    $script:EventsWriter = $null
+    $script:Completed = $false
+    $script:Failure = ''
+    $script:Finished = $false
+}
+
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
@@ -1413,60 +1478,7 @@ public static class QtSoakNative
 }
 
 # State
-$script:Samples = [System.Collections.Generic.List[object]]::new()
-$script:TrackedPid = $null
-$script:SeenPids = [System.Collections.Generic.List[int]]::new()
-$script:PidChanges = 0
-$script:MultiProcessSamples = 0
-$script:ProcessEverSeen = $false
-$script:AbsentTracker = New-Tracker
-$script:LastCpu = $null
-$script:LastCpuAt = [DateTime]::MinValue
-$script:LastCpuPid = $null
-$script:SampleFailures = 0
-$script:LastSampleFailure = ''
-$script:ActiveSampleCount = 0
-
-$script:Baseline = $false
-$script:CurrentLog = $null
-$script:PreviousLog = $null
-$script:Offsets = @{}
-$script:LogLines = 0
-$script:ContinuationLines = 0
-$script:NoEventLines = 0
-$script:LevelCounts = @{}
-$script:LogBytes = [long]0
-$script:LogResets = 0
-$script:LogRollovers = 0
-$script:LogMissingSamples = 0
-$script:LogDirMissingSamples = 0
-$script:LogReadErrors = 0
-$script:LogOversized = 0
-$script:TickLines = 0
-$script:TickEvents = 0
-$script:TickErrors = 0
-$script:Events = @{}
-$script:ErrorEvents = @{}
-
-$script:Health = 'notstarted'
-$script:BaselineHealthVia = ''
-$script:HealthTransitions = [System.Collections.Generic.List[object]]::new()
-$script:Listen = 'unknown'
-$script:ListenWhy = ''
-$script:ListenTransitions = [System.Collections.Generic.List[object]]::new()
-$script:SafeTracker = New-Tracker
-$script:InputLost = @{}
-$script:InputLostPeriods = [System.Collections.Generic.List[object]]::new()
-$script:ReattachFailed = 0
-$script:AppStarts = 0
-$script:UncleanStarts = 0
-$script:LastProcessEvent = ''
-
-$script:CsvWriter = $null
-$script:EventsWriter = $null
-$script:Completed = $false
-$script:Failure = ''
-$script:Finished = $false
+Initialize-SoakState
 
 # ---------------------------------------------------------------------------
 # Run
