@@ -145,7 +145,15 @@ export function problemText(problem: StartupProblem, engine: EngineNow | null = 
   switch (problem.kind) {
     case 'safe_mode': {
       const reason = str(a.reason);
-      return `已进入安全模式：${reason ? label(safeModeNames, reason) : '原因未知'}。输入监听已暂停，设置暂时不能修改；可以导入配置或打开数据目录检查。`;
+      const why = reason ? label(safeModeNames, reason) : '原因未知';
+      // Importing leaves only CrashLoop and NoValidConfig (Rust `import_leaves_safe_mode`); in
+      // Locked and NewerSchema the unread file must not be replaced, so import is not offered.
+      if (reason === 'locked')
+        // The backend retries the read (`spawn_locked_retry`); leaving safe mode keeps the pause.
+        return `已进入安全模式：${why}。输入监听已暂停，期间不会写入任何文件；占用解除后会自动退出安全模式，之后点「恢复监听」即可继续。也可以打开数据目录检查。`;
+      if (reason === 'newer_schema')
+        return `已进入安全模式：${why}。当前版本以只读方式打开，不会修改或覆盖它，输入监听已暂停；请改用更新版本的 Quicker Text，或打开数据目录检查。`;
+      return `已进入安全模式：${why}。输入监听已暂停，设置暂时不能修改；可以导入配置或打开数据目录检查。`;
     }
     case 'recovered': {
       const revision = num(a.revision);
@@ -206,6 +214,9 @@ export function problemText(problem: StartupProblem, engine: EngineNow | null = 
     }
     case 'store_meta_reset':
       return '启动记录文件无法读取，已重新建立；连续启动失败的计数已清零。';
+    case 'backup_failed':
+      // Wording from docs/ipc-contract-0.4.md §3 (R6): every write is refused and retried.
+      return '升级前备份失败，暂时不能保存，已有配置照常生效。';
     default:
       return `启动时发现一个问题：${other(problem.kind)}。可在「运行状态与恢复」中导出诊断包了解详情。`;
   }

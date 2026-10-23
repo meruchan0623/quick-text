@@ -113,5 +113,6 @@ GPL-3.0-or-later 第 1 节的「对应源码」包括编进二进制文件的第
 - [ ] 下载 `…-package`、`…-release-notes` 附件，核对 `Quicker-Text-<版本>-SHA256SUMS.txt`（`Get-FileHash -Algorithm SHA256`）。`…-package` 里要有 `Source.zip`、`Source-deps.zip` 和 `THIRD-PARTY-LICENSES.txt`。发布绿色包时，绿色包 ZIP 与 `Source-deps.zip` 一起核对、一起上传。
 - [ ] 在干净的 Windows 机器上运行安装包（或绿色版 exe）：能启动；安装向导显示 GPL 许可证页；程序目录里有 `THIRD-PARTY-LICENSES.txt`（第 2 节）；卸载干净。
 - [ ] 按 `docs/acceptance.md` 和发布前手工清单完成实机最小集（记事本、Chrome、微信 PC 版，各配合微软拼音）并存档。真实钩子的注入测试没有自托管 runner 时，在这里以手工记录替代（开发计划 R-10）。
+- [ ] 0.4 起：按 `docs/acceptance-0.4-manual.md`（0.4 实机验收清单）逐条填写结果，连同日志、诊断包一起存档；§12 汇总表的退出标准全部打勾后才能发布。
 - [ ] 创建 GitHub Release（草稿）：上传 `…-package` 里的全部文件，包括 `Source.zip`、`Source-deps.zip`（体积大，上传需要一些时间）和 `THIRD-PARTY-LICENSES.txt`，一个都不能少；说明以 `release-notes.md` 的内容开头（许可证与源码获取），之后写更新内容和已知限制；说明平台定位（macOS 未验收）。
 - [ ] 对照第 2 节核对完毕后再点发布。

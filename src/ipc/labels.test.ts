@@ -122,6 +122,15 @@ describe('labels', () => {
     expectNamed(logLevelNames, ['error', 'warn', 'info', 'debug', 'trace']);
   });
 
+  it('names the self-test checks as the backend notice does (startup.rs check_label)', () => {
+    expect(selfTestNames).toEqual({
+      raw_input: '原始键盘输入',
+      hook_heartbeat: '键盘鼠标监听',
+      foreground: '前台窗口识别',
+      clipboard: '剪贴板',
+    });
+  });
+
   it('shows an unknown value as 其他 with the raw text, and never throws', () => {
     expect(label(reasonNames, 'quantum_tunnel')).toBe('其他（quantum_tunnel）');
     expect(label(capabilityNames, 'telepathy')).toBe('其他（telepathy）');
