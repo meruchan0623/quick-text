@@ -23,6 +23,7 @@
 | 测试 | `cargo test --workspace --locked` | |
 | 构建没有改依赖锁文件 | `git diff --exit-code -- Cargo.lock package-lock.json` | 发布的依赖版本就是仓库里固定的版本 |
 | PDB 与 exe 中没有故障注入函数 | `scripts/check-binary-strings.ps1`，对归档的 PDB 与 `quicker-text.exe` | 不含 `debug_inject_fault`；同一次扫描要求 PDB 含 `quicker_platform`、exe 含 `com.quickertext.desktop`，空文件或编码不对的文件通不过 |
+| 打包进 exe 的前端没有 mock 后端 | `node scripts/check-bundle.mjs --scan-only dist`（安装包构建之后、打包之前；PR 的 `frontend` 任务跑不带参数的 `npm run check:bundle`） | `tauri build` 经 `build.beforeBuildCommand` 构建到 `dist/` 并压缩嵌入 exe 的那份前端里，没有 mock 分块，也没有只在 `src/ipc/mock.ts` 里出现的标记字符串；`--scan-only` 不重新构建，直接扫描构建留下的 `dist/`，另做一次把 mock 打进去的对照构建（写到临时目录），对照里找不到就判定扫描失效（FE-18） |
 | 第三方版权与许可证文字 | `scripts/generate-third-party-licenses.ps1`（`notices` 任务在 PR 里也会跑 `-CheckOnly`） | 为实际分发的每个 Rust crate 和 npm 包收集版权与许可证原文，生成 `THIRD-PARTY-LICENSES.txt`；任何一个包找不到许可证文字就失败，不写文件（S-28） |
 | 依赖源码包（先于安装包构建） | `scripts/package-dependency-sources.ps1` | 生成 `Quicker-Text-<版本>-Source-deps.zip`：`cargo vendor --locked` 的全部 crate、会进入前端产物的 npm 生产依赖（用 `npm pack` 取的注册表原始 tarball，放在 `npm/tarballs/`，每个都按 `package-lock.json` 的 sha512 `integrity` 校验）、离线重建说明；检查实际分发的每个 crate 都在、数量与 `Cargo.lock` 一致、只靠这些源码 cargo 能离线解析工作区；写完后用门槛函数把成品再验一遍，不通过就删掉这个包（S-28、B-51）。不需要先 `npm ci` |
 | 安装包构建的门槛 | `src-tauri/tauri.conf.json` 的 `build.beforeBundleCommand`，即 `scripts/check-bundle-preconditions.ps1` | Tauri 在编译完成、写安装包之前运行它。声明文件是占位文件、没有设置 `QT_DEPENDENCY_SOURCES_ZIP`、依赖源码包与本树锁文件不符或不完整，或平台不是 Windows x64，都使打包失败，不产出安装包（见下面「产出可分发二进制的路径」） |

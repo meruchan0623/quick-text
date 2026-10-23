@@ -10,7 +10,8 @@
 #   macos-check    every PR            cargo check --workspace (ADR-f: compile check only)
 #   deps           every PR; weekly    dependency direction + cargo deny (B-51); the
 #                                      advisories check runs weekly / on demand only
-#   frontend       every PR            typecheck, lint, format, test (FE-53)
+#   frontend       every PR            typecheck, lint, format, test (FE-53), check:bundle
+#                                      (no mock backend in production builds, FE-18)
 #   notices        every PR            every distributed Rust crate and npm package has a license
 #                                      text for THIRD-PARTY-LICENSES.txt (S-28); the release
 #                                      workflow generates the real file and fails the same way
@@ -182,6 +183,12 @@ jobs:
 
       - name: Test
         run: npm run test
+
+      # FE-18: production builds (plain and VITE_MOCK=1) contain no mock backend, with a
+      # control build that proves the scan sees it when it is there. The release workflow scans
+      # the dist/ that `tauri build` embeds (--scan-only).
+      - name: Bundle has no mock backend (FE-18)
+        run: npm run check:bundle
 
   # Early warning for the release gate: a dependency bump that brings in a crate without a
   # license file fails here, not on release day. Checks only, writes nothing
