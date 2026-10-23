@@ -596,6 +596,11 @@ where
             failure = Some(e.into());
             break;
         }
+        // The match proof's focus/caret stamp protects the first output only:
+        // once we send, our own keys (Enter, Tab) move focus and caret, and a
+        // stale stamp would stop every later step. Window, generation, pause,
+        // cancel and modifier checks still run before each step.
+        rawinput::install(None);
         let result = (|| -> Result<(), Stop> {
             match &step.operation {
                 Operation::Text {
@@ -836,6 +841,37 @@ mod tests {
             ..Default::default()
         };
         assert!(preflight(&plan).is_err());
+    }
+    #[test]
+    fn every_windows_key_name_the_parser_accepts_has_a_code() {
+        for name in [
+            "Enter",
+            "PRIOR",
+            "NEXT",
+            "APPS",
+            "RWIN",
+            "SHIFTKEY",
+            "LCONTROLKEY",
+            "ADD",
+            "DECIMAL",
+            "NUMPAD0",
+            "NUMPAD9",
+            "OEMPLUS",
+            "OEMBACKSLASH",
+            "BROWSERHOME",
+            "SCROLL",
+            "BREAK",
+        ] {
+            assert!(quicker_domain::parse_key(name).is_ok(), "{name}");
+            assert!(vk(&Key::named(name)).is_ok(), "{name}");
+        }
+        assert_eq!(vk(&Key::named("NUMPAD7")), Ok(0x67));
+    }
+    #[test]
+    fn repeated_enter_presses_pass_preflight() {
+        let plan = quicker_domain::parse_sendkeys("ab{Enter 3}~").unwrap();
+        assert_eq!(plan.steps.len(), 5);
+        assert!(preflight(&plan).is_ok());
     }
     #[test]
     fn unknown_native_key_fails_preflight() {

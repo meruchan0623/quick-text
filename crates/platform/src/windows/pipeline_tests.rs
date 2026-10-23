@@ -617,9 +617,10 @@ fn unchanged_stamp_passes_guard_and_completes() {
     assert_eq!(rig.chords(), 1);
     assert_eq!(rig.clipboard.content(), clip("original"));
     // The guard compared live stamps: 3 pre-erase checks (one after the
-    // paste write), 3 backspaces, the step check and the paste check.
+    // paste write), 3 backspaces and the step check; the proof is dropped
+    // once the first output is about to be sent.
     let compared = rig.foreground.input_context_reads() - reads;
-    assert!(compared >= 8, "stamp read {compared} times");
+    assert!(compared >= 7, "stamp read {compared} times");
 }
 
 #[test]
