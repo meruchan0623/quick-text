@@ -50,7 +50,7 @@
 //! | `clipboard.slow` | warn | the clipboard was held open past its budget; `held_ms`, `budget_ms` |
 //! | `clipboard.unreadable` | warn | an enumerated clipboard format gave no data or unreadable memory; the backup is refused; format id |
 //! | `clipboard.worker_failed` | warn | the clipboard backup worker thread did not start; error |
-//! | `command.execute_failed` | warn / error | a manual run (`execute_action`) failed: fenced or refused by the send exclusion (`category` `stalled`, warn, with the `health` returned), or otherwise (`run_failed`, error, with its `trace_id`); the run's reason code, never the run's text |
+//! | `command.execute_failed` | warn / error | a manual run (`execute_action`) failed: fenced or refused by the send exclusion (`category` `stalled`, warn, with the `health` returned), or otherwise (`run_failed`, error, with its `trace_id`); the run's reason code, never the run's text; or a thread of the run did not start (`spawn_failed`, error: the `thread` name, the OS error's `kind` and `os_code`, the `trace_id`) |
 //! | `command.execute_refused` | warn | a manual run (`execute_action`) refused before it started because earlier runs' jobs have not ended (`reason` `jobs_exhausted`, the `limit`, the `health` read); no content |
 //! | `command.internal` | error | `CommandError::Internal`; `trace_id` and the original error |
 //! | `command.io` | warn | `CommandError::Io`; operation, file name, OS error |
