@@ -1802,7 +1802,7 @@ flowchart LR
 **数据目录**
 - 保留：`active.json` 是生效配置，外部编辑者只需关心这一个文件；`draft.json` 是旧版遗留文件，0.5 起不再读写：首次启动时如果它存在，显示一次「旧版草稿」横幅（ADR-a、§6.3 ⑪），用户处理后删除（升级前已备份到 `backup-pre-0.5/`）；`previous.json`（【现状】回退一级）和 `migration-unresolved.json`（【现状】Quicker 导入中无法转换的条目）只读兼容，后者 v2 起并入导入那次 revision 的元数据。
 - 改造：`revisions/` + `index.json`【现状】无限增长（`src-tauri/src/main.rs:245-248`），改为带元数据与保留策略（B-25），清理进 `revisions/trash/`（F-53）。
-- 新增：`prefs.json`（`app`、`ui` 两节，不进版本历史、不随导出）；`stats.json`（B-36，0.6）；`store-meta.json`（`last_good_revision`、运行标记、连续崩溃计数，B-04）；`logs/` 与 `crash-*.txt`（B-09）；被隔离的 `*.corrupt-<时间>.json`（B-04）；升级前备份 `backup-pre-0.4/`、`backup-pre-0.5/`、`backup-pre-v2/`（§9）。
+- 新增：`prefs.json`（`app`、`ui` 两节，不进版本历史、不随导出）；`stats.json`（B-36，0.6）；`store-meta.json`（`last_good_revision`、`previous_revision`（每次发布记录被替换的版本，即回滚目标；缺失时按 `revisions/<active-1>.json`、`previous.json` 推断）、运行标记、连续崩溃计数，B-04）；`logs/` 与 `crash-*.txt`（B-09）；被隔离的 `*.corrupt-<时间>.json`（B-04）；升级前备份 `backup-pre-0.4/`、`backup-pre-0.5/`、`backup-pre-v2/`（§9）。
 
 **可观测性**（B-09、B-44）
 - 日志写到 `logs/quicker-text.YYYY-MM-DD.log`，按天滚动、保留 7 天；事件按 `<组件>.<事件>` 命名，例如 `executor.panic`、`hook.reinstall`、`store.quarantine`、`supervisor.circuit_open`。

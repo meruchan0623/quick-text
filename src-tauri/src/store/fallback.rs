@@ -3,7 +3,10 @@
 //! every way the data directory can be broken ends in a [`LoadOutcome`].
 use super::{
     atomic::atomic_json,
-    meta::{next_crash_count, parse_meta, RunMarker, StoreMeta, CRASH_LOOP_THRESHOLD, META_FILE},
+    meta::{
+        next_crash_count, parse_meta, PreviousRevision, RunMarker, StoreMeta, CRASH_LOOP_THRESHOLD,
+        META_FILE,
+    },
 };
 use crate::{
     error::{file_label, SafeModeReason},
@@ -262,7 +265,7 @@ pub fn load_or_fallback(dir: &Path, env: &StoreEnv) -> LoadReport {
         }
         Candidate::Newer => return loader.read_only(SafeModeReason::NewerSchema, meta),
     };
-    let previous = loader.previous(&active);
+    let previous = loader.previous(&active, meta.previous_revision);
 
     // Rules that did not compile plus entries that did not read; entries
     // without a string id count but have no id to list.
@@ -588,16 +591,34 @@ impl Loader<'_> {
 
     /// The configuration `rollback` returns to. Not a fallback candidate: a
     /// file that does not read only makes rollback unavailable.
-    fn previous(&self, active: &Config) -> Option<Config> {
-        let historical = self
-            .dir
-            .join("revisions")
-            .join(format!("{}.json", active.revision.saturating_sub(1)));
-        let path = if active.revision > 0 && historical.exists() {
-            historical
-        } else {
-            self.dir.join("previous.json")
+    ///
+    /// The predecessor the publish of `active` recorded, so that a restart
+    /// keeps the rollback target of the session before (R3); `None` when it
+    /// replaced the empty stand-in. Without a record for this revision (a
+    /// meta file from before it existed, not written or rebuilt, or a
+    /// revision published by 0.3.1), or when the recorded snapshot is gone,
+    /// the predecessor is guessed as before: `revisions/<active - 1>.json`,
+    /// then `previous.json`.
+    fn previous(&self, active: &Config, recorded: Option<PreviousRevision>) -> Option<Config> {
+        let revisions = self.dir.join("revisions");
+        let recorded = match recorded {
+            Some(PreviousRevision {
+                active: of,
+                revision,
+            }) if of == active.revision => {
+                let n = revision?;
+                Some(revisions.join(format!("{n}.json"))).filter(|path| path.exists())
+            }
+            _ => None,
         };
+        let path = recorded.unwrap_or_else(|| {
+            let historical = revisions.join(format!("{}.json", active.revision.saturating_sub(1)));
+            if active.revision > 0 && historical.exists() {
+                historical
+            } else {
+                self.dir.join("previous.json")
+            }
+        });
         let Read::Bytes(bytes) = self.read(&path) else {
             return None;
         };

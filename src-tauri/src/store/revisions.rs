@@ -3,6 +3,7 @@ use super::{
     atomic::atomic_json,
     fallback::revision_numbers,
     load::{hash_file, read_config},
+    meta::PreviousRevision,
     metadata::metadata_for_config,
     Store,
 };
@@ -89,6 +90,21 @@ impl Store {
                 &self.dir.join("active-migration-unresolved.json"),
                 &metadata,
             )?;
+            // R3: the predecessor is recorded before the new revision becomes
+            // active, so that after a restart rollback returns where it would
+            // now. If it is not written (store-meta.json read-only this
+            // session, or the write fails), the entry left on disk describes
+            // an older active revision, and the next load guesses as before.
+            let previous = PreviousRevision {
+                active: config.revision,
+                revision: old_on_disk.then_some(old.revision),
+            };
+            if let Err(e) = self
+                .meta
+                .update(|meta| meta.previous_revision = Some(previous))
+            {
+                tracing::warn!(event = "store.meta_write_failed", error = %e, "store-meta.json not written");
+            }
             atomic_json(&self.dir.join("active.json"), &config)?;
             Ok::<_, CommandError>(())
         })();

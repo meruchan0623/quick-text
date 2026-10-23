@@ -1,5 +1,6 @@
-//! `store-meta.json` (B-04): last-known-good revision, the run marker and
-//! the consecutive crash count. A new file that 0.3.1 never reads (§9), so
+//! `store-meta.json` (B-04): last-known-good revision, the predecessor of
+//! the active revision, the run marker and the consecutive crash count. A
+//! new file that 0.3.1 never reads (§9), so
 //! nothing here touches `active.json` or `revisions/<n>.json`.
 use super::atomic::atomic_json;
 use serde::{Deserialize, Serialize};
@@ -22,11 +23,29 @@ const BOOT_ID_TOLERANCE_S: u64 = 10;
 #[serde(default)]
 pub struct StoreMeta {
     pub last_good_revision: Option<u64>,
+    /// What rollback returns to after a restart (R3), written by every
+    /// publish. Absent in a file from before it existed.
+    pub previous_revision: Option<PreviousRevision>,
     pub run_marker: Option<RunMarker>,
     pub crash_count: u32,
     /// Fields written by a newer release, kept verbatim (B-43).
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// The revision a publish replaced: the one rollback returns to. Recorded
+/// because it is a fact that `active - 1` only guesses: revision 3
+/// published over revision 1 recovered as last-known-good is not preceded
+/// by revision 2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviousRevision {
+    /// The revision that was published. Any other active revision (one
+    /// published by 0.3.1, which never writes this file, or one recovered
+    /// from a fallback) is not described by this entry.
+    pub active: u64,
+    /// `revisions/<n>.json`; `None` when `active` replaced the empty
+    /// stand-in, which is never backed up, so there is nothing to return to.
+    pub revision: Option<u64>,
 }
 
 /// Written at startup and cleared on a clean exit or session end; one still
@@ -222,6 +241,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.last_good_revision, Some(4));
+        // A file from before the predecessor was recorded (R3).
+        assert_eq!(parsed.previous_revision, None);
         let expected = RunMarker {
             boot_id: Some(7),
             started_ms: 9,
@@ -235,6 +256,21 @@ mod tests {
         assert!(parse_meta(b"{\"crash_count\": \"x\"}").is_none());
         assert!(parse_meta(b"{trunc").is_none());
         assert_eq!(parse_meta(b"{}"), Some(StoreMeta::default()));
+        let recorded = parse_meta(
+            b"{\"previous_revision\": {\"active\": 3, \"revision\": 1}, \"crash_count\": 0}",
+        )
+        .unwrap();
+        let previous = PreviousRevision {
+            active: 3,
+            revision: Some(1),
+        };
+        assert_eq!(recorded.previous_revision, Some(previous));
+        assert!(recorded.extra.is_empty());
+        let written = serde_json::to_value(&recorded).unwrap();
+        assert_eq!(
+            written["previous_revision"],
+            serde_json::json!({"active": 3, "revision": 1})
+        );
     }
 
     #[cfg(windows)]

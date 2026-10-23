@@ -9,7 +9,7 @@ use super::{
         StoreIo,
     },
     load::read_config,
-    meta::{parse_meta, StoreMeta, META_FILE},
+    meta::{parse_meta, PreviousRevision, StoreMeta, META_FILE},
     test_support::*,
     RecoverySource, Store,
 };
@@ -822,6 +822,168 @@ fn directories_not_found_are_empty() {
     let store = Store::load_with(dir.path(), &env(&world));
     assert_eq!(store.safe_mode(), None);
     assert!(store.startup_problems().is_empty());
+}
+
+/// Writes `revisions/<revision>.json` with the one rule `id`, and its
+/// metadata: a migration original marked `id`.
+fn write_revision(dir: &Path, revision: u64, id: &str) -> Config {
+    let config = Config {
+        revision,
+        ..metadata_config(&[id])
+    };
+    write(dir, &format!("revisions/{revision}.json"), &bytes(&config));
+    let metadata = dir.join(format!("revisions/{revision}.metadata.json"));
+    atomic_json(&metadata, &vec![original(id, id)]).unwrap();
+    config
+}
+/// What rollback would return to, with its migration metadata.
+fn rollback_target(store: &Store) -> (Option<Config>, Value) {
+    let metadata = serde_json::to_value(&store.previous_unresolved).unwrap();
+    (store.previous.clone(), metadata)
+}
+
+/// F4-1 review R3: rollback returns to the same configuration before and
+/// after a restart. Recovered from last-known-good revision 1 (bypassing
+/// revision 2), revision 3 is published over revision 1: after a clean
+/// restart rollback restores revision 1 with its migration metadata, not
+/// revision 2. A rollback is a publish too: its predecessor survives the
+/// next restart as well, and rolling back again goes back again.
+#[test]
+fn rollback_target_survives_a_restart_after_recovery() {
+    let dir = TempDir::new();
+    let world = world();
+    let one = write_revision(&dir, 1, "one");
+    write_revision(&dir, 2, "two");
+    write(&dir, "active.json", TRUNCATED);
+    let meta = StoreMeta {
+        last_good_revision: Some(1),
+        ..StoreMeta::default()
+    };
+    atomic_json(&dir.join(META_FILE), &meta).unwrap();
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.active, one);
+    let three = metadata_config(&["three"]);
+    store.publish(three.clone()).unwrap();
+    assert_eq!(store.active.revision, 3);
+    assert_eq!(store.previous.as_ref().unwrap().rules, one.rules);
+    assert_eq!(
+        meta_on_disk(&dir).previous_revision,
+        Some(PreviousRevision {
+            active: 3,
+            revision: Some(1)
+        })
+    );
+    let target = rollback_target(&store);
+    clean_exit(store, &world);
+
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.safe_mode(), None);
+    assert_eq!(store.active.revision, 3);
+    assert_eq!(rollback_target(&store), target);
+    store.rollback_previous().unwrap();
+    assert_eq!(store.active.revision, 4);
+    assert_eq!(store.active.rules, one.rules);
+    let restored = BTreeMap::from([("one".to_string(), "one".to_string())]);
+    assert_eq!(metadata_sources(store.unresolved.clone()), restored);
+    assert_eq!(store.previous.as_ref().unwrap().rules, three.rules);
+    let target = rollback_target(&store);
+    clean_exit(store, &world);
+
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.active.rules, one.rules);
+    assert_eq!(metadata_sources(store.active_unresolved.clone()), restored);
+    assert_eq!(rollback_target(&store), target);
+    store.rollback_previous().unwrap();
+    assert_eq!(store.active.revision, 5);
+    assert_eq!(store.active.rules, three.rules);
+    assert_eq!(store.previous.as_ref().unwrap().rules, one.rules);
+    let target = rollback_target(&store);
+    clean_exit(store, &world);
+    let store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(rollback_target(&store), target);
+}
+
+/// F4-1 review R3: without a record for the active revision the
+/// predecessor is guessed as before (`revisions/<active - 1>.json`, then
+/// `previous.json`): no `previous_revision` in store-meta.json (a file from
+/// before it existed), an entry for another active revision (one published
+/// by 0.3.1), or a recorded snapshot that is gone. A record that applies
+/// wins over the guess. When store-meta.json is read-only for a session,
+/// its publishes leave it untouched and the next launch guesses as before.
+#[test]
+fn rollback_target_without_a_record_is_guessed_as_before() {
+    let world = world();
+    let dir = TempDir::new();
+    let one = write_revision(&dir, 1, "one");
+    let two = write_revision(&dir, 2, "two");
+    let three = Config {
+        revision: 3,
+        ..metadata_config(&["three"])
+    };
+    write(&dir, "active.json", &bytes(&three));
+    let previous_with = |recorded: Option<PreviousRevision>| {
+        let meta = StoreMeta {
+            previous_revision: recorded,
+            ..StoreMeta::default()
+        };
+        atomic_json(&dir.join(META_FILE), &meta).unwrap();
+        load_or_fallback(&dir, &env(&world)).previous
+    };
+    let recorded = |active, revision| Some(PreviousRevision { active, revision });
+    for guessed in [None, recorded(2, Some(1)), recorded(3, Some(7))] {
+        assert_eq!(previous_with(guessed), Some(two.clone()), "{guessed:?}");
+    }
+    assert_eq!(previous_with(recorded(3, Some(1))), Some(one));
+    assert_eq!(previous_with(recorded(3, None)), None);
+
+    let dir = TempDir::new();
+    write_revision(&dir, 1, "one");
+    let two = Config {
+        revision: 2,
+        ..metadata_config(&["two"])
+    };
+    write(&dir, "active.json", &bytes(&two));
+    write(&dir, META_FILE, b"{}");
+    world.locked.lock().push(META_FILE);
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    store.publish(metadata_config(&["three"])).unwrap();
+    assert_eq!(store.previous, Some(two.clone()));
+    assert_eq!(fs::read(dir.join(META_FILE)).unwrap(), b"{}");
+    clean_exit(store, &world);
+    world.locked.lock().clear();
+    let store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.active.revision, 3);
+    assert_eq!(store.previous, Some(two));
+}
+
+/// F4-1 review R3: a revision published over the empty stand-in of a new
+/// data directory has no rollback target, also after a restart: not even
+/// a `previous.json` that the guess would take.
+#[test]
+fn stand_in_has_no_rollback_target_after_a_restart() {
+    let dir = TempDir::new();
+    let world = world();
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    store.publish(metadata_config(&["first"])).unwrap();
+    assert_eq!(store.previous, None);
+    assert_eq!(
+        meta_on_disk(&dir).previous_revision,
+        Some(PreviousRevision {
+            active: 1,
+            revision: None
+        })
+    );
+    clean_exit(store, &world);
+    write(&dir, "previous.json", &bytes(&config_at(0)));
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.previous, None);
+    assert!(matches!(
+        store.rollback_previous(),
+        Err(CommandError::NotFound {
+            kind: EntityKind::Revision,
+            ..
+        })
+    ));
 }
 
 /// Fallback order: last-known-good, other revisions newest first, then
