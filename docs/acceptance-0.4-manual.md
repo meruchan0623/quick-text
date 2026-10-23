@@ -1,6 +1,6 @@
 # 0.4 实机验收清单（S-25 书面记录模板）
 
-> 状态：2026-10-23 依据 `576aa5a`（`feat/0.4-stability-foundation`）编写，**全部条目待实测**。本文件是记录模板：实测时直接在每条的「结果」行填写，填完后连同日志、诊断包和录屏按 [release-checklist.md](release-checklist.md) §5 存档。
+> 状态：2026-10-23 依据 `576aa5a`（`feat/0.4-stability-foundation`）编写，同日按审查意见修订。修订时还依据了前端提交 `cfa41f2`（安全模式横幅按原因给出出路）、`e0fc068`（自检项改名「键盘鼠标监听」）、`9cbe400`（浸泡监视脚本），以及尚未合入 `integrate/0.4` 的分支头：存储 `fe31dec`（含升级前备份 R6、会话结束清标记 R5、回退目标 R3）、上次正常配置 `b32062f`、鼠标重挂 `384f8d1`、执行器 `02c3fd9`、发布卫生 `f5d553a`。**实测用的构建必须包含以上全部提交**，否则 SV-14、ST-13、CP-04、CP-05 等条目的预期不成立。**全部条目待实测**。本文件是记录模板：实测时直接在每条的「结果」行填写，填完后连同日志、诊断包和录屏按 [release-checklist.md](release-checklist.md) §5 存档。
 >
 > 依据：[开发计划](development-plan.md) §10 退出标准（第 2448 行）、§11 故障注入表（第 2481–2489 行）、隐私测试（第 2491 行）、§5.5 不得倒退清单（第 993–1006 行）、S-25（第 717 行）；[性能基线](performance-baseline.md)；[S-29 spike](spikes/s-29.md)；[验收模式](windows-acceptance-mode.md)。
 
@@ -18,6 +18,12 @@
   - 覆盖了用户新复制的剪贴板内容；
   - 日志或诊断包里出现隐私哨兵串。
 - 故障注入、截断或锁定配置等破坏性操作，一律在**独立数据目录**或**已备份的数据目录**上做（§1.3）。
+- **恢复后再触发，先按一次物理空格或回车**。凡是步骤写「恢复后（或释放后、重新挂上后）再键入 `zzk`」，都先等界面回到「正常 / 监听中」，再在目标窗口里按一次**物理**空格或回车，然后键入触发词。原因：
+  - 检测缓冲在这些情况下断开：分隔键（空格是分隔符）、重置键（回车、Tab、Esc、方向键、Home/End）、鼠标点击或滚轮（`crates/platform/src/windows/hook.rs:387`）、输入源重挂或会话信号（`crates/platform/src/windows/input.rs:382-389`）。
+  - 「按空格、分号等指定键执行」的规则要求触发词前一个字符是分隔符，只有触发词恰好在缓冲开头时才不检查（`crates/domain/src/matching.rs:230-236`）。如果之前键入的字母还留在缓冲里（例如 SV-04 先键入的 `x`），它们会和新键入的 `zzk` 粘成一个词 `xzzk`，按设计不触发，看起来像「恢复后不工作」。
+  - 恢复恰好发生在键入 `zzk` 中途时，`zzk` 会被拆成两段，同样不触发。
+  - 微信里回车会直接发送消息，只用空格。
+  - 下文涉及的条目：IN-08、CB-08、SV-02～SV-09、SV-11、SV-15、NR-02 b 等。步骤里写了「按空格」的，就是这条规则；没写的也照此执行。不按这条规则测出的「恢复后不触发」不能记为不通过，要按规则重测一次。
 
 ## 1. 前置
 
@@ -61,7 +67,9 @@
   - release 构建是 `%APPDATA%\com.quickertext.desktop`；debug-fi 构建是 `QUICKER_TEXT_DATA_DIR` 指定的目录。
   - 主要内容：
     - 配置：`active.json`、`draft.json`、`previous.json`、`prefs.json`、`store-meta.json`；
+    - `store-meta.json` 里与本清单有关的字段：`last_good_revision`（上次正常运行时的生效版本，ST-13）、`previous_revision {active, revision}`（「恢复上一个版本」的目标，只在 `active` 等于当前生效版本时采用，ST-13、NR-08）、`backup_pre_0_4`（`true` 表示升级前备份已建立，`false` 表示不需要备份，CP-04、CP-05）；
     - 历史版本：`revisions\<n>.json`、`revisions\<n>.metadata.json`；
+    - 升级前备份：`backup-pre-0.4\`，在 0.3.1 数据目录上首次启动 0.4 时建立，只建一次（CP-04）；
     - 被隔离的损坏文件：`*.corrupt-<时间>.json`；
     - 崩溃记录：`crash-<UTC yyyymmdd-hhmmss>.txt`；
     - `logs\` 目录。
@@ -169,6 +177,7 @@ while ($true) {
 
 - 导出文件是 portable 格式：顶层有 `format`、`version`、`config.rules`，示例见 `crates/domain/tests/fixtures/portable.json`。
 - 导入校验很严格（`crates/domain/src/package.rs:160`），所以不要添加任何未知字段。
+- 生成的文件**只含 5000 条合成规则**，不含原有规则。FE-02 导入时选「保留两份」，原有规则保持不动，新增的正好是这 5000 条；如果文件里也带着原有规则，「保留两份」会把它们再追加一遍，条数就对不上了。
 
 ```powershell
 $src = [IO.File]::ReadAllText('D:\qt-0.4-rules.json') | ConvertFrom-Json
@@ -176,7 +185,7 @@ $base = $src.config.rules | Where-Object { $_.match.value -eq 'zzk' } | Select-O
 $bulk = for ($i = 0; $i -lt 5000; $i++) {
   $r = $base | ConvertTo-Json -Depth 30 | ConvertFrom-Json
   $r.id = "bulk-$i"; $r.match.value = "zqb$i"; $r.enabled = $false; $r }
-$src.config.rules = @($src.config.rules) + $bulk
+$src.config.rules = @($bulk)
 [IO.File]::WriteAllText('D:\qt-bulk-5000.json', ($src | ConvertTo-Json -Depth 40), (New-Object Text.UTF8Encoding $false))
 ```
 
@@ -195,24 +204,35 @@ Get-ChildItem 'D:\qt-diag' -File -Recurse | Select-String -Pattern $pat -SimpleM
 
 **P10 文件哈希**（CP、ST）：`Get-FileHash "$d\active.json","$d\draft.json","$d\prefs.json" -Algorithm SHA256 | Format-Table -AutoSize`
 
-**P11 浸泡负载**（PF-05）：
+（原 P11「浸泡负载」已删除：它用 SendKeys 发送按键，必须在验收模式下运行，测不到真实输入路径。PF-05 改用人工打字或实体按键工具，加 `scripts/soak/soak.ps1` 监视，见 PF-05。）
 
-- 只在虚拟机 B 或专用的测试会话里运行。它会向**当前前台窗口**发送按键。
-- 程序必须以验收模式启动，否则外部模拟输入会被过滤（见 PF-05）。
+**P12 剪贴板图片格式的长度与哈希**（CB-04 e）。读取 `CF_DIB`（8）和 `CF_ENHMETAFILE`（14）两种格式，输出字节数和 SHA256；只读，不改剪贴板：
 
 ```powershell
-Add-Type -AssemblyName System.Windows.Forms
-$end = (Get-Date).AddHours(2); $n = 0; $log = 'D:\qt-soak-sent.log'
-$words = 'lorem','ipsum','dolor','amet','quick','brown','jumps','over'
-while ((Get-Date) -lt $end) {
-  for ($i = 0; $i -lt 10; $i++) { [System.Windows.Forms.SendKeys]::SendWait("$(Get-Random $words) "); Start-Sleep -Milliseconds 1100 }
-  $abbr = if ($n % 2) { 'zzq' } else { 'zzv' }
-  [System.Windows.Forms.SendKeys]::SendWait("$abbr "); $n++
-  "$(Get-Date -Format s) $abbr $n" | Add-Content $log
-  Start-Sleep -Seconds 2
-  [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+Add-Type -Namespace QtTest -Name ClipHash -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool OpenClipboard(IntPtr h);
+[DllImport("user32.dll")] public static extern bool CloseClipboard();
+[DllImport("user32.dll")] public static extern IntPtr GetClipboardData(uint f);
+[DllImport("kernel32.dll")] public static extern IntPtr GlobalLock(IntPtr h);
+[DllImport("kernel32.dll")] public static extern bool GlobalUnlock(IntPtr h);
+[DllImport("kernel32.dll")] public static extern UIntPtr GlobalSize(IntPtr h);
+[DllImport("gdi32.dll")] public static extern uint GetEnhMetaFileBits(IntPtr h, uint n, byte[] b);
+public static byte[] Read(uint f) {
+  IntPtr h = GetClipboardData(f); if (h == IntPtr.Zero) return null;
+  if (f == 14) { uint n = GetEnhMetaFileBits(h, 0, null); byte[] e = new byte[n]; GetEnhMetaFileBits(h, n, e); return e; }
+  IntPtr p = GlobalLock(h); if (p == IntPtr.Zero) return null;
+  try { byte[] b = new byte[(int)GlobalSize(h).ToUInt64()]; Marshal.Copy(p, b, 0, b.Length); return b; } finally { GlobalUnlock(h); }
 }
+'@
+$sha = [Security.Cryptography.SHA256]::Create()
+if (-not [QtTest.ClipHash]::OpenClipboard([IntPtr]::Zero)) { throw '剪贴板被占用，稍后再试' }
+try { foreach ($f in 8, 14) { $b = [QtTest.ClipHash]::Read($f)
+  if ($null -eq $b) { "格式 ${f}：无" } else { "格式 ${f}：$($b.Length) 字节 SHA256=$(([BitConverter]::ToString($sha.ComputeHash($b))) -replace '-','')" } }
+} finally { [void][QtTest.ClipHash]::CloseClipboard() }
 ```
+
+- 同一个 PowerShell 窗口里 `Add-Type` 只能执行一次；再次读取时只运行 `$sha = …` 之后的部分。
+- `GlobalSize` 返回的长度可能带对齐填充。前后哈希不同时，把两次的字节数一起记进备注交给开发判断，不要自行判定为通过。
 
 ### 1.5 测试规则集
 
@@ -230,7 +250,7 @@ while ((Get-Date) -lt $end) {
 | `zzp` | 粘贴纯文本 | `粘贴测试 Paste-OK` | 剪贴板、通用 |
 | `zzm` | 粘贴纯文本 | 三行：`第一行` / `second line` / `第三行 3` | 多行 |
 | `zzl` | 键入纯文本 | 约 300 字：「快速的棕色狐狸跳过懒狗 0123456789。」重复 15 遍 | 焦点切换、终止键 |
-| `zzh` | 粘贴带格式的文字 | `<b>粗体</b>普通<i>斜体</i>`（需确认：编辑器是否按 HTML 源码接收） | 剪贴板 |
+| `zzh` | 粘贴带格式的文字 | 「带格式文字的 HTML 代码」填 `<b>粗体</b>普通<i>斜体</i>`；「无法显示格式时使用的普通文字」填 `粗体普通斜体`，**不能留空**（`src/ActionEditor.tsx:817-834`）。程序把两者同时放进剪贴板（HTML Format + CF_UNICODETEXT，`crates/platform/src/windows/clipboard.rs:561-573`）：富文本目标（Word、网页 contenteditable）取 HTML，显示粗体和斜体；纯文本目标（记事本、input、textarea）取普通文字，显示 `粗体普通斜体`。普通文字留空时，纯文本目标会静默粘贴出空内容（§12.3 第 17 条） | 剪贴板 |
 | `zzc` | 按快捷键 | `Ctrl+End`（在编辑器里录入） | 修饰键 |
 | `zzw` | 按顺序执行多个操作 | 步骤：逐字键入「步骤一」→ 等待 3000 毫秒 → 逐字键入「步骤二」。焦点策略选「始终在指令开始时的窗口执行」 | 焦点切换、fail-stop |
 | `zzi` | 键入纯文本，触发方式选「缩写输入完成后立即执行（不支持匹配规则）」 | `立即触发OK` | 立即触发 |
@@ -257,15 +277,15 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 
 | 注入点 | 何时生效 | param | 条目 |
 |---|---|---|---|
-| `executor_panic` | 下一次执行的第一批 SendInput（`executor.rs:1748-1751、1824`） | 0 | SV-02、PR-01 |
+| `executor_panic` | 下一次执行的第一批 SendInput（`executor.rs:1748-1751、1824`） | 0 | SV-02、SV-15、PR-01 |
 | `executor_hang` | 同上，线程睡眠 param 毫秒 | 200000（计划 §11 的 200 秒）；NR-02 用 30000 | SV-03、NR-02 |
 | `hook_panic` | 下一次键盘钩子回调（`hook.rs:243`） | 0 | SV-04 |
 | `hook_unhook` | 输入消费循环的下一轮（`input.rs:916`） | 0 | SV-05 |
 | `rawinput_unregister` | 同上（`input.rs:920`） | 0 | SV-06 |
 | `rawinput_close` | 同上（`input.rs:924`） | 0 | SV-07 |
 | `clipboard_busy` | 此后 param 毫秒内视为剪贴板被占用 | 5000 | CB-08 |
-| `store_write_fail` | 下一次原子写（`src-tauri/src/store/atomic.rs:18`） | 0 | NR-08 |
-| `session_end` | 输入消费循环的下一轮，模拟 WM_QUERYENDSESSION 和 WM_ENDSESSION（`input.rs:997`、`session.rs:216-221`） | 0 | SV-14 |
+| `store_write_fail` | 下一次原子写，在替换那一步失败：报「重命名文件失败：<文件名>。」，不带系统错误码，目标文件保持原样（`src-tauri/src/store/atomic.rs:16-23`）。发布时第一次原子写是旧版本的 `revisions\<n>.json` 或 `<n>.metadata.json`，不是 `active.json` | 0 | NR-08 |
+| `session_end` | 输入消费循环的下一轮，模拟 WM_QUERYENDSESSION 和 WM_ENDSESSION（`input.rs:997`、`session.rs:216-221`）。会话结束回调同时清除运行标记，之后被 taskkill 也不算崩溃（`241b3f3`，复审 R5） | 0 | SV-14 |
 | `config_corrupt`、`store_locked`、`autostart_stale` | 只在启动期检查，进程起来后再布防已经来不及 | — | 不用。实机分别用 ST-05/06、ST-01/02、SV-12 的真实操作代替。`store_locked` 没有解除手段，**不要布防** |
 
 ## 2. 输入与注入（M4-IN）
@@ -298,7 +318,8 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
   3. 在 `#rich` 里把光标移到已有文字中间再执行一次 `zzk`。
 - **预期结果**：
   - 三种控件都正确展开。
-  - `#area` 的多行正确，`#rich` 中 `zzh` 带粗体和斜体。
+  - `#area` 的多行正确。
+  - `zzh` 分目标判定：`#rich`（富文本）显示带粗体和斜体的「**粗体**普通*斜体*」；`#plain`、`#area`（纯文本）显示普通文字 `粗体普通斜体`，不出现 HTML 标签。纯文本目标里粘贴出空内容，先检查 `zzh` 的「无法显示格式时使用的普通文字」是否填了（§1.5）。
   - 在文字中间展开时不删除前后的无关文字。
 - **通过标准**：没有错删、残留或吞键；页面事件记录区（`#events`）没有异常的重复输入。
 - **出处**：S-25 实机最小集「Chrome」；docs/browser-ime-manual-tests.md B01、B02（0.2.0 的矩阵，仅作对照）。
@@ -355,11 +376,12 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
   2. 在记事本执行 `zzw` + 空格，等「步骤一」出现后，在 3 秒等待内切到 Chrome 的 `#plain`。
   3. 查看「最近执行」。
 - **预期结果**：
-  - 两种情况下，切换之后的字符都**不会**进入 Chrome，「步骤二」不会出现在任何窗口。
-  - 历史为「已停止」或「失败」，原因「执行中切换了窗口」。
-- **通过标准**：Chrome 里没有出现任何来自规则的字符；历史原因正确。
-- **出处**：ReasonCode `focus_changed`（`src/ipc/labels.ts`）；焦点策略「始终在指令开始时的窗口执行」（`src/ActionEditor.tsx:1473-1474`）；§5.5 #6。
-- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注 ____
+  - 两种情况下，切换之后的字符都**不会**进入 Chrome，「步骤二」不会出现在任何窗口，切换后记事本里也不再有新的输出。
+  - 历史为「已停止」或「失败」，原因是「输入已过期」（`stale_input`）或「执行中切换了窗口」（`focus_changed`），两者都算通过。用 Alt+Tab 或鼠标点击切换时，通常先看到「输入已过期」：执行期间的物理按键和鼠标点击都会让检测代次前进（`crates/platform/src/windows/hook.rs:277-284、385-388`），这条检查排在焦点检查之前。
+- **通过标准**：Chrome 里没有出现任何来自规则的字符；切换之后没有任何后续输出；历史原因是上述两者之一。
+- **可选**：要专门看到「执行中切换了窗口」，需要不经键盘和鼠标就改变前台窗口的受控夹具（例如由开发提供、定时自己抢焦点的测试窗口）。没有夹具时本项记「未测」，不影响本条判定。
+- **出处**：ReasonCode `focus_changed`、`stale_input`（`src/ipc/labels.ts:149-150`）；焦点策略「始终在指令开始时的窗口执行」（`src/ActionEditor.tsx:1473-1474`）；§5.5 #6。
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（历史原因：____；可选项：____）
 
 ### M4-IN-06 修饰键不卡住；按住修饰键时执行
 
@@ -370,10 +392,11 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
   4. 执行后在记事本中输入 `a`，确认 Shift、Ctrl、Alt 都没有卡住。
 - **预期结果**：
   - 第 1、2 步之后没有修饰键残留。
-  - 第 3 步第二步不在 Ctrl 按住时输出（否则会变成 Ctrl+字母）。历史原因「按住了 Ctrl、Alt 等修饰键」，或者等松开后再输出（需确认是哪一种）。
-- **通过标准**：没有卡键；没有在修饰键按下时把正文打成快捷键。
-- **出处**：ReasonCode `modifier_held`。待实测：`crates/platform/src/windows/keystate.rs:344`（注入的通用修饰键是否置位左侧键状态）、`keystate.rs:444`（INJECTION_QUIET 250 ms 是否足够）。
-- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注 ____
+  - 第 3 步：「步骤二」不在 Ctrl 按住时输出（否则会变成 Ctrl+字母），松开 Ctrl 后也不再补发。历史为「已停止」或「失败」，原因是「输入已过期」（`stale_input`）或「按住了 Ctrl、Alt 等修饰键」（`modifier_held`），两者都算通过。物理按下 Ctrl 本身就是执行期间的一次按键，会让检测代次前进（`crates/platform/src/windows/hook.rs:277-284`），所以通常先看到「输入已过期」。
+- **通过标准**：没有卡键；没有在修饰键按下时把正文打成快捷键；第 3 步按下 Ctrl 之后没有任何后续输出；历史原因是上述两者之一。
+- **可选**：要专门看到「按住了 Ctrl、Alt 等修饰键」，需要不产生执行期间按键事件就让修饰键处于按下状态的受控夹具（由开发提供）。没有夹具时本项记「未测」，不影响本条判定。
+- **出处**：ReasonCode `modifier_held`、`stale_input`（`src/ipc/labels.ts:150-152`）。待实测：`crates/platform/src/windows/keystate.rs:344`（注入的通用修饰键是否置位左侧键状态）、`keystate.rs:444`（INJECTION_QUIET 250 ms 是否足够）。
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（第 3 步历史原因：____；可选项：____）
 
 ### M4-IN-07 终止键 Ctrl+Shift+Esc
 
@@ -393,7 +416,7 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 
 - **步骤**：
   1. 在监听中按 Win+L 锁屏，在锁屏密码框里输入 `zzk` + 空格，然后删除这些字符，正常解锁。
-  2. 解锁后 5 秒内在记事本执行 `zzk` + 空格。
+  2. 解锁后 5 秒内在记事本先按一次物理空格（§0），再执行 `zzk` + 空格。
   3. 「开始」→「电源」→「睡眠」，等 1 分钟后唤醒，解锁，重复第 2 步。
   4. 检索日志里的 `session.signal`、`input.refused`、`input.check`、`supervisor.`。
 - **预期结果**：
@@ -412,7 +435,7 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
   3. 静置 10 分钟后再执行一次，然后检索日志里的 `input.check`。
 - **预期结果**：
   - 能正常展开。
-  - 日志里没有误判的 `input.check source=raw_input result=…` 或 `source=keyboard_hook result=lost`。
+  - 日志里没有误判的 `input.check source="raw_input" result=…` 或 `source="keyboard_hook" result="lost"`。
 - **通过标准**：展开成功，没有反复重挂。如果 RawInput 收不到键（没有设备句柄），记录现象。
 - **出处**：待实测 `crates/platform/src/windows/input.rs:966`、`pipeline_tests_input.rs:1745`、`pipeline_tests_input.rs:2671`（远程会话的按键没有设备句柄）。
 - **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注 ____
@@ -480,26 +503,30 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 ### M4-CB-04 粘贴后格式完整恢复（best_effort）
 
 - **步骤**（对子表的每一行做一次）：
-  1. 准备好剪贴板内容，用 P5 记录格式列表 L1。
+  1. 准备好剪贴板内容，用 P5 记录格式列表 L1。c、e 两行再用 P12 记录 `CF_DIB`（8）和 `CF_ENHMETAFILE`（14）的字节数和 SHA256（H1）。
   2. 在记事本执行 `zzp` + 空格。
-  3. 等 1 秒，用 P5 记录 L2，再把剪贴板粘贴到对应程序里核对内容。
+  3. 等 1 秒，用 P5 记录 L2；c、e 两行再用 P12 记录 H2。然后把剪贴板粘贴到对应程序里核对内容。
   4. 检索日志里的 `clipboard.skipped`。
 - **预期结果**：
   - L2 与 L1 一致，或者少掉的格式恰好列在 `clipboard.skipped formats=… policy=BestEffort` 里。后一种情况下历史显示「部分剪贴板格式未能恢复」。
+  - c、e 两行：H1 里存在的格式，H2 里也存在，字节数和 SHA256 都相同。
   - 粘贴出来的内容与原来一致。
-- **通过标准**：没有静默丢失格式（丢了就必须有 skipped 日志和历史提示）；恢复后的内容可用。
-- **出处**：B-08；`clipboard.rs:47-49、98、125、1408`；`traits.rs:185-202`。
+- **通过标准**：
+  - 没有静默丢失格式（丢了就必须有 skipped 日志和历史提示）；恢复后的内容可用。
+  - **e 行必做**：Word 或 PowerPoint 复制图表或形状，L1 里要有 `CF_ENHMETAFILE`（P12 输出「格式 14」不是「无」）；如果复制出来的内容不含 EMF，换一个对象重做，直到含 EMF 为止。
+  - c、e 两行没有 P12 前后哈希的证据，S-07（「恢复后 CF_DIB 内容与触发前逐字节一致」「Word 富文本（含 CF_ENHMETAFILE）」）记为**未完成**，不能只凭 L1/L2 格式列表判通过。
+- **出处**：S-07（development-plan.md:707）；B-08；`clipboard.rs:47-49、98、125、1408`（`clipboard.rs:96-99`：CF_METAFILEPICT 靠恢复后的 CF_ENHMETAFILE 由系统重新合成，待实测）；`traits.rs:185-202`。
 - **子表**：
 
-| 行 | 剪贴板来源 | L1 格式数 | L2 格式数 | skipped 日志 | 粘贴核对 | 判定 |
-|---|---|---|---|---|---|---|
-| a | 记事本复制一行中文（CF_UNICODETEXT，系统合成 CF_LOCALE；待实测 `clipboard.rs:125`、`clipboard.rs:1408`） | | | | | |
-| b | Chrome 选中网页复制（HTML Format） | | | | | |
-| c | Win+Shift+S 截图（位图） | | | | | |
-| d | 资源管理器复制 2 个文件（CF_HDROP） | | | | 粘贴到另一个文件夹 | |
-| e（可选） | Word 或 Excel 复制图表（EMF / METAFILEPICT；待实测 `clipboard.rs:98`） | | | | | |
+| 行 | 剪贴板来源 | L1 格式数 | L2 格式数 | skipped 日志 | P12 前后（字节数 / 哈希是否相同） | 粘贴核对 | 判定 |
+|---|---|---|---|---|---|---|---|
+| a | 记事本复制一行中文（CF_UNICODETEXT，系统合成 CF_LOCALE；待实测 `clipboard.rs:125`、`clipboard.rs:1408`） | | | | — | | |
+| b | Chrome 选中网页复制（HTML Format） | | | | — | | |
+| c | Win+Shift+S 截图（位图，含 CF_DIB） | | | | 8：____ | | |
+| d | 资源管理器复制 2 个文件（CF_HDROP） | | | | — | 粘贴到另一个文件夹 | |
+| e（必做） | Word 或 PowerPoint 复制图表或形状（CF_ENHMETAFILE，系统合成 CF_METAFILEPICT；待实测 `clipboard.rs:98`） | | | | 8：____；14：____ | 粘贴回 Word | |
 
-- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注 ____
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（c、e 两行的 H1/H2 字节数：____）
 
 ### M4-CB-05 超大剪贴板内容
 
@@ -561,7 +588,7 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
   1. 用 debug-fi 执行 `await inv('debug_inject_fault', { point: 'clipboard_busy', param: 5000 })`。
   2. 5 秒内在记事本执行 `zzp` + 空格。
   3. 在占用期间执行 `await inv('self_test')`，记下返回结果。
-  4. 5 秒后再执行一次 `zzp`。
+  4. 5 秒后，在记事本先按一次物理空格（§0），再执行一次 `zzp` + 空格。
 - **预期结果**：
   - 第 2 步的现象与 CB-07 相同：失败，原因是剪贴板被占用，不改用键入。
   - 第 3 步：这个注入点不影响自检探针，自检的剪贴板项通过。
@@ -616,7 +643,9 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 | 加载重试 RETRY_DELAYS_MS | 100, 200, 400, 800 | `src-tauri/src/store/fallback.rs:29` | |
 | CRASH_LOOP_THRESHOLD / CRASH_WINDOW / BOOT_ID_TOLERANCE | 2 次 / 5 分钟 / 10 s | `src-tauri/src/store/meta.rs:16、14、19` | |
 
-熔断（10 分钟内失败 5 次进入「故障」，此时出现「修复引擎」按钮，见 `src/StatusArea.tsx:70-74`）很难在实机上稳定复现，由 L2 测试覆盖，本清单不单列。如果实测中意外遇到，在对应条目的备注里记录，并点一次「修复引擎」（提示「已开始修复引擎，结果会自动更新」）。
+熔断（10 分钟内 5 次故障进入「故障」）是 S-03 的退出标准，单列为必做条目 SV-15。其他条目里如果意外遇到熔断，在该条备注里记录，并点一次「修复引擎」（提示「已开始修复引擎，结果会自动更新」）。
+
+本节所有「恢复后再执行」的步骤，都按 §0 先按一次物理空格或回车。
 
 ### M4-SV-01 空闲 10 分钟不误判
 
@@ -624,7 +653,7 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
   1. 用 release 构建启动，状态行显示「监听中」后，不碰键盘鼠标 10 分钟（电脑不睡眠）。
   2. 然后在记事本执行 `zzk` + 空格。
   3. 检索这 10 分钟内的日志：`supervisor.recovering`、`input.check`、`executor.stalled`、`supervisor.respawn`、`supervisor.unsupervised`。
-- **预期结果**：上述事件都没有出现（`input.check … result=registered` 这类例行信息除外）；展开成功。
+- **预期结果**：上述事件都没有出现（`input.check … result="registered"` 这类例行信息除外）；展开成功。
 - **通过标准**：空闲期间没有任何恢复或重挂动作。
 - **出处**：`supervisor_wiring.rs:42、109`；`supervisor.rs:93`；liveness 常量的基线（`liveness.rs:30、35`）。
 - **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注 ____
@@ -635,12 +664,12 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
   1. 用 debug-fi 执行 `await inv('debug_inject_fault', { point: 'executor_panic', param: 0 })`。
   2. 在记事本执行 `zzk` + 空格。
   3. 观察「运行状态与恢复」的引擎状态和「最近执行」。
-  4. 5 秒后再执行一次 `zzk` + 空格。
+  4. 5 秒后，等状态回到「正常」，在记事本先按一次物理空格，再执行一次 `zzk` + 空格。
   5. 检查数据目录里的 `crash-*.txt`，检索日志。
 - **预期结果**：
   - 第一次执行失败，历史显示「失败 · 执行器内部错误」，没有输出任何字符（panic 发生在第一批 SendInput 之前）。
   - 引擎状态里执行器从「恢复中」回到「正常」。
-  - 日志依次有 `executor.panic`、`app.panic`、`executor.rebuilt`、`supervisor.recovered`。
+  - 日志依次有：`app.panic`（panic 钩子先记）→ `executor.panic`（执行器捕获后记，`executor.rs:1527-1533`）→ `supervisor.recovering … incidents=1`（监督器下一次巡检，最多约 1 秒后）→ `executor.rebuilt` → `supervisor.recovered`。执行器的故障标记只在重建时清除（`executor.rs:1141、1166`），所以 `supervisor.recovering` 必然出现。
   - 生成了一份 `crash-*.txt`；进程没有退出。
   - 第二次执行成功。
 - **通过标准**：自动恢复（不需要手动操作），5 秒内恢复正常，下一次触发成功。
@@ -652,7 +681,7 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 - **步骤**：
   1. 用 debug-fi 执行 `await inv('debug_inject_fault', { point: 'executor_hang', param: 200000 })`。
   2. 在记事本执行 `zzk` + 空格，开始计时。
-  3. 15 秒后再执行一次 `zzk` + 空格。
+  3. 15 秒后，在记事本先按一次物理空格，再执行一次 `zzk` + 空格。
   4. 保持记事本在前台，等满 200 秒以上，观察有没有多出来的字符或退格。
   5. 检索日志。
 - **预期结果**：
@@ -669,7 +698,7 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 - **步骤**：
   1. 用 debug-fi 执行 `await inv('debug_inject_fault', { point: 'hook_panic', param: 0 })`。
   2. 在记事本输入 `x`。
-  3. 再执行 `zzk` + 空格。
+  3. 按一次物理空格，把 `x` 和后面的触发词隔开，再执行 `zzk` + 空格。
   4. 检索日志里的 `hook.panic`。
 - **预期结果**：
   - 回调里的 panic 被捕获并计数，日志为 `hook.panic count=1`（`input.rs:357`）。
@@ -683,10 +712,10 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 - **步骤**：
   1. 用 debug-fi 执行 `await inv('debug_inject_fault', { point: 'hook_unhook', param: 0 })`。
   2. 在记事本输入 12 个普通字母，例如 `abcdefghijkl`。
-  3. 等状态行回到「监听中」后，执行 `zzk` + 空格。
+  3. 等状态行回到「监听中」后，先按一次物理空格，再执行 `zzk` + 空格。
   4. 变体 b：再布防一次，**不打字**，等 30 秒后检索日志，看是否不靠按键也能检出并重挂。
 - **预期结果**：
-  - 日志依次有 `fault.injected point="hook_unhook"`、`input.check source=keyboard_hook result=lost`、`input.reattach component=keyboard_hook … ok=true`（`input.rs:839-844`）。
+  - 日志依次有 `fault.injected point="hook_unhook"`、`input.check source="keyboard_hook" result="lost"`、`input.reattach component="keyboard_hook" … ok=true`（`input.rs:839-844`；字符串字段在日志里带双引号，检索时注意）。
   - 状态行可能短暂显示「正在恢复…」或「部分功能降级：…」。
   - 重挂后展开成功。
   - 摘除期间输入的字母不会触发展开。
@@ -699,10 +728,10 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 - **步骤**：
   1. 用 debug-fi 执行 `await inv('debug_inject_fault', { point: 'rawinput_unregister', param: 0 })`。
   2. 在记事本输入 12 个字母。
-  3. 执行 `zzk` + 空格。
+  3. 等状态行回到「监听中」后，先按一次物理空格，再执行 `zzk` + 空格。
   4. 检索日志。
 - **预期结果**：
-  - 日志依次有 `fault.injected point="rawinput_unregister"`、`input.check source=raw_input result=unregistered`、`input.reattach component=raw_input reason=raw_input_missing ok=true`（`input.rs:693-697、955-963`）。
+  - 日志依次有 `fault.injected point="rawinput_unregister"`、`input.check source="raw_input" result="unregistered"`、`input.reattach component="raw_input" reason="raw_input_missing" ok=true`（`input.rs:693-697、955-963`）。
   - 展开成功。
 - **通过标准**：由交叉校验检出并重新注册；不需要手动操作。
 - **出处**：development-plan.md:2448、2485；待实测 `rawinput.rs:933`（从不拥有窗口的线程注册，失败时退回到重建）。
@@ -712,7 +741,7 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 
 - **步骤**：
   1. 用 debug-fi 执行 `await inv('debug_inject_fault', { point: 'rawinput_close', param: 0 })`。
-  2. 等 5 秒，输入几个字母，然后执行 `zzk` + 空格。
+  2. 等 5 秒，输入几个字母；等状态行回到「监听中」后，先按一次物理空格，再执行 `zzk` + 空格。
   3. 检索日志里的 `rawinput.closed`、`rawinput.rebuild_*`、`input.reattach`、`supervisor.recovered`。
 - **预期结果**：日志有 `rawinput.closed`，随后检测窗口重建成功，没有 `rawinput.rebuild_stuck` 或 `rawinput.rebuild_failed`；展开成功。
 - **通过标准**：自动恢复；记录重建耗时，即从 `rawinput.closed` 到恢复的时间差。
@@ -725,10 +754,10 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
   1. 在记事本里按住 `a` 5 秒，再按住 Backspace 5 秒。
   2. 在「控制面板 → 键盘」把重复速度调到最快、重复延迟调到最短，重复第 1 步；然后把重复速度调到最慢再做一次。
   3. 快速连按同一个键 50 次。
-  4. 执行 `zzk` + 空格。
+  4. 先按一次物理空格，再执行 `zzk` + 空格。
   5. 检索日志里的 `input.check`、`input.queue_full`。
   6. 把键盘设置还原。
-- **预期结果**：没有 `input.check … result=lost` 误判，没有 `input.queue_full`；展开成功。
+- **预期结果**：没有 `input.check … result="lost"` 误判，没有 `input.queue_full`；展开成功。
 - **通过标准**：自动重复和连按都不会引起误判或重挂。
 - **出处**：待实测 `liveness.rs:52`（自动重复每秒 2.5–30 次）、`liveness.rs:115`（连按五十次、丢失 key-up）、`hook.rs:32`、`rawinput.rs:101`（队列容量）。
 - **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注 ____
@@ -737,7 +766,7 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 
 - **步骤**：
   1. 以管理员身份运行一个记事本，在里面输入 20 个字母和 `zzk` + 空格。
-  2. 切回普通记事本，立即执行 `zzk` + 空格。
+  2. 切回普通记事本，立即按一次物理空格，再执行 `zzk` + 空格。
   3. 检索日志里的 `input.check`、`input.reattach`。
   4. 用 debug-fi 在开发者工具执行 `setTimeout(() => inv('self_test').then(r => console.log(JSON.stringify(r))), 5000)`，5 秒内把管理员记事本切到前台，等结果打印出来。
 - **预期结果**：
@@ -769,7 +798,7 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
   1. 确认「启动时自动开始监听」已勾选，然后退出程序。
   2. 运行 P2，占用时间改为 40 秒。
   3. 在占用期间启动 release 构建，观察系统通知、横幅和状态行。
-  4. P2 结束后点顶部的「恢复监听」，然后执行 `zzp` + 空格。
+  4. P2 结束后点顶部的「恢复监听」，然后在记事本先按一次物理空格，再执行 `zzp` + 空格。
   5. 检索日志里的 `self_test.check`、`self_test.startup`。
 - **预期结果**：
   - 系统通知标题「启动自检未通过」，正文「未通过：剪贴板。输入监听保持暂停，可从托盘菜单选择「恢复监听」，或打开管理界面查看引擎状态。」（`startup.rs:348-381`）。
@@ -777,27 +806,33 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
   - 恢复后粘贴成功。
 - **通过标准**：自检失败时不自动开始监听，并且有明确提示；恢复后功能正常。
 - **出处**：B-10；`self_test_probes.rs:139-152`；`App.tsx:1429`（提示文字说明全部通过才开始监听）。
-- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（横幅里列出的检查项名称：____，对照 §12.3 第 7 条）
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（横幅里列出的检查项名称：____。横幅和系统通知里的检查项名称应一致；键盘钩子心跳一项在两处都叫「键盘鼠标监听」，`e0fc068` 已修，见 §12.3 第 7 条）
 
 ### M4-SV-12 修复过期的自启动项（只用 release）
 
 - **步骤**：
   1. 确认「登录后自动启动」已勾选，然后退出程序。
-  2. 执行：
+  2. 在 PowerShell 里先保存原值，再写入过期路径，并读回确认（用 `Set-ItemProperty`，避免 `reg add` 在 PowerShell 里转义引号出错）：
 
      ```powershell
-     reg add HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v QuickerText /t REG_SZ /d "\"C:\old\quicker-text.exe\" --background" /f
+     $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+     $orig = (Get-ItemProperty -Path $run -Name QuickerText -ErrorAction SilentlyContinue).QuickerText
+     "原值：$orig"
+     Set-ItemProperty -Path $run -Name QuickerText -Value '"C:\old\quicker-text.exe" --background'
+     (Get-ItemProperty -Path $run -Name QuickerText).QuickerText
      ```
 
+     读回的值必须正好是 `"C:\old\quicker-text.exe" --background`（路径带双引号），否则不要继续。把「原值」抄进备注。
   3. 手动启动 release 构建，观察横幅，检索日志。
-  4. 执行 `reg query HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v QuickerText`。
+  4. 在同一个 PowerShell 窗口执行 `(Get-ItemProperty -Path $run -Name QuickerText).QuickerText`，读回修正后的值。
+  5. 还原：如果第 2 步的原值不为空，执行 `Set-ItemProperty -Path $run -Name QuickerText -Value $orig`；如果原值为空（原来没有这一项），执行 `Remove-ItemProperty -Path $run -Name QuickerText`。PowerShell 窗口已经关闭时，用备注里抄下的原值替换 `$orig`。
 - **预期结果**：
   - 横幅显示「登录自动启动项指向的程序位置已过期，已自动修正。」。
   - 日志有 `autostart.repair`。
-  - 注册表的值改为当前 exe 的路径加 `--background`。
-- **通过标准**：自动修正并有提示。
+  - 第 4 步读回的值改为当前 exe 的路径（带双引号）加 ` --background`。
+- **通过标准**：自动修正并有提示；还原后注册表与测试前一致。
 - **出处**：development-plan.md:2488；`src-tauri/src/autostart.rs:12-14、90-115`。
-- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注 ____
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（原值：____；修正后的值：____）
 
 ### M4-SV-13 真实注销或重启不算崩溃
 
@@ -821,11 +856,49 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
   3. 按计划 §11 用 `taskkill /F /IM quicker-text.exe` 结束进程，然后连续启动两次（第一次启动后正常退出，再启动第二次）。
   4. 检索日志里的 `session.end`、`store.crash_loop`、`store.run_marker_cleared`。
 - **预期结果**：
-  - 日志有 `fault.injected point="session_end"` 和 `session.end source=fault callbacks=N`（`session.rs:169、216-221`）。
-  - 计划预期之后连续启动两次不会被误判为崩溃循环。
-- **通过标准**：按计划，两次启动都正常，没有进入 crash_loop。
-- **出处**：development-plan.md:2489；`input.rs:997`；`session.rs:216-221`。
-- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（需确认：这个注入点只调用会话结束回调，不走 RunEvent::Exit，因此**不清除运行标记**；随后 taskkill 会被算作一次崩溃。真实注销由 SV-13 覆盖，两者差异见 §12.3。注入后进程是否继续监听：____）
+  - 注入后日志依次有 `fault.injected point="session_end"`、`session.end source="fault" callbacks=N`（`session.rs:169、216-221`），紧接着有 `store.run_marker_cleared`：会话结束回调本身就清除运行标记，不再依赖 `RunEvent::Exit`（`241b3f3`，复审 R5；存储分支 `src-tauri/src/store/meta.rs:164-200`）。
+  - taskkill 之后连续两次启动都正常：没有 `store.crash_loop`，没有进入「连续多次启动失败」的安全模式。
+- **通过标准**：注入后立即有 `store.run_marker_cleared`；两次启动都没有 crash_loop。
+- **出处**：development-plan.md:2489；`input.rs:997`；`session.rs:216-221`；`241b3f3`（R5）。
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（注入后进程是否继续监听：____。如果没有 `store.run_marker_cleared`，先确认构建包含 `241b3f3`）
+
+### M4-SV-15 熔断：10 分钟内 5 次故障进入「故障」，手动修复（必做）
+
+- **步骤**（debug-fi，独立数据目录；不要给 `zzk` 打开执行通知，以免和要观察的系统通知混淆）：
+  1. 记下开始时间。以下 5 轮必须在 10 分钟内做完（`CIRCUIT_WINDOW`，`supervisor.rs:78、80`）。
+  2. 每一轮：
+     1. 在开发者工具执行 `await inv('debug_inject_fault', { point: 'executor_panic', param: 0 })`。
+     2. 点一下记事本，按一次物理空格，执行 `zzk` + 空格（这一次失败）。
+     3. 等引擎状态回到「正常」、状态行回到「监听中」，再开始下一轮。前 4 轮每轮都应自动恢复。
+  3. 第 5 轮之后不要再操作，观察：
+     - 「运行状态与恢复」的总体状态、状态行和「修复引擎」按钮；
+     - 托盘图标和托盘提示文字；
+     - 有没有系统通知。
+  4. 等 3 分钟，确认不会自行恢复；期间按一次物理空格后执行 `zzk` + 空格。
+  5. 点「修复引擎」。等状态回到「正常」后，按一次物理空格，执行 `zzk` + 空格。
+  6. 检索日志里的 `supervisor.`、`executor.panic`、`executor.rebuilt`。
+- **预期结果**：
+  - 日志里 `supervisor.recovering` 的 `incidents=` 依次为 1、2、3、4、5；第 5 次之后紧接着 `supervisor.circuit_open cause="incidents"`（`supervisor.rs:529-546、804-814`）。
+  - 第 5 轮之后：总体状态「故障」，状态行「输入监听已停止」，出现「修复引擎」按钮（`src/StatusArea.tsx:68-74`、`src/status.ts:75-76`）；托盘提示文字「Quicker Text · 输入监听已停止」（`crates/platform/src/health.rs:327`）。托盘、提示文字和界面三处一致。
+  - **系统通知**：S-03 要求熔断时发通知。代码里没有熔断通知（托盘只在恢复监听被拒绝、启动自检失败、规则执行时发通知），**预计此项不通过**，记为缺陷（§12.3 第 16 条）。
+  - 第 4 步：不自行恢复；`zzk` 不展开，历史显示失败，记事本里没有任何输出。
+  - 第 5 步：界面提示「已开始修复引擎，结果会自动更新」；日志依次有 `supervisor.repair`、`executor.rebuilt`、`supervisor.recovered`；回到「正常」，`zzk` 展开成功。
+- **通过标准**：第 5 次故障后进入「故障」且三处一致；不自行恢复；「修复引擎」能恢复。系统通知一项单独判定（预计不通过），不影响前面几项的判定，但 S-03 要在系统通知补上并复测后才算完成。
+- **出处**：S-03（development-plan.md:704）；`supervisor.rs:70、78、80、529-546、804-814、884-925`；`src/App.tsx:735`；`src-tauri/src/tray.rs:78-119`。
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（5 轮用时：____；系统通知：☐有 ☐无；三处是否一致：____）
+
+### M4-SV-16（可选，仅观察）鼠标钩子不误判丢失
+
+- **步骤**（release；只观察，不判通过与否）：
+  1. 在记事本里快速连续单击 30 次、双击 10 次、拖动选中文字 10 次，然后滚动滚轮几下。
+  2. 检索这段时间的日志里的 `input.check source="mouse_hook" result="lost"`。
+  3. 可选：做 SV-05（debug-fi）时，在 `hook_unhook` 布防之后点几下鼠标，看日志里是否出现 `input.check source="mouse_hook" result="lost"` 和随后的 `input.reattach component="mouse_hook" reason="hook_missing" ok=true`。
+- **预期结果**：
+  - 第 1 步不出现 `result="lost"`。
+  - 触摸、触控笔和外部注入的点击不参与交叉校验，被忽略。
+- **说明**：这一分支（F5-2，鼠标钩子丢失检出与重挂）由 L2 测试覆盖，均在鼠标重挂分支 `384f8d1` 上：`crates/platform/src/windows/pipeline_tests_input.rs:3891、3936、4247`；日志出处 `crates/platform/src/windows/input.rs:1009-1012`。本条只补充实机观察。
+- **出处**：鼠标重挂分支 `384f8d1`；S-06。
+- **结果**：日期 ____；机器 ____；构建 ____；☐已观察 ☐未测；备注（是否出现 `result="lost"`：____）
 
 ## 5. 安全模式与存储（M4-ST）
 
@@ -847,7 +920,7 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
   6. 编辑一条规则的正文，点「保存」，再点「应用设置」，然后核对规则条数。
 - **预期结果**：
   - 第 3 步：
-    - 横幅显示「已进入安全模式：配置文件被其他程序占用。输入监听已暂停，设置暂时不能修改；可以导入配置或打开数据目录检查。」；
+    - 横幅显示「已进入安全模式：配置文件被其他程序占用。输入监听已暂停，期间不会写入任何文件；占用解除后会自动退出安全模式，之后点「恢复监听」即可继续。也可以打开数据目录检查。」（`src/status.ts:151-153`，`cfa41f2`；不再提「导入配置」）；
     - 状态行显示「已暂停（安全模式）」；
     - 写入入口不可用。「应用设置」仍可点击，但会提示「当前处于安全模式（配置文件被其他程序占用），暂时不能修改设置。」；
     - 「启动时自动开始监听」仍可操作（`App.tsx:1432-1434`）；
@@ -898,7 +971,7 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
   - 确认后报错「当前处于安全模式（配置文件被其他程序占用），暂时不能修改设置。」，没有写入任何文件，对话框保持打开。
 - **通过标准**：Locked 状态下不写入；提示明确。
 - **出处**：`src/App.tsx:899-922`；`src-tauri/src/store/mod.rs:85-94`（Locked 和 NewerSchema 下导入只能预览、不能写入）、`mod.rs:290-299`；`src/ipc/errors.ts`。
-- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（横幅写着「可以导入配置」，但 Locked 下导入按设计会被拒绝，见 §12.3 第 6 条。需确认：横幅文字是否要按原因区分）
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（Locked 横幅已不再提「导入配置」，与这里按设计拒绝导入一致；`cfa41f2` 已修，见 §12.3 第 6 条）
 
 ### M4-ST-05 截断 active.json：诊断包显示 eof
 
@@ -919,19 +992,22 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
   4. 点一次「应用设置」，然后再重启。
 - **预期结果**：
   - 日志依次有：
-    - `store.corrupt file=active.json code=config_malformed kind=eof line=… column=…`；
+    - `store.corrupt file=active.json code="config_malformed" kind="eof" line=… column=…`；
     - `store.quarantine file=active.json quarantined_as=…`；
-    - `store.recovered file=… from=… revision=…`。
+    - `store.recovered file=<n>.json from=… revision=Some(<n>)`。
   - 数据目录里出现 `active.corrupt-<时间>.json`。
-  - 横幅显示「配置文件无法读取，已自动从历史版本 v{n} 恢复。请检查最近的改动是否还在。」和「active.json 已损坏，已改名为 … 保留，可在数据目录中查看。」。
+  - 恢复来源取决于 `store-meta.json` 里有没有 `last_good_revision`（候选顺序：active → 上次正常配置 → revisions 从新到旧 → previous）：
+    - 有（程序此前在「正常」状态持续 60 秒以上并成功展开过一次，ST-13）：`from=LastGood`，横幅「配置文件无法读取，已自动从上次正常运行时的配置恢复。请检查最近的改动是否还在。」；
+    - 没有：`from=Revision`，横幅「配置文件无法读取，已自动从历史版本 v{n} 恢复。请检查最近的改动是否还在。」。
+  - 另有横幅「active.json 已损坏，已改名为 … 保留，可在数据目录中查看。」。
   - 草稿不受影响。
-  - 第 3 步恢复横幅再次出现，因为恢复时不重写 `active.json`。第 4 步之后不再出现。
+  - 第 3 步恢复横幅再次出现，因为恢复时不重写 `active.json`，这是设计如此（§12.3 第 5 条）。第 4 步之后不再出现。
 - **通过标准**：
-  - 不进入安全模式，自动恢复到最近的可用版本；
+  - 不进入安全模式，自动恢复到上次正常配置或最近的可用版本；
   - 损坏的文件被保留；
-  - 记下恢复到的版本号。
-- **出处**：development-plan.md:2487（config_corrupt）；`fallback.rs:121-233`（候选顺序：active → LKG → revisions 从新到旧 → previous）；`src-tauri/src/store/revisions.rs:30-69`。
-- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（恢复到 v____，应用前的生效版本为 v____。需确认：是否存在 `revisions/N.json`，使恢复能回到 vN 而不是 v(N-1)）
+  - 记下恢复来源和版本号。
+- **出处**：development-plan.md:2487（config_corrupt）；`fallback.rs:121-233`；上次正常配置分支 `b32062f`（`src-tauri/src/store/fallback.rs:173-194` 候选顺序）；`src-tauri/src/store/revisions.rs:30-69`。
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（`from=____`，恢复到 v____，应用前的生效版本为 v____，`last_good_revision`=____）
 
 ### M4-ST-07 带 BOM 的 prefs.json、active.json、draft.json
 
@@ -955,7 +1031,7 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
   3. 退出后再用 P10 核对哈希，把版本改回 1，再启动。
 - **预期结果**：
   - 日志有 `store.newer_schema` 和 `store.safe_mode reason=NewerSchema`。
-  - 横幅显示「已进入安全模式：配置文件来自更新的版本。…」，处于只读状态，不写运行标记。
+  - 横幅显示「已进入安全模式：配置文件来自更新的版本。当前版本以只读方式打开，不会修改或覆盖它，输入监听已暂停；请改用更新版本的 Quicker Text，或打开数据目录检查。」（`src/status.ts:154-155`，`cfa41f2`；不提「导入配置」），处于只读状态，不写运行标记。
   - `active.json` 的哈希与第 2 步改完后的一致，没有被改写。
   - 改回 1 之后正常启动。
 - **通过标准**：不改写更新版本的文件；提示明确。
@@ -970,7 +1046,7 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
   3. 第三次启动，观察。
   4. 从托盘「退出」（正常退出），然后再启动。
 - **预期结果**：
-  - 第 3 步：日志有 `store.crash_loop crash_count=2` 和 `store.safe_mode reason=CrashLoop`；横幅显示「已进入安全模式：连续多次启动失败。…」；「启动时自动开始监听」可以操作。
+  - 第 3 步：日志有 `store.crash_loop crash_count=2` 和 `store.safe_mode reason=CrashLoop`；横幅显示「已进入安全模式：连续多次启动失败。输入监听已暂停，设置暂时不能修改；可以导入配置或打开数据目录检查。」（`src/status.ts:156`）；「启动时自动开始监听」可以操作。
   - 第 4 步正常启动。
 - **通过标准**：5 分钟内连续崩溃 2 次后进入安全模式；正常退出一次即可解除。
 - **出处**：`meta.rs:14-19`；B-04。
@@ -985,7 +1061,7 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
   4. 观察横幅，然后点底部「应用设置」。
   5. 观察横幅、规则列表和监听状态。
 - **预期结果**：
-  - 第 2 步：所有损坏的文件都被隔离；日志有 `store.safe_mode reason=NoValidConfig`；横幅显示「已进入安全模式：没有找到可用的配置。…」。
+  - 第 2 步：所有损坏的文件都被隔离；日志有 `store.safe_mode reason=NoValidConfig`；横幅显示「已进入安全模式：没有找到可用的配置。输入监听已暂停，设置暂时不能修改；可以导入配置或打开数据目录检查。」（`src/status.ts:156`）。
   - 第 3 步：导入写入草稿，提示「导入草稿已保存，请应用设置」，此时仍在安全模式。
   - 第 4、5 步：「应用设置」在安全模式下仍可点击。发布成功后日志有 `store.safe_mode_import`，安全模式解除，规则出现。监听仍然暂停，需要点「恢复监听」。
 - **通过标准**：导入加应用可以解除安全模式，且规则完整。
@@ -996,11 +1072,116 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 
 - **步骤**：退出程序，把 `prefs.json` 的内容改成 `{"app":`，然后启动。
 - **预期结果**：
-  - 日志有 `store.quarantine file=prefs.json to=… reason=… line=… column=…`。
+  - 日志有 `store.quarantine file="prefs.json" to=Some("prefs.corrupt-<时间>.json") reason=Eof line=1 column=…`（`src-tauri/src/store/prefs.rs:352-360`；这里的字段名是 `to=`，与配置文件的 `quarantined_as=` 不同）。
   - 数据目录里出现 `prefs.corrupt-<时间>.json`，程序使用默认偏好正常启动，不进入安全模式。
 - **通过标准**：自动隔离并使用默认值。
 - **出处**：`src-tauri/src/store/prefs.rs`。
 - **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（需确认：是否显示 config_quarantined 横幅）
+
+### M4-ST-12 S-04 损坏样本：非法 UTF-8、规则字段类型错误、无法编译的正则、某个版本文件损坏
+
+背景：S-04 要求 5 种损坏样例下都能启动且不丢数据。截断（`eof`）见 ST-05、ST-06，所有版本都损坏见 ST-10，来自更新版本见 ST-08。本条补其余四类：整个文件无法解码（a）、单条规则读不了（b）、规则能读但编译不了（c）、回退时某个版本文件也坏了（d）。
+
+每个样本都在已备份的数据目录上做，做完把整个目录还原，再做下一个。
+
+- **步骤**：
+  - a）非法 UTF-8：
+    1. 退出程序，确认 `revisions\` 下有可用的历史版本。
+    2. 在 `active.json` 的第一个双引号后插入字节 `FF FE`，然后记下哈希：
+
+       ```powershell
+       $p = "$d\active.json"; $b = [IO.File]::ReadAllBytes($p)
+       $i = [Array]::IndexOf($b, [byte]0x22)
+       [IO.File]::WriteAllBytes($p, [byte[]]($b[0..$i] + [byte[]](0xFF, 0xFE) + $b[($i + 1)..($b.Length - 1)]))
+       Get-FileHash $p -Algorithm SHA256
+       ```
+
+    3. 启动，观察横幅、数据目录和日志；用 `Get-FileHash` 查看新出现的 `active.corrupt-<时间>.json`。
+  - b）规则字段类型错误：
+    1. 退出程序。用记事本打开 `active.json`，找到 `zzp` 那条规则，把它的 `"enabled": true` 改成 `"enabled": "yes"`，记下这条规则的 `id`。
+    2. 启动，观察横幅、规则列表和日志；在记事本里输入 `zzk` 加空格、`zzp` 加空格；导出诊断包（不包含短语内容）。
+    3. 在「运行状态与恢复」点「放弃未应用草稿」→「放弃草稿」。`draft.json` 是单独读取的，第 1 步只改了 `active.json`，不放弃草稿的话，编辑器里显示的仍是改之前的草稿（`src-tauri/src/store/mod.rs:319-330`）。
+    4. 改另一条规则（例如在 `zzk` 的正文末尾加一个字），保存，点「应用设置」。
+    5. 退出程序，用记事本打开新的 `active.json`，查找第 1 步记下的 id。
+  - b′）（可选）顶层或 `globals` 字段类型错误：退出程序，把 `active.json` 顶层的 `"enabled": true` 改成 `"enabled": "yes"`，或把 `globals` 里的 `"word_separators"` 改成数字 `5`，然后启动。
+  - c）无法编译的正则：
+    1. 退出程序。在 `active.json` 的 `rules` 数组末尾追加一条规则：复制 `zzk` 那条规则的整个对象，把 `id` 改成 `st12-regex`，把 `match` 改成 `{"kind": "regex", "value": "zzx("}`，其他不变（保持启用，触发方式仍为按键后执行）。别忘了在前一条规则后面加逗号。
+    2. 启动后同 b 第 3 步，放弃未应用草稿。
+    3. 观察横幅、规则列表和日志；输入 `zzk` 加空格；导出诊断包。
+    4. 直接点「应用设置」；然后在编辑器里把 `st12-regex` 停用（或把正则改成 `zzx\(`），保存，再点「应用设置」。
+  - d）某个版本文件损坏：
+    1. 退出程序。打开 `store-meta.json`，记下 `last_good_revision`（没有这个键就记「无」）。在 `revisions\` 下确定启动时最先尝试的版本文件 `<k>.json`（不含 `.metadata.json`）：有 `last_good_revision` 时 k 就是它，没有时 k 是编号最大的那个。确认除它之外至少还有一个 `<n>.json`。
+    2. 用记事本把 `active.json` 和 `revisions\<k>.json` 的内容都改成 `{`，保存。
+    3. 启动，观察横幅、数据目录、`revisions\` 目录和日志。
+    4. 点「应用设置」，记下新的「当前生效版本」。
+- **预期结果**：
+  - a）
+    - 日志依次有：
+      - `store.corrupt file=active.json code="config_malformed" kind="utf8" line=0 column=0`（非法 UTF-8 没有位置）；
+      - `store.quarantine file=active.json quarantined_as=active.corrupt-<时间>.json`；
+      - `store.recovered …`。
+    - 恢复来源和横幅与 ST-06 相同，不进入安全模式。
+    - `active.corrupt-<时间>.json` 的哈希与第 2 步记下的一致：损坏的文件被原样保留。
+  - b）
+    - 正常启动，不进入安全模式，没有文件被隔离。
+    - 日志有 `store.diagnostic code=rule_unreadable path=rules[<序号>]` 和 `store.rules_skipped count=1`（`src-tauri/src/store/fallback.rs:224-243、570-573`）。
+    - 横幅「有 1 条规则无法读取或无法使用，已跳过：「<id>」。其他规则不受影响。」（`src/status.ts:179-184`）。
+    - `zzk` 照常展开，`zzp` 不展开。
+    - 诊断包 `active.counts.rules` 比原来少 1：读不了的条目不计入规则数（`src-tauri/src/diagnostics/bundle.rs:634-694`）。
+    - 第 3 步之后，规则列表末尾出现「无法读取的规则」行，带 id，说明为「这条规则含有当前界面无法编辑的内容，只能查看；已保留在配置中。」（`src/App.tsx:1270-1290`）。
+    - 第 5 步：新 `active.json` 的 `rules` 数组里仍有这条规则，`"enabled": "yes"` 原样保留，没有被删掉或改成默认值（`crates/domain/src/stored.rs:282-297`；`crates/domain/src/model.rs:48-51`）。
+  - b′）正常启动；日志有 `store.diagnostic code=field_reset path=enabled` 或 `path=globals.word_separators`；该字段按默认值使用；没有「已跳过」横幅（`crates/domain/src/stored.rs:181-228`）。
+  - c）
+    - 正常启动；日志有 `store.diagnostic code=regex_unsupported path=rules[<序号>].match.value` 和 `store.rules_skipped count=1`；横幅同 b，id 为 `st12-regex`。
+    - 规则列表里 `st12-regex` 作为普通规则显示，可以编辑，但不生效；`zzk` 照常展开。
+    - 诊断包 `active.counts.diagnostics` 里有 `code` 为 `regex_unsupported`、`severity` 为 `error`、`count` 为 1 的一项。
+    - 第 4 步：带着这条规则直接「应用设置」会被拒绝，因为发布和保存草稿都严格编译（`src-tauri/src/store/revisions.rs:33`、`src-tauri/src/store/mod.rs:300-304`）。界面提示以「内容没有通过检查：」开头，后面是后端的英文原文，因为 `regex_unsupported` 没有中文文案（`src/ipc/errors.ts:174-187`）；记下原文。生效版本不变。停用或改正之后可以保存和应用。
+  - d）
+    - 日志依次有：
+      - `store.corrupt file=active.json …` 和 `store.quarantine file=active.json …`；
+      - `store.corrupt file=<k>.json code="config_malformed" kind="eof" …` 和 `store.quarantine file=<k>.json quarantined_as=<k>.corrupt-<时间>.json`；
+      - `store.recovered file=<m>.json from=Revision revision=Some(<m>)`，m 是除 k 以外编号最大的版本（候选顺序：上次正常配置 → revisions 从新到旧，已试过的 k 不再重复，`src-tauri/src/store/fallback.rs:466-490`）。
+    - 数据目录里出现 `active.corrupt-<时间>.json`，`revisions\` 里出现 `<k>.corrupt-<时间>.json`，都原样保留。
+    - 不进入安全模式。横幅「配置文件无法读取，已自动从历史版本 v<m> 恢复。请检查最近的改动是否还在。」，另有两条「… 已损坏，已改名为 … 保留，可在数据目录中查看。」（`src/status.ts:160-179`）。
+    - 第 4 步可以应用。新版本号按现存的 `<n>.json` 和当前版本中较大者加 1 计算，隔离出去的文件不算（`src-tauri/src/store/revisions.rs:120-130`）；k 原来是最大编号时，新版本会再次用 v<k>。记下实际编号即可，`<k>.corrupt-<时间>.json` 不受影响。
+- **通过标准**：四类损坏都不导致启动失败或丢数据。整个文件坏了就隔离并恢复，回退途中遇到的坏版本也隔离并跳过；单条规则坏了只跳过这一条，读不了的原文在保存后仍保留；横幅、日志、诊断包三处的结论一致。
+- **出处**：S-04（development-plan.md:705）；B-43；`crates/domain/src/stored.rs:112-155、251-300`；`src-tauri/src/store/fallback.rs:142-194、224-243、389-460、544-574`；`crates/domain/src/matching.rs:312-342、435-453`。
+- **结果**：日期 ____；机器 ____；构建 ____；a ☐通过 ☐不通过 ☐未测；b ☐通过 ☐不通过 ☐未测；b′ ☐通过 ☐不通过 ☐未测；c ☐通过 ☐不通过 ☐未测；d ☐通过 ☐不通过 ☐未测；备注（c 第 4 步的界面提示原文：____；d：k=____，m=____，第 4 步的新版本 v____）
+
+### M4-ST-13 上次正常配置（LKG）：记录、恢复，以及恢复后发布再回滚
+
+- **前提**：构建包含 `b32062f`（上次正常配置）和 `7b727ca`（复审 R3，回滚目标记在 `store-meta.json`，在 `fe31dec` 分支上）。在已备份的数据目录上做。
+- **步骤**：
+  1. 在「文本指令管理」把 `zzk` 的正文末尾加上 `-A`，保存，点「应用设置」。在「运行状态与恢复」记下「当前生效版本」vA。
+  2. 等 2～3 秒，在记事本里输入 `zzk` 加空格，确认展开出的文字以 `-A` 结尾。然后保持「正常」，从应用算起至少 70 秒，期间不要注入故障、不要锁屏。检索日志里的 `store.last_good`，打开 `store-meta.json` 查看。
+  3. 把 `-A` 改成 `-B`，保存，应用，记下 vB。**之后不要再触发任何展开**，直接从托盘「退出」。
+  4. 执行 P3 截断 `active.json`，然后启动。
+  5. 观察横幅、「当前生效版本」和「草稿状态」，在记事本里输入 `zzk` 加空格，检索日志。
+  6. 点「应用设置」，记下新的生效版本 vN。
+  7. 退出程序再启动，打开 `store-meta.json` 查看 `previous_revision`。然后在「运行状态与恢复」点「恢复上一个版本」→「回滚」。
+  8. 在记事本里输入 `zzk` 加空格，查看「当前生效版本」。
+- **预期结果**：
+  - 第 2 步：
+    - 约 60 秒后日志有 `store.last_good revision=<vA>`（`src-tauri/src/store/mod.rs:279-283`）；
+    - `store-meta.json` 里 `"last_good_revision": <vA>`，`revisions\<vA>.json` 存在。
+  - 第 3 步之后 `last_good_revision` 仍是 vA：B 版没有成功展开过，不满足条件。
+  - 第 5 步：
+    - 日志依次有 `store.corrupt file=active.json …`、`store.quarantine file=active.json …`、`store.recovered file=<vA>.json from=LastGood revision=Some(<vA>)`；
+    - 横幅「配置文件无法读取，已自动从上次正常运行时的配置恢复。请检查最近的改动是否还在。」，另有「active.json 已损坏，已改名为 … 保留，可在数据目录中查看。」；
+    - 不进入安全模式；「当前生效版本」为 vA，`zzk` 展开出 `-A`。
+    - `draft.json` 没有损坏、单独读取，所以编辑器里 `zzk` 可能仍显示 `-B`，「草稿状态」为「存在未应用的设置」。这是现状，不算失败，记下即可。
+  - 第 6 步：发布成功，vN = vB + 1（新版本号大于磁盘上所有历史版本，`src-tauri/src/store/revisions.rs:149`）。
+  - 第 7 步：`store-meta.json` 里有 `"previous_revision": {"active": <vN>, "revision": <vA>}`。
+  - 第 8 步：`zzk` 展开出 `-A`，即回到恢复时的版本 vA，而不是 vB；「当前生效版本」为 vN+1，因为回滚本身也是一次发布。回到 `-B` 判为不通过：说明回滚目标仍按 `revisions\<vN-1>.json` 推算。
+- **通过标准**：
+  - 只有在「正常」状态持续 60 秒、并且在当前版本上成功展开过一次之后，才记录为上次正常配置；
+  - `active.json` 损坏时优先恢复到上次正常配置；
+  - 恢复后发布、再重启，「恢复上一个版本」回到恢复时的版本。
+- **出处**：
+  - B-04；development-plan.md §7.2 LKG。
+  - `b32062f`：`src-tauri/src/lkg.rs:7-23`（条件）、`lkg.rs:136`（60 秒）、`src-tauri/src/store/mod.rs:262-285`（`mark_last_good`）、`src-tauri/src/store/fallback.rs:173-194`（候选顺序）。
+  - `7b727ca`：`src-tauri/src/store/revisions.rs`（发布时在写 `active.json` 之前记录 `previous_revision`）。
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（vA=____，vB=____，vN=____，回滚后的版本=____；第 5 步编辑器显示 `-A` 还是 `-B`：____）
 
 ## 6. 前端状态一致性（M4-FE）
 
@@ -1032,13 +1213,14 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 ### M4-FE-02 导入草稿保存进行中，对话框不能关闭
 
 - **步骤**：
-  1. 用 P8 生成 `qt-bulk-5000.json`。
-  2. 点「导入」，选择该文件，选择「保留两份」，在预览中点「确认导入草稿」。
+  1. 用 P8 生成 `qt-bulk-5000.json`（只含 5000 条合成规则，不含原有规则）。记下导入前的规则条数 M。
+  2. 点「导入」，选择该文件，在「遇到重复的指令时怎么处理？」里选「保留两份（keep_both）」，点「导入」，在预览中点「确认导入草稿」。
   3. 立即连按 Esc 两次，并点「关闭」和「✕」。
 - **预期结果**：
   - 保存期间「关闭」和「✕」不可用，Esc 被忽略，对话框保持打开。
   - 保存完成后提示「导入草稿已保存，请应用设置」。
-- **通过标准**：保存完成前对话框不消失；没有重复导入（草稿条数等于原条数加 5000，只加一次）。
+  - 草稿条数为 M + 5000：原有规则不变，新增的正好是文件里的 5000 条。
+- **通过标准**：保存完成前对话框不消失；没有重复导入（只增加 5000 条，只加一次）。
 - **出处**：`src/App.tsx:923-925、1870、1905`（`importing` 期间忽略关闭）；提交 `72804aa`。
 - **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（需确认：保存耗时是否足够长，能观察到这个窗口期。如果太快，以 FE-03 为准）
 
@@ -1049,7 +1231,7 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
   2. 「导入」一个小文件，然后点「确认导入草稿」。
   3. 释放锁，在同一个对话框里再点一次「确认导入草稿」。
 - **预期结果**：
-  - 第 2 步立即报错「写入文件失败：draft.json（系统错误 32）」（原子替换用 MoveFileExW，不重试），对话框和预览保持不变。
+  - 第 2 步立即报错「重命名文件失败：draft.json（系统错误 5）。」或「…（系统错误 32）。」，对话框和预览保持不变。临时文件 `draft.json.tmp` 能写成，失败的是用 MoveFileExW 替换被锁的 `draft.json` 那一步，不重试，所以报的是「重命名文件」（`src-tauri/src/store/atomic.rs:23`；`src/ipc/errors.ts:200-205`）。
   - 第 3 步成功，草稿只增加一次。
 - **通过标准**：失败后不丢预览、不关对话框；重试后不重复写入。
 - **出处**：`src-tauri/src/store/atomic.rs`；`src/ipc/errors.ts`（io 错误文案）。
@@ -1058,15 +1240,21 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 ### M4-FE-04 外部修改配置文件：revision_conflict
 
 - **步骤**：
-  1. 程序运行中，用记事本打开 `active.json`，把某条规则的 `description` 改一个字，保存（保持 JSON 合法）。
-  2. 在 Quicker Text 里编辑另一条规则，点「保存」，再点「应用设置」。
-  3. 点「刷新状态」或重启后再应用一次。
+  1. 程序运行中，用记事本打开 `active.json`，在 `zzk` 那条规则的 `description` 末尾加上 `-EXT`，保存（保持 JSON 合法）。
+  2. 在 Quicker Text 里编辑另一条规则（例如在 `zzp` 的正文末尾加 `-APP`），点「保存」，再点「应用设置」。
+  3. 在「运行状态与恢复」点「刷新状态」，再点一次「应用设置」。
+  4. 退出程序再启动。在「运行状态与恢复」点「放弃未应用草稿」→「放弃草稿」，让草稿按磁盘上的生效配置（含 `-EXT`）重建。
+  5. 重新做第 2 步的修改（`zzp` 加 `-APP`），保存，点「应用设置」。
+  6. 退出程序，用记事本打开 `active.json`，查找 `-EXT` 和 `-APP`。
 - **预期结果**：
   - 第 2 步报错「设置已在别处更新（当前版本 N），请刷新后再试。」，`active.json` 保留外部修改，监听状态不变。
-  - 第 3 步重新读取后能应用成功。
-- **通过标准**：不覆盖外部修改；提示明确。
-- **出处**：`revisions.rs:30-69`（磁盘哈希不一致时返回 RevisionConflict）；`src/ipc/errors.ts`。
-- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注 ____
+  - 第 3 步仍然报同样的错。「刷新状态」只取内存里的状态（`src-tauri/src/commands/runtime.rs:13-15`），不重新读磁盘；比对用的磁盘哈希只在启动和发布时更新（`src-tauri/src/store/load.rs:85`、`revisions.rs:103`），所以冲突要到重启后才解除。提示里的「请刷新后再试」做不到，记入 §12.3 第 18 条。
+  - 第 4 步之后编辑器里能看到 `-EXT`，`zzp` 没有 `-APP`。
+  - 第 5 步应用成功；第 6 步 `active.json` 里 `-EXT` 和 `-APP` 都在。
+  - 注意：如果第 4 步不放弃草稿、直接应用，发布的是重启前保存的旧草稿，草稿里没有 `-EXT`，外部修改会被覆盖而且没有任何提示。这是已知问题，0.5 修（§12.3 第 18 条）。实测时可以在第 6 步之后另行验证一次，记进备注，但本条只按上面的步骤判定。
+- **通过标准**：冲突时不覆盖外部修改，提示明确；按「重启 → 放弃未应用草稿 → 重做修改 → 应用」之后，两处修改都保留。
+- **出处**：`revisions.rs:30-41`（磁盘哈希不一致时返回 RevisionConflict）；`src-tauri/src/store/mod.rs:319-330`（放弃草稿时按生效配置重建）；`src/ipc/errors.ts:196-197`。
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（第 3 步是否仍冲突：____；如另行验证了旧草稿覆盖，结果：____）
 
 ### M4-FE-05 安全模式下的写入入口
 
@@ -1150,16 +1338,27 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 
 ### M4-PR-04 执行历史和界面
 
+执行历史只在内存里：最多 200 条、30 分钟，退出或重启后就没有了（`crates/platform/src/history.rs:14-17`）。所以本条必须在执行哨兵的**同一次运行**里、执行完 30 分钟内检查，否则看到的是空表，什么也证明不了。
+
 - **步骤**：
-  1. 查看「最近执行」的各列（时间、指令、方式、程序、结果、耗时）。
-  2. 展开「详细运行信息（高级）」。
-  3. 在 debug-fi 执行 `JSON.stringify(await inv('list_history', { since_seq: null })).includes('QTSENTINEL')`。
+  1. release：PR-01 第 2 步做完后，不退出、不重启，立即打开「最近执行」，确认表里有刚才的 `zzs`、`zzt` 记录，再查看各列（时间、指令、方式、程序、结果、耗时）。
+  2. 同一次运行中，展开「详细运行信息（高级）」。
+  3. debug-fi（单独记录）：同样建好 `zzs`、`zzt` 并应用，在记事本各执行 5 次。不重启，在开发者工具的 Console 执行：
+
+     ```js
+     const h = await inv('list_history', { since_seq: null });
+     [h.length, JSON.stringify(h).includes('QTSENTINEL'), JSON.stringify(h).includes('隐私哨兵')]
+     ```
+
 - **预期结果**：
-  - 任何地方都不出现哨兵正文或窗口标题，只有程序名。
-  - 第 3 步返回 `false`。
-- **通过标准**：执行历史中零命中。
-- **出处**：development-plan.md:2491；`history.rs:4-7`。
-- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（测完删除 `zzs`、`zzt` 并「应用设置」）
+  - 第 1 步表里有记录；任何地方都不出现哨兵正文或窗口标题，只有程序名。
+  - 第 3 步第一个值不小于 10，后两个值都是 `false`。
+- **通过标准**：执行历史不为空，且其中零命中。release 界面（第 1、2 步）和 debug-fi 原始数据（第 3 步）分别判定。
+- **出处**：development-plan.md:2491；`history.rs:4-7、14-17`；`src-tauri/src/commands/engine.rs:128-133`。
+- **结果**：
+  - release 界面：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；距 PR-01 第 2 步结束 ____ 分钟；表中记录条数 ____。
+  - debug-fi `list_history`：日期 ____；构建 ____；☐通过 ☐不通过 ☐未测；返回值 ____。
+  - 备注（测完删除 `zzs`、`zzt` 并「应用设置」）____
 
 ## 8. 数据兼容：0.3.1 与 0.4 互读（M4-CP）
 
@@ -1170,46 +1369,97 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
   2. 换成 0.4 release 构建并启动。
   3. 观察横幅，检索 `store.` 开头的日志，核对条数。
   4. 抽 5 条不同操作类型的规则实际执行一遍。
-  5. 不应用，退出后再用 P10 核对哈希。
+  5. 不应用，退出后再用 P10 核对哈希，并打开 `store-meta.json`。
 - **预期结果**：
   - 没有进入安全模式，没有隔离，没有 `store.corrupt`。
   - 条数相同，抽测的规则都能执行。
-  - `active.json`、`draft.json` 的哈希不变。加载时会新写 `revisions\<n>.metadata.json`，这是新增文件，可以接受。
+  - 第一次启动时就出现 `backup-pre-0.4\`（加载时先备份，再写别的文件），日志有 `store.backup_pre_0_4 result="created" files=<N>`，`store-meta.json` 里有 `"backup_pre_0_4": true`。备份内容在 CP-04 核对。
+  - `active.json`、`draft.json` 的哈希不变。加载时会写当前版本的 `revisions\<n>.metadata.json`（迁移元数据快照），可以接受；它写在备份之后。
 - **通过标准**：无损加载（退出标准原文）。
-- **出处**：development-plan.md:2448；§9（development-plan.md:2339-2340）。
-- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（规则条数：0.3.1 ____ / 0.4 ____）
+- **出处**：development-plan.md:2448；§9（development-plan.md:2339-2340）；R6 `fe31dec`：`load.rs:91-95`（加载时先备份，备份失败就不写元数据快照）、`backup.rs`。
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（规则条数：0.3.1 ____ / 0.4 ____；备份 files=____）
 
 ### M4-CP-02 0.4 写入的数据 0.3.1 仍能读取
 
 - **步骤**：
   1. 接着 CP-01，在 0.4 中编辑一条规则，点「应用设置」，修改一项参数，然后退出。
   2. 安装或运行 0.3.1，启动，核对条数和被编辑的那一条，并执行一次。
-- **预期结果**：0.3.1 正常加载，看得到 0.4 的修改，忽略 0.4 新增的文件（`store-meta.json`、`revisions\*.metadata.json`、`prefs.json` 中的新键）。
+- **预期结果**：0.3.1 正常加载，看得到 0.4 的修改，忽略 0.4 新增的内容：`store-meta.json`（包括 `previous_revision`、`backup_pre_0_4` 等字段）、`backup-pre-0.4\` 目录、`prefs.json` 中的新键。`revisions\*.json` 与 `*.metadata.json` 是两个版本共用的格式。
 - **通过标准**：0.3.1 可以读取（退出标准原文）。
 - **出处**：development-plan.md:2448、2340。
 - **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注 ____
 
 ### M4-CP-03 保留未知字段和读不懂的规则
 
+`active.json` 的最外层就是配置对象（`version`、`revision`、`enabled`、`globals`、`rules`），没有 `config` 这一层包装。
+
 - **步骤**：
-  1. 退出程序，在 `active.json` 的顶层 `config` 对象里加入 `"x_acceptance_future": {"keep": true}`，并在某条规则对象里加入 `"x_rule_future": 1`。
-  2. 另复制一条规则，把它的 `action.type` 改成 `"future_action"`，`id` 改成唯一值。
-  3. 启动，看界面怎样显示这条读不懂的规则。
-  4. 编辑**另一条**规则，「应用设置」，然后用记事本打开新的 `active.json` 检索这三处。
+  1. 退出程序，用 P10 记下哈希。在 `active.json` 里做两处修改：
+     - 在最外层对象里加入 `"x_acceptance_future": {"keep": true}`；
+     - 在 `zzk` 这条规则对象里（与 `id`、`match` 同级，不要放进 `action`）加入 `"x_rule_future": 1`。
+  2. 在 `rules` 数组里再复制一条规则，`id` 改成唯一值（例如 `cp03-future`），把它的 `action.type` 改成 `"future_action"`。
+  3. 启动。如果「运行状态与恢复」里的「放弃未应用草稿」可以点，就点它并在「放弃全部未应用草稿？」中选「放弃草稿」，让草稿等于刚改过的 `active.json`。（否则 `draft.json` 里没有这三处修改，下一步应用的是旧草稿；也可以在第 1 步对 `draft.json` 做同样的修改来代替。）
+  4. 记下横幅、日志和规则列表怎样显示这条读不懂的规则。
+  5. 编辑**另一条**规则（例如改 `zzp` 的描述），「应用设置」，然后用记事本打开新的 `active.json`，检索这三处。
 - **预期结果**：
-  - 正常启动。
-  - 三处内容原样保留在新的 `active.json` 里。存储格式保留未知字段（B-43），读不懂的规则原样存放在 `unreadable_rules` 中。
-- **通过标准**：没有丢失。
-- **出处**：`crates/domain/src/model.rs:50-63`；`crates/domain/src/stored.rs:115`；`package.rs:160`（导入是严格模式，与存储不同）。
-- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（界面上如何显示读不懂的规则：____）
+  - 正常启动，没有进入安全模式，没有隔离。
+  - 日志有 `store.diagnostic code=rule_unreadable path=rules[<序号>]` 和 `store.rules_skipped count=1`；横幅「有 1 条规则无法读取或无法使用，已跳过：「cp03-future」。其他规则不受影响。」。
+  - 规则列表里这一行显示「无法读取的规则」、它的 `id`，以及「这条规则含有当前界面无法编辑的内容，只能查看；已保留在配置中。」。
+  - 新的 `active.json` 里三处内容都原样保留：最外层的 `x_acceptance_future`、`zzk` 里的 `x_rule_future`，以及 `cp03-future` 整条（仍在 `rules` 数组里，字段和取值不变）。文件里**不会**出现 `unreadable_rules` 这个键：程序内部把读不懂的条目单独存放，写回时放回 `rules` 数组。
+- **通过标准**：三处都没有丢失；没有出现新的键。
+- **出处**：`crates/domain/src/model.rs:48-63`（`Config` 的写回规则：读不懂的条目放回 `rules`，不新增键，B-43）；`crates/domain/src/stored.rs:248-300`（逐条读取规则，读不懂的保留原文并给出 `rule_unreadable`）；`src/App.tsx:1270-1290`（只读行）；`src/status.ts:179-184`（横幅）；`package.rs:160`（导入是严格模式，与存储不同）。
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（第 3 步是否点了「放弃未应用草稿」：____；界面如何显示读不懂的规则：____）
 
 ### M4-CP-04 跨版本首次写入前的备份 backup-pre-0.4
 
-- **步骤**：在 CP-01 的数据目录上，0.4 第一次「应用设置」之后，查看数据目录里有没有 `backup-pre-0.4\`。
-- **预期结果**：按计划 §9 应该有这个目录，包含 `active.json`、`draft.json`、`previous.json` 和 `revisions\` 中的相关文件。
-- **通过标准**：按计划判定。**预计不通过**：代码里没有找到这项实现（§12.3）。
-- **出处**：development-plan.md:1805、2339。
-- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注 ____
+R6（`fe31dec`）实现了这项备份：0.4 第一次往 0.3.1 留下的数据目录写任何 0.3.1 会读的文件之前，先把这些文件逐字节复制到 `backup-pre-0.4\`。先复制到临时目录 `backup-pre-0.4.tmp-<时间>`，复制完再改名，所以目录要么完整，要么不存在。加载时就会触发（加载时要写元数据快照），之后每个写入命令前也会检查一次；`store-meta.json` 记下 `backup_pre_0_4` 之后就不再检查。
+
+- **步骤**：
+  1. 接着 CP-01（第一次启动 0.4 之后）。用 CP-01 第 1 步记下的 P10 哈希（0.4 启动前）作对照。
+  2. 列出备份里的文件和哈希：
+
+     ```powershell
+     $b = "$d\backup-pre-0.4"
+     Get-ChildItem $b -Recurse -File | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $_.FullName.Substring($b.Length + 1) }
+     Get-ChildItem $d -Directory -Filter 'backup-pre-0.4.tmp-*'   # 应为空
+     ```
+
+  3. 做完 CP-02 第 1 步的「应用设置」后，再重启一次 0.4，记下 `backup-pre-0.4\` 的文件列表和修改时间。
+  4. 空目录对照：退出程序，`Rename-Item $d 'com.quickertext.desktop.cp04'`，启动 0.4（会建一个新的空数据目录），看日志和 `store-meta.json`，然后退出，删掉新建的目录，再把 `.cp04` 改回原名。（debug-fi 也可以直接把 `QUICKER_TEXT_DATA_DIR` 指向一个空目录。）
+- **预期结果**：
+  - 第 2 步：备份里只有下列文件中**存在的那些**（不存在的跳过），每个文件的哈希都与 0.4 启动前的 P10 记录相同：
+    - `active.json`、`draft.json`、`previous.json`、`migration-unresolved.json`、`active-migration-unresolved.json`；
+    - `revisions\` 中三个版本的 `<n>.json` 和 `<n>.metadata.json`：当前生效版本、生效版本减 1（0.3.1 回滚的目标）、`previous.json` 记录的版本；
+    - `prefs.json`、`revisions\index.json`。
+
+    更早的版本不在备份里。没有残留的 `backup-pre-0.4.tmp-*`。日志 `store.backup_pre_0_4 result="created" files=<N>` 中的 N 等于备份里的文件数；`store-meta.json` 有 `"backup_pre_0_4": true`。
+  - 第 3 步：没有第二次备份。目录内容和修改时间都不变，日志里也不再有 `store.backup_pre_0_4`（记下之后直接跳过，不写日志）。
+  - 第 4 步：日志 `store.backup_pre_0_4 result="not_needed" files=0`，没有 `backup-pre-0.4\`，`store-meta.json` 有 `"backup_pre_0_4": false`。
+- **通过标准**：备份内容和哈希与上面一致；只备份一次；空目录不备份。
+- **出处**：development-plan.md:1805、2339；R6 `fe31dec`：`src-tauri/src/store/backup.rs:40-51`（复制哪些文件）、`backup.rs:110-131`、`backup.rs:324-330`（哪三个版本）、`backup.rs:210-238`（已有目录、同名文件、无需备份）、`backup.rs:251-296`（日志和 `store-meta.json`）、`load.rs:91-95`；测试 `startup_tests.rs` 的 `first_write_backs_up_a_031_directory_byte_for_byte`、`fresh_directory_gets_no_backup`。
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（files=____；与 P10 不一致的文件：____）
+
+### M4-CP-05 备份失败时拒绝写入，修好后补做备份
+
+用一个与备份目录同名的**文件**挡住备份。这是最容易复现的失败方式，不需要任何注入输入的程序；展开用手动打字。
+
+- **步骤**：
+  1. 退出程序。把数据目录恢复成 CP-01 第 1 步备份的那份 0.3.1 数据（没有 `store-meta.json`，也没有 `backup-pre-0.4\`）。如果 `store-meta.json` 里已经有 `backup_pre_0_4`，就不会再备份，本条无法测。
+  2. 用 P10 记下哈希，然后建一个同名的空文件：`New-Item -ItemType File "$d\backup-pre-0.4"`。
+  3. 启动 0.4 release，看横幅、日志和 `store-meta.json`。
+  4. 在记事本手动输入 `zzk` + 空格。
+  5. 编辑一条规则并保存，再点「应用设置」。
+  6. 不退出程序，删掉那个文件：`Remove-Item "$d\backup-pre-0.4"`。再保存一次并「应用设置」。
+  7. 记下横幅是否消失，然后重启程序再看一次。
+- **预期结果**：
+  - 第 3 步：没有进入安全模式。横幅显示「升级前备份失败，暂时不能保存，已有配置照常生效。」。日志有 `store.backup_pre_0_4 result="failed" files=0 op=CreateDir file="backup-pre-0.4" error_kind=AlreadyExists`（这个错误不是系统调用返回的，所以没有 `os_code`）。`store-meta.json` 里没有 `backup_pre_0_4` 键；0.3.1 的文件哈希与第 2 步相同（加载时的元数据快照也没有写）。
+  - 第 4 步：照常展开。
+  - 第 5 步：保存和应用都被拒绝，提示「创建文件夹失败：backup-pre-0.4。」（没有系统错误码）。P10 哈希不变，横幅仍在。
+  - 第 6 步：保存和应用成功；出现 `backup-pre-0.4\` 目录，内容按 CP-04 核对；日志 `store.backup_pre_0_4 result="created" files=<N>`；`store-meta.json` 有 `"backup_pre_0_4": true`。
+  - 第 7 步：后端在备份成功时已经撤销了这个问题，但撤销不发事件，前端只合并新增的问题，所以横幅当场不会消失，要到重启后才消失（§12.3 第 19 条），如实记录；重启后不应再出现。
+- **通过标准**：备份失败期间不写任何 0.3.1 会读的文件，已有配置照常展开；问题修好后下一次写入补做备份并成功。第 7 步横幅当场没有消失不判为不通过，只记录。
+- **出处**：R6 `fe31dec`：`backup.rs:213-220`（同名文件 → `CreateDir`/`AlreadyExists`）、`backup.rs:257-276`（失败日志与返回的错误）、`backup.rs:297-322`（`backup_before_write`、`note_backup`）、`load.rs:91-95`、`load.rs:114-116`；测试 `startup_tests.rs` 的 `failed_backup_refuses_writes_until_it_succeeds`；横幅文案 `src/status.ts:217-219`（`cfa41f2`）；错误文案 `src/ipc/errors.ts:200-205`。
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（第 7 步横幅当场是否消失：____）
 
 ## 9. 性能与浸泡（M4-PF）
 
@@ -1220,25 +1470,39 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 
 ### M4-PF-01 触发到开始输出的 p95（基线，1.0 的目标是 < 100 ms）
 
+先说清楚能拿到什么数据：
+
+- 每次执行的计时只存在内存里的执行历史中（最多 200 条、30 分钟），字段是 `queue_us`、`resolve_us`、`erase_us`、`output_us`、`restore_us`、`total_us`（微秒）。日志和诊断包里都没有这些数字，`get_health` 也还没有 p50/p95 汇总（`src-tauri/src/commands/diagnostics.rs:506` 是 TODO）。
+- release 构建没有开发者工具。界面「最近执行」的「耗时」列只显示 `total_us`，并四舍五入到毫秒（`src/StatusArea.tsx:138`、`:155`；`src/status.ts:272-277`）。分阶段的数字只能在 debug-fi 里用 `list_history` 取。
+- 各阶段并不首尾相接，不能直接加起来。执行依次经过 Resolve → Preflight → Guard → Clipboard → Erase → Output → Cleanup → Restore → Done。Preflight、Guard、Clipboard 三段没有单独的字段；Cleanup 算进 `output_us`。`queue_us` 从入队算起，钩子收到终止键到入队的时间不在任何字段里。所以只能这样推算：
+  - 入队 → 开始擦除 ≈ `total_us − erase_us − output_us − restore_us`；
+  - 入队 → 开始输出 ≈ `total_us − output_us − restore_us`。
+
+  缺失的字段（例如这次没有擦除或恢复）按 0 计。
+
 - **步骤**：
-  1. 方法 A（各阶段计时）：
-     1. 用 debug-fi 构建（结论里注明是调试构建，数值偏大）。
-     2. 在记事本执行 `zzk` + 空格 100 次（每批不超过 200 条，30 分钟内取完）。
-     3. 在开发者工具执行：
+  1. 方法 A（debug-fi，分阶段）：
+     1. 用 debug-fi 构建，结论里注明是调试构建，数值偏大。
+     2. 在记事本手动输入 `zzk` + 空格 100 次，30 分钟内做完并取数。
+     3. 在开发者工具执行（`inv` 的定义见 §1.6；只统计结果为 `succeeded` 的执行）：
 
         ```js
-        const h = await inv('list_history', { since_seq: null });
-        const xs = h.map(e => ((e.timings.queue_us ?? 0) + (e.timings.resolve_us ?? 0)) / 1000).sort((a, b) => a - b);
-        const q = p => xs[Math.min(xs.length - 1, Math.floor(p * xs.length))];
-        ({ n: xs.length, p50: q(0.5), p95: q(0.95), max: xs[xs.length - 1] })
+        const h = (await inv('list_history', { since_seq: null })).filter(e => e.outcome === 'succeeded' && e.timings.total_us !== null);
+        const v = (e, k) => e.timings[k] ?? 0;
+        const toErase = h.map(e => (v(e, 'total_us') - v(e, 'erase_us') - v(e, 'output_us') - v(e, 'restore_us')) / 1000);
+        const toOutput = h.map(e => (v(e, 'total_us') - v(e, 'output_us') - v(e, 'restore_us')) / 1000);
+        const total = h.map(e => v(e, 'total_us') / 1000);
+        const stat = xs => { xs = [...xs].sort((a, b) => a - b); const q = p => xs[Math.min(xs.length - 1, Math.floor(p * xs.length))]; return { n: xs.length, p50: q(0.5), p95: q(0.95), max: xs[xs.length - 1] }; };
+        ({ toErase: stat(toErase), toOutput: stat(toOutput), total: stat(total) })
         ```
 
-  2. 方法 B：在 release 构建中执行同样的 100 次，记下「最近执行」耗时列（即 total_us，包含退格、输出和恢复）的 p50 和 p95，作为上界。
-  3. 可选方法 C：用 240 fps 录屏，从终止键按下到第一个字符变化逐帧计数。
-- **预期结果**：得到三组数字中的至少两组；p95 低于 100 ms 记为达到 1.0 目标，否则只记作基线。
+  2. 方法 B（release，上界）：在 release 构建中同样执行 100 次，分 2～3 批，每批做完就把「最近执行」的「耗时」列抄下来或截图，再自己算 p50 和 p95。这是 `total_us`，包含擦除、输出和恢复，只能作上界。
+  3. 可选方法 C：用 240 fps 录屏，从终止键按下到第一个退格生效、第一个字符出现，逐帧计数。只有这个方法包含钩子到入队的那一段。
+  4. 可选（未验证）：release 下想拿分阶段数字，可以在启动前设 `$env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = '--remote-debugging-port=9222'`（只对这次启动有效），再用 Edge 的 `edge://inspect` 连上窗口，执行方法 A 的脚本。连不上就记「不可用」。
+- **预期结果**：至少得到 A、B 两组数字；有条件时加上 C。「入队 → 开始输出」的 p95 低于 100 ms 记为达到 1.0 目标，否则只记作基线。
 - **通过标准**：0.4 只要求「有数据」（performance-baseline.md:43），所以完成测量并存档即为通过。
-- **出处**：performance-baseline.md:43；`crates/platform/src/health.rs:238-245`（StageTimings）；`executor.rs:412-437`。
-- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（A：p50 ____ / p95 ____；B：p50 ____ / p95 ____。需确认：从钩子到入队的时间不在 queue_us 里；release 构建没有开发者工具，`get_health` 也还没有 p50/p95 汇总（diagnostics.rs:506 是 TODO））
+- **出处**：performance-baseline.md:43；`crates/platform/src/health.rs:236-245`（StageTimings）；`crates/platform/src/windows/executor.rs:409-437`（各字段的起止）；`crates/platform/src/windows/actions.rs:31-42`（阶段顺序）；`src/StatusArea.tsx:138-155`。
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（A 入队→擦除 p50 ____ / p95 ____；A 入队→输出 p50 ____ / p95 ____；A total p50 ____ / p95 ____；B p50 ____ / p95 ____；C ____；第 4 步是否可用：____）
 
 ### M4-PF-02 启动到「正常」< 2 s
 
@@ -1272,43 +1536,42 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 
 ### M4-PF-05 2 小时浸泡
 
+用 release 构建正常启动（不用验收模式），由人打字或用实体按键工具触发，这样走的是真实的键盘输入路径。`scripts/soak/soak.ps1` 只读日志、只查询进程，不注入输入，也不写数据目录；它统计「静默失效」的可疑项，但看不到每次执行的结果，所以还要人工对照执行历史。
+
 - **步骤**：
-  1. 在虚拟机 B 上用 release 构建，以验收模式启动：
+  1. 在虚拟机 B（或一台日常机器）上用 release 构建正常启动，导入规则集（含 `zzq`、`zzv`），「应用设置」，等健康页显示「正常」。
+  2. 在仓库根目录另开 PowerShell，每轮用一个新的输出目录：
 
      ```powershell
-     $env:QUICKER_TEXT_TEST_INPUT = '1'
-     $env:QUICKER_TEXT_DATA_DIR = 'D:\qt-soak'
-     & .\quicker-text.exe --acceptance-test-input
+     powershell -NoProfile -ExecutionPolicy Bypass -File scripts\soak\soak.ps1 -Hours 2 -OutputDirectory D:\soak\round<N>
      ```
 
-     导入规则集（含 `zzq`、`zzv`），「应用设置」，确认「详细运行信息（高级）」显示 `explicit_test_mode`。
-  2. 打开一个空白记事本，保存为 `D:\soak.txt`，让它保持在前台。
-  3. 另开 PowerShell 运行 P7（采样），再运行 P11（负载）。
-  4. 每 10 分钟手动做一次：
-     - 暂停再恢复（托盘）；
-     - `Set-Clipboard -Value "soak $(Get-Date)"`；
-     - 每 20 分钟对「最近执行」截图一次（历史只保留 30 分钟）。
-  5. 结束后保存 `soak.txt`，统计数据：
+     数据目录不是默认的 `%APPDATA%\com.quickertext.desktop` 时，加 `-DataDirectory <目录>`。脚本已经每 10 秒采样内存、句柄和线程，P7 可以不跑。
+  3. 打开一个空白记事本，保存为 `D:\soak.txt`。在 2 小时内手动输入 `zzq` + 空格和 `zzv` + 空格，每个触发单独一行，自己记下次数（例如每 10 分钟 20 次，分布在整个 2 小时内）。暂停期间不要输入。
+  4. 每 10 分钟做一次：托盘暂停再恢复；`Set-Clipboard -Value "soak $(Get-Date)"`。
+  5. 每 30 分钟内至少看一次「最近执行」，记下成功、失败、「未执行」的条数；有失败或未执行时截图（执行历史只在内存里，最多 200 条、30 分钟）。
+  6. 脚本到时自动写出汇总；提前结束按 Ctrl+C，已有数据照样汇总（直接关掉终端窗口不会写最终汇总）。保存 `soak.txt`，统计：
 
      ```powershell
      $t = [IO.File]::ReadAllText('D:\soak.txt')
      ([regex]::Matches($t, '\[QT-SOAK-OK\]')).Count; ([regex]::Matches($t, '\[QT-SOAK-PASTE\]')).Count
-     ([regex]::Matches($t, '\bzz[qv]\b')).Count      # 残留的缩写，等于失败次数
-     (Get-Content D:\qt-soak-sent.log).Count          # 发送的触发次数
+     ([regex]::Matches($t, '\bzz[qv]\b')).Count      # 残留的缩写，等于没有展开的次数
      ```
 
-  6. 检索日志中 error 的条数，以及 `supervisor.circuit_open`、`input.queue_full`、`executor.stalled`。
-  7. 把结果填进 performance-baseline.md §4 的记录表。
+  7. 打开 `D:\soak\round<N>\summary.txt`，看「静默失效」可疑项（A 自动可疑项、B 人工复核项）、句柄和线程的趋势、Private Bytes 的增长、结束时的健康状态。结果填进 performance-baseline.md §4 的记录表。
 - **预期结果**：
-  - 发送次数 = 成功次数 + 残留次数，每次残留都能在截图的历史或日志里找到带原因的失败。
-  - 句柄数、线程数不是单调增长。
-  - 结束时健康状态为「正常」。
+  - 自己记的触发次数 = 两种标记数之和 + 残留缩写数；每个残留都能在执行历史（截图）里找到一条带原因的失败或「未执行」。
+  - `summary.txt` 的 A 部分为空，或者每一项都能解释（例如第 4 步有意的暂停）；B 部分逐项对照过执行历史。
+  - 句柄、线程没有标「疑似单调增长」。
+  - 结束时健康页显示「正常」。`summary.txt` 里的健康是从日志推断的，「正常 ↔ 降级」不写日志，以界面为准。
   - 记下 Private Bytes 从开始到结束的增长（1.0 要求 < 20 MB，0.4 只记录）。
-- **通过标准**：没有静默失效（退出标准原文）；句柄数和线程数不单调增长；结束时状态「正常」。
-- **出处**：development-plan.md:2448；performance-baseline.md:76-89；[windows-acceptance-mode.md](windows-acceptance-mode.md)。
-- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（触发 ____ / 成功 ____ / 失败 ____ / 静默 ____；Private Bytes ____ → ____；句柄 ____ → ____；线程 ____ → ____。需确认：`scripts/soak/` 不存在，P11 是临时替代；失败不一定都写日志，历史只保留 200 条或 30 分钟，靠截图补足；外部模拟输入不能代表实体键盘路径）
+- **通过标准**：没有静默失效（退出标准原文），即 A 部分没有解释不了的项，B 部分对照后没有「打了触发词却没有任何记录」的情况；句柄和线程不单调增长；结束时状态「正常」。
+- **出处**：development-plan.md:2448；performance-baseline.md:76-89；`scripts/soak/README.md`（用法、输出、「静默失效」的判定方法；`9cbe400`）。
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（触发 ____ / 成功 ____ / 残留 ____ / 残留中找不到记录的 ____；A 项 ____；B 项 ____；Private Bytes ____ → ____；句柄 ____ → ____；线程 ____ → ____；输出目录 ____）
 
 ## 10. S-29 spike（M4-SP）
+
+S-29 在计划里是 0.4 的 **P0** 条目（development-plan.md:630、2381），0.4 末必须给出三项结论（第 720 行），所以本节四条都是必做，结果要计入发布判定，不是只记录的参考项。每个 T-xx 都要有记录，不能留空；只有维护者书面同意缩小范围（写明谁、哪天、去掉哪几项、理由），才可以标「未测」，并把同意记录附在备注里。
 
 所有 spike 只在虚拟机 B 上运行。可执行文件在宿主机上用 `cargo build -p quicker-platform --examples` 生成，再复制进虚拟机（s-29.md:91）。
 
@@ -1331,13 +1594,20 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 
 ### M4-SP-02 管理员窗口检测与输入可见性 T-09 ～ T-14
 
+- **前提**：T-09 ～ T-12 和 T-14 需要一个临时探针程序（s-29.md:188），目前还没有。**由开发者在本轮验收前写好**，在宿主机编译，只复制到虚拟机 B 运行。按 s-29.md §3.5，探针要做到：
+  - 创建一个隐藏窗口，注册 `RIDEV_INPUTSINK` 的键盘和鼠标 RawInput，安装 `WH_KEYBOARD_LL` 和 `WH_MOUSE_LL`，只打印收到的事件数，不记录按键内容（T-09 ～ T-11）；
+  - 能按批次调用 `SendInput`，打印请求数、返回数和 `GetLastError`（T-12）；
+  - 加一个 `EVENT_SYSTEM_FOREGROUND` 回调，打印它与第一个按键的间隔（T-14）。
+
+  探针还没到位时，本条不能开始，也不能用「探针未编写」作为「未测」的理由（见本节开头）。
 - **步骤**：
-  1. T-13 可以直接执行：管理员记事本在前台时运行 `spike_integrity` 和 `spike_integrity <PID>`（s-29.md:196、300-303）。
-  2. T-09 ～ T-12 和 T-14 需要一个临时探针程序（s-29.md:188）。**这个探针还没有编写**，本轮预计只能标「未测」，原因写「探针未编写」。
-- **预期结果**：T-13 有记录；其余按探针是否到位决定。
-- **通过标准**：T-13 有记录；T-09 ～ T-11 的结果用于回填 C.2 #3。
-- **出处**：s-29.md §0（第 12 行）、§3.5（第 186–199 行）。
-- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注 ____
+  1. T-13：管理员记事本在前台时运行 `spike_integrity` 和 `spike_integrity <PID>`（s-29.md:196、300-303）。
+  2. T-09 ～ T-12、T-14：按 s-29.md §3.5 的表逐条用探针执行，记录栏填事件数、返回值、错误码或毫秒数。
+  3. SV-09 的日志（管理员窗口在前台时的 `input.check`）只作旁证，不能代替 T-09 ～ T-11 的探针计数。
+- **预期结果**：见 s-29.md §3.5 表中的「预期」栏；T-10（RawInput 在管理员窗口前台时能否收到）和 T-12（被 UIPI 拦截时 `SendInput` 实际返回什么）的预期本来就是「未知」，以实测为准。
+- **通过标准**：T-09 ～ T-14 每一条都有记录，没有空白；T-09 ～ T-11 的结果回填 C.2 #3，并据此给出 ② 项的结论（可行 / 降级方案 / 不可行）。
+- **出处**：development-plan.md:630、720、2381；s-29.md §0（第 12 行）、§3.5（第 186–199 行）。
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（探针的提交或来源：____；T-09 ____；T-10 ____；T-11 ____；T-12 ____；T-13 ____；T-14 ____；缩小范围的书面同意：____）
 
 ### M4-SP-03 Backspace 擦除单元 T-15 ～ T-21
 
@@ -1346,7 +1616,7 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
      1. 把展开文本复制到剪贴板；
      2. 在目标程序里先输入前文 `x `，再粘贴；
      3. 一次一次按 Backspace，数到只剩前文为止，这个次数就是 U。
-  2. 对 T-15 ～ T-19 逐条记录。T-20 需要 espanso，可选。T-21 要等 B-34 实现之后才能做，本轮标「未测」。
+  2. 对 T-15 ～ T-19 逐条记录。T-20 需要 espanso，可选，没做时写「未做（可选）」，不要留空。T-21 按 s-29.md:279 要等 B-34 实现（0.5.x）之后才能做，记「不适用：B-34 未实现」。
 - **预期结果**：见 s-29.md 表中的「预期」栏。
 - **通过标准**：T-15 ～ T-19 都有记录，并建立「擦除模型表」（按进程映像名列出）。
 - **出处**：s-29.md §0（第 13 行）、§4.5。
@@ -1393,7 +1663,7 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
   2. 场景 b（debug-fi）：
      1. 布防 `executor_hang`，param 30000；
      2. 在记事本执行 `zzp` + 空格；
-     3. 约 10 秒后出现 `executor.rebuilt`，此时立即再执行一次 `zzp` + 空格；
+     3. 约 10 秒后出现 `executor.rebuilt`，此时立即在记事本先按一次物理空格（§0），再执行一次 `zzp` + 空格；
      4. 检索 `executor.clipboard_busy`；
      5. 等满 30 秒，确认没有多余的输出。
 - **预期结果**：
@@ -1468,21 +1738,50 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 
 ### M4-NR-08 发布事务化：失败时保留生效配置和暂停状态
 
+发布按固定顺序写文件（R6 `fe31dec` 的 `revisions.rs`）：
+1. 备份检查；
+2. `revisions\<旧>.json`（已有就不写）；
+3. `revisions\<旧>.metadata.json`；
+4. `draft.json`；
+5. `revisions\<新>.metadata.json`；
+6. `migration-unresolved.json`；
+7. `active-migration-unresolved.json`；
+8. `store-meta.json` 的 `previous_revision`；
+9. 最后才是 `active.json`。
+
+任何一步失败，整个发布失败：内存里的生效配置不变，暂停状态恢复原样。但第 2～8 步已经写下的文件不会撤回。场景 a、b、c 分别让失败落在第一次写入、开始写入之前、最后一步写入上。
+
 - **步骤**：
-  1. 场景 a（debug-fi）：
-     1. 编辑一条规则并「保存」到草稿，记下「当前生效 v{N}」、状态行（监听中），用 P10 记下 `active.json` 的哈希；
-     2. 布防 `store_write_fail`；
-     3. 点「应用设置」；
+  1. 场景 a（debug-fi，`store_write_fail`）：
+     1. 编辑一条规则并保存到草稿。记下「当前生效 v{N}」和状态行（监听中），用 P10 记下 `active.json` 的哈希。
+     2. 布防 `store_write_fail`（§1.6）。
+     3. 点「应用设置」。
      4. 再点一次「应用设置」。
-  2. 场景 a′：先点「暂停监听」，再按场景 a 做一遍。
-  3. 场景 b（release）：用 P1 锁定 `active.json` 后点「应用设置」；释放锁后再点一次。
+  2. 场景 a′：先点「暂停监听」，再按场景 a 做一遍，最后恢复监听。
+  3. 场景 b（release，P1 独占锁定 `active.json`）：用 P1 锁定 `active.json` 后点「应用设置」；释放锁后再点一次。
+  4. 场景 c（release，只允许读的占用）：
+     1. 在 `zzk` 的描述末尾加 `-C1`，「应用设置」，记下 v{N}，用 P10 记下 `active.json` 的哈希。
+     2. 把描述末尾改成 `-C2`，保存到草稿。
+     3. 另开 PowerShell 执行 `$f = [IO.File]::Open("$d\active.json", 'Open', 'Read', 'Read')`。这样程序还能读这个文件，但不能替换它。
+     4. 点「应用设置」，记下提示；查看 `revisions\` 里各文件的修改时间和 `store-meta.json`。
+     5. 不释放占用，退出程序；然后执行 `$f.Close()`，再启动程序。
+     6. 在「运行状态与恢复」点「恢复上一个版本」→「回滚」，看 `zzk` 的描述。
 - **预期结果**：
-  - 第一次「应用设置」报错「写入文件失败：…」。生效版本仍是 v{N}，`active.json` 的哈希不变，草稿还在，监听或暂停状态与操作前相同。
-  - 第二次应用成功，生效版本变为 v{N+1}。
-  - 场景 b 的错误码为 32。
-- **通过标准**：失败的发布不改变生效配置和暂停状态（§5.5 #8）。
-- **出处**：development-plan.md:1006；`revisions.rs:30-69`（交换期间持有 MANUAL，结束后恢复）；`atomic.rs:18`。
-- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（需确认：注入的失败落在 `revisions/<旧>.json` 备份还是 `active.json` 的写入上，两者都应该使发布整体失败）
+  - 场景 a：
+    - 第一次应用报错「重命名文件失败：<N>.json。」。如果 `revisions\<N>.json` 已经存在，则是「重命名文件失败：<N>.metadata.json。」。注入的错误不是系统错误，所以没有系统错误码。
+    - 日志有 `command.io op=Rename path=Some("<N>.json") error=injected store_write_fail`（或对应的 metadata 文件名）。
+    - 生效版本仍是 v{N}，`active.json` 的哈希不变，草稿还在，状态行与操作前相同（监听中）。
+    - 第二次应用成功，生效版本变为 v{N+1}。注入只生效一次。
+  - 场景 a′：同场景 a；失败后和成功后状态行都仍是「已暂停」，没有被发布顺带恢复监听。
+  - 场景 b：报「读取文件失败：active.json（系统错误 32）。」。发布在比较 `active.json` 的哈希时就停下了，什么都没写，状态不变；释放后再应用得到 v{N+1}。
+  - 场景 c：
+    - 第 4 步报「重命名文件失败：active.json（系统错误 5）。」或系统错误 32。`active.json` 的哈希不变，生效版本仍是 v{N}，状态行恢复原样。
+    - 第 4 步时，前面几步已经写下的文件不会撤回：`revisions\<N>.json`（原来没有时）、`<N>.metadata.json`、`<N+1>.metadata.json`、`draft.json`（`-C2`），以及 `store-meta.json` 里的 `"previous_revision": {"active": <N+1>, "revision": <N>}`。
+    - 第 5 步重启后，生效的仍是 v{N}（`-C1`），草稿是 `-C2`。
+    - 第 6 步：`previous_revision.active`（N+1）与真正生效的 v{N} 对不上，这条记录不被采用，回滚目标按旧规则取 `revisions\<N−1>.json`（与 ST-13 的 R3 规则一致）。所以 `zzk` 的描述回到加 `-C1` 之前的样子，生效版本变为 v{N+1}。如果描述仍是 `-C1`，说明错误地采用了那条记录，判不通过。
+- **通过标准**：失败的发布不改变生效配置和暂停状态（§5.5 #8）。错误提示与上面一致。场景 c 残留的文件不影响重启后的回滚，回滚本身（也是一次发布）能成功。
+- **出处**：development-plan.md:1006；R6 `fe31dec`：`src-tauri/src/store/revisions.rs:35-41`（哈希比较）、`revisions.rs:42-58`（备份检查、持有 MANUAL、结束后恢复）、`revisions.rs:64-115`（写入顺序、失败时恢复暂停状态）；`atomic.rs:16-23`（`store_write_fail` 与真实替换失败都报 `Rename`）；`load.rs:226-232`（读文件失败报 `Read`）；`src-tauri/src/error.rs:114-122`（`command.io` 日志、只带文件名）；`fallback.rs:602-621`（`previous_revision` 只在 `active` 对得上时采用，否则取 `revisions\<生效−1>.json`；R3 `7b727ca`）；`src/ipc/errors.ts:200-205`。
+- **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（场景 a 报错的文件名：____；场景 c 的系统错误码：____；场景 c 第 6 步回滚后 `zzk` 的描述：____）
 
 ## 12. 汇总
 
@@ -1492,15 +1791,15 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 |---|---|---|---|---|---|
 | 2 输入与注入 | M4-IN-01 ～ 10（09、10 可选） | 10 | | | |
 | 3 剪贴板 | M4-CB-01 ～ 09（09 可选） | 9 | | | |
-| 4 监督与自愈 | M4-SV-01 ～ 14 | 14 | | | |
-| 5 安全模式与存储 | M4-ST-01 ～ 11（03 可选） | 11 | | | |
+| 4 监督与自愈 | M4-SV-01 ～ 16（16 可选） | 16 | | | |
+| 5 安全模式与存储 | M4-ST-01 ～ 13（03 可选） | 13 | | | |
 | 6 前端状态一致性 | M4-FE-01 ～ 07 | 7 | | | |
 | 7 隐私 | M4-PR-01 ～ 04 | 4 | | | |
-| 8 数据兼容 | M4-CP-01 ～ 04 | 4 | | | |
+| 8 数据兼容 | M4-CP-01 ～ 05 | 5 | | | |
 | 9 性能与浸泡 | M4-PF-01 ～ 05 | 5 | | | |
 | 10 S-29 spike | M4-SP-01 ～ 04 | 4 | | | |
 | 11 不得倒退 | M4-NR-01 ～ 08 | 8 | | | |
-| **合计** | | **76** | | | |
+| **合计** | | **81** | | | |
 
 ### 12.2 条目与 0.4 退出标准的对应
 
@@ -1508,40 +1807,59 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 
 | 退出标准 | 覆盖条目 | 判定 |
 |---|---|---|
-| E1 故障注入点（§11）全部能自动恢复或明确提示；`hook_unhook`、`rawinput_unregister` 由交叉校验检出并重建 | 各注入点及其覆盖条目：<br>• `executor_panic`：SV-02<br>• `executor_hang`：SV-03、NR-02<br>• `hook_panic`：SV-04<br>• `hook_unhook`：SV-05<br>• `rawinput_unregister`：SV-06<br>• `rawinput_close`：SV-07<br>• `clipboard_busy`：CB-08，真实场景 CB-07<br>• `store_write_fail`：NR-08<br>• `config_corrupt`：用真实操作代替，ST-05、ST-06<br>• `store_locked`：用真实操作代替，ST-01、ST-02<br>• `autostart_stale`：用真实操作代替，SV-12<br>• `session_end`：SV-14，真实注销 SV-13<br>补充：SV-01、SV-08 ～ SV-11、ST-03、ST-04、ST-07 ～ ST-11、CB-01 ～ CB-06、CB-09 | ☐ |
+| E1 故障注入点（§11）全部能自动恢复或明确提示；`hook_unhook`、`rawinput_unregister` 由交叉校验检出并重建 | 各注入点及其覆盖条目：<br>• `executor_panic`：SV-02、SV-15（熔断）、PR-01<br>• `executor_hang`：SV-03、NR-02<br>• `hook_panic`：SV-04<br>• `hook_unhook`：SV-05<br>• `rawinput_unregister`：SV-06<br>• `rawinput_close`：SV-07<br>• `clipboard_busy`：CB-08，真实场景 CB-07<br>• `store_write_fail`：NR-08<br>• `config_corrupt`：用真实操作代替，ST-05、ST-06<br>• `store_locked`：用真实操作代替，ST-01、ST-02<br>• `autostart_stale`：用真实操作代替，SV-12<br>• `session_end`：SV-14，真实注销 SV-13<br>补充：SV-01、SV-08 ～ SV-11、SV-16（可选）、ST-03、ST-04、ST-07 ～ ST-13、CB-01 ～ CB-06、CB-09 | ☐ |
 | E2 2 小时浸泡无静默失效 | PF-05（PF-04 作为空闲参照） | ☐ |
 | E3 隐私测试通过（日志、诊断包、执行历史不含正文） | PR-01 ～ PR-04、CB-06 | ☐ |
 | E4 S-25 实机最小集有书面记录 | IN-01 ～ IN-08（记事本、Chrome、微信，各配合微软拼音）；CB-04 ～ CB-06（development-plan.md:2524：0.4 的最低覆盖还包括剪贴板子表，第 2545–2554 行）。本文件填写后存档 | ☐ |
-| E5 0.3.1 数据无损加载，0.4 写入的数据 0.3.1 可读 | CP-01、CP-02（CP-03、CP-04 为 §9 的配套要求） | ☐ |
+| E5 0.3.1 数据无损加载，0.4 写入的数据 0.3.1 可读 | CP-01、CP-02（CP-03 ～ CP-05 为 §9 的配套要求：保留未知字段、升级前备份及其失败处理） | ☐ |
 | E6 无 P0 缺陷 | 全部条目。任一条触发 §0 的立即停止条件即为 P0 | ☐ |
 | E7 不得倒退清单全部通过 | NR-01 ～ NR-08 | ☐ |
 | 前端底座与状态一致性（0.4 交付内容，不是独立的退出标准） | FE-01 ～ FE-07、ST-01、ST-02（I6） | ☐ |
-| 记录项（不阻断发布）：性能基线、S-29 结论 | PF-01 ～ PF-04、SP-01 ～ SP-04、IN-09、IN-10 | ☐ |
+| S-29 可行性 spike（0.4 的 P0 条目，development-plan.md:630、2381；必做，计入发布判定） | SP-01 ～ SP-04，每个 T-xx 都有记录（§10 开头） | ☐ |
+| 记录项（不阻断发布）：性能基线、可选条目 | PF-01 ～ PF-04、IN-09、IN-10、SV-16 | ☐ |
 
-### 12.3 编写时发现的文档与代码不一致（只记录，不在本次修改）
+0.4 的 P0 条目（development-plan.md:602-639）大多以自动化测试和代码审查验收。下表只列验收标准里有实机要求的几项，逐条对到本清单（验收标准原文见 development-plan.md:704-720）：
 
-1. **backup-pre-0.4 没有实现**：development-plan.md:1805、2339 要求跨版本首次写入前备份，代码里没有找到（CP-04）。
+| P0 条目 | 计划中的实机验收要点 | 覆盖条目 |
+|---|---|---|
+| S-03 引擎监督器与真实健康状态 | `WM_CLOSE` 后 5 秒内自动重建；10 分钟内失败 5 次熔断为「故障」并发通知；托盘图标、托盘提示文字、运行状态区三处一致 | 重建：SV-07；熔断与三处一致：SV-15；各故障注入条目（SV-02 ～ SV-07）都核对状态显示。熔断时没有系统通知，SV-15 对这一项单独判定（§12.3 第 16 条） |
+| S-04 启动自愈与安全模式（B-04、B-43） | 5 种损坏样例都能启动；坏文件改名为 `*.corrupt-<时间>.json`；横幅说明从哪个版本恢复；全程无崩溃 | 截断 JSON：ST-05、ST-06；非法 UTF-8：ST-12 a；字段类型错误：ST-12 b（b′ 可选）；正则无法编译：ST-12 c；某个版本文件损坏：ST-12 d；所有版本都损坏：ST-10；上次正常配置作为第一回退：ST-13。另见 ST-07 ～ ST-09、ST-11 |
+| S-06 输入源存活检测与自动重挂 | `hook_unhook`、`rawinput_unregister` 后 10 秒内（或 50 次硬件按键内）恢复触发，日志有 `input.reattach` | SV-05、SV-06；误判方面见 SV-01、SV-08、SV-09 |
+| S-07 剪贴板句柄格式与恢复策略 | 位图恢复后 CF_DIB 逐字节一致；截图、Word 富文本（含 CF_ENHMETAFILE）、文件列表下粘贴类短语都成功且能再次粘贴；超过 32MB 的格式按策略处理；不进入 Win+V 历史 | CB-04 c、d、e（e 必做，配合 P12 比较字节）；CB-05；CB-06。CF_PALETTE 与 0x80–0x8F 的跳过由单元测试覆盖（`crates/platform/src/windows/clipboard.rs:2079-2087`），实机出现时记在 CB-04 的「skipped 日志」列 |
+| S-29 可行性 spike | 焦点获取与归还、管理员窗口下的输入可见性、Backspace 补偿三项各给出结论 | SP-01 ～ SP-04，必做，计入发布判定（§10 开头） |
+
+### 12.3 编写时发现的文档与代码不一致
+
+本节只记录，本文件的提交不改代码。第 1 ～ 15 条是初稿（`576aa5a`）时记下的，修订时逐条回到代码复核：已经由其他提交修复的标「已修」并写明提交，这些提交不在 `feat/0.4-stability-foundation` 上的，实测构建必须包含它们（见文首）。第 16 ～ 19 条是修订时新发现的。
+
+1. **backup-pre-0.4**（已修，R6 `fe31dec`，`fix/0.4-final-store` 分支）：development-plan.md:1805、2339 要求跨版本首次写入前备份，初稿时代码里没有。`fe31dec` 已实现：加载时和每次写入前检查，备份失败时拒绝写入（CP-04 备份内容，CP-05 备份失败）。
 2. **B-01 ⑤ 与 §5.5 #2 相冲突**：
    - development-plan.md:1819 写的是：剪贴板被卡住的旧线程占着时，新纪元的执行器「改用键入输出」；
    - §5.5 #2 和代码（`executor.rs:1715-1733`）都是拒绝，不改用键入（NR-02）。
-3. **session_end 场景与代码不同**：
+3. **session_end 场景与代码不同**（已修，R5 `241b3f3`，`fix/0.4-final-store` 分支）：
    - 计划 §11（development-plan.md:2489）预期这个注入点之后结束进程，连续启动两次不会被误判为崩溃循环；
-   - 但这个注入点只调用会话结束回调（`session.rs:216-221`），不清除运行标记；
-   - 真实注销走 RunEvent::Exit，会清除运行标记（`startup.rs:384-395`）（SV-13、SV-14）。
-4. **LKG 没有接上**：计划把 last-good 版本作为第一回退，但生产代码不调用 `mark_last_good`，回退实际上直接从 `revisions/` 开始（ST-06）。
-5. **恢复横幅每次启动都会出现**：从回退候选恢复后不重写 `active.json`，所以直到下一次「应用设置」之前，每次启动都显示恢复横幅（ST-06）。是否符合预期，需确认。
-6. **横幅说「可以导入配置」，Locked 时导入却被拒绝**：safe_mode 横幅对所有原因用同一句话（`src/status.ts:146-210`）。但后端只允许 CrashLoop 和 NoValidConfig 用导入解除，Locked、NewerSchema 下只能预览（`src-tauri/src/store/mod.rs:85-94`）（ST-04、ST-08）。
-7. **自检项名称不一致**：系统通知里写「键盘鼠标监听」（`startup.rs:363`），前端横幅写「键盘监听心跳」（`src/ipc/labels.ts:177`）。
+   - 初稿时这个注入点只调用会话结束回调（`session.rs:216-221`），不清除运行标记，连续重启会进入 CrashLoop；
+   - `241b3f3` 改为在会话结束回调里清除运行标记，SV-14 按修复后的行为验收；真实注销仍走 RunEvent::Exit 清除运行标记（`startup.rs:384-395`，SV-13）。
+4. **LKG 没有接上**（已修，`b32062f`，`fix/0.4-final-lkg` 分支）：计划把上次正常配置作为第一回退，初稿时生产代码不调用 `mark_last_good`，回退直接从 `revisions/` 开始。`b32062f` 已接上：在「正常」状态持续 60 秒以上并成功展开一次后记录（ST-06、ST-13）；`lkg.rs` 自己列出的限制见附表 A。
+5. **恢复横幅每次启动都会出现**（按设计）：从回退候选恢复后不重写 `active.json`，所以直到下一次「应用设置」之前，每次启动都显示恢复横幅（ST-06）。加载流程按设计只隔离坏文件、只写运行标记，不写配置文件（`src-tauri/src/store/fallback.rs:121-141`），所以不算缺陷；ST-06 第 4 步核对应用之后不再出现。
+6. **横幅说「可以导入配置」，Locked 时导入却被拒绝**（已修，`cfa41f2`）：初稿时 safe_mode 横幅对所有原因用同一句话。后端只允许 CrashLoop 和 NoValidConfig 用导入解除，Locked、NewerSchema 下只能预览（`src-tauri/src/store/mod.rs:85-94`）。`cfa41f2` 改为按原因给出出路，只有这两种原因提「可以导入配置」（`src/status.ts:146-157`）（ST-04、ST-08 ～ ST-10）。
+7. **自检项名称不一致**（已修，`e0fc068`）：系统通知里写「键盘鼠标监听」（`startup.rs:363`），初稿时前端横幅写「键盘监听心跳」。`e0fc068` 把前端标签改为「键盘鼠标监听」，与通知一致（SV-11）。
 8. **终止键与计划默认值不同**：代码是 Ctrl+Shift+Esc（`hook.rs:262-275`），计划默认值是 Ctrl+Alt+Pause；development-plan.md:215 标为【待核实】（IN-07）。
-9. **p50/p95 汇总缺失**：`get_health` 还没有 p50/p95 汇总（`src-tauri/src/commands/diagnostics.rs:506` 是 TODO），只有每条历史的 StageTimings。前端也没有调用 `report_metric`、`self_test`、`set_log_level`（PF-01）。
-10. **`scripts/soak/` 不存在**：计划 L6（development-plan.md:2477）和 performance-baseline.md:82 都要求有它（PF-05）。
+9. **p50/p95 汇总缺失**（未修）：`get_health` 还没有 p50/p95 汇总（`src-tauri/src/commands/diagnostics.rs:506` 是 TODO），只有每条历史的 StageTimings，日志和诊断包里都没有耗时。release 界面只在「最近执行」显示总耗时（`total_us`，按毫秒取整），各阶段耗时只能在 debug-fi 构建里用 `list_history` 取（PF-01）。前端也没有调用 `report_metric`、`self_test`、`set_log_level`。
+10. **`scripts/soak/`**（已补，`9cbe400`）：计划 L6（development-plan.md:2477）要求的浸泡监视脚本已加在 `scripts/soak/`，PF-05 使用。performance-baseline.md:82 仍写「目前尚不存在」，需同步（本次不改）。
 11. **版本号仍是 0.3.1**：所以本清单的构建栏要求写提交哈希。
 12. **§5.5「现有实现位置」过时**：引用的仍是拆分前的 `windows.rs`、`windows_espanso.rs`、`main.rs` 行号；performance-baseline.md:40 也是如此。
 13. **S-06 与代码参数的关系**：计划 S-06 写「50 次按键」，代码中 K=5、R=8，最多 33 次按下（`liveness.rs:47-51`，符合要求）。但「10 秒内」这一条在用户不打字时由谁保证，代码注释里没有说明（SV-05 变体 b）。
 14. **计划 §11 的实机矩阵列不对应**：development-plan.md:2518-2554 的「自动」列在 0.4 没有对应物。其中管理员记事本一行（S-20）不在 0.4 范围。
 15. **TODO 26**：另一个窗口里的 `save_draft` 没有纳入保存进行中的跟踪（合并记录）。本清单没有为它单列条目。
+16. **熔断时没有系统通知**（未修）：S-03（development-plan.md:704）要求熔断为「故障」时发通知。托盘只在恢复监听被拒绝、启动自检失败、规则执行时发通知（`src-tauri/src/tray.rs:78-119`），`supervisor.circuit_open` 之后没有通知。SV-15 对这一项单独判定。
+17. **`zzh` 的普通文字留空时，纯文本目标粘贴出空内容**（未修）：编辑器和领域模型都不检查「无法显示格式时使用的普通文字」是否为空（`src/ActionEditor.tsx:827-830`；`crates/domain/src/model.rs:549`），执行时照样把空的 CF_UNICODETEXT 和 HTML Format 一起放进剪贴板（`crates/platform/src/windows/clipboard.rs:561-573`），记事本等纯文本目标静默粘贴出空内容，没有任何提示。本清单在 §1.5 要求 `zzh` 的普通文字不能留空。
+18. **外部修改后「请刷新后再试」做不到，旧草稿发布会覆盖外部修改**（未修，0.5 修）：比对用的磁盘哈希只在启动和发布时更新（`src-tauri/src/store/load.rs:85`、`revisions.rs:103`），「刷新状态」只取内存里的状态（`src-tauri/src/commands/runtime.rs:13-15`），冲突要到重启后才解除；重启后如果不放弃草稿直接应用，发布的是旧草稿，外部修改被覆盖而且没有提示（FE-04）。
+19. **备份补做成功后，backup_failed 横幅当场不消失**（未修）：后端在备份成功时撤销这个问题（`fe31dec` 的 `backup.rs:297-322`），但撤销不发事件；前端只在安全模式解除时用后端的列表替换问题列表，其他时候只合并新增（`src/ipc/events.ts:310-321、439-456`），所以横幅要到重启后才消失（CP-05 第 7 步，只记录）。
 
 ## 附表 A：代码与文档中的「待实测」由哪条覆盖
+
+代码行号以 `576aa5a` 为准；表尾几行是修订时在其他分支头上新增的「待实测」，行号以对应分支头为准（这些分支上的文件行号整体也有移动，例如鼠标重挂分支的 `hook.rs`、`rawinput.rs`）。
 
 | 位置 | 内容 | 条目 |
 |---|---|---|
@@ -1565,7 +1883,7 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 | `crates/platform/src/windows/input.rs:966`；`pipeline_tests_input.rs:1745、2671` | 远程会话的按键没有设备句柄 | IN-09 |
 | `crates/platform/src/windows/inject.rs:331` | 左右键互换时注入的左键置位哪个 VK | IN-10 |
 | `crates/platform/src/windows/clipboard.rs:41` | OWNER_PROBE_TIMEOUT 对慢但还活着的所有者的取值 | CB-09 |
-| `clipboard.rs:98` | 复制 HMETAFILE（METAFILEPICT） | CB-04 e |
+| `clipboard.rs:98` | 复制 HMETAFILE（METAFILEPICT） | CB-04 e（必做，配合 P12 比较字节） |
 | `clipboard.rs:125` | 只写 CF_UNICODETEXT 后是否有 CF_LOCALE | CB-04 a |
 | `clipboard.rs:738` | 等待所有者处理 WM_RENDERFORMAT 的时长 | CB-09 |
 | `clipboard.rs:827` | 超时后慢但还活着的所有者被记为 hung | CB-09 |
@@ -1581,3 +1899,7 @@ await inv('debug_inject_fault', { point: 'executor_panic', param: 0 });
 | development-plan.md:215【待核实】 | Ctrl+Shift+Esc 的实际表现 | IN-07 |
 | merge-log 第 525 行 | 剪贴板健康链在实机上的表现 | CB-07、FE-07 |
 | merge-log 第 1270 行（TODO 22） | 管理员窗口在前台时自检误报 | SV-09 |
+| `fe31dec`：`src-tauri/src/startup.rs:195` | 真实会话结束时，tao 能否在进程结束前把它变成 RunEvent::Exit（会话结束回调已先清除运行标记） | SV-13 |
+| `b32062f`：`src-tauri/src/lkg.rs:106` | 上次正常配置的限制：Health 只取最新值、检查与写入之间的窗口、发布安装与事件之间的成功不计、只有 Windows 记录、60 秒的实际时序 | ST-13 |
+| `384f8d1`：`crates/platform/src/windows/input.rs:901` | 鼠标点击交叉校验沿用按键的 MISS_LIMIT 及退避 | SV-16 |
+| `384f8d1`：`input.rs:998`；`rawinput.rs:407`；`pipeline_tests_input.rs:3785、4004` | 注入的点击是否进入 RawInput（只按「RawInput 看到、鼠标钩子没看到」一个方向判定） | SV-16 |
