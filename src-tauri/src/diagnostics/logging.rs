@@ -50,7 +50,7 @@
 //! | `clipboard.slow` | warn | the clipboard was held open past its budget; `held_ms`, `budget_ms` |
 //! | `clipboard.unreadable` | warn | an enumerated clipboard format gave no data or unreadable memory; the backup is refused; format id |
 //! | `clipboard.worker_failed` | warn | the clipboard backup worker thread did not start; error |
-//! | `command.internal` | error | `CommandError::Internal`; `trace_id` and the original error |
+//! | `command.internal` | error | `CommandError::Internal`; `trace_id` and the original error, or for a blocking task that handed back no result (`CommandError::task_failed`) `task` (`panicked` / `cancelled` / `failed`) and the panic payload's class, length and fingerprint, never the join error's text (it quotes the payload) |
 //! | `command.io` | warn | `CommandError::Io`; operation, file name, OS error |
 //! | `diagnostics.export` | info | a bundle was written; redaction, entry count, `elapsed_ms` |
 //! | `engine.unavailable` | warn | the platform refused to start or resume |

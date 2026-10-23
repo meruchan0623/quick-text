@@ -159,7 +159,7 @@ pub async fn self_test(app: tauri::AppHandle) -> Result<SelfTestReport, CommandE
         quicker_platform::self_test::run_platform(&runtime)
     })
     .await
-    .map_err(CommandError::internal)
+    .map_err(CommandError::task_failed)
 }
 
 /// Arms a one-shot fault (B-52). Exists only with the `fault-injection`

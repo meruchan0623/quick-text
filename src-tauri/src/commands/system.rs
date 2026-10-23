@@ -23,7 +23,7 @@ pub async fn capture_selection(app: tauri::AppHandle) -> Result<serde_json::Valu
         let _ = w.show();
     }
     let text = result
-        .map_err(CommandError::internal)?
+        .map_err(CommandError::task_failed)?
         .map_err(CommandError::internal)?;
     Ok(
         serde_json::json!({"text":text,"status":"success","message":"Selection read through accessibility; clipboard unchanged"}),

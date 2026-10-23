@@ -1,6 +1,7 @@
 //! `CommandError`, the error type of every Tauri command (B-45,
 //! docs/ipc-contract-0.4.md §2). Errors carry a code and structured detail
 //! only; the frontend translates them. Original error text goes to the log.
+use crate::diagnostics::redact::PanicPayload;
 use quicker_domain::{Diagnostic, SourceSpan};
 use quicker_platform::health::HealthState;
 use serde::Serialize;
@@ -86,6 +87,36 @@ impl CommandError {
     pub fn internal(err: impl Display) -> Self {
         let trace_id = uuid::Uuid::new_v4().to_string();
         tracing::error!(event = "command.internal", trace_id = %trace_id, error = %err, "command failed");
+        Self::Internal { trace_id }
+    }
+    /// A blocking task (`tauri::async_runtime::spawn_blocking`) that handed
+    /// back no result, as an internal error. `err` is never formatted:
+    /// tokio's `JoinError` quotes a `&str` / `String` panic payload in both
+    /// `Display` and `Debug` (tokio 1.53), and tauri wraps it transparently,
+    /// while a payload can quote a phrase or the clipboard (a bad slice
+    /// quotes the string it was slicing). The log gets a fixed class
+    /// (`panicked`, `cancelled`, `failed`) and, for a panic, the payload's
+    /// class, length and fingerprint as in `app.panic`; the panic hook has
+    /// already written the crash record.
+    pub fn task_failed(err: tauri::Error) -> Self {
+        let trace_id = uuid::Uuid::new_v4().to_string();
+        let (task, payload) = match err {
+            tauri::Error::JoinError(join) if join.is_panic() => (
+                "panicked",
+                Some(PanicPayload::of(join.into_panic().as_ref())),
+            ),
+            tauri::Error::JoinError(join) if join.is_cancelled() => ("cancelled", None),
+            _ => ("failed", None),
+        };
+        tracing::error!(
+            event = "command.internal",
+            trace_id = %trace_id,
+            task,
+            panic_class = payload.as_ref().map(|p| p.class.as_str()),
+            payload_len = payload.as_ref().map(|p| p.len),
+            payload_hash = payload.as_ref().map(|p| p.hash.as_str()),
+            "blocking task did not complete"
+        );
         Self::Internal { trace_id }
     }
     pub fn validation(diagnostics: Vec<Diagnostic>) -> Self {

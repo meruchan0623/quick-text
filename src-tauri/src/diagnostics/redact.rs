@@ -283,6 +283,17 @@ impl PanicPayload {
             hash: fingerprint(text),
         }
     }
+    /// The summary of a panic payload as caught: the hook's
+    /// `info.payload()`, a `catch_unwind` error or a join error's
+    /// `into_panic()`. Only `&str` and `String` payloads have text.
+    pub fn of(payload: &(dyn std::any::Any + Send)) -> Self {
+        Self::summarize(
+            payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str)),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -457,6 +468,20 @@ mod tests {
         }
         let other = PanicPayload::summarize(None);
         assert_eq!((other.class, other.len), (PanicClass::NonString, 0));
+        // As caught: `&str` and `String` payloads are read, others are not.
+        let caught: [(Box<dyn std::any::Any + Send>, PanicClass, usize); 3] = [
+            (
+                Box::new("index out of bounds: x"),
+                PanicClass::IndexOutOfBounds,
+                22,
+            ),
+            (Box::new(String::from("SENTINEL")), PanicClass::Other, 8),
+            (Box::new(7_u32), PanicClass::NonString, 0),
+        ];
+        for (payload, class, len) in caught {
+            let summary = PanicPayload::of(payload.as_ref());
+            assert_eq!((summary.class, summary.len), (class, len));
+        }
         assert_eq!(PanicClass::ByteIndex.as_str(), "byte_index");
         assert_eq!(PanicClass::NonString.as_str(), "non_string");
     }

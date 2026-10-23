@@ -103,11 +103,6 @@ fn record(info: &PanicHookInfo<'_>) {
     let now = SystemTime::now();
     let thread = std::thread::current();
     let thread = thread.name().unwrap_or("<unnamed>");
-    let payload = info.payload();
-    let text = payload
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
     let report = CrashReport {
         version: env!("CARGO_PKG_VERSION"),
         debug_build: cfg!(debug_assertions),
@@ -116,7 +111,7 @@ fn record(info: &PanicHookInfo<'_>) {
         location: info
             .location()
             .map(|at| crate_location(at.file(), at.line(), at.column(), &user_homes())),
-        payload: PanicPayload::summarize(text),
+        payload: PanicPayload::of(info.payload()),
         exe_base: exe_base(),
         backtrace: format!("{:#}", Backtrace::force_capture()),
     };
@@ -471,6 +466,92 @@ mod tests {
             4
         );
         assert!(files.keys().any(|name| name.starts_with("logs/")));
+        for (name, text) in &files {
+            assert!(!text.contains(S), "{name} leaks:\n{text}");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Sends this thread's crash records to `dir` until dropped, which also
+    /// happens when the thread unwinds past it.
+    struct ThreadCrashDir;
+    impl ThreadCrashDir {
+        fn set(dir: PathBuf) -> Self {
+            TEST_CRASH_DIR.with(|crash_dir| *crash_dir.borrow_mut() = Some(dir));
+            Self
+        }
+    }
+    impl Drop for ThreadCrashDir {
+        fn drop(&mut self) {
+            TEST_CRASH_DIR.with(|crash_dir| crash_dir.borrow_mut().take());
+        }
+    }
+
+    /// S-08 privacy test, task-join half (Codex F2-1): a panic inside
+    /// `spawn_blocking` reaches the awaiting command as tokio's `JoinError`,
+    /// whose `Display` quotes the payload. Mapped by
+    /// `CommandError::task_failed`, the phrase reaches neither the log nor a
+    /// Summary bundle, and the trace id still finds its log line.
+    #[test]
+    fn a_panic_in_a_blocking_task_never_reaches_the_log_or_the_bundle() {
+        use crate::{
+            diagnostics::{
+                bundle::test_support::summary_entries,
+                logging::{
+                    log_dir,
+                    test_support::{read_logs, scoped},
+                },
+            },
+            error::CommandError,
+        };
+        use tracing::level_filters::LevelFilter;
+
+        const S: &str = "SENTINEL-join-9c41";
+        let dir = temp_dir();
+        install();
+        let built = scoped(&log_dir(&dir), LevelFilter::TRACE);
+        let err = tracing::subscriber::with_default(built.subscriber, || {
+            // The worker logs to the same file and records its crash in
+            // `dir`, as the app's global subscriber and data directory do.
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            let crash_dir = dir.clone();
+            let task = tauri::async_runtime::spawn_blocking(move || {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    let _crash_dir = ThreadCrashDir::set(crash_dir);
+                    // byte index 1 is not a char boundary; ... of `éSENTINEL`
+                    let phrase = std::hint::black_box(format!("é{S}"));
+                    std::hint::black_box(&phrase[..1]);
+                });
+            });
+            let join = tauri::async_runtime::block_on(task).expect_err("the task panicked");
+            // The premise: formatted as is, the join error quotes the phrase.
+            assert!(join.to_string().contains(S), "{join}");
+            CommandError::task_failed(join)
+        });
+        drop(built.guard);
+        let CommandError::Internal { trace_id } = err else {
+            panic!("a failed task must be an internal error, got {err:?}");
+        };
+
+        let log = read_logs(&log_dir(&dir));
+        let line = log
+            .lines()
+            .find(|line| line.contains(&trace_id))
+            .unwrap_or_else(|| panic!("trace id {trace_id} missing from log:\n{log}"));
+        assert!(line.contains("event=\"command.internal\""), "{line}");
+        assert!(line.contains("task=\"panicked\""), "{line}");
+        assert!(line.contains("panic_class=\"byte_index\""), "{line}");
+        assert!(log.contains("event=\"app.panic\""), "{log}");
+        assert!(!log.contains(S), "the log leaks:\n{log}");
+
+        let records = crash_files(&dir);
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record = fs::read_to_string(&records[0]).unwrap();
+        assert!(!record.contains(S), "the crash record leaks:\n{record}");
+
+        let files = summary_entries(&dir);
+        assert!(files.keys().any(|name| name.starts_with("logs/")));
+        assert!(files.keys().any(|name| name.starts_with("crashes/")));
         for (name, text) in &files {
             assert!(!text.contains(S), "{name} leaks:\n{text}");
         }

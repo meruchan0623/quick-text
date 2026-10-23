@@ -49,7 +49,7 @@ pub async fn get_foreground(
         quicker_platform::foreground()
     })
     .await
-    .map_err(CommandError::internal)?;
+    .map_err(CommandError::task_failed)?;
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.set_focus();

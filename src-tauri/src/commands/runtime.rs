@@ -110,7 +110,7 @@ pub async fn execute_action(
     if let Some(w) = window {
         let _ = w.show();
     }
-    result.map_err(CommandError::internal)?
+    result.map_err(CommandError::task_failed)?
 }
 /// Opens a recording session. Detection pauses through the `Recording`
 /// reason before the session opens and for as long as it stays open.
