@@ -1,6 +1,5 @@
 //! Publishing a configuration as a new revision, and rolling back to the previous one.
 use super::{
-    fallback::revision_numbers,
     load::{read_config, read_existing},
     meta::{Fingerprint, PreviousRevision},
     metadata::metadata_for_config,
@@ -10,7 +9,7 @@ use crate::error::{CommandError, EntityKind, IoOp};
 use quicker_domain::*;
 use quicker_platform::health::PauseReasons;
 use sha2::{Digest, Sha256};
-use std::{fs, sync::atomic::Ordering};
+use std::{fs, io, path::Path, sync::atomic::Ordering};
 
 impl Store {
     pub fn publish(&mut self, config: Config) -> Result<(), CommandError> {
@@ -156,11 +155,18 @@ impl Store {
         self.report_store_state();
         Ok(())
     }
-    /// One above the active revision and every `revisions/<n>.json`, so that
-    /// after recovering from an older revision the newer snapshots are never
-    /// overwritten or mistaken for a conflict.
+    /// One above the active revision and every number a file in
+    /// `revisions/` uses, so that after recovering from an older revision the
+    /// newer snapshots are never overwritten or mistaken for a conflict, and
+    /// a number is never given out twice (review R7): not after its snapshot
+    /// was quarantined (`<n>.corrupt-*.json`) or never written (only
+    /// `<n>.metadata.json`), where the publish would overwrite that metadata
+    /// and a record for the old revision could match the new one. A
+    /// `revisions/` that cannot be listed refuses the publish.
     fn next_revision(&self) -> Result<u64, CommandError> {
-        revision_numbers(&self.dir)
+        let revisions = self.dir.join("revisions");
+        occupied_revision_numbers(&revisions)
+            .map_err(|e| CommandError::io(IoOp::Read, Some(&revisions), &e))?
             .into_iter()
             .fold(self.active.revision, u64::max)
             .checked_add(1)
@@ -181,6 +187,33 @@ impl Store {
             })?;
         self.publish_with_metadata(config, self.previous_unresolved.clone())
     }
+}
+
+/// Every revision number that a name in `revisions` uses: `<n>.json`,
+/// `<n>.metadata.json`, `<n>.corrupt-*.json`, any `<n>.<rest>` (review R7-2).
+/// Only for [`Store::next_revision`]; the fallback candidates are the
+/// snapshots alone (`fallback::revision_numbers`). No `revisions/` yet is no
+/// number.
+fn occupied_revision_numbers(revisions: &Path) -> io::Result<Vec<u64>> {
+    let entries = match fs::read_dir(revisions) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e),
+    };
+    let mut numbers = vec![];
+    for entry in entries {
+        numbers.extend(occupied_number(&entry?.file_name().to_string_lossy()));
+    }
+    Ok(numbers)
+}
+
+/// `n` for a name `<n>.<rest>`.
+fn occupied_number(name: &str) -> Option<u64> {
+    let (number, _) = name.split_once('.')?;
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    number.parse().ok()
 }
 
 #[cfg(test)]
@@ -288,6 +321,22 @@ mod tests {
         assert_eq!(s.active.revision, 3);
         assert!(s.engine.paused.load(Ordering::SeqCst));
         fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn every_numbered_name_occupies_its_revision() {
+        for (name, number) in [
+            ("3.json", 3),
+            ("5.metadata.json", 5),
+            ("7.corrupt-20260101-000000.json", 7),
+            ("7.corrupt-20260101-000000-1.json", 7),
+            ("8.metadata.corrupt-20260101-000000.json", 8),
+            ("9.json.tmp", 9),
+        ] {
+            assert_eq!(occupied_number(name), Some(number), "{name}");
+        }
+        for name in ["index.json", ".json", "a1.json", "1a.json", "-1.json", "12"] {
+            assert_eq!(occupied_number(name), None, "{name}");
+        }
     }
     #[test]
     fn revision_overflow_is_error() {

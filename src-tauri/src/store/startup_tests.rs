@@ -2594,6 +2594,8 @@ fn a_failed_publish_keeps_the_rollback_target_of_the_committed_revision() {
 /// read; recovered from 2, the next publish is revision 3 again and its
 /// record cannot be written. Once store-meta.json reads again, the old
 /// record for "3" does not describe this revision 3: rollback returns to 2.
+/// (Since R7-2 the number is reused only when nothing in `revisions/` uses
+/// it any more: here `revisions/3.metadata.json` went away as well.)
 #[test]
 fn a_record_for_a_reused_revision_number_is_ignored() {
     let dir = TempDir::new();
@@ -2611,6 +2613,7 @@ fn a_record_for_a_reused_revision_number_is_ignored() {
     assert_eq!(store.active.revision, 3);
     clean_exit(store, &world);
 
+    fs::remove_file(dir.join("revisions/3.metadata.json")).unwrap();
     write(&dir, "active.json", TRUNCATED);
     assert!(!dir.join("revisions/3.json").exists());
     world.locked.lock().push(META_FILE);
@@ -2628,6 +2631,112 @@ fn a_record_for_a_reused_revision_number_is_ignored() {
     assert_eq!(store.active.revision, 3);
     assert_eq!(store.active.rules, metadata_config(&["three again"]).rules);
     assert_eq!(store.previous, Some(two));
+}
+
+/// Review R7-2: test 2 with the configuration published again unchanged.
+/// Its bytes as revision 3 would be those of the lost revision 3, so the
+/// old record for "3" would match them. `revisions/3.metadata.json` still
+/// uses the number, so the publish is revision 4 instead: rollback returns
+/// to 2 before and after the restart, and that metadata keeps its bytes.
+#[test]
+fn an_unchanged_republish_does_not_reuse_the_lost_revision_number() {
+    let dir = TempDir::new();
+    let world = world();
+    write_revision(&dir, 1, "one");
+    let two = write_revision(&dir, 2, "two");
+    write(&dir, "active.json", TRUNCATED);
+    let meta = StoreMeta {
+        last_good_revision: Some(1),
+        ..StoreMeta::default()
+    };
+    atomic_json(&dir.join(META_FILE), &meta).unwrap();
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    store.publish(metadata_config(&["three"])).unwrap();
+    assert_eq!(store.active.revision, 3);
+    clean_exit(store, &world);
+    let metadata_of_three = fs::read(dir.join("revisions/3.metadata.json")).unwrap();
+
+    write(&dir, "active.json", TRUNCATED);
+    assert!(!dir.join("revisions/3.json").exists());
+    world.locked.lock().push(META_FILE);
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.active, two);
+    store.publish(metadata_config(&["three"])).unwrap();
+    assert_eq!(store.previous, Some(two.clone()), "before the restart");
+    let revision = store.active.revision;
+    clean_exit(store, &world);
+    world.locked.lock().clear();
+
+    let store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.previous, Some(two), "after the restart");
+    assert_eq!((revision, store.active.revision), (4, 4));
+    assert_eq!(
+        fs::read(dir.join("revisions/3.metadata.json")).unwrap(),
+        metadata_of_three
+    );
+}
+
+/// Review R7-2: a number that only `revisions/<n>.metadata.json` uses is
+/// not given out again; that file keeps its bytes.
+#[test]
+fn a_revision_number_used_only_by_metadata_is_not_given_out() {
+    const METADATA: &[u8] = b"[{\"kept\":\"as it was\"}]";
+    let dir = TempDir::new();
+    let world = world();
+    write(&dir, "revisions/5.metadata.json", METADATA);
+    let mut store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.safe_mode(), None);
+    store.publish(metadata_config(&["one"])).unwrap();
+    assert_eq!(store.active.revision, 6);
+    assert_eq!(
+        fs::read(dir.join("revisions/5.metadata.json")).unwrap(),
+        METADATA
+    );
+}
+
+/// Review R7-3, diagnostic only: when the backup directory store-meta.json
+/// names is gone, the load logs `store.backup_missing` with that name and
+/// writes go on; with the directory there nothing is logged.
+#[test]
+fn a_missing_recorded_backup_is_only_logged() {
+    use crate::diagnostics::logging::{
+        test_support::{read_logs, scoped},
+        DEFAULT_LEVEL,
+    };
+    const RECORDED: &str = "backup-pre-0.4-20260101-000000";
+    let dir = TempDir::new();
+    let world = world();
+    let meta = StoreMeta {
+        backup_pre_0_4: Some(true),
+        backup_pre_0_4_dir: Some(RECORDED.into()),
+        ..StoreMeta::default()
+    };
+    atomic_json(&dir.join(META_FILE), &meta).unwrap();
+    let load_logged = || {
+        let logs = TempDir::new();
+        let built = scoped(&logs, DEFAULT_LEVEL);
+        let store = tracing::subscriber::with_default(built.subscriber, || {
+            Store::load_with(dir.path(), &env(&world))
+        });
+        drop(built.guard);
+        let missing: Vec<String> = read_logs(&logs)
+            .lines()
+            .filter(|line| line.contains("event=\"store.backup_missing\""))
+            .map(str::to_owned)
+            .collect();
+        (store, missing)
+    };
+
+    let (mut store, missing) = load_logged();
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert!(missing[0].contains(RECORDED), "{}", missing[0]);
+    store.publish(metadata_config(&["one"])).unwrap();
+    assert!(!dir.join(RECORDED).exists());
+    clean_exit(store, &world);
+
+    fs::create_dir(dir.join(RECORDED)).unwrap();
+    let (_store, missing) = load_logged();
+    assert_eq!(missing, Vec::<String>::new());
 }
 
 /// Review I-B1 (test 3): at the first 0.4 start a damaged `active.json` is
@@ -2714,7 +2823,13 @@ fn a_failed_backup_leaves_a_corrupt_active_in_place() {
     assert!(!dir.join("active.json").exists());
     assert_eq!(quarantined(&problem_kinds(&store)), ["active.json"]);
     store.publish(store.draft.clone()).unwrap();
-    assert_eq!(store.active.revision, 3);
+    // Review R7-2: 0.3.1's `revisions/3.metadata.json` keeps the number
+    // taken (the lost revision 3), and keeps its bytes.
+    assert_eq!(store.active.revision, 4);
+    assert_eq!(
+        fs::read(dir.join("revisions/3.metadata.json")).unwrap(),
+        b"[ ]\r\n"
+    );
 }
 
 /// Review I-B3 (test 5): a `backup-pre-0.4` without a valid manifest (empty,
@@ -2772,8 +2887,11 @@ fn an_incomplete_existing_backup_is_kept_and_a_dated_one_made() {
 /// corrupt is no new data directory. The mark is never `false`, and the
 /// backup holds the originals: the damaged candidates this launch found
 /// (still unrenamed), and the quarantine copies an earlier launch left.
+/// Review R7-1: with them the metadata of the damaged snapshot, which
+/// 0.3.1 reads beside it; the publish (revision 2, R7-2) leaves it as it is.
 #[test]
 fn a_recovery_import_backs_up_the_corrupt_candidates() {
+    const METADATA_OF_ONE: &[u8] = b"[{\"kept\":\"as 0.3.1 left it\"}]";
     let import = |dir: &Path, world: &Arc<World>| {
         let mut store = Store::load_with(dir.to_path_buf(), &env(world));
         assert_no_valid_config(&store);
@@ -2783,17 +2901,37 @@ fn a_recovery_import_backs_up_the_corrupt_candidates() {
         store.publish(store.draft.clone()).unwrap();
         assert_eq!(store.safe_mode(), None);
         assert_eq!(meta_value(dir)["backup_pre_0_4"], true);
-        assert_valid_backup(&backup_dir(dir))
+        let backup = assert_valid_backup(&backup_dir(dir));
+        assert_eq!(
+            backup
+                .get(&rel("revisions/1.metadata.json"))
+                .map(Vec::as_slice),
+            Some(METADATA_OF_ONE),
+            "metadata of 1 in the backup"
+        );
+        assert_eq!(
+            fs::read(dir.join("revisions/1.metadata.json")).unwrap(),
+            METADATA_OF_ONE,
+            "metadata of 1 after the save and publish"
+        );
+        assert_eq!(store.active.revision, 2);
+        backup
     };
 
     let dir = TempDir::new();
     let world = world();
     write(&dir, "active.json", TRUNCATED);
     write(&dir, "revisions/1.json", b"\xFF");
+    write(&dir, "revisions/1.metadata.json", METADATA_OF_ONE);
     write(&dir, "previous.json", b"[]");
     let before = files(&dir);
     let backup = import(&dir, &world);
-    let names = ["active.json", "revisions/1.json", "previous.json"];
+    let names = [
+        "active.json",
+        "revisions/1.json",
+        "revisions/1.metadata.json",
+        "previous.json",
+    ];
     assert_eq!(subset(&backup, &names), before);
     assert_eq!(quarantine_files(&dir).len(), 3);
     assert_nothing_lost(&before, &files(&dir));
@@ -2802,11 +2940,13 @@ fn a_recovery_import_backs_up_the_corrupt_candidates() {
     let world = self::world();
     write(&dir, "active.corrupt-20260101-000000.json", TRUNCATED);
     write(&dir, "revisions/1.corrupt-20260101-000000.json", b"\xFF");
+    write(&dir, "revisions/1.metadata.json", METADATA_OF_ONE);
     let before = files(&dir);
     let backup = import(&dir, &world);
     let names = [
         "active.corrupt-20260101-000000.json",
         "revisions/1.corrupt-20260101-000000.json",
+        "revisions/1.metadata.json",
     ];
     assert_eq!(subset(&backup, &names), before);
 }

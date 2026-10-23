@@ -11,6 +11,11 @@
 //!   ([`Store::quarantine_deferred`]). `store-meta.json` and `prefs.json`
 //!   do not trigger the gate because 0.3.1 never reads them: both files are
 //!   new in 0.4. Logs and exports do not either.
+//! - Contents: the files 0.3.1 reads, the snapshot and metadata of the
+//!   active revision, of the one before it and of the recorded predecessor,
+//!   the corrupt files the load left in place and the quarantined ones, and
+//!   for each revision snapshot among them, corrupt or not, its
+//!   `<n>.metadata.json` (review R7-1).
 //! - Once: `store-meta.json` records the outcome in `backup_pre_0_4` and the
 //!   directory in `backup_pre_0_4_dir`. While the mark is absent the gate
 //!   looks at the directory: a complete backup found there is taken as it
@@ -34,8 +39,10 @@
 //!   next write tries again. The engine keeps running on the active
 //!   configuration.
 //!
-//! Known limit: going back to 0.3.1, changing data there and upgrading
-//! again makes no second backup (the mark is already set).
+//! Known limits: going back to 0.3.1, changing data there and upgrading
+//! again makes no second backup (the mark is already set). Once the mark is
+//! `true` the backup is not checked again: a recorded directory that is
+//! gone is only logged at load (`store.backup_missing`, review R7-3).
 use super::{
     atomic::atomic_json, fallback::quarantine_target, meta::Fingerprint, prefs::utc_stamp, Store,
 };
@@ -203,6 +210,20 @@ fn quarantined_files(dir: &Path) -> Vec<PathBuf> {
     }
     found.sort();
     found
+}
+
+/// `revisions/<n>.metadata.json` for `revisions/<n>.json` or a quarantined
+/// `revisions/<n>.corrupt-*.json` (review R7-1): 0.3.1 reads the metadata
+/// beside the snapshot, and it must be in the backup before anything may
+/// write that number again.
+fn metadata_companion(relative: &Path) -> Option<PathBuf> {
+    let name = relative.strip_prefix("revisions").ok()?.to_str()?;
+    let stem = name.strip_suffix(".json")?;
+    let number = stem
+        .split_once(QUARANTINE_MARK)
+        .map_or(stem, |(number, _)| number);
+    (!number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| Path::new("revisions").join(format!("{number}.metadata.json")))
 }
 
 /// Removes `backup-pre-0.4.tmp-*` directories an interrupted attempt left.
@@ -386,7 +407,8 @@ fn free_name(dir: &Path) -> String {
 
 /// Takes a complete backup found in `dir`, or makes one unless there is
 /// nothing to back up. `files` are relative to `dir`; the quarantined files
-/// are added.
+/// are added, and the metadata of every revision snapshot among them, of a
+/// corrupt one too (R7-1).
 fn run(dir: &Path, files: &[PathBuf]) -> Result<Outcome, Failure> {
     remove_stale_temps(dir);
     for name in existing_backups(dir) {
@@ -408,6 +430,15 @@ fn run(dir: &Path, files: &[PathBuf]) -> Result<Outcome, Failure> {
     let target = dir.join(&name);
     let mut files = files.to_vec();
     for path in quarantined_files(dir) {
+        if !files.contains(&path) {
+            files.push(path);
+        }
+    }
+    let companions: Vec<PathBuf> = files
+        .iter()
+        .filter_map(|path| metadata_companion(path))
+        .collect();
+    for path in companions {
         if !files.contains(&path) {
             files.push(path);
         }
@@ -626,6 +657,39 @@ mod tests {
             "a1.json",
         ] {
             assert!(!is_revision_file(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn metadata_companions_of_snapshots() {
+        let companion = |name: &str| {
+            metadata_companion(&relative_path(name))
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+        };
+        for (name, metadata) in [
+            ("revisions/1.json", "revisions/1.metadata.json"),
+            (
+                "revisions/12.corrupt-20260101-000000.json",
+                "revisions/12.metadata.json",
+            ),
+            (
+                "revisions/3.corrupt-20260101-000000-1.json",
+                "revisions/3.metadata.json",
+            ),
+        ] {
+            assert_eq!(companion(name).as_deref(), Some(metadata), "{name}");
+        }
+        for name in [
+            "1.json",
+            "active.json",
+            "active.corrupt-20260101-000000.json",
+            "revisions/1.metadata.json",
+            "revisions/index.json",
+            "revisions/.json",
+            "revisions/a1.json",
+            "revisions/1.json.tmp",
+        ] {
+            assert_eq!(companion(name), None, "{name}");
         }
     }
 

@@ -184,6 +184,14 @@ pub fn load_or_fallback(dir: &Path, env: &StoreEnv) -> LoadReport {
     let (meta, meta_file) = loader.read_meta();
     // I-B1: an unreadable or rebuilt store-meta.json says nothing either.
     loader.defer = meta.backup_pre_0_4.is_none();
+    // Review R7-3, diagnostic only: once the mark is set the backup is not
+    // checked again, so a recorded directory that went away is only logged.
+    if let (Some(true), Some(name)) = (meta.backup_pre_0_4, &meta.backup_pre_0_4_dir) {
+        let recorded = Path::new(name);
+        if matches!(dir.join(recorded).try_exists(), Ok(false)) {
+            tracing::warn!(event = "store.backup_missing", dir = %label(recorded), "recorded pre-0.4 backup directory is missing");
+        }
+    }
     let now = RunMarker {
         boot_id: env.boot_id,
         started_ms: env.clock.wall_ms(),
@@ -655,8 +663,11 @@ impl<'a> Loader<'a> {
     /// `None`), never takes another revision's record. Without a record
     /// that applies (a meta file from before it existed, not written or
     /// rebuilt, or a revision published by 0.3.1), or when the recorded
-    /// snapshot is gone, the predecessor is guessed as before:
-    /// `revisions/<active - 1>.json`, then `previous.json`.
+    /// snapshot is gone, the predecessor is guessed: the nearest snapshot
+    /// below the active revision, which is `revisions/<active - 1>.json`
+    /// whenever that is there (as before), else the next one down, since
+    /// a publish skips the numbers other files in `revisions/` use (review
+    /// R7-2); with none, `previous.json`.
     fn previous(
         &self,
         active: &Config,
@@ -677,12 +688,14 @@ impl<'a> Loader<'a> {
             None => None,
         };
         let path = recorded.unwrap_or_else(|| {
-            let historical = revisions.join(format!("{}.json", active.revision.saturating_sub(1)));
-            if active.revision > 0 && historical.exists() {
-                historical
-            } else {
-                self.dir.join("previous.json")
-            }
+            revision_numbers(self.dir)
+                .into_iter()
+                .filter(|&n| n < active.revision)
+                .max()
+                .map_or_else(
+                    || self.dir.join("previous.json"),
+                    |n| revisions.join(format!("{n}.json")),
+                )
         });
         let Read::Bytes(bytes) = self.read(&path) else {
             return None;
