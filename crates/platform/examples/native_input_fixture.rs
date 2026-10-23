@@ -64,7 +64,7 @@ mod fixture {
                 }
             }
             let json = serde_json::to_string_pretty(&serde_json::json!({
-                "fixture": "Quicker Text Native Input Fixture",
+                "fixture": "Quicktext Native Input Fixture",
                 "controls": controls,
                 "selections": selections
             }))
@@ -112,7 +112,7 @@ mod fixture {
             !LoadLibraryW(wide("Msftedit.dll").as_ptr()).is_null(),
             "Load Msftedit.dll"
         );
-        let class = wide("QuickerTextInputFixtureClass");
+        let class = wide("QuicktextInputFixtureClass");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
             hInstance: instance,
@@ -125,7 +125,7 @@ mod fixture {
         let hwnd = CreateWindowExW(
             0,
             class.as_ptr(),
-            wide("Quicker Text Native Input Fixture").as_ptr(),
+            wide("Quicktext Native Input Fixture").as_ptr(),
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
             CW_USEDEFAULT,
             CW_USEDEFAULT,

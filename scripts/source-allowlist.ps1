@@ -20,7 +20,7 @@
 # file must be classified).
 #
 # crates.io and npm dependencies are NOT listed here: they are not part of this repository.
-# Their source ships in the separate Quicker-Text-<version>-Source-deps.zip
+# Their source ships in the separate Quicktext-<version>-Source-deps.zip
 # (scripts/package-dependency-sources.ps1), and Source.zip plus Source-deps.zip together are the
 # complete corresponding source. Cargo.lock and package-lock.json (both listed) pin the exact
 # versions and checksums that archive was made from. See docs/release-checklist.md.
@@ -79,7 +79,7 @@ $SourceDirectories = @(
 
 $SourceExtensions = @(
     '.cpp', '.css', '.h', '.html', '.ico', '.json', '.md', '.mjs', '.png', '.ps1', '.rs',
-    '.sh', '.ts', '.tsx', '.txt', '.yml'
+    '.sh', '.svg', '.ts', '.tsx', '.txt', '.yml'
 )
 
 # Tracked files that are deliberately not shipped (path prefix or exact path, with reason).

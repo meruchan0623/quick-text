@@ -38,9 +38,9 @@ fn main() {
                 } else {
                     None
                 };
-            let dir = match acceptance_dir {
-                Some(dir) => dir,
-                None => app.path().app_data_dir()?,
+            let (dir, migration) = match acceptance_dir {
+                Some(dir) => (dir, store::legacy::Migration::None),
+                None => store::legacy::migrate_data_dir(app.path().app_data_dir()?),
             };
             // Logging comes first so the store and every command can log
             // (`CommandError::internal` trace ids must be findable).
@@ -50,8 +50,9 @@ fn main() {
                 event = "app.start",
                 version = env!("CARGO_PKG_VERSION"),
                 debug_build = cfg!(debug_assertions),
-                "Quicker Text starting"
+                "Quicktext starting"
             );
+            store::legacy::log_migration(&migration);
             app.manage(DataDir(dir.clone()));
             app.manage(commands::diagnostics::BundledAssets::embedded(
                 &app.asset_resolver(),
@@ -159,14 +160,14 @@ fn main() {
             commands::engine::debug_inject_fault
         ])
         .build(tauri::generate_context!())
-        .expect("Quicker Text startup failed")
+        .expect("Quicktext startup failed")
         .run(|app, event| {
             let exiting = matches!(event, tauri::RunEvent::Exit);
             // Clears the run marker (safe mode, B-04) before the exit is logged,
             // so the final flush also covers anything it logs.
             startup::on_run_event(app, event);
             if exiting {
-                tracing::info!(event = "app.exit", "Quicker Text exiting");
+                tracing::info!(event = "app.exit", "Quicktext exiting");
                 diagnostics::logging::flush();
             }
         });

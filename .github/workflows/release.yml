@@ -43,7 +43,7 @@
 #     8. scripts/package-artifacts.ps1 (installer, exe, license text, notices, docs, Source.zip,
 #        Source-deps.zip, SHA256SUMS; validates the dependency archive again and refuses without
 #        it; before copying it repeats the B-52 and FE-18 checks of steps 2 and 7 on the exact
-#        exe it packages and checks that target/release/quicker_text.pdb is that exe's PDB,
+#        exe it packages and checks that target/release/quicktext.pdb is that exe's PDB,
 #        scripts/release-binary-checks.ps1), then check-source-allowlist.ps1 -Strict on the
 #        finished ZIP
 #     9. license / source-acquisition text for the release description
@@ -130,7 +130,7 @@ jobs:
       - name: Embedded-frontend check self-test (FE-18)
         run: pwsh -NoProfile -File scripts/check-embedded-frontend.ps1 -SelfTest
 
-      # `cargo tree -e features`: the release configuration of quicker-text must not enable
+      # `cargo tree -e features`: the release configuration of quicktext must not enable
       # fault-injection or mock in any crate. Fails too when no crate defines those features
       # any more (the check would pass vacuously).
       - name: Release enables no fault-injection / mock (B-52)
@@ -184,7 +184,7 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          $env:QT_DEPENDENCY_SOURCES_ZIP = Join-Path $env:RUNNER_TEMP "deps/Quicker-Text-$env:VERSION-Source-deps.zip"
+          $env:QT_DEPENDENCY_SOURCES_ZIP = Join-Path $env:RUNNER_TEMP "deps/Quicktext-$env:VERSION-Source-deps.zip"
           npm run tauri -- build --bundles nsis
           if ($LASTEXITCODE -ne 0) { throw 'tauri build failed' }
 
@@ -229,9 +229,9 @@ jobs:
         run: |
           $symbols = Join-Path $env:RUNNER_TEMP 'symbols'
           New-Item -ItemType Directory -Path $symbols | Out-Null
-          $base = "Quicker-Text-$env:VERSION-Windows-x64"
-          $pdb = 'target/release/quicker_text.pdb'
-          $exe = 'target/release/quicker-text.exe'
+          $base = "Quicktext-$env:VERSION-Windows-x64"
+          $pdb = 'target/release/quicktext.pdb'
+          $exe = 'target/release/quicktext.exe'
           foreach ($file in @($pdb, $exe)) {
             if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing build output: $file" }
           }
@@ -254,7 +254,7 @@ jobs:
         run: pwsh -NoProfile -File scripts/check-binary-strings.ps1 "${{ steps.symbols.outputs.pdb }}" -RequirePresent quicker_platform
 
       - name: Release exe has no debug_inject_fault (B-52)
-        run: pwsh -NoProfile -File scripts/check-binary-strings.ps1 target/release/quicker-text.exe -RequirePresent com.quickertext.desktop
+        run: pwsh -NoProfile -File scripts/check-binary-strings.ps1 target/release/quicktext.exe -RequirePresent com.quicktext.desktop
 
       # FE-18 on the frontend this build shipped: `tauri build` ran `npm run build`
       # (build.beforeBuildCommand) into dist/ and embedded that output in the exe (compressed, so
@@ -265,7 +265,7 @@ jobs:
       # temporary directory. Plain `npm run check:bundle` would rebuild dist/ and scan those builds
       # instead. package-artifacts.ps1 repeats this check on the exe it packages.
       - name: Shipped frontend has no mock backend (FE-18)
-        run: pwsh -NoProfile -File scripts/check-embedded-frontend.ps1 -Exe target/release/quicker-text.exe -Dist dist
+        run: pwsh -NoProfile -File scripts/check-embedded-frontend.ps1 -Exe target/release/quicktext.exe -Dist dist
 
       # --- package ----------------------------------------------------------------------
 
@@ -276,7 +276,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           $notices = Join-Path $env:RUNNER_TEMP 'notices/THIRD-PARTY-LICENSES.txt'
-          $deps = Join-Path $env:RUNNER_TEMP "deps/Quicker-Text-$env:VERSION-Source-deps.zip"
+          $deps = Join-Path $env:RUNNER_TEMP "deps/Quicktext-$env:VERSION-Source-deps.zip"
           foreach ($required in @($notices, $deps)) {
             if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Release precondition missing: $required" }
           }
@@ -284,7 +284,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Packaging failed' }
 
       - name: Source ZIP covers every crate (B-51)
-        run: pwsh -NoProfile -File scripts/check-source-allowlist.ps1 -Strict -Zip "$env:RUNNER_TEMP/release/Quicker-Text-${{ steps.version.outputs.version }}-Source.zip"
+        run: pwsh -NoProfile -File scripts/check-source-allowlist.ps1 -Strict -Zip "$env:RUNNER_TEMP/release/Quicktext-${{ steps.version.outputs.version }}-Source.zip"
 
       - name: License and source-acquisition text (S-28)
         env:
@@ -296,8 +296,8 @@ jobs:
           $notes = Join-Path $env:RUNNER_TEMP 'release-notes/release-notes.md'
           $arguments = @{
             Version       = $env:VERSION
-            SourceZip     = Join-Path $env:RUNNER_TEMP "release/Quicker-Text-$env:VERSION-Source.zip"
-            DependencySourcesZip = Join-Path $env:RUNNER_TEMP "release/Quicker-Text-$env:VERSION-Source-deps.zip"
+            SourceZip     = Join-Path $env:RUNNER_TEMP "release/Quicktext-$env:VERSION-Source.zip"
+            DependencySourcesZip = Join-Path $env:RUNNER_TEMP "release/Quicktext-$env:VERSION-Source-deps.zip"
             RepositoryUrl = $env:REPOSITORY_URL
             Ref           = $env:REF_NAME
             CommitSha     = $env:GITHUB_SHA
@@ -309,7 +309,7 @@ jobs:
           '' | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
           '### SHA256SUMS' | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
           '```' | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
-          Get-Content -LiteralPath (Join-Path $env:RUNNER_TEMP "release/Quicker-Text-$env:VERSION-SHA256SUMS.txt") -Encoding utf8 | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          Get-Content -LiteralPath (Join-Path $env:RUNNER_TEMP "release/Quicktext-$env:VERSION-SHA256SUMS.txt") -Encoding utf8 | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
           '```' | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
 
       # --- upload -----------------------------------------------------------------------
@@ -317,7 +317,7 @@ jobs:
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
-          name: Quicker-Text-${{ steps.version.outputs.version }}-package
+          name: Quicktext-${{ steps.version.outputs.version }}-package
           path: ${{ runner.temp }}/release/*
           if-no-files-found: error
           retention-days: 90
@@ -325,7 +325,7 @@ jobs:
       - name: Upload release notes (license and source acquisition)
         uses: actions/upload-artifact@v4
         with:
-          name: Quicker-Text-${{ steps.version.outputs.version }}-release-notes
+          name: Quicktext-${{ steps.version.outputs.version }}-release-notes
           path: ${{ runner.temp }}/release-notes/release-notes.md
           if-no-files-found: error
           retention-days: 90
@@ -334,7 +334,7 @@ jobs:
       - name: Upload PDB (symbols)
         uses: actions/upload-artifact@v4
         with:
-          name: Quicker-Text-${{ steps.version.outputs.version }}-symbols
+          name: Quicktext-${{ steps.version.outputs.version }}-symbols
           path: ${{ steps.symbols.outputs.path }}/*
           if-no-files-found: error
           retention-days: 90

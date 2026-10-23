@@ -10,13 +10,13 @@ Copyright (C) 2019-2021 Federico Terzi. Licensed under GNU GPL version 3 or late
 The full license is at `vendor/espanso-win32/LICENSE`. Original copyright/license
 headers are retained. Local modifications are documented in that directory's README.
 
-Quicker Text itself is licensed under GPL-3.0-or-later (see `LICENSE`). The combined
+Quicktext itself is licensed under GPL-3.0-or-later (see `LICENSE`). The combined
 executable includes GPL-3.0-or-later code and must be distributed with GPL rights,
 the full license, and complete corresponding source for the combined work.
 The corresponding source of a release is two archives, published together:
-`Quicker-Text-<version>-Source.zip` (all workspace code, native vendor code, Cargo.lock,
+`Quicktext-<version>-Source.zip` (all workspace code, native vendor code, Cargo.lock,
 frontend lockfile and build/package scripts needed to reproduce it) and
-`Quicker-Text-<version>-Source-deps.zip` (the source of every third-party package built into
+`Quicktext-<version>-Source-deps.zip` (the source of every third-party package built into
 the binaries, see below).
 
 ## Rust and npm dependencies
@@ -31,7 +31,7 @@ GPL-3.0-or-later.
 Their copyright notices and license texts travel with every release artifact in
 `THIRD-PARTY-LICENSES.txt`: it is bundled into the installer and the portable package
 (next to the executable, together with the GPL text and this file) and attached to the
-release as `Quicker-Text-<version>-THIRD-PARTY-LICENSES.txt`. The file is not kept in the
+release as `Quicktext-<version>-THIRD-PARTY-LICENSES.txt`. The file is not kept in the
 repository: `scripts/generate-third-party-licenses.ps1` writes it from the packages that are
 actually distributed (the normal and build dependencies of the application crate for the
 Windows x64 target from `cargo metadata --locked`, and the production packages of
@@ -41,7 +41,7 @@ package; for those the file reproduces the upstream project's text, pinned by na
 version in `scripts/third-party-license-clarifications.json` and marked `clarified`.
 
 The source of these packages is published with every release as
-`Quicker-Text-<version>-Source-deps.zip` (`cargo vendor --locked` output plus the npm
+`Quicktext-<version>-Source-deps.zip` (`cargo vendor --locked` output plus the npm
 production packages as the original registry tarballs, with offline build instructions); the
 portable package carries it as a companion file next to the ZIP, named and hashed in the
 ZIP's `DEPENDENCY-SOURCES.txt`. The build and packaging scripts (installer build, release

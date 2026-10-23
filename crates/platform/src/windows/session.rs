@@ -263,7 +263,7 @@ pub(super) fn start() {
 }
 
 fn run() {
-    let class = wide("QuickerTextSessionWindow");
+    let class = wide("QuicktextSessionWindow");
     // SAFETY: the class name outlives every call below; the window and the
     // WinEvent hook belong to this thread, which pumps their messages.
     unsafe {

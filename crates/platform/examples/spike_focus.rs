@@ -275,7 +275,7 @@ mod imp {
         DefWindowProcW(hwnd, msg, wp, lp)
     }
 
-    const CLASS_NAME: &str = "QuickerTextS29FocusSpike";
+    const CLASS_NAME: &str = "QuicktextS29FocusSpike";
 
     unsafe fn register_class() -> bool {
         let class = wide(CLASS_NAME);

@@ -613,7 +613,7 @@ impl WinClipboard {
             CreateWindowExW(
                 0,
                 wide("STATIC").as_ptr(),
-                wide("QuickerText Clipboard").as_ptr(),
+                wide("Quicktext Clipboard").as_ptr(),
                 0,
                 0,
                 0,

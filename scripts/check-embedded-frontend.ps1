@@ -40,7 +40,7 @@
   summary line; add -Verbose for one line per case.
 
 .PARAMETER Exe
-  The exe about to be packaged. Default: target\release\quicker-text.exe.
+  The exe about to be packaged. Default: target\release\quicktext.exe.
 
 .PARAMETER Dist
   The frontend directory to scan. Default: dist\ (build.frontendDist).
@@ -60,7 +60,7 @@
 [CmdletBinding(DefaultParameterSetName = 'Check')]
 param(
     [Parameter(ParameterSetName = 'Check')]
-    [string] $Exe = (Join-Path (Split-Path -Parent $PSScriptRoot) 'target\release\quicker-text.exe'),
+    [string] $Exe = (Join-Path (Split-Path -Parent $PSScriptRoot) 'target\release\quicktext.exe'),
     [Parameter(ParameterSetName = 'Check')]
     [string] $Dist = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist'),
     [Parameter(ParameterSetName = 'SelfTest', Mandatory = $true)]
@@ -109,7 +109,7 @@ function Get-EmbeddedFrontendDigest {
     $name = [IO.Path]::GetFileName($Path)
     if ($values.Count -eq 0) { throw "$name has no frontend record ('$RecordPrefix...'): built before the record existed, or not by src-tauri/build.rs; rebuild it" }
     if ($values.Count -gt 1) { throw "$name has $($values.Count) different frontend records ($($values -join ', ')); cannot tell which frontend it embeds" }
-    if ($values[0] -eq 'dev-mode') { throw "$name is a Tauri development-mode build and contains no frontend: it was compiled without the custom-protocol feature (for example with --no-default-features) and loads the dev server (build.devUrl) at run time; rebuild it with default features (cargo build -p quicker-text --release)" }
+    if ($values[0] -eq 'dev-mode') { throw "$name is a Tauri development-mode build and contains no frontend: it was compiled without the custom-protocol feature (for example with --no-default-features) and loads the dev server (build.devUrl) at run time; rebuild it with default features (cargo build -p quicktext --release)" }
     if ($values[0] -eq 'unavailable') { throw "$name records no frontend digest (build.rs could not hash the frontend directory; see its cargo warning); rebuild it" }
     return $values[0]
 }
@@ -121,7 +121,7 @@ function Assert-EmbeddedFrontendDigest {
     $actual = Get-FrontendDistDigest -Path $DistPath
     $name = [IO.Path]::GetFileName($ExePath)
     if ($recorded -ne $actual.Digest) {
-        throw "$name embeds another frontend than $DistPath (recorded $recorded, directory $($actual.Digest)); rebuild the exe from this directory (npm run build, then cargo build -p quicker-text --release), or restore the directory it was built from"
+        throw "$name embeds another frontend than $DistPath (recorded $recorded, directory $($actual.Digest)); rebuild the exe from this directory (npm run build, then cargo build -p quicktext --release), or restore the directory it was built from"
     }
     Write-Host "ok:   $name embeds the frontend in $DistPath ($($actual.Files) files, sha256 $recorded)"
 }

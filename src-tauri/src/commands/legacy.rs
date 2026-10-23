@@ -68,7 +68,7 @@ pub fn export_config(
     // must not block other commands and the tray while it is open.
     let target = path.map(PathBuf::from).or_else(|| {
         dialog(CONFIG_FILTERS)
-            .set_file_name("quicker-text-package.json")
+            .set_file_name("quicktext-package.json")
             .save_file()
     });
     let Some(target) = target else {

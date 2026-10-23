@@ -5,14 +5,14 @@
 # Assert-ReleaseBinaries before they write their first file. The release workflow also runs the
 # scanners as steps of their own; these calls make every packaging run, local or in CI, fail closed
 # in the same way instead of relying on someone having run them first:
-#   1. scripts/check-release-features.ps1: the release configuration of quicker-text enables
+#   1. scripts/check-release-features.ps1: the release configuration of quicktext enables
 #      neither `fault-injection` nor `mock` (cargo tree -e features; needs cargo and this tree).
 #   2. The PDB is the exe's own: the GUID in the exe's CodeView debug record (RSDS) must be in the
 #      PDB, and the record must name a PDB of that file name. Otherwise a PDB left over from another
 #      build could pass step 3 for an exe it does not describe.
 #   3. scripts/check-binary-strings.ps1 on that PDB (no `debug_inject_fault`; positive control
 #      `quicker_platform`) and on the exe (no `debug_inject_fault`; positive control
-#      `com.quickertext.desktop`), the same calls as the release workflow.
+#      `com.quicktext.desktop`), the same calls as the release workflow.
 #   4. scripts/check-embedded-frontend.ps1 (FE-18, Codex review 1): the exe records the digest of
 #      the frontend directory its build embedded (src-tauri/build.rs); dist/ must have that digest,
 #      so dist/ is the frontend inside this exe and not one rebuilt since; then
@@ -21,7 +21,7 @@
 # stops before anything is written.
 #
 # Not covered: the NSIS installer is compressed, so its copy of the exe cannot be scanned. It comes
-# from the same `tauri build` as target\release\quicker-text.exe (release workflow, build-windows.ps1).
+# from the same `tauri build` as target\release\quicktext.exe (release workflow, build-windows.ps1).
 
 function Invoke-ReleaseCheckScript {
     param([Parameter(Mandatory = $true)][string] $Script, [string[]] $Arguments = @())
@@ -111,6 +111,6 @@ function Assert-ReleaseBinaries {
     Invoke-ReleaseCheckScript 'check-release-features.ps1'
     Assert-PdbMatchesExe -Exe $Exe -Pdb $Pdb
     Invoke-ReleaseCheckScript 'check-binary-strings.ps1' @($Pdb, '-RequirePresent', 'quicker_platform')
-    Invoke-ReleaseCheckScript 'check-binary-strings.ps1' @($Exe, '-RequirePresent', 'com.quickertext.desktop')
+    Invoke-ReleaseCheckScript 'check-binary-strings.ps1' @($Exe, '-RequirePresent', 'com.quicktext.desktop')
     Invoke-ReleaseCheckScript 'check-embedded-frontend.ps1' @('-Exe', $Exe, '-Dist', $Dist)
 }

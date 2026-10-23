@@ -14,7 +14,7 @@
 # Workspace crates are the project itself (GPL-3.0-or-later, LICENSE) and are not listed.
 
 $ThirdPartyCargoTarget = 'x86_64-pc-windows-msvc'
-$ThirdPartyCargoRoot = 'quicker-text'
+$ThirdPartyCargoRoot = 'quicktext'
 
 # Dev-only npm packages whose code still ends up in the production bundle. Vite injects its
 # module-preload polyfill into every production bundle (confirmed in dist/assets/index-*.js),
@@ -408,7 +408,7 @@ function Assert-DependencySourcesZip {
     )
     $label = 'Dependency source archive'
     if (!(Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$label missing: $Path (build it with scripts/package-dependency-sources.ps1)" }
-    $expectedName = "Quicker-Text-$Version-Source-deps.zip"
+    $expectedName = "Quicktext-$Version-Source-deps.zip"
     if ((Split-Path -Leaf $Path) -ne $expectedName) { throw "$label must be named $expectedName (built for version $Version), got $(Split-Path -Leaf $Path)" }
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     try { $archive = [IO.Compression.ZipFile]::OpenRead($Path) } catch { throw "$label is not a readable ZIP file: $Path ($($_.Exception.Message))" }
@@ -416,7 +416,7 @@ function Assert-DependencySourcesZip {
         # Before anything is read or hashed: every check below looks entries up by exact name, so an alias that
         # unpacks onto a verified file (or a duplicate) would otherwise slip through unchecked.
         Assert-ZipEntryNames -Archive $archive -Label $label
-        $stage = "Quicker-Text-$Version-Source-deps"
+        $stage = "Quicktext-$Version-Source-deps"
         # Case-sensitive lookup; after the check above no two entries differ only by case.
         $entries = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
         foreach ($entry in $archive.Entries) { $entries[$entry.FullName] = $entry }
@@ -426,7 +426,7 @@ function Assert-DependencySourcesZip {
 
         # Manifest: version and the lock files the archive was built from.
         $manifest = Read-ZipEntryText -Entry $entries["$stage/SOURCE-DEPS-MANIFEST.txt"]
-        if ($manifest -notmatch "(?m)^Quicker Text $([regex]::Escape($Version)) dependency sources\s*$") { throw "$label manifest is not for version $Version" }
+        if ($manifest -notmatch "(?m)^Quicktext $([regex]::Escape($Version)) dependency sources\s*$") { throw "$label manifest is not for version $Version" }
         foreach ($lockName in @('Cargo.lock', 'package-lock.json')) {
             $declaredHash = [regex]::Match($manifest, "(?m)^$([regex]::Escape($lockName)) SHA-256: ([0-9A-Fa-f]{64})\s*$")
             if (-not $declaredHash.Success) { throw "$label manifest has no $lockName hash" }

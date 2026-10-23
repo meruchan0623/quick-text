@@ -108,6 +108,22 @@ pub fn after_load(app: &AppHandle) {
     // A development build would point the user's login item at itself.
     if !cfg!(debug_assertions) {
         if let Ok(exe) = std::env::current_exe() {
+            let legacy_exe = exe.clone();
+            store.when_writable(
+                "autostart_migrate",
+                Box::new(move |_| match autostart::migrate_legacy(&legacy_exe) {
+                    Ok(true) => tracing::info!(
+                        event = "autostart.legacy_migrated",
+                        "legacy autostart entry carried over"
+                    ),
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(
+                        event = "autostart.legacy_migrate_failed",
+                        error = %e,
+                        "legacy autostart entry could not be carried over"
+                    ),
+                }),
+            );
             defer_autostart_repair(&mut store, autostart::SystemLoginItem, exe);
         }
     }

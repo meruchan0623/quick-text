@@ -138,7 +138,7 @@ function Invoke-TestCase([string] $Name, [scriptblock] $Body) {
 # One line in tracing_subscriber's default format.
 function New-TestLine([DateTime] $Utc, [string] $Level, [string] $Event, [string] $Fields) {
     $line = $Utc.ToString("yyyy-MM-dd'T'HH:mm:ss.ffffff'Z'", $script:Inv) + ' ' + $Level.PadLeft(5) +
-        ' main quicker_text::soak_test: synthetic'
+        ' main quicktext::soak_test: synthetic'
     if ($Event) { $line += ' event="' + $Event + '"' }
     if ($Fields) { $line += ' ' + $Fields }
     return $line

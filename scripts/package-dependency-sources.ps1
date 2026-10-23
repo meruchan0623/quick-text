@@ -1,6 +1,6 @@
 #requires -Version 7.0
-# Builds Quicker-Text-<version>-Source-deps.zip: the source of every third-party package the release is
-# built from. Together with Quicker-Text-<version>-Source.zip (scripts/package-artifacts.ps1) it is the
+# Builds Quicktext-<version>-Source-deps.zip: the source of every third-party package the release is
+# built from. Together with Quicktext-<version>-Source.zip (scripts/package-artifacts.ps1) it is the
 # complete corresponding source of the release binaries (GPL-3.0-or-later section 1; the dependency
 # code is compiled or bundled into them), so a release must not be published without it (S-28, B-51).
 #
@@ -42,14 +42,14 @@ $ProjectRoot = [IO.Path]::GetFullPath($ProjectRoot)
 $version = (Get-Content -LiteralPath (Join-Path $ProjectRoot 'package.json') -Raw | ConvertFrom-Json).version
 if ($version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') { throw 'Package version must use major.minor.patch format' }
 $output = [IO.Path]::GetFullPath($OutputDirectory)
-$zipName = "Quicker-Text-$version-Source-deps.zip"
+$zipName = "Quicktext-$version-Source-deps.zip"
 $zipPath = Join-Path $output $zipName
 if (Test-Path -LiteralPath $zipPath) { throw "Output already exists; preserve it: $zipName" }
 New-Item -ItemType Directory -Path $output -Force | Out-Null
 if (-not $WorkDirectory) { $WorkDirectory = Join-Path ([IO.Path]::GetTempPath()) ("qt-source-deps-" + [Guid]::NewGuid().ToString('N')) }
 $work = [IO.Path]::GetFullPath($WorkDirectory)
 if ((Test-Path -LiteralPath $work) -and @(Get-ChildItem -LiteralPath $work -Force).Count -gt 0) { throw "Work directory must be empty: $work" }
-$stageName = "Quicker-Text-$version-Source-deps"
+$stageName = "Quicktext-$version-Source-deps"
 $stage = Join-Path $work $stageName
 $vendorDir = Join-Path $stage 'cargo-vendor'
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
@@ -136,7 +136,7 @@ directory = "cargo-vendor"
     if (Test-Path -LiteralPath (Join-Path $ProjectRoot '.git')) { $commit = ((& git -C $ProjectRoot rev-parse HEAD) | Out-String).Trim() }
     $tool = { param($exe, $argument) try { ((& $exe $argument) | Out-String).Trim() } catch { 'unavailable' } }
     $manifestLines = @(
-        "Quicker Text $version dependency sources",
+        "Quicktext $version dependency sources",
         "source commit: $(if ($commit) { $commit } else { 'unknown (no .git directory)' })",
         "Cargo.lock SHA-256: $(Get-ThirdPartyLockfileSha256 -Path (Join-Path $ProjectRoot 'Cargo.lock'))",
         "package-lock.json SHA-256: $(Get-ThirdPartyLockfileSha256 -Path (Join-Path $ProjectRoot 'package-lock.json'))",
@@ -149,14 +149,14 @@ directory = "cargo-vendor"
     )
     Set-Content -LiteralPath (Join-Path $stage 'SOURCE-DEPS-MANIFEST.txt') -Value $manifestLines -Encoding utf8NoBOM
     $readme = @'
-# Quicker Text {{VERSION}} - dependency sources (Source-deps)
+# Quicktext {{VERSION}} - dependency sources (Source-deps)
 
-This archive holds the source of the third-party packages that Quicker Text {{VERSION}} is built from.
-Together with `Quicker-Text-{{VERSION}}-Source.zip` it is the complete corresponding source of the
+This archive holds the source of the third-party packages that Quicktext {{VERSION}} is built from.
+Together with `Quicktext-{{VERSION}}-Source.zip` it is the complete corresponding source of the
 release binaries (GPL-3.0-or-later). The licenses of these packages are listed in
 `THIRD-PARTY-LICENSES.txt`, which ships with the installer and as a release attachment.
 
-本压缩包包含 Quicker Text {{VERSION}} 所用第三方依赖的源码，与 `Quicker-Text-{{VERSION}}-Source.zip`
+本压缩包包含 Quicktext {{VERSION}} 所用第三方依赖的源码，与 `Quicktext-{{VERSION}}-Source.zip`
 合在一起才是发布二进制文件的完整对应源码（GPL-3.0-or-later）。
 
 ## Contents / 内容
@@ -173,7 +173,7 @@ release binaries (GPL-3.0-or-later). The licenses of these packages are listed i
 
 Needs Rust (MSVC toolchain), the MSVC C++ build tools with the Windows SDK, Node.js and PowerShell 7.
 
-1. Unpack `Quicker-Text-{{VERSION}}-Source.zip` into an empty directory (`<src>`).
+1. Unpack `Quicktext-{{VERSION}}-Source.zip` into an empty directory (`<src>`).
 2. Unpack this archive, copy its `cargo-vendor` directory to `<src>\cargo-vendor` and `cargo-config.toml` to
    `<src>\.cargo\config.toml` (create the `.cargo` directory). `<src>\Cargo.lock` stays unchanged.
 3. Frontend (`npm`): `npm\tarballs` holds the original registry tarballs (`.tgz`) of the production packages,
@@ -184,7 +184,7 @@ Needs Rust (MSVC toolchain), the MSVC C++ build tools with the Windows SDK, Node
    React plugin, the Tauri CLI) are not part of the product and are not in this archive. Run `npm ci`: it
    fetches the packages from the npm registry and verifies every one against the same `integrity` values, so
    the production packages it installs have the same content as the tarballs here. Then run `npm run build`.
-4. Rust, offline: `cargo build -p quicker-text --release --locked --offline`. Cargo resolves everything from
+4. Rust, offline: `cargo build -p quicktext --release --locked --offline`. Cargo resolves everything from
    `cargo-vendor`; no registry access is needed.
 5. Notices: `pwsh scripts/generate-third-party-licenses.ps1` regenerates `THIRD-PARTY-LICENSES.txt` from the
    licenses in `cargo-vendor` (through the cargo configuration of step 2) and in `node_modules`.
@@ -197,7 +197,7 @@ Needs Rust (MSVC toolchain), the MSVC C++ build tools with the Windows SDK, Node
    is `npm run tauri -- build --no-bundle`.
 
 The exact build steps used by the release workflow are in `.github/workflows/release.yml` and
-`docs/release-checklist.md` inside `Quicker-Text-{{VERSION}}-Source.zip`.
+`docs/release-checklist.md` inside `Quicktext-{{VERSION}}-Source.zip`.
 '@
     $readme = $readme.Replace('{{VERSION}}', $version).Replace('{{CRATES}}', [string]$vendored.Count)
     Set-Content -LiteralPath (Join-Path $stage 'README-OFFLINE-BUILD.md') -Value $readme -Encoding utf8NoBOM

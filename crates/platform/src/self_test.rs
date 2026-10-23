@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 /// How long startup waits for Healthy before it runs the checks anyway
 /// (B-10).
 pub const STARTUP_HEALTHY_WAIT: Duration = Duration::from_secs(30);
-const HEALTH_POLL: Duration = Duration::from_millis(100);
+const HEALTH_POLL: Duration = Duration::from_millis(20);
 
 /// The checks, in report order (contract §5 `name`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]

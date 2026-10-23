@@ -3334,7 +3334,7 @@ fn a_busy_word_is_reported_only_where_the_matcher_would_take_it() {
     probe.set_protection(Some("password field"));
     assert!(rig.enter("qzx").is_empty());
     probe.set_protection(None);
-    for process in ["quicker-text.exe", "Quicker-Text.EXE", ""] {
+    for process in ["quicktext.exe", "Quicktext.EXE", ""] {
         probe.set_foreground(MockForeground::window(FOCUS, process));
         assert!(rig.enter("qzx").is_empty());
     }

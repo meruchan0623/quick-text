@@ -829,7 +829,7 @@ mod tests {
         let plan = ActionPlan {
             steps: vec![Step::new(
                 Operation::PasteFiles {
-                    paths: vec!["C:\\nonexistent-quicker-text-fixture\\missing.txt".into()],
+                    paths: vec!["C:\\nonexistent-quicktext-fixture\\missing.txt".into()],
                 },
                 SourceSpan::default(),
             )],

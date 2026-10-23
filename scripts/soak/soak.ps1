@@ -1,7 +1,7 @@
 ﻿#requires -Version 5.1
 <#
 .SYNOPSIS
-    Quicker Text 浸泡监视（只读）：按间隔采样进程资源，统计日志事件，结束或 Ctrl+C 时写出汇总。
+    Quicktext 浸泡监视（只读）：按间隔采样进程资源，统计日志事件，结束或 Ctrl+C 时写出汇总。
 
 .DESCRIPTION
     计划 L6 / S-27 的浸泡监视工具，用法见同目录的 README.md。
@@ -29,10 +29,10 @@
     （每轮一个新目录）。
 
 .PARAMETER ProcessName
-    进程名（不带 .exe），默认 quicker-text。
+    进程名（不带 .exe），默认 quicktext。
 
 .PARAMETER DataDirectory
-    应用数据目录，默认 %APPDATA%\com.quickertext.desktop。日志在其下的 logs 目录。
+    应用数据目录，默认 %APPDATA%\com.quicktext.desktop。日志在其下的 logs 目录。
 
 .PARAMETER UnhealthySuspectSeconds
     健康处于「正在启动 / 恢复中 / 故障」、或输入源丢失后未重新挂接，持续多少秒算可疑，默认 60。
@@ -60,7 +60,7 @@ param(
     [string] $OutputDirectory = '',
 
     [ValidateNotNullOrEmpty()]
-    [string] $ProcessName = 'quicker-text',
+    [string] $ProcessName = 'quicktext',
 
     [string] $DataDirectory = '',
 
@@ -278,7 +278,7 @@ function Test-PathInside([string] $Child, [string] $Parent) {
 
 function Get-LogPathForUtc([DateTime] $Utc) {
     # tracing_appender Rotation::DAILY: <prefix>.<UTC yyyy-MM-dd>.<suffix>
-    return [System.IO.Path]::Combine($script:LogDirectory, 'quicker-text.' + $Utc.ToString('yyyy-MM-dd', $script:Inv) + '.log')
+    return [System.IO.Path]::Combine($script:LogDirectory, 'quicktext.' + $Utc.ToString('yyyy-MM-dd', $script:Inv) + '.log')
 }
 
 function ConvertFrom-LogTime([string] $Text, [DateTime] $Fallback) {
@@ -1260,7 +1260,7 @@ function Build-Summary([string] $Status) {
     $auto = [System.Collections.Generic.List[string]]::new()
     $manual = [System.Collections.Generic.List[string]]::new()
 
-    $o.Add('Quicker Text 浸泡监视汇总（scripts/soak/soak.ps1，汇总格式 1）')
+    $o.Add('Quicktext 浸泡监视汇总（scripts/soak/soak.ps1，汇总格式 1）')
     $o.Add('==============================================================')
     $o.Add('状态：' + $Status)
     $o.Add('开始：' + (Format-Full $script:RunStart) + '    结束：' + (Format-Full $end) +
@@ -1682,7 +1682,7 @@ function Initialize-SoakState {
 
 if ([string]::IsNullOrWhiteSpace($DataDirectory)) {
     if ([string]::IsNullOrEmpty($env:APPDATA)) { throw '找不到 APPDATA 环境变量；请用 -DataDirectory 指定数据目录。' }
-    $DataDirectory = Join-Path $env:APPDATA 'com.quickertext.desktop'
+    $DataDirectory = Join-Path $env:APPDATA 'com.quicktext.desktop'
 }
 $DataDirectory = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DataDirectory)
 $script:LogDirectory = Join-Path $DataDirectory 'logs'
@@ -1792,7 +1792,7 @@ try {
     foreach ($p in $startProcs) { try { $p.Dispose() } catch { } }
     Invoke-Baseline $running
 
-    Write-Line 'Quicker Text 浸泡监视（只读：只查询进程、只读日志，不写数据目录，不产生输入）'
+    Write-Line 'Quicktext 浸泡监视（只读：只查询进程、只读日志，不写数据目录，不产生输入）'
     Write-Line ('进程名 ' + $ProcessName + '；数据目录 ' + $DataDirectory)
     Write-Line ('时长 ' + (Format-Dur ($Hours * 3600)) + '，间隔 ' + $IntervalSeconds + ' 秒；输出 ' + $script:OutDir)
     Write-Line ('起始健康（日志推断）：' + (Get-Label $script:HealthLabel $script:Health) + '（' + $script:BaselineHealthVia + '）')

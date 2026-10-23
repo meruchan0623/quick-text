@@ -11,7 +11,7 @@
 
   `-e features` lists a node `<crate> feature "<name>"` for every enabled feature; the
   inverted tree (-i) of a crate also contains the features of the crates that depend on it,
-  such as `quicker-text feature "fault-injection"`, which enables the one in quicker-platform.
+  such as `quicktext feature "fault-injection"`, which enables the one in quicker-platform.
   Dev-dependencies are not part of the check (`cargo build --release` does not compile
   them); only the host target is resolved, like the real build.
 
@@ -26,7 +26,7 @@
   other half of B-52 is scripts/check-binary-strings.ps1 on the archived PDB and the exe.
 
 .PARAMETER Package
-  The package the installer is built from. Default: quicker-text (src-tauri).
+  The package the installer is built from. Default: quicktext (src-tauri).
 
 .PARAMETER Forbidden
   Feature names that must not be enabled. Default: fault-injection, mock.
@@ -47,7 +47,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string] $Package = 'quicker-text',
+    [string] $Package = 'quicktext',
     [string[]] $Forbidden = @('fault-injection', 'mock'),
     [string[]] $CargoArgs = @()
 )

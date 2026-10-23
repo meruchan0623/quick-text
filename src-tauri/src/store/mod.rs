@@ -4,6 +4,7 @@ mod atomic;
 mod backup;
 mod export;
 mod fallback;
+pub mod legacy;
 mod load;
 mod meta;
 mod metadata;
@@ -469,7 +470,7 @@ mod tests {
     /// with another reason still set it succeeds and stays paused.
     #[test]
     fn manual_pause_is_the_only_reason_set_paused_touches() {
-        let dir = std::env::temp_dir().join(format!("quicker-text-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("quicktext-test-{}", uuid::Uuid::new_v4()));
         let store = Store::load(dir.clone());
         assert_eq!(store.runtime.pause_reasons(), PauseReasons::MANUAL);
         let generation = || store.engine.generation.load(Ordering::SeqCst);
@@ -555,7 +556,7 @@ mod tests {
     /// B-42: `save_draft` validates first; an invalid draft is not written.
     #[test]
     fn save_rejects_drafts_with_error_diagnostics() {
-        let dir = std::env::temp_dir().join(format!("quicker-text-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("quicktext-test-{}", uuid::Uuid::new_v4()));
         let mut store = Store::load(dir.clone());
         let valid = metadata_config(&["kept"]);
         store.save(valid.clone()).unwrap();

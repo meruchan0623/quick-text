@@ -32,7 +32,7 @@
 
 .EXAMPLE
   ./scripts/check-source-allowlist.ps1
-  ./scripts/check-source-allowlist.ps1 -Strict -Zip out/Quicker-Text-0.4.0-Source.zip
+  ./scripts/check-source-allowlist.ps1 -Strict -Zip out/Quicktext-0.4.0-Source.zip
 
 .NOTES
   Needs git and cargo on PATH (`cargo metadata --no-deps --locked` needs no network and

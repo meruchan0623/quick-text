@@ -1,5 +1,5 @@
 //! Thin bridge around the vendored Espanso Windows RawInput detector/injector.
-//! Matching remains Quicker Text's domain compiler; UIA only supplies optional vetoes.
+//! Matching remains Quicktext's domain compiler; UIA only supplies optional vetoes.
 //!
 //! B-02: the detector callback only reads atomics and the foreground input
 //! context, pushes one fixed-size [`RawRecord`] onto a bounded lock-free
@@ -569,7 +569,7 @@ fn terminator_of(kind: &Kind) -> Option<&'static str> {
 fn eligible(target: &Foreground, stamp: &Stamp, probe: &impl ForegroundProbe) -> bool {
     target.id == stamp.focus
         && !target.process.is_empty()
-        && !target.process.eq_ignore_ascii_case("quicker-text.exe")
+        && !target.process.eq_ignore_ascii_case("quicktext.exe")
         && probe.protection().is_none()
 }
 /// A rule the user typed while an action was running, which the matcher

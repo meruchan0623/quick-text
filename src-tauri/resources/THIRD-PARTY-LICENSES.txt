@@ -1,6 +1,6 @@
 QT-THIRD-PARTY-LICENSES-PLACEHOLDER
 
-Quicker Text - third-party licenses (placeholder)
+Quicktext - third-party licenses (placeholder)
 
 This file only exists so that `cargo build`, `cargo test` and `tauri build --no-bundle` work from a
 plain checkout (tauri-build fails when a bundled resource is missing). It is NOT the notice file.

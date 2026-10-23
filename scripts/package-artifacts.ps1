@@ -1,14 +1,14 @@
 #requires -Version 7.0
 # -ThirdPartyLicensesFile: THIRD-PARTY-LICENSES.txt from scripts/generate-third-party-licenses.ps1 (the file the
 #   installer bundles; the committed placeholder is refused).
-# -DependencySourcesZip: Quicker-Text-<version>-Source-deps.zip from scripts/package-dependency-sources.ps1.
+# -DependencySourcesZip: Quicktext-<version>-Source-deps.zip from scripts/package-dependency-sources.ps1.
 #   Source.zip and Source-deps.zip together are the complete corresponding source (GPL-3.0-or-later), so a
 #   package without the dependency archive is refused. The archive is validated against this tree's
 #   Cargo.lock and package-lock.json (Assert-DependencySourcesZip): a stale, damaged or incomplete one fails.
 # Everything is checked before the first file is written. When a later step fails, every file this run created
 # is removed again, so no half-finished package is left in the output directory.
 # B-52 (scripts/release-binary-checks.ps1): before anything is copied, the release configuration must enable no
-# fault-injection / mock feature, target\release\quicker_text.pdb must be the PDB of the exe, and neither may
+# fault-injection / mock feature, target\release\quicktext.pdb must be the PDB of the exe, and neither may
 # contain debug_inject_fault. FE-18 (same file, Codex review 1): dist\ must be the frontend the exe embeds (the
 # digest its build recorded, src-tauri/build.rs), then scripts/check-bundle.mjs --scan-only dist finds no mock
 # backend in it. The installer comes from the same `tauri build` as the exe. Needs node. Any failure stops the run
@@ -26,9 +26,9 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $version = (Get-Content -LiteralPath (Join-Path $projectRoot 'package.json') -Raw | ConvertFrom-Json).version
 if ($version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') { throw 'Package version must use major.minor.patch format' }
 $output = [IO.Path]::GetFullPath($OutputDirectory)
-$exe = Join-Path $projectRoot 'target\release\quicker-text.exe'
-$installer = Join-Path $projectRoot "target\release\bundle\nsis\Quicker Text_${version}_x64-setup.exe"
-$pdb = Join-Path $projectRoot 'target\release\quicker_text.pdb'
+$exe = Join-Path $projectRoot 'target\release\quicktext.exe'
+$installer = Join-Path $projectRoot "target\release\bundle\nsis\Quicktext_${version}_x64-setup.exe"
+$pdb = Join-Path $projectRoot 'target\release\quicktext.pdb'
 foreach ($file in @($exe, $installer, $pdb)) { if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing build: $file" } }
 # B-52 on the exact exe that is copied below and its PDB; FE-18 on the frontend it embeds. Throws on any failure.
 Assert-ReleaseBinaries -Exe $exe -Pdb $pdb
@@ -42,24 +42,24 @@ if (!(Test-Path -LiteralPath $notes -PathType Leaf)) { throw "Missing release no
 $licensesFile = [IO.Path]::GetFullPath($ThirdPartyLicensesFile)
 Assert-ThirdPartyLicensesFile -Path $licensesFile -ProjectRoot $projectRoot
 $depsZip = [IO.Path]::GetFullPath($DependencySourcesZip)
-$depsName = "Quicker-Text-$version-Source-deps.zip"
+$depsName = "Quicktext-$version-Source-deps.zip"
 $deps = Assert-DependencySourcesZip -Path $depsZip -ProjectRoot $projectRoot -Version $version
 $deliveries = [ordered]@{
-    "Quicker-Text-$version-THIRD-PARTY-NOTICES.md" = Join-Path $projectRoot 'THIRD_PARTY_NOTICES.md'
-    "Quicker-Text-$version-THIRD-PARTY-LICENSES.txt" = $licensesFile
-    "Quicker-Text-$version-GPL-3.0.txt" = Join-Path $projectRoot 'LICENSE'
-    "Quicker-Text-$version-Windows-x64.exe" = $exe
-    "Quicker-Text-$version-Windows-x64-Setup.exe" = $installer
-    "Quicker-Text-$version-使用与构建说明.md" = Join-Path $projectRoot 'README.md'
-    "Quicker-Text-$version-平台支持与手工测试.md" = Join-Path $projectRoot 'docs\platform-support.md'
-    "Quicker-Text-$version-浏览器与IME手测.md" = Join-Path $projectRoot 'docs\browser-ime-manual-tests.md'
-    "Quicker-Text-$version-验收矩阵.md" = Join-Path $projectRoot 'docs\acceptance.md'
-    "Quicker-Text-$version-构建验证记录.md" = Join-Path $projectRoot 'docs\build-verification.md'
-    "Quicker-Text-$version-先读与测试.md" = $notes
-    "Quicker-Text-$version-浏览器测试页面.html" = Join-Path $projectRoot 'scripts\fixtures\browser-input.html'
+    "Quicktext-$version-THIRD-PARTY-NOTICES.md" = Join-Path $projectRoot 'THIRD_PARTY_NOTICES.md'
+    "Quicktext-$version-THIRD-PARTY-LICENSES.txt" = $licensesFile
+    "Quicktext-$version-GPL-3.0.txt" = Join-Path $projectRoot 'LICENSE'
+    "Quicktext-$version-Windows-x64.exe" = $exe
+    "Quicktext-$version-Windows-x64-Setup.exe" = $installer
+    "Quicktext-$version-使用与构建说明.md" = Join-Path $projectRoot 'README.md'
+    "Quicktext-$version-平台支持与手工测试.md" = Join-Path $projectRoot 'docs\platform-support.md'
+    "Quicktext-$version-浏览器与IME手测.md" = Join-Path $projectRoot 'docs\browser-ime-manual-tests.md'
+    "Quicktext-$version-验收矩阵.md" = Join-Path $projectRoot 'docs\acceptance.md'
+    "Quicktext-$version-构建验证记录.md" = Join-Path $projectRoot 'docs\build-verification.md'
+    "Quicktext-$version-先读与测试.md" = $notes
+    "Quicktext-$version-浏览器测试页面.html" = Join-Path $projectRoot 'scripts\fixtures\browser-input.html'
 }
-$zipName = "Quicker-Text-$version-Source.zip"
-$hashName = "Quicker-Text-$version-SHA256SUMS.txt"
+$zipName = "Quicktext-$version-Source.zip"
+$hashName = "Quicktext-$version-SHA256SUMS.txt"
 foreach ($name in (@($deliveries.Keys) + @($zipName, $depsName, $hashName))) {
     if (Test-Path -LiteralPath (Join-Path $output $name)) { throw "Output already exists; preserve it: $name" }
 }
@@ -102,5 +102,5 @@ try {
     throw $failure
 }
 Write-Output "Packaged version $version; source files: $(($relativeFiles | Sort-Object -Unique).Count)"
-Get-ChildItem -LiteralPath $output -File | Where-Object Name -Like "Quicker-Text-$version-*" | Select-Object Name,Length
+Get-ChildItem -LiteralPath $output -File | Where-Object Name -Like "Quicktext-$version-*" | Select-Object Name,Length
 Get-Content -LiteralPath (Join-Path $output $hashName)

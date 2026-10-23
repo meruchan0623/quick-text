@@ -1,4 +1,4 @@
-# CI for Quicker Text (development plan, section 11 "CI").
+# CI for Quicktext (development plan, section 11 "CI").
 #
 # Jobs and triggers (names match the plan; branch protection should require
 # rust-windows, rust-portable, deps and frontend):

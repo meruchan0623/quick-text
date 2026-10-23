@@ -11,7 +11,7 @@ use std::{io, path::Path};
 #[cfg(windows)]
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 #[cfg(windows)]
-const RUN_VALUE: &str = "QuickerText";
+const RUN_VALUE: &str = "Quicktext";
 
 /// The login item as the OS stores it: the Run value on Windows, the plist
 /// content on macOS. Behind a trait so that tests never touch the real one.
@@ -81,7 +81,7 @@ fn launch_entry(exe: &Path) -> String {
             .replace('<', "&lt;")
             .replace('>', "&gt;")
             .replace('"', "&quot;");
-        format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>Label</key><string>com.quickertext.desktop</string><key>ProgramArguments</key><array><string>{escaped}</string><string>--background</string></array><key>RunAtLoad</key><true/></dict></plist>")
+        format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>Label</key><string>com.quicktext.desktop</string><key>ProgramArguments</key><array><string>{escaped}</string><string>--background</string></array><key>RunAtLoad</key><true/></dict></plist>")
     } else {
         format!("\"{}\" --background", exe.display())
     }
@@ -95,7 +95,7 @@ pub fn repair(item: &dyn LoginItem, exe: &Path) -> io::Result<bool> {
         return Ok(false);
     };
     if faults::take(FaultPoint::AutostartStale).is_some() {
-        current = launch_entry(Path::new("stale-quicker-text.exe"));
+        current = launch_entry(Path::new("stale-quicktext.exe"));
     }
     let expected = launch_entry(exe);
     let matches = if cfg!(windows) {
@@ -112,6 +112,55 @@ pub fn repair(item: &dyn LoginItem, exe: &Path) -> io::Result<bool> {
         "autostart entry now points at this executable"
     );
     Ok(true)
+}
+
+/// The Run value of the app before it was renamed Quicktext.
+#[cfg(windows)]
+const LEGACY_RUN_VALUE: &str = "QuickerText";
+
+/// Carries autostart over from before the rename: removes the legacy login
+/// item and, when there was one, turns autostart on for `exe`. Returns
+/// whether a legacy item was found.
+pub fn migrate_legacy(exe: &Path) -> io::Result<bool> {
+    #[cfg(windows)]
+    {
+        use winreg::{enums::*, RegKey};
+        let run = match RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(RUN_KEY, KEY_QUERY_VALUE | KEY_SET_VALUE)
+        {
+            Ok(run) => run,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        match run.get_value::<String, _>(LEGACY_RUN_VALUE) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        if run.get_value::<String, _>(RUN_VALUE).is_err() {
+            run.set_value(RUN_VALUE, &launch_entry(exe))?;
+        }
+        run.delete_value(LEGACY_RUN_VALUE)?;
+        Ok(true)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let new = mac_login_path().map_err(io::Error::other)?;
+        let legacy = new.with_file_name("com.quickertext.desktop.plist");
+        if !legacy.exists() {
+            return Ok(false);
+        }
+        if !new.exists() {
+            fs::write(&new, launch_entry(exe))?;
+        }
+        fs::remove_file(legacy)?;
+        Ok(true)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = exe;
+        Ok(false)
+    }
 }
 
 pub fn is_enabled() -> bool {
@@ -169,7 +218,7 @@ pub fn set_enabled(enabled: bool) -> Result<bool, CommandError> {
 fn mac_login_path() -> Result<PathBuf, CommandError> {
     let user_home = std::env::var_os("HOME")
         .ok_or_else(|| CommandError::internal("macOS home directory is unavailable"))?;
-    Ok(PathBuf::from(user_home).join("Library/LaunchAgents/com.quickertext.desktop.plist"))
+    Ok(PathBuf::from(user_home).join("Library/LaunchAgents/com.quicktext.desktop.plist"))
 }
 #[cfg(target_os = "macos")]
 fn set_mac_autostart(enabled: bool) -> Result<bool, CommandError> {
@@ -221,7 +270,7 @@ mod tests {
 
     #[test]
     fn repair_rewrites_only_a_stale_entry() {
-        let exe = Path::new("C:/Apps/Quicker Text/quicker-text.exe");
+        let exe = Path::new("C:/Apps/Quicktext/quicktext.exe");
         let off = FakeLoginItem::default();
         assert!(!repair(&off, exe).unwrap());
         assert_eq!(*off.entry.borrow(), None);
@@ -230,7 +279,7 @@ mod tests {
         assert!(!repair(&current, exe).unwrap());
         assert_eq!(*current.writes.borrow(), 0);
 
-        let moved = FakeLoginItem::with(launch_entry(Path::new("D:/old/quicker-text.exe")));
+        let moved = FakeLoginItem::with(launch_entry(Path::new("D:/old/quicktext.exe")));
         assert!(repair(&moved, exe).unwrap());
         assert_eq!(*moved.entry.borrow(), Some(launch_entry(exe)));
         assert_eq!(*moved.writes.borrow(), 1);
@@ -239,7 +288,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn repair_ignores_case_on_windows() {
-        let exe = Path::new("C:/Apps/quicker-text.exe");
+        let exe = Path::new("C:/Apps/quicktext.exe");
         let item = FakeLoginItem::with(launch_entry(exe).to_uppercase());
         assert!(!repair(&item, exe).unwrap());
         assert_eq!(*item.writes.borrow(), 0);
@@ -250,7 +299,7 @@ mod tests {
     #[test]
     fn autostart_stale_fault_is_repaired() {
         let _scope = crate::faults::scope::FaultScope::new();
-        let exe = Path::new("C:/Apps/quicker-text.exe");
+        let exe = Path::new("C:/Apps/quicktext.exe");
         let item = FakeLoginItem::with(launch_entry(exe));
         quicker_platform::fault::debug_inject_fault(FaultPoint::AutostartStale, 1);
         assert!(repair(&item, exe).unwrap());

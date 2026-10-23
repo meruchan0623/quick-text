@@ -79,6 +79,9 @@ pub const CIRCUIT_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// The failure (or incident) that opens the circuit (Health → Failed).
 pub const CIRCUIT_FAILURES: usize = 5;
 pub const TICK: Duration = Duration::from_secs(1);
+/// The tick while Starting: the first Healthy publish (which startup and
+/// its self-test wait for) follows the engine coming up within this.
+pub const STARTING_TICK: Duration = Duration::from_millis(50);
 /// After a rebuild reported success, how long the components may take to
 /// report healthy before the attempt counts as failed. 待实测 (hook and
 /// RawInput re-registration time on real machines).
@@ -940,11 +943,16 @@ impl Supervisor {
         let Some(machine) = self.machine.try_lock() else {
             return TICK;
         };
+        let tick = if machine.state == HealthState::Starting {
+            STARTING_TICK
+        } else {
+            TICK
+        };
         [machine.next_attempt, machine.verify_until]
             .into_iter()
             .flatten()
             .map(|due| due.saturating_duration_since(now))
-            .fold(TICK, Duration::min)
+            .fold(tick, Duration::min)
     }
 
     /// Starts (or replaces) the driver thread that ticks every second.

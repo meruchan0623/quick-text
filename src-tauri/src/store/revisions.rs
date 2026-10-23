@@ -263,7 +263,7 @@ mod tests {
     }
     #[test]
     fn persistent_revision_conflict() {
-        let dir = std::env::temp_dir().join(format!("quicker-text-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("quicktext-test-{}", uuid::Uuid::new_v4()));
         let mut s = Store::load(dir.clone());
         s.publish(Config::default()).unwrap();
         assert_eq!(s.active.revision, 1);
@@ -277,7 +277,7 @@ mod tests {
     /// No-regression list #8 (§5.5): a failed publish keeps the active config and pause state.
     #[test]
     fn failed_publish_preserves_active_and_pause() {
-        let dir = std::env::temp_dir().join(format!("quicker-text-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("quicktext-test-{}", uuid::Uuid::new_v4()));
         let mut s = Store::load(dir.clone());
         s.publish(Config::default()).unwrap();
         let old = s.active.clone();
@@ -300,7 +300,7 @@ mod tests {
     /// a reason set by someone else is left alone.
     #[test]
     fn publish_restores_only_the_manual_reason() {
-        let dir = std::env::temp_dir().join(format!("quicker-text-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("quicktext-test-{}", uuid::Uuid::new_v4()));
         let mut s = Store::load(dir.clone());
         s.runtime.publish_health(healthy());
         assert_eq!(s.runtime.pause_reasons(), PauseReasons::MANUAL);
@@ -320,7 +320,7 @@ mod tests {
     }
     #[test]
     fn rollback_revision_and_reload() {
-        let dir = std::env::temp_dir().join(format!("quicker-text-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("quicktext-test-{}", uuid::Uuid::new_v4()));
         let mut s = Store::load(dir.clone());
         s.publish(Config::default()).unwrap();
         let mut next = s.active.clone();
@@ -340,7 +340,7 @@ mod tests {
     /// ones `quarantine_target` and `atomic_json` produce included.
     #[test]
     fn every_name_of_this_program_occupies_its_revision() {
-        let dir = std::env::temp_dir().join(format!("quicker-text-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("quicktext-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let quarantined = |name: &str| {
             let path = dir.join(name);
@@ -402,7 +402,7 @@ mod tests {
     }
     #[test]
     fn revision_overflow_is_error() {
-        let dir = std::env::temp_dir().join(format!("quicker-text-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("quicktext-test-{}", uuid::Uuid::new_v4()));
         let mut s = Store::load(dir.clone());
         s.active.revision = u64::MAX;
         assert!(s.publish(Config::default()).is_err());
@@ -412,7 +412,7 @@ mod tests {
     }
     #[test]
     fn publish_and_rollback_failures_use_specific_error_codes() {
-        let dir = std::env::temp_dir().join(format!("quicker-text-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("quicktext-test-{}", uuid::Uuid::new_v4()));
         let mut s = Store::load(dir.clone());
         assert!(matches!(
             s.rollback_previous(),

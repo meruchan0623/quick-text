@@ -20,10 +20,10 @@
   major.minor.patch, as in the package file names.
 
 .PARAMETER SourceZip
-  The Quicker-Text-<version>-Source.zip that package-artifacts.ps1 produced.
+  The Quicktext-<version>-Source.zip that package-artifacts.ps1 produced.
 
 .PARAMETER DependencySourcesZip
-  The Quicker-Text-<version>-Source-deps.zip that package-dependency-sources.ps1 produced and
+  The Quicktext-<version>-Source-deps.zip that package-dependency-sources.ps1 produced and
   package-artifacts.ps1 attached. A release without it is not allowed, so it is mandatory.
 
 .PARAMETER RepositoryUrl
@@ -42,8 +42,8 @@
   Where to write the Markdown. Must not exist yet.
 
 .EXAMPLE
-  ./scripts/write-release-notes.ps1 -Version 0.4.0 -SourceZip out/Quicker-Text-0.4.0-Source.zip `
-    -DependencySourcesZip out/Quicker-Text-0.4.0-Source-deps.zip `
+  ./scripts/write-release-notes.ps1 -Version 0.4.0 -SourceZip out/Quicktext-0.4.0-Source.zip `
+    -DependencySourcesZip out/Quicktext-0.4.0-Source-deps.zip `
     -RepositoryUrl https://github.com/owner/repo -Ref v0.4.0 -CommitSha 0123abc -IsTag -OutputFile out/release-notes.md
 
 .NOTES
@@ -79,15 +79,15 @@ $origin = if ($IsTag) { "标签 ``$Ref``（提交 ``$CommitSha``）：$repositor
 $text = @"
 ## 许可证与源码获取（GPL-3.0-or-later）
 
-Quicker Text $Version 的整个项目（自研代码与静态纳入的 espanso 组件）按 GPL-3.0-or-later 授权与分发。
+Quicktext $Version 的整个项目（自研代码与静态纳入的 espanso 组件）按 GPL-3.0-or-later 授权与分发。
 
-- 许可证全文：``Quicker-Text-$Version-GPL-3.0.txt``（与仓库根目录的 ``LICENSE`` 相同）。
-- 第三方声明：``Quicker-Text-$Version-THIRD-PARTY-NOTICES.md``（espanso 的版权、许可和本地修改说明）。
-- 第三方依赖的版权声明与许可证全文：``Quicker-Text-$Version-THIRD-PARTY-LICENSES.txt``（由实际分发的 Rust crate 与 npm 包生成；安装包和绿色包内也带有同一份文件）。
+- 许可证全文：``Quicktext-$Version-GPL-3.0.txt``（与仓库根目录的 ``LICENSE`` 相同）。
+- 第三方声明：``Quicktext-$Version-THIRD-PARTY-NOTICES.md``（espanso 的版权、许可和本地修改说明）。
+- 第三方依赖的版权声明与许可证全文：``Quicktext-$Version-THIRD-PARTY-LICENSES.txt``（由实际分发的 Rust crate 与 npm 包生成；安装包和绿色包内也带有同一份文件）。
 - 完整对应源码由下面两个文件**合在一起**构成，缺一不可：
   - ``$zipName``（SHA256 ``$zipSha256``）：全部工作区代码、``vendor/espanso-win32`` 原生组件、``Cargo.lock``、``package-lock.json`` 以及构建与打包脚本。
   - ``$depsName``（SHA256 ``$depsSha256``）：全部第三方依赖的源码，即 ``cargo vendor --locked`` 的 Rust crate 和打包进前端的 npm 包，附离线重建说明 ``README-OFFLINE-BUILD.md``。
-  - 两个文件的校验和同时列在 ``Quicker-Text-$Version-SHA256SUMS.txt``。
+  - 两个文件的校验和同时列在 ``Quicktext-$Version-SHA256SUMS.txt``。
 - 版本库：$origin
 - 构建方法：源码包内 ``README.md`` 的「许可与绿色包构建」一节和 ``docs/build-verification.md``。
 - 依赖：Rust 与前端依赖的源码已随本次发布提供（``$depsName``），版本和校验和由 ``Cargo.lock`` 与 ``package-lock.json`` 固定；Rust 依赖的许可证由 ``deny.toml`` 对照与 GPL-3.0-or-later 兼容的清单检查。前端构建工具（``devDependencies``，如 TypeScript）不属于产品，仍在构建时由 npm 获取。

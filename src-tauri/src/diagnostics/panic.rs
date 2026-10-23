@@ -205,7 +205,7 @@ pub fn crate_location(file: &str, line: u32, column: u32, homes: &[String]) -> S
 
 pub fn render_report(report: &CrashReport<'_>) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "Quicker Text crash report");
+    let _ = writeln!(out, "Quicktext crash report");
     let _ = writeln!(out, "version: {}", report.version);
     let _ = writeln!(
         out,

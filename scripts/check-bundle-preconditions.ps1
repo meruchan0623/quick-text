@@ -7,7 +7,7 @@
 #     notice generator and the archive follow the x86_64-pc-windows-msvc dependency set);
 #   - src-tauri\resources\THIRD-PARTY-LICENSES.txt, which the bundle puts into the installer, is the generated file
 #     (not the committed placeholder) and was generated from this tree's Cargo.lock and package-lock.json;
-#   - $env:QT_DEPENDENCY_SOURCES_ZIP names Quicker-Text-<version>-Source-deps.zip, built from the same lock files
+#   - $env:QT_DEPENDENCY_SOURCES_ZIP names Quicktext-<version>-Source-deps.zip, built from the same lock files
 #     and complete (Assert-DependencySourcesZip). An installer is a distributable binary: the dependency code compiled into
 #     it needs its corresponding source (GPL-3.0-or-later), so it is not built without that archive.
 # scripts/build-windows.ps1 and .github/workflows/release.yml set the variable; a bare `npm run tauri build` fails here.
@@ -31,7 +31,7 @@ try {
     Assert-ThirdPartyLicensesFile -Path $notices -ProjectRoot $root
     $depsPath = $env:QT_DEPENDENCY_SOURCES_ZIP
     if (-not $depsPath) {
-        throw "QT_DEPENDENCY_SOURCES_ZIP is not set. Build Quicker-Text-$version-Source-deps.zip with scripts/package-dependency-sources.ps1 and point the variable at it (scripts/build-windows.ps1 -DependencySourcesZip does this); an installer must not be built without its dependency sources."
+        throw "QT_DEPENDENCY_SOURCES_ZIP is not set. Build Quicktext-$version-Source-deps.zip with scripts/package-dependency-sources.ps1 and point the variable at it (scripts/build-windows.ps1 -DependencySourcesZip does this); an installer must not be built without its dependency sources."
     }
     $deps = Assert-DependencySourcesZip -Path ([IO.Path]::GetFullPath($depsPath)) -ProjectRoot $root -Version $version
     Write-Output "bundle gate OK: generated notice file; dependency sources $($deps.Crates) crates + $($deps.NpmPackages) npm packages (SHA-256 $($deps.Sha256))"

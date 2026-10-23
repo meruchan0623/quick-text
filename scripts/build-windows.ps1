@@ -1,7 +1,7 @@
 #requires -Version 7.0
 # Builds the Windows installer (NSIS or MSI) from a clean install of the locked dependencies.
 # An installer is a distributable binary, so it is built under the same gate as the release workflow:
-#   -DependencySourcesZip (mandatory): Quicker-Text-<version>-Source-deps.zip from scripts/package-dependency-sources.ps1.
+#   -DependencySourcesZip (mandatory): Quicktext-<version>-Source-deps.zip from scripts/package-dependency-sources.ps1.
 #     It is validated before anything is built and handed to the Tauri hook scripts/check-bundle-preconditions.ps1
 #     (QT_DEPENDENCY_SOURCES_ZIP), which refuses to bundle without it.
 # The third-party notices are generated here and bundled in place of the committed placeholder

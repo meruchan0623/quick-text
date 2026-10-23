@@ -13,7 +13,7 @@ if ($EvidencePath) {
 }
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text = 'Quicker Text Native Input Fixture'
+$form.Text = 'Quicktext Native Input Fixture'
 $form.ClientSize = New-Object System.Drawing.Size(760, 640)
 $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
 $form.MaximizeBox = $false
@@ -87,7 +87,7 @@ $saveEvidence = {
     if ($EvidencePath) {
         try {
             $evidence = [ordered]@{
-                fixture = 'Quicker Text Native Input Fixture'
+                fixture = 'Quicktext Native Input Fixture'
                 updatedAtUtc = [DateTime]::UtcNow.ToString('o')
                 controls = $values
             }

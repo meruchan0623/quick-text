@@ -2,7 +2,7 @@
 //!
 //! # Output
 //!
-//! - `<data_dir>/logs/quicker-text.YYYY-MM-DD.log`, one file per UTC day,
+//! - `<data_dir>/logs/quicktext.YYYY-MM-DD.log`, one file per UTC day,
 //!   the newest [`MAX_LOG_FILES`] kept. Lines are written by a background
 //!   thread (`tracing_appender::non_blocking`), so a log call never waits for
 //!   the disk; under extreme load lines are dropped rather than stalling the
@@ -12,7 +12,7 @@
 //!
 //! # Levels
 //!
-//! The default is `info`. Our crates (`quicker_text`, `quicker_platform`,
+//! The default is `info`. Our crates (`quicktext`, `quicker_platform`,
 //! `quicker_domain`) follow the runtime level ([`apply_level`], driven by
 //! [`super::level`] and the command `set_log_level`); everything else (tauri, wry, ...) stays capped at
 //! `info`, so raising the level never logs IPC payloads.
@@ -38,6 +38,8 @@
 //! | `app.start` | info | process started; version and build profile |
 //! | `app.exit` | info | event loop finished; the log is flushed next |
 //! | `app.panic` | error | a panic; thread, crate-relative location, payload class, length and fingerprint (never the payload), crash file name |
+//! | `autostart.legacy_migrated` | info | the login item from before the rename to Quicktext was removed and autostart carried over to this executable |
+//! | `autostart.legacy_migrate_failed` | warn | the login item from before the rename could not be carried over; error |
 //! | `autostart.repair` | info | the autostart entry was rewritten to point at this executable |
 //! | `autostart.repair_failed` | warn | the autostart entry could not be checked or repaired at startup; error |
 //! | `clipboard.options_set` | info | the clipboard lease options were set at startup (`app.clipboard` prefs); restore policy and `restore_delay_ms` |
@@ -130,6 +132,8 @@
 //! | `session.registered` | info | session notifications were registered; `attempts` |
 //! | `session.signal` | info | a session signal arrived (lock, unlock, ...); signal name |
 //! | `session.start_failed` | warn | session monitoring did not start; `stage` (`thread`, `window`, `desktop_switch`, or `wts` with `attempts`) |
+//! | `store.legacy_dir_moved` | info | the data directory of the app before the rename to Quicktext was moved to the new one |
+//! | `store.legacy_dir_kept` | warn | the legacy data directory could not be moved and is used as it is for this run; error |
 //! | `store.quarantine` | warn | a damaged file was renamed aside |
 //! | `store.quarantine_failed` | error / warn | the rename failed; the file stays in place (error for `prefs.json`; warn for a configuration file, and for one the load left in place (review I-B1) at each write that tries it again, which a file this store writes also refuses) |
 //! | `store.quarantine_deferred` | warn | a damaged file that 0.3.1 reads is left in place until the pre-0.4 backup holds it (review I-B1); file name |
@@ -213,13 +217,13 @@ use tracing_subscriber::{
 
 /// Subdirectory of the data directory that holds the log files.
 pub const LOG_DIR: &str = "logs";
-pub const FILE_PREFIX: &str = "quicker-text";
+pub const FILE_PREFIX: &str = "quicktext";
 pub const FILE_SUFFIX: &str = "log";
 pub const MAX_LOG_FILES: usize = 7;
 pub const DEFAULT_LEVEL: LevelFilter = LevelFilter::INFO;
 /// Targets that follow the runtime level; everything else is capped at
 /// [`DEFAULT_LEVEL`].
-const OWN_TARGETS: [&str; 3] = ["quicker_text", "quicker_platform", "quicker_domain"];
+const OWN_TARGETS: [&str; 3] = ["quicktext", "quicker_platform", "quicker_domain"];
 
 pub type FilterHandle = reload::Handle<Targets, Registry>;
 
@@ -388,8 +392,8 @@ mod tests {
     fn our_crates_follow_the_level_and_the_rest_stays_at_info() {
         use tracing::Level;
         let info = targets(DEFAULT_LEVEL);
-        assert!(info.would_enable("quicker_text::store", &Level::INFO));
-        assert!(!info.would_enable("quicker_text::store", &Level::DEBUG));
+        assert!(info.would_enable("quicktext::store", &Level::INFO));
+        assert!(!info.would_enable("quicktext::store", &Level::DEBUG));
         assert!(!info.would_enable("tauri::ipc", &Level::DEBUG));
         let trace = targets(LevelFilter::TRACE);
         for target in OWN_TARGETS {
@@ -419,7 +423,7 @@ mod tests {
             .collect();
         assert_eq!(names.len(), 1);
         let date = names[0]
-            .strip_prefix("quicker-text.")
+            .strip_prefix("quicktext.")
             .and_then(|rest| rest.strip_suffix(".log"))
             .unwrap();
         assert_eq!(date.len(), 10, "YYYY-MM-DD, got {date}");

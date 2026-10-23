@@ -7,7 +7,7 @@
 //! | `system.json`: version, build, OS | yes | yes |
 //! | `health.json`: health and capability snapshot, log level | yes | yes |
 //! | `config-summary.json`: counts and reason codes only | yes | yes |
-//! | `logs/quicker-text.YYYY-MM-DD.log`: the last 7 days | yes | yes |
+//! | `logs/quicktext.YYYY-MM-DD.log`: the last 7 days | yes | yes |
 //! | `crashes/crash-*.txt`: the newest crash records | yes | yes |
 //! | `active.json`: the active configuration, phrases included | no | yes |
 //!
@@ -179,9 +179,9 @@ impl SystemInfo {
     }
 }
 
-/// `quicker-text-diagnostics-<UTC yyyymmdd-hhmmss>.zip`.
+/// `quicktext-diagnostics-<UTC yyyymmdd-hhmmss>.zip`.
 pub fn default_file_name(now: SystemTime) -> String {
-    format!("quicker-text-diagnostics-{}.zip", utc_stamp(now))
+    format!("quicktext-diagnostics-{}.zip", utc_stamp(now))
 }
 
 #[derive(Serialize)]
@@ -391,7 +391,7 @@ fn recent_logs(dir: &Path, now: SystemTime) -> Vec<(String, std::path::PathBuf)>
     logs
 }
 
-/// The `YYYY-MM-DD` of `quicker-text.YYYY-MM-DD.log`.
+/// The `YYYY-MM-DD` of `quicktext.YYYY-MM-DD.log`.
 fn log_date(name: &str) -> Option<&str> {
     let date = name
         .strip_prefix(FILE_PREFIX)?
@@ -905,7 +905,7 @@ mod tests {
         fs::create_dir_all(&logs).unwrap();
         for day in 14..=22 {
             fs::write(
-                logs.join(format!("quicker-text.2026-10-{day}.log")),
+                logs.join(format!("quicktext.2026-10-{day}.log")),
                 format!("day {day} at C:\\Users\\alice\\AppData\\Roaming\n"),
             )
             .unwrap();
@@ -937,13 +937,13 @@ mod tests {
                 "crashes/crash-20261020-080000.txt",
                 "crashes/crash-20261021-080000.txt",
                 "health.json",
-                "logs/quicker-text.2026-10-16.log",
-                "logs/quicker-text.2026-10-17.log",
-                "logs/quicker-text.2026-10-18.log",
-                "logs/quicker-text.2026-10-19.log",
-                "logs/quicker-text.2026-10-20.log",
-                "logs/quicker-text.2026-10-21.log",
-                "logs/quicker-text.2026-10-22.log",
+                "logs/quicktext.2026-10-16.log",
+                "logs/quicktext.2026-10-17.log",
+                "logs/quicktext.2026-10-18.log",
+                "logs/quicktext.2026-10-19.log",
+                "logs/quicktext.2026-10-20.log",
+                "logs/quicktext.2026-10-21.log",
+                "logs/quicktext.2026-10-22.log",
                 "manifest.json",
                 "system.json",
             ]
@@ -1133,7 +1133,7 @@ mod tests {
         )
         .unwrap();
         let files = build(&dir, Redaction::Full, &[r"D:\Profiles\alice"]);
-        assert!(files["logs/quicker-text.2026-10-22.log"].contains(r"C:\Users\%USERNAME%\AppData"));
+        assert!(files["logs/quicktext.2026-10-22.log"].contains(r"C:\Users\%USERNAME%\AppData"));
         assert!(files["active.json"].contains(r"D:\\Profiles\\%USERNAME%\\tool.exe"));
         for (name, text) in &files {
             assert!(!text.contains("alice"), "{name} names the user:\n{text}");
@@ -1555,12 +1555,12 @@ mod tests {
 
     #[test]
     fn log_names_and_codes_are_validated() {
-        assert_eq!(log_date("quicker-text.2026-10-22.log"), Some("2026-10-22"));
+        assert_eq!(log_date("quicktext.2026-10-22.log"), Some("2026-10-22"));
         for name in [
-            "quicker-text.2026-10-22.log.bak",
-            "quicker-text.2026-1-22.log",
+            "quicktext.2026-10-22.log.bak",
+            "quicktext.2026-1-22.log",
             "other.2026-10-22.log",
-            "quicker-text.log",
+            "quicktext.log",
         ] {
             assert_eq!(log_date(name), None, "{name}");
         }
@@ -1569,7 +1569,7 @@ mod tests {
         assert_eq!(code_or_other(""), "other");
         assert_eq!(
             default_file_name(UNIX_EPOCH + Duration::from_secs(NOW_SECS)),
-            "quicker-text-diagnostics-20261022-102133.zip"
+            "quicktext-diagnostics-20261022-102133.zip"
         );
     }
 
@@ -1671,10 +1671,10 @@ mod tests {
         let dir = temp_dir();
         let logs = log_dir(&dir);
         fs::create_dir_all(&logs).unwrap();
-        let line = "2026-10-22T10:21:33.000000Z  INFO quicker_text::store: event=\"store.publish\" revision=3 rules=120 elapsed_ms=4\n";
+        let line = "2026-10-22T10:21:33.000000Z  INFO quicktext::store: event=\"store.publish\" revision=3 rules=120 elapsed_ms=4\n";
         let day = line.repeat(2 * 1024 * 1024 / line.len());
         for d in 16..=22 {
-            fs::write(logs.join(format!("quicker-text.2026-10-{d}.log")), &day).unwrap();
+            fs::write(logs.join(format!("quicktext.2026-10-{d}.log")), &day).unwrap();
         }
         fs::write(
             dir.join("active.json"),

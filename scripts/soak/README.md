@@ -4,7 +4,7 @@
 
 开发计划 L6 的浸泡监视工具，用于 0.4 实机验收的 S-27（2 小时浸泡）和 PF-05：
 
-- 按固定间隔采样 Quicker Text 进程的工作集、Private Bytes、句柄、线程、GDI/USER 对象和 CPU 时间；
+- 按固定间隔采样 Quicktext 进程的工作集、Private Bytes、句柄、线程、GDI/USER 对象和 CPU 时间；
 - 只读当天日志的新增部分，统计健康变化、输入源丢失与重新挂接、执行器 panic、熔断、故障注入和 ERROR 级日志；
 - 结束时（或按 Ctrl+C 时）写出汇总：内存起止、峰值和增长（对照 S-27 的 20 MB 参考线），句柄和线程增长，各事件次数，进程重启次数，「静默失效」可疑项和需要人工复核的项。
 
@@ -12,7 +12,7 @@
 
 ## 前提
 
-- **触发词由人工打字，或用实体按键工具（例如硬件宏键盘、按键机器人）输入。** 外部模拟输入（SendInput、`[System.Windows.Forms.SendKeys]`、AutoHotkey 之类）会让 Quicker Text 的检测缓冲失效（不回归清单第 4 条），**外部模拟输入不能代表实体键盘路径**，用它跑出来的结果不能算浸泡通过。
+- **触发词由人工打字，或用实体按键工具（例如硬件宏键盘、按键机器人）输入。** 外部模拟输入（SendInput、`[System.Windows.Forms.SendKeys]`、AutoHotkey 之类）会让 Quicktext 的检测缓冲失效（不回归清单第 4 条），**外部模拟输入不能代表实体键盘路径**，用它跑出来的结果不能算浸泡通过。
 - 脚本本身不产生任何输入，不装钩子。它只查询进程信息、以共享只读方式打开日志文件，不写数据目录，不改任何设置，不需要管理员权限。
 - 汇总和 `events.csv` 里只有事件名、少量白名单字段的值、计数和时间戳，不抄日志原文。日志本来就不含短语正文、缩写原文和剪贴板内容；白名单字段的值也只允许字母、数字和 `_ . -`，其他一律记为「(其他)」。
 - 需要 PowerShell 7，或 Windows PowerShell 5.1。
@@ -37,7 +37,7 @@ pwsh -NoProfile -File scripts/soak/soak.ps1 -DataDirectory D:\qt-acceptance-data
 
 建议的流程：
 
-1. 先启动 Quicker Text（release 构建），等健康页显示「正常」；
+1. 先启动 Quicktext（release 构建），等健康页显示「正常」；
 2. 每一轮用一个新的输出目录启动脚本（已有上一轮结果的目录会被拒绝）；
 3. 人工打字或用实体按键工具按计划触发；每 30 分钟内至少看一次界面的执行历史并记下成功、失败和「未执行」的条数（执行历史只在内存里，最多 200 条、30 分钟）；
 4. 时间到后脚本自动写出汇总；提前结束按 Ctrl+C，已有数据照样汇总。直接关掉终端窗口不会写最终汇总，但 `soak.csv` 和 `events.csv` 每次采样都已落盘，`summary.txt` 每 10 分钟刷新一次检查点；
@@ -52,8 +52,8 @@ pwsh -NoProfile -File scripts/soak/soak.ps1 -DataDirectory D:\qt-acceptance-data
 | `-Hours` | `2` | 监视时长（小时），0.01 到 168 |
 | `-IntervalSeconds` | `10` | 采样间隔（秒），1 到 3600 |
 | `-OutputDirectory` | `%TEMP%\qt-soak-<开始时间>` | 输出目录。不能在数据目录里；里面已有 `soak.csv`、`events.csv` 或 `summary.txt` 时拒绝运行 |
-| `-ProcessName` | `quicker-text` | 进程名，可带或不带 `.exe` |
-| `-DataDirectory` | `%APPDATA%\com.quickertext.desktop` | 数据目录，日志在其下 `logs\`。release 版只在验收模式下使用 `QUICKER_TEXT_DATA_DIR`，脚本不读这个变量，需要时用本参数指定 |
+| `-ProcessName` | `quicktext` | 进程名，可带或不带 `.exe` |
+| `-DataDirectory` | `%APPDATA%\com.quicktext.desktop` | 数据目录，日志在其下 `logs\`。release 版只在验收模式下使用 `QUICKER_TEXT_DATA_DIR`，脚本不读这个变量，需要时用本参数指定 |
 | `-UnhealthySuspectSeconds` | `60` | 健康处于「正在启动 / 恢复中 / 故障」、或输入源丢失未重新挂接，持续多久算可疑 |
 | `-PauseSuspectSeconds` | `300` | 暂停（手动暂停、安全模式、启动时未自动监听等）持续多久算可疑 |
 | `-ActiveWindowMinutes` | `10` | 连续输入活动多长的时段列入人工复核 |
@@ -180,7 +180,7 @@ pwsh -NoProfile -File scripts/soak/soak.ps1 -DataDirectory D:\qt-acceptance-data
 
 ## 局限
 
-- 日志按 UTC 日期分文件（`logs\quicker-text.YYYY-MM-DD.log`），应用在 UTC 零点之后第一次写日志时才换文件；脚本跨日时先读完旧文件再读新文件，并在之后的每次采样里继续检查旧文件的尾部。
+- 日志按 UTC 日期分文件（`logs\quicktext.YYYY-MM-DD.log`），应用在 UTC 零点之后第一次写日志时才换文件；脚本跨日时先读完旧文件再读新文件，并在之后的每次采样里继续检查旧文件的尾部。
 - 健康和监听状态是从日志推断的，「正常 ↔ 降级」和「正在启动 → 正常」不写日志；以界面为准。
 - 输入活动只说明「有人在操作」，不说明打了触发词，也不区分键盘和鼠标。
 - 内存统计以最后一个进程实例为准；进程重启过时另列全程峰值。
@@ -226,7 +226,7 @@ $t = $null; $e = $null
 | 6a | 手动执行的 `command.execute_refused`、三类 `command.execute_failed`、`executor.manual_send_refused`：字段拆分正确；被拒和 `stalled` 列 A 类，`run_failed` / `spawn_failed` 计入 ERROR；`trace_id`、`os_code` 不进汇总 |
 | 6b | 没有手动执行事件：关键事件照样列出 0 次，不列 A 类；`executor.manual_send_refused` 只计数 |
 
-**没有自动化的部分**是脚本主体里把真实进程接到这些函数上的几行（启动检查把 `GetProcessesByName` 的结果交给 `Register-StartupProcess`；`Invoke-Sample` 取进程启动时间交给 `Update-LogCoverage`），因为要有真实进程。手工核对时不需要 Quicker Text，也不产生输入：
+**没有自动化的部分**是脚本主体里把真实进程接到这些函数上的几行（启动检查把 `GetProcessesByName` 的结果交给 `Register-StartupProcess`；`Invoke-Sample` 取进程启动时间交给 `Update-LogCoverage`），因为要有真实进程。手工核对时不需要 Quicktext，也不产生输入：
 
 1. 建一个空目录，例如 `%TEMP%\qt-soak-manual\`，在里面建空的 `logs\` 子目录；
 2. 启动记事本，随即运行 `pwsh -NoProfile -File scripts/soak/soak.ps1 -ProcessName notepad -DataDirectory $env:TEMP\qt-soak-manual -Hours 0.1 -IntervalSeconds 5`（共 6 分钟）；

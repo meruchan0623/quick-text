@@ -323,16 +323,16 @@ impl StatusText {
     /// Tray tooltip text (without the timed-pause clock suffix).
     pub fn tooltip(self, paused: PauseReasons) -> &'static str {
         match self {
-            Self::Starting => "Quicker Text · 正在启动…",
-            Self::Failed => "Quicker Text · 输入监听已停止",
-            Self::Recovering => "Quicker Text · 正在恢复…",
+            Self::Starting => "Quicktext · 正在启动…",
+            Self::Failed => "Quicktext · 输入监听已停止",
+            Self::Recovering => "Quicktext · 正在恢复…",
             Self::Paused if paused.contains(PauseReasons::SAFE_MODE) => {
-                "Quicker Text · 已暂停（安全模式）"
+                "Quicktext · 已暂停（安全模式）"
             }
-            Self::Paused => "Quicker Text · 已暂停",
-            Self::Degraded => "Quicker Text · 监听中（部分功能降级）",
-            Self::Listening => "Quicker Text · 监听中",
-            Self::Executing => "Quicker Text · 执行中",
+            Self::Paused => "Quicktext · 已暂停",
+            Self::Degraded => "Quicktext · 监听中（部分功能降级）",
+            Self::Listening => "Quicktext · 监听中",
+            Self::Executing => "Quicktext · 执行中",
         }
     }
 }
@@ -388,7 +388,7 @@ mod tests {
         );
         assert_eq!(
             StatusText::Paused.tooltip(PauseReasons::SAFE_MODE),
-            "Quicker Text · 已暂停（安全模式）"
+            "Quicktext · 已暂停（安全模式）"
         );
     }
 
@@ -471,26 +471,26 @@ mod tests {
             assert_eq!(StatusText::resolve(Healthy, none, busy), healthy);
         }
         let tooltips = [
-            (StatusText::Starting, none, "Quicker Text · 正在启动…"),
-            (StatusText::Failed, none, "Quicker Text · 输入监听已停止"),
-            (StatusText::Recovering, none, "Quicker Text · 正在恢复…"),
+            (StatusText::Starting, none, "Quicktext · 正在启动…"),
+            (StatusText::Failed, none, "Quicktext · 输入监听已停止"),
+            (StatusText::Recovering, none, "Quicktext · 正在恢复…"),
             (
                 StatusText::Paused,
                 PauseReasons::MANUAL,
-                "Quicker Text · 已暂停",
+                "Quicktext · 已暂停",
             ),
             (
                 StatusText::Paused,
                 PauseReasons::SAFE_MODE.with(PauseReasons::MANUAL),
-                "Quicker Text · 已暂停（安全模式）",
+                "Quicktext · 已暂停（安全模式）",
             ),
             (
                 StatusText::Degraded,
                 none,
-                "Quicker Text · 监听中（部分功能降级）",
+                "Quicktext · 监听中（部分功能降级）",
             ),
-            (StatusText::Listening, none, "Quicker Text · 监听中"),
-            (StatusText::Executing, none, "Quicker Text · 执行中"),
+            (StatusText::Listening, none, "Quicktext · 监听中"),
+            (StatusText::Executing, none, "Quicktext · 执行中"),
         ];
         for (status, paused, text) in tooltips {
             assert_eq!(status.tooltip(paused), text, "{status:?}");

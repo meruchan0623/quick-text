@@ -6,7 +6,7 @@
 
 .DESCRIPTION
   scripts/package-artifacts.ps1 names the deliverables after package.json's version and looks
-  for the installer `Quicker Text_<version>_x64-setup.exe`, which tauri names after
+  for the installer `Quicktext_<version>_x64-setup.exe`, which tauri names after
   tauri.conf.json's version. If the tag, the manifests and the installer disagree, the
   package would carry the wrong version or fail late, after a long build. This script fails
   early.

@@ -1863,7 +1863,7 @@ struct FakeLoginItem {
 impl FakeLoginItem {
     fn stale() -> Arc<Self> {
         Arc::new(Self {
-            entry: parking_lot::Mutex::new(Some("\"D:/old/quicker-text.exe\" --background".into())),
+            entry: parking_lot::Mutex::new(Some("\"D:/old/quicktext.exe\" --background".into())),
             writes: AtomicU32::new(0),
         })
     }
@@ -1886,7 +1886,7 @@ impl LoginItem for Arc<FakeLoginItem> {
 /// repaired exactly once when the store becomes writable.
 #[test]
 fn autostart_repair_waits_until_the_store_is_writable() {
-    let exe = PathBuf::from("C:/Apps/quicker-text.exe");
+    let exe = PathBuf::from("C:/Apps/quicktext.exe");
     let repaired = |store: &Store| {
         store
             .startup_problems()
@@ -1930,11 +1930,11 @@ fn autostart_repair_waits_until_the_store_is_writable() {
             .lock()
             .as_ref()
             .unwrap()
-            .contains("C:/Apps/quicker-text.exe"));
+            .contains("C:/Apps/quicktext.exe"));
         assert_eq!(repaired(&store), 1, "{mode:?}");
 
         // Later writes and registrations do not repair again.
-        *item.entry.lock() = Some("\"D:/old/quicker-text.exe\" --background".into());
+        *item.entry.lock() = Some("\"D:/old/quicktext.exe\" --background".into());
         store.publish(metadata_config(&["later"])).unwrap();
         defer_autostart_repair(&mut store, item.clone(), exe.clone());
         assert_eq!(item.writes(), 1, "{mode:?}");

@@ -206,13 +206,11 @@ pub fn engine_ready() -> bool {
 pub fn native_ready() -> Result<(), String> {
     unsafe {
         if !AXIsProcessTrusted() {
-            return Err(
-                "Grant Accessibility to Quicker Text in System Settings, then resume".into(),
-            );
+            return Err("Grant Accessibility to Quicktext in System Settings, then resume".into());
         }
         if !CGPreflightListenEventAccess() {
             return Err(
-                "Grant Input Monitoring to Quicker Text in System Settings; restart if required"
+                "Grant Input Monitoring to Quicktext in System Settings; restart if required"
                     .into(),
             );
         }
@@ -901,7 +899,7 @@ pub fn start_engine(shared: Arc<Shared>) -> Result<(), String> {
                 || !CGPreflightListenEventAccess()
                 || !CGPreflightPostEventAccess()
             {
-                let message = "macOS permissions required: System Settings → Privacy & Security → Accessibility and Input Monitoring; grant Quicker Text and resume".to_string();
+                let message = "macOS permissions required: System Settings → Privacy & Security → Accessibility and Input Monitoring; grant Quicktext and resume".to_string();
                 if last_error != message {
                     error_status(&shared, message.clone());
                     last_error = message;
@@ -1485,14 +1483,14 @@ fn write_clipboard(
             std::process::id(),
             CLIPBOARD_TOKEN.fetch_add(1, Ordering::SeqCst)
         );
-        let marker = StringRef::new("com.quickertext.clipboard-lease");
+        let marker = StringRef::new("com.quicktext.clipboard-lease");
         for item in payload {
             let object = msg!(msg!(class("NSPasteboardItem"),"alloc"=>Id),"init"=>Id);
             if object.is_null() {
                 return Err("Could not allocate pasteboard item".into());
             }
             for (kind, bytes) in item {
-                if kind == "com.quickertext.clipboard-lease" {
+                if kind == "com.quicktext.clipboard-lease" {
                     continue;
                 }
                 let data = msg!(class("NSData"),"dataWithBytes:length:"=>Id,bytes.as_ptr() as *const c_void=>*const c_void,bytes.len()=>usize);

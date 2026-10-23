@@ -25,7 +25,7 @@
   -RequirePresent is the positive control. A scan that finds nothing in an empty, truncated
   or differently encoded file would prove nothing, so each file must contain the given
   strings, for example `quicker_platform` in the PDB and the app identifier
-  `com.quickertext.desktop` in the exe.
+  `com.quicktext.desktop` in the exe.
 
   -SelfTest checks the scanner itself on synthetic files (ASCII and UTF-16LE hits, a hit
   across a chunk border at every alignment, absent string, near miss, missing positive control,
@@ -48,10 +48,10 @@
   Run the built-in tests and exit.
 
 .EXAMPLE
-  ./scripts/check-binary-strings.ps1 target/release/quicker_text.pdb -RequirePresent quicker_platform
+  ./scripts/check-binary-strings.ps1 target/release/quicktext.pdb -RequirePresent quicker_platform
 
 .EXAMPLE
-  ./scripts/check-binary-strings.ps1 target/release/quicker-text.exe -RequirePresent com.quickertext.desktop
+  ./scripts/check-binary-strings.ps1 target/release/quicktext.exe -RequirePresent com.quicktext.desktop
 
 .NOTES
   Exit code 0 = pass, 1 = a forbidden string was found or a positive control failed.
