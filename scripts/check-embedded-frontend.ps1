@@ -13,7 +13,10 @@
 
   src-tauri/build.rs records the digest of the directory the same build embedded, as the string
   `quicker-text-frontend-dist-sha256:<64 hex>` in the exe (src-tauri/src/main.rs). This script:
-    1. reads that record from the exe; none, `unavailable`, or two different values fail;
+    1. reads that record from the exe; none, `unavailable`, `dev-mode`, or two different values
+       fail. `dev-mode` is what build.rs records in Tauri's development mode (built without the
+       custom-protocol feature, e.g. --no-default-features): such an exe embeds no frontend and
+       loads build.devUrl, so no directory can stand for it;
     2. computes the digest of -Dist the same way and requires it to be equal; otherwise the exe
        embeds another frontend and has to be rebuilt from this one (or this one restored);
     3. runs `node scripts/check-bundle.mjs --scan-only <Dist>` on that directory: no mock chunk,
@@ -32,8 +35,8 @@
   it on its own to check a build without packaging it.
 
   -SelfTest checks steps 1 and 2 on synthetic files (known digest vector, empty directory, order,
-  content, rename, added and hidden files, link, missing, `unavailable`, duplicate and conflicting
-  records) and that a failing step 3 fails the script (needs node). It prints only failures and a
+  content, rename, added and hidden files, link, missing, `unavailable`, `dev-mode`, duplicate and
+  conflicting records) and that a failing step 3 fails the script (needs node). It prints only failures and a
   summary line; add -Verbose for one line per case.
 
 .PARAMETER Exe
@@ -101,11 +104,12 @@ function Get-EmbeddedFrontendDigest {
     param([Parameter(Mandatory = $true)][string] $Path)
     if (!(Test-Path -LiteralPath $Path -PathType Leaf)) { throw "exe not found: $Path" }
     $text = [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($Path))
-    $values = @([regex]::Matches($text, [regex]::Escape($RecordPrefix) + '(?:[0-9a-f]{64}|unavailable)') |
+    $values = @([regex]::Matches($text, [regex]::Escape($RecordPrefix) + '(?:[0-9a-f]{64}|unavailable|dev-mode)') |
         ForEach-Object { $_.Value.Substring($RecordPrefix.Length) } | Sort-Object -Unique)
     $name = [IO.Path]::GetFileName($Path)
     if ($values.Count -eq 0) { throw "$name has no frontend record ('$RecordPrefix...'): built before the record existed, or not by src-tauri/build.rs; rebuild it" }
     if ($values.Count -gt 1) { throw "$name has $($values.Count) different frontend records ($($values -join ', ')); cannot tell which frontend it embeds" }
+    if ($values[0] -eq 'dev-mode') { throw "$name is a Tauri development-mode build and contains no frontend: it was compiled without the custom-protocol feature (for example with --no-default-features) and loads the dev server (build.devUrl) at run time; rebuild it with default features (cargo build -p quicker-text --release)" }
     if ($values[0] -eq 'unavailable') { throw "$name records no frontend digest (build.rs could not hash the frontend directory; see its cargo warning); rebuild it" }
     return $values[0]
 }
@@ -213,6 +217,10 @@ if ($SelfTest) {
         Assert-Throws 'exe without a record fails' { Assert-EmbeddedFrontendDigest -ExePath $none -DistPath $base } 'has no frontend record'
         $unavailable = New-Exe 'unavailable.exe' @("${RecordPrefix}unavailable")
         Assert-Throws 'exe recording "unavailable" fails' { Assert-EmbeddedFrontendDigest -ExePath $unavailable -DistPath $base } 'records no frontend digest'
+        $devMode = New-Exe 'dev-mode.exe' @("${RecordPrefix}dev-mode")
+        Assert-Throws 'exe recording "dev-mode" (Tauri development mode) fails' { Assert-EmbeddedFrontendDigest -ExePath $devMode -DistPath $base } 'Tauri development-mode build and contains no frontend'
+        $devAndDigest = New-Exe 'dev-and-digest.exe' @("$RecordPrefix$digest", "${RecordPrefix}dev-mode")
+        Assert-Throws 'exe recording both "dev-mode" and a digest fails' { Assert-EmbeddedFrontendDigest -ExePath $devAndDigest -DistPath $base } 'different frontend records'
         $other = (Get-FrontendDistDigest -Path $changed).Digest
         $two = New-Exe 'two.exe' @("$RecordPrefix$digest", "$RecordPrefix$other")
         Assert-Throws 'exe with two different records fails' { Assert-EmbeddedFrontendDigest -ExePath $two -DistPath $base } 'different frontend records'

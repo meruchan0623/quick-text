@@ -183,7 +183,9 @@ compile_error!(
 // scripts (scripts/check-embedded-frontend.ps1) find this string in the exe
 // and scan the frontend directory only if its digest is the same, so a dist/
 // rebuilt after the exe (or never compiled into it) cannot stand in for the
-// one that ships. `unavailable` when build.rs could not hash the directory.
+// one that ships. `unavailable` when build.rs could not hash the directory,
+// `dev-mode` in Tauri's development mode (no frontend embedded); the
+// packaging check refuses both.
 static FRONTEND_DIST_RECORD: &str = concat!(
     "quicker-text-frontend-dist-sha256:",
     env!("QUICKER_TEXT_FRONTEND_DIST_SHA256")

@@ -26,6 +26,12 @@
 //! `unavailable` and cargo prints a warning. The build itself goes on: debug
 //! builds and tests do not need the record, and the packaging check fails on
 //! it.
+//!
+//! In Tauri's development mode the value is `dev-mode` and no directory is
+//! hashed (Codex review 2 of the 0.4 release hygiene): such an exe embeds no
+//! frontend, so the digest of `dist/` would vouch for something it does not
+//! contain. The packaging check refuses it. See [`DEV_MODE`] for how the mode
+//! is told.
 
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
@@ -35,20 +41,40 @@ use tauri_utils::config::FrontendDist;
 
 const DIGEST_ENV: &str = "QUICKER_TEXT_FRONTEND_DIST_SHA256";
 
+/// The record of an exe built in Tauri's development mode, which embeds no
+/// frontend.
+///
+/// The mode is told with `tauri_build::is_dev()`, which reads `cargo:dev` from
+/// the build script of the `tauri` crate: `true` when `tauri` is compiled
+/// without its `custom-protocol` feature (this crate's default feature
+/// `custom-protocol` turns it on; `--no-default-features` turns it off).
+/// `generate_context!` decides with the same feature
+/// (tauri-macros 2.7: `dev: cfg!(not(feature = "custom-protocol"))`, and
+/// `tauri/custom-protocol` enables `tauri-macros/custom-protocol`), so
+/// `is_dev()` false means the macro embeds `frontendDist`. In development mode
+/// tauri-codegen embeds an empty asset set when `build.devUrl` is set (it is:
+/// the exe loads http://localhost:1420); without a devUrl it would embed the
+/// directory, but it is still a development build (dev CSP), not one to ship,
+/// so both cases get this value.
+const DEV_MODE: &str = "dev-mode";
+
 fn main() {
-    let digest = frontend_dist().and_then(|dist| {
-        // A directory is scanned recursively for changes; a missing path makes
-        // the script run on every build, so the record never goes stale.
-        println!("cargo:rerun-if-changed={}", dist.display());
-        dist_digest(&dist)
-    });
-    match digest {
-        Ok(digest) => println!("cargo:rustc-env={DIGEST_ENV}={digest}"),
-        Err(reason) => {
+    let record = if tauri_build::is_dev() {
+        // A legitimate build against the dev server; no warning.
+        DEV_MODE.to_owned()
+    } else {
+        let digest = frontend_dist().and_then(|dist| {
+            // A directory is scanned recursively for changes; a missing path makes
+            // the script run on every build, so the record never goes stale.
+            println!("cargo:rerun-if-changed={}", dist.display());
+            dist_digest(&dist)
+        });
+        digest.unwrap_or_else(|reason| {
             println!("cargo:warning=frontend digest unavailable: {reason}");
-            println!("cargo:rustc-env={DIGEST_ENV}=unavailable");
-        }
-    }
+            "unavailable".to_owned()
+        })
+    };
+    println!("cargo:rustc-env={DIGEST_ENV}={record}");
     tauri_build::build()
 }
 
