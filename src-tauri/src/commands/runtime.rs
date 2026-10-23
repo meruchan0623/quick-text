@@ -12,10 +12,12 @@ use quicker_platform::{
 };
 use std::{
     fmt::Display,
+    future::Future,
+    io,
     sync::{
-        atomic::Ordering,
+        atomic::{AtomicUsize, Ordering},
         mpsc::{self, RecvTimeoutError, TryRecvError},
-        PoisonError,
+        Arc, PoisonError,
     },
     time::Duration,
 };
@@ -53,16 +55,12 @@ pub async fn execute_action(
     action: Action,
     app: tauri::AppHandle,
 ) -> Result<ExecutionResult, CommandError> {
-    let (engine, runtime, busy, compiled, action, speed) = {
+    let (engine, runtime, busy, permit, compiled, action, speed) = {
         let state = app.state::<Managed>();
         let s = state.lock();
         // Safe mode: the data is for viewing; nothing runs (B-04).
         s.ensure_writable()?;
-        // `busy` is the executor's: claimed and given back under its
-        // lifecycle lock, never over a task's (dropping the claim frees it).
-        let Some(busy) = quicker_platform::ManualBusy::claim(&s.engine) else {
-            return Err(CommandError::Busy);
-        };
+        let (busy, permit) = admit(&s.engine, &MANUAL_JOBS, || s.runtime.health().state)?;
         s.engine.cancel.store(false, Ordering::SeqCst);
         // The active rules as compiled at load or publish (B-43).
         let compiled = s.engine.compiled.lock().unwrap().clone();
@@ -70,6 +68,7 @@ pub async fn execute_action(
             s.engine.clone(),
             s.runtime.clone(),
             busy,
+            permit,
             compiled,
             action.clone(),
             match &action {
@@ -97,7 +96,8 @@ pub async fn execute_action(
     let ticket = busy.ticket();
     let watch = busy.ticket();
     let (done, finished) = mpsc::channel::<()>();
-    let job = tauri::async_runtime::spawn_blocking(move || {
+    // The job holds the run's slot until its thread really returns (X2).
+    let job = spawn_job(permit, move || {
         // Dropped when the job ends, returned or unwound, which ends the
         // command's wait.
         let _done = done;
@@ -154,6 +154,108 @@ pub async fn execute_action(
 /// goes on: the command returns this long after a fence at the latest.
 const FENCE_POLL: Duration = Duration::from_millis(250);
 
+/// At most this many manual jobs that have not really ended (F5-1 X2). A
+/// fenced job is left to itself and may hold its blocking thread for good (a
+/// system call that never returns), and Tauri's blocking pool is shared with
+/// the rest of the app: each job keeps its slot until its thread returns, so
+/// stuck jobs cannot pile up there. Four: the live run plus room for three
+/// stuck ones, so a stuck job does not stop the next runs (each stuck job
+/// already cost a fence and a rebuild); a desktop that strands more than
+/// that needs the user's attention, not more threads.
+const MAX_MANUAL_JOBS: usize = 4;
+
+/// The slots of the manual jobs that have not ended (F5-1 X2).
+static MANUAL_JOBS: JobSlots = JobSlots::new(MAX_MANUAL_JOBS);
+
+/// A count of live jobs under a limit (F5-1 X2).
+struct JobSlots {
+    live: AtomicUsize,
+    limit: usize,
+}
+
+impl JobSlots {
+    const fn new(limit: usize) -> Self {
+        Self {
+            live: AtomicUsize::new(0),
+            limit,
+        }
+    }
+
+    /// A slot, or `None` while `limit` jobs hold theirs.
+    fn take(&'static self) -> Option<JobPermit> {
+        self.live
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
+                (live < self.limit).then_some(live + 1)
+            })
+            .ok()
+            .map(|_| JobPermit(self))
+    }
+}
+
+/// One job's slot, given back when dropped.
+struct JobPermit(&'static JobSlots);
+
+impl Drop for JobPermit {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Admits a manual run (F5-1 C, X2): its `busy` claim, then a job slot.
+/// Refused, it holds neither and nothing has started (no window hidden, no
+/// history entry). `health` is read only for a refusal at the cap.
+fn admit(
+    engine: &Arc<Shared>,
+    slots: &'static JobSlots,
+    health: impl FnOnce() -> HealthState,
+) -> Result<(quicker_platform::ManualBusy, JobPermit), CommandError> {
+    // `busy` is the executor's: claimed and given back under its lifecycle
+    // lock, never over a task's (dropping the claim frees it).
+    let Some(busy) = quicker_platform::ManualBusy::claim(engine) else {
+        return Err(CommandError::Busy);
+    };
+    let Some(permit) = slots.take() else {
+        drop(busy);
+        return Err(jobs_exhausted(health()));
+    };
+    Ok((busy, permit))
+}
+
+/// Runs a manual run's job on Tauri's blocking pool, holding `permit` until
+/// the job's thread returns or unwinds (F5-1 X2): not until the command
+/// returns, which after a fence is long before.
+fn spawn_job<T: Send + 'static>(
+    permit: JobPermit,
+    job: impl FnOnce() -> T + Send + 'static,
+) -> tauri::async_runtime::JoinHandle<T> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        job()
+    })
+}
+
+/// The answer when [`MAX_MANUAL_JOBS`] jobs have not ended (F5-1 X2),
+/// logged without content. `Busy` while the supervisor accepts a resume:
+/// earlier runs really are still going, stuck past their fence outside an
+/// executor that was rebuilt and serves, so "the previous action is still
+/// running" is the truth, where `engine_unavailable` would name a healthy
+/// engine unavailable. `EngineUnavailable` with the supervisor's state when
+/// it does not accept a resume.
+fn jobs_exhausted(health: HealthState) -> CommandError {
+    tracing::warn!(
+        event = "command.execute_refused",
+        reason = "jobs_exhausted",
+        limit = MAX_MANUAL_JOBS,
+        ?health,
+        "manual run refused: earlier runs have not ended"
+    );
+    if health.accepts_resume() {
+        CommandError::Busy
+    } else {
+        CommandError::EngineUnavailable { health }
+    }
+}
+
 /// Why the blocking job of a manual run ended without a result.
 enum RunError {
     /// The action does not expand (an invalid or unavailable rule).
@@ -192,6 +294,30 @@ fn wait_for_run(done: &mpsc::Receiver<()>, fenced: impl Fn() -> bool, poll: Dura
     }
 }
 
+/// Runs [`wait_for_run`] on a thread of its own and hands its answer to the
+/// command (F5-1 X2). Not on Tauri's blocking pool: the jobs it watches run
+/// there and may hold every thread of it, and a wait queued behind them
+/// would never see the fence. Not a timer on the async runtime either: Tauri
+/// builds its Tokio without `time`. The thread ends as soon as the job ended
+/// or its claim was fenced, whether or not the command still listens; a job
+/// that hangs is fenced within its stall budget (the executor supervises its
+/// claim), so the thread does not live on with it.
+async fn watch_run(
+    finished: mpsc::Receiver<()>,
+    fenced: impl Fn() -> bool + Send + 'static,
+    poll: Duration,
+) -> tauri::Result<RunEnd> {
+    let (tell, mut told) = tauri::async_runtime::channel(1);
+    std::thread::Builder::new()
+        .name("qt-manual-watch".into())
+        .spawn(move || {
+            let _ = tell.blocking_send(wait_for_run(&finished, fenced, poll));
+        })?;
+    told.recv()
+        .await
+        .ok_or_else(|| io::Error::other("the manual run's watch ended without an answer").into())
+}
+
 /// The command's side of a manual run (F5-1 A): joins the job, but waits no
 /// longer than its claim stays unfenced (`fenced`, looked at every `poll`),
 /// then runs `restore` (the claim given back, the state announced, the
@@ -199,16 +325,16 @@ fn wait_for_run(done: &mpsc::Receiver<()>, fenced: impl Fn() -> bool, poll: Dura
 /// while the job went on. The job is left to itself, not waited for: its
 /// thread may never return, and if it does it sends nothing, writes no
 /// history, publishes nothing and touches no newer claim (the executor's
-/// epoch and claim checks).
-async fn join_unless_fenced<T: Send + 'static>(
-    job: tauri::async_runtime::JoinHandle<T>,
+/// epoch and claim checks). The wait runs off the blocking pool
+/// ([`watch_run`], X2), so it needs no pool thread to see the fence.
+async fn join_unless_fenced<T>(
+    job: impl Future<Output = tauri::Result<T>>,
     finished: mpsc::Receiver<()>,
     fenced: impl Fn() -> bool + Send + 'static,
     poll: Duration,
     restore: impl FnOnce(),
 ) -> Option<tauri::Result<T>> {
-    let end =
-        tauri::async_runtime::spawn_blocking(move || wait_for_run(&finished, fenced, poll)).await;
+    let end = watch_run(finished, fenced, poll).await;
     let joined = match end {
         Ok(RunEnd::Finished) => Some(job.await),
         Ok(RunEnd::Fenced) => None,
@@ -572,5 +698,226 @@ mod tests {
         assert!(line.contains("category=\"run_failed\""), "{line}");
         assert!(line.contains("reason=PreflightFailed"), "{line}");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Sets its flag when dropped: the watch thread drops its `fenced`
+    /// closure, and this with it, when it is done waiting.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Waits up to `limit` for `flag`.
+    fn becomes_set(flag: &AtomicBool, limit: Duration) -> bool {
+        let start = Instant::now();
+        while !flag.load(Ordering::SeqCst) {
+            if start.elapsed() > limit {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    /// F5-1 X2: the wait for the fence needs no thread of Tauri's blocking
+    /// pool, which the jobs it watches may hold in full. The job here never
+    /// starts, as one queued behind a full pool would not (filling the real
+    /// pool, shared by every test of this binary, would stall the others),
+    /// and every look at the fence is made off Tauri's runtime: the command
+    /// still returns within a poll of the fence, restores once, and the
+    /// watch thread ends once it answered.
+    #[test]
+    fn the_fence_is_seen_off_the_blocking_pool_and_its_watch_thread_ends() {
+        let fenced = Arc::new(AtomicBool::new(false));
+        let on_runtime = Arc::new(AtomicBool::new(false));
+        let ended = Arc::new(AtomicBool::new(false));
+        // The job never started: its end of the channel stays open.
+        let (_done, finished) = mpsc::channel::<()>();
+        let fence = {
+            let fenced = Arc::clone(&fenced);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                fenced.store(true, Ordering::SeqCst);
+                Instant::now()
+            })
+        };
+        let restored = AtomicUsize::new(0);
+        let joined = tauri::async_runtime::block_on(join_unless_fenced(
+            std::future::pending::<tauri::Result<()>>(),
+            finished,
+            {
+                let fenced = Arc::clone(&fenced);
+                let on_runtime = Arc::clone(&on_runtime);
+                let ends = DropFlag(Arc::clone(&ended));
+                move || {
+                    let _ = &ends;
+                    if tauri::async_runtime::TokioHandle::try_current().is_ok() {
+                        on_runtime.store(true, Ordering::SeqCst);
+                    }
+                    fenced.load(Ordering::SeqCst)
+                }
+            },
+            FENCE_POLL,
+            || {
+                restored.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+        let returned = Instant::now();
+        let fenced_at = fence.join().unwrap();
+        assert!(joined.is_none(), "the job is not waited for");
+        assert!(
+            returned.duration_since(fenced_at) < Duration::from_secs(1),
+            "returned {:?} after the fence",
+            returned.duration_since(fenced_at)
+        );
+        assert_eq!(restored.load(Ordering::SeqCst), 1, "restored once");
+        assert!(
+            !on_runtime.load(Ordering::SeqCst),
+            "the fence was looked at on a thread of Tauri's runtime"
+        );
+        assert!(
+            becomes_set(&ended, Duration::from_secs(1)),
+            "the watch thread is still waiting after it answered"
+        );
+
+        // A job that ended is joined, and its watch ends too.
+        let ended = Arc::new(AtomicBool::new(false));
+        let (done, finished) = mpsc::channel::<()>();
+        drop(done);
+        let joined = tauri::async_runtime::block_on(join_unless_fenced(
+            std::future::ready(Ok(7)),
+            finished,
+            {
+                let ends = DropFlag(Arc::clone(&ended));
+                move || {
+                    let _ = &ends;
+                    false
+                }
+            },
+            FENCE_POLL,
+            || {
+                restored.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+        assert!(matches!(joined, Some(Ok(7))));
+        assert_eq!(restored.load(Ordering::SeqCst), 2);
+        assert!(becomes_set(&ended, Duration::from_secs(1)));
+    }
+
+    /// F5-1 X2: manual jobs that have not really ended are capped. A job
+    /// holds its slot until its thread returns, not until its command does:
+    /// at the cap the next one is refused, a job its command gave up on (its
+    /// handle dropped, as after a fence) still counts, and once one really
+    /// ends a job can run again.
+    #[test]
+    fn manual_jobs_that_have_not_ended_are_capped_until_one_really_ends() {
+        let slots: &'static JobSlots = Box::leak(Box::new(JobSlots::new(MAX_MANUAL_JOBS)));
+        let mut gates = Vec::new();
+        let mut jobs = Vec::new();
+        for _ in 0..MAX_MANUAL_JOBS {
+            let permit = slots.take().expect("under the cap");
+            let (open, gate) = mpsc::channel::<()>();
+            gates.push(open);
+            jobs.push(spawn_job(permit, move || {
+                // The timeout only keeps a broken test from hanging the run.
+                let _ = gate.recv_timeout(Duration::from_secs(10));
+            }));
+        }
+        assert!(slots.take().is_none(), "a job past the cap was admitted");
+        // The command stops waiting for a stuck job: its slot stays taken.
+        drop(jobs.pop());
+        assert!(slots.take().is_none(), "a dropped handle freed its slot");
+        // The first job really ends: a job can run again.
+        gates[0].send(()).unwrap();
+        tauri::async_runtime::block_on(jobs.remove(0)).unwrap();
+        let permit = slots.take().expect("a slot is free once a job ended");
+        let again = tauri::async_runtime::block_on(spawn_job(permit, || 7)).unwrap();
+        assert_eq!(again, 7);
+        for open in &gates {
+            let _ = open.send(());
+        }
+        for job in jobs {
+            tauri::async_runtime::block_on(job).unwrap();
+        }
+        // The job whose handle was dropped gives its slot back as it ends.
+        let start = Instant::now();
+        while slots.live.load(Ordering::SeqCst) != 0 {
+            assert!(start.elapsed() < Duration::from_secs(5), "a slot leaked");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// F5-1 C, X2: a run is admitted with `busy` and a slot, or with
+    /// neither. While earlier jobs hold slots short of the cap a run is
+    /// still admitted (a stuck job does not stop the next runs); at the cap
+    /// it is refused before anything starts, with `busy` given back, as
+    /// `busy` while the supervisor accepts a resume and `engine_unavailable`
+    /// otherwise, logged without content.
+    #[test]
+    fn a_run_is_admitted_under_the_cap_and_refused_at_it_without_holding_busy() {
+        use crate::diagnostics::logging::{test_support, DEFAULT_LEVEL};
+        let slots: &'static JobSlots = Box::leak(Box::new(JobSlots::new(MAX_MANUAL_JOBS)));
+        let engine = Shared::new();
+        let stuck: Vec<_> = (1..MAX_MANUAL_JOBS)
+            .map(|_| slots.take().expect("under the cap"))
+            .collect();
+        let (busy, permit) =
+            admit(&engine, slots, || unreachable!("health read under the cap")).expect("admitted");
+        // `busy` held: refused as busy, and no slot is taken for it.
+        assert!(matches!(
+            admit(&engine, slots, || HealthState::Healthy),
+            Err(CommandError::Busy)
+        ));
+        drop(permit);
+        assert!(matches!(
+            admit(&engine, slots, || HealthState::Healthy),
+            Err(CommandError::Busy)
+        ));
+        drop(busy);
+
+        let dir = std::env::temp_dir().join(format!("quicker-exec-cap-{}", uuid::Uuid::new_v4()));
+        let built = test_support::scoped(&dir, DEFAULT_LEVEL);
+        let extra = slots.take().expect("the run's slot was given back");
+        let (healthy, failed) = tracing::subscriber::with_default(built.subscriber, || {
+            (
+                admit(&engine, slots, || HealthState::Healthy).map(|_| ()),
+                admit(&engine, slots, || HealthState::Failed).map(|_| ()),
+            )
+        });
+        drop(built.guard);
+        assert!(matches!(healthy, Err(CommandError::Busy)), "{healthy:?}");
+        assert!(
+            matches!(
+                failed,
+                Err(CommandError::EngineUnavailable {
+                    health: HealthState::Failed
+                })
+            ),
+            "{failed:?}"
+        );
+        assert!(
+            !engine.busy.load(Ordering::SeqCst),
+            "a refused run kept busy"
+        );
+        let log = test_support::read_logs(&dir);
+        let refused: Vec<_> = log
+            .lines()
+            .filter(|line| line.contains("event=\"command.execute_refused\""))
+            .collect();
+        assert_eq!(refused.len(), 2, "{log}");
+        for line in refused {
+            assert!(line.contains("reason=\"jobs_exhausted\""), "{line}");
+            assert!(line.contains(&format!("limit={MAX_MANUAL_JOBS}")), "{line}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+
+        // A stuck job ends: a run is admitted again.
+        drop(stuck);
+        drop(extra);
+        let admitted = admit(&engine, slots, || HealthState::Healthy);
+        assert!(admitted.is_ok());
     }
 }
