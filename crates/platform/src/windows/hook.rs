@@ -190,6 +190,11 @@ pub(super) struct HookPipe<'k> {
     /// cannot be dropped; the consumer takes it before it accepts the next
     /// record.
     stop: AtomicU64,
+    /// Mouse button presses the mouse hook saw since the consumer last
+    /// took them, of any origin: the mouse hook's side of the click
+    /// cross-check (F5-2). Counted, not queued, so a full queue or our
+    /// own clicks (which queue nothing) still count.
+    clicks: AtomicU64,
 }
 impl<'k> HookPipe<'k> {
     pub(super) fn new(keys: &'k KeyBits, capacity: usize, test_mode: bool, wake: fn()) -> Self {
@@ -198,6 +203,7 @@ impl<'k> HookPipe<'k> {
             keys,
             test_mode,
             stop: AtomicU64::new(0),
+            clicks: AtomicU64::new(0),
         }
     }
     pub(super) fn lane(&self) -> &Lane<HookRecord> {
@@ -207,6 +213,11 @@ impl<'k> HookPipe<'k> {
     /// overflowed the queue since the last call, or 0.
     pub(super) fn take_stop(&self) -> u64 {
         self.stop.swap(0, Ordering::SeqCst)
+    }
+    /// Consumer side: the mouse button presses the mouse hook saw since the
+    /// last call (F5-2).
+    pub(super) fn take_clicks(&self) -> u64 {
+        self.clicks.swap(0, Ordering::SeqCst)
     }
 }
 /// The production pipe over the global key mirror; created once, before the
@@ -358,6 +369,14 @@ fn mouse_button(msg: u32, data: u32) -> Option<(u16, bool)> {
 }
 /// Mouse hook body: atomics and one lock-free push.
 pub(super) fn on_mouse(pipe: &HookPipe, shared: &Shared, mouse: MouseInfo) {
+    let button = mouse_button(mouse.msg, mouse.data);
+    // F5-2: every press counts for the click cross-check, ours and
+    // injected ones included. RawInput reports clicks without a device, so
+    // it cannot tell whose they are; the hook counts every click RawInput
+    // may report, and a click only RawInput saw is evidence of a lost hook.
+    if matches!(button, Some((_, true))) {
+        pipe.clicks.fetch_add(1, Ordering::SeqCst);
+    }
     // External injected clicks still move the caret, so only our own input
     // is skipped.
     if classify(mouse.flags & LLMHF_INJECTED != 0, mouse.extra) == Origin::Own {
@@ -366,7 +385,7 @@ pub(super) fn on_mouse(pipe: &HookPipe, shared: &Shared, mouse: MouseInfo) {
     // M2: as for keys, the event belongs to the recording session current
     // when this callback started, read before anything is handled.
     let session = recording_session();
-    if let Some((button, down)) = mouse_button(mouse.msg, mouse.data) {
+    if let Some((button, down)) = button {
         if !down {
             // H1: as for keys, a button-up not ours ends our hold.
             own_input().released_elsewhere(button);
