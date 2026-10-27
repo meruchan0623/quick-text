@@ -2,6 +2,7 @@
 mod app_state;
 mod autostart;
 mod commands;
+mod config_package;
 mod diagnostics;
 mod error;
 mod events;
@@ -125,9 +126,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::runtime::load_state,
-            commands::legacy::save_draft,
-            commands::legacy::apply_settings,
-            commands::legacy::discard_draft,
+            commands::legacy::save_config,
             commands::legacy::rollback,
             commands::runtime::set_paused,
             commands::rules::validate_config,
@@ -139,6 +138,7 @@ fn main() {
             commands::import_export::choose_file,
             commands::legacy::export_config,
             commands::import_export::export_excel_template,
+            commands::import_export::export_excel_config,
             commands::legacy::import_config,
             commands::runtime::start_recording,
             commands::runtime::stop_recording,

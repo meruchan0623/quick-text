@@ -69,6 +69,18 @@ pub fn merge_import_metadata(
             .iter()
             .zip(merged.rules.iter().skip(existing.rules.len()))
             .map(|(original, appended)| (original.id.as_str(), appended.id.as_str()))
+            .chain(
+                incoming
+                    .unreadable_rules
+                    .iter()
+                    .zip(
+                        merged
+                            .unreadable_rules
+                            .iter()
+                            .skip(existing.unreadable_rules.len()),
+                    )
+                    .filter_map(|(original, appended)| Some((original.id()?, appended.id()?))),
+            )
             .collect()
     } else {
         BTreeMap::new()
@@ -268,8 +280,8 @@ mod tests {
         assert_eq!(replaced, [("new".into(), "new".into())].into());
     }
 
-    /// F4-2 (Codex's case): an imported rule that is not published yet
-    /// becomes unreadable through an outside edit of `draft.json`. An
+    /// F4-2 (Codex's case): an imported active rule
+    /// becomes unreadable through an outside edit of `active.json`. An
     /// unrelated save, a restart, an export and a publish all keep its
     /// Quicker original, the only copy there is.
     #[test]
@@ -292,9 +304,9 @@ mod tests {
             imported.clone(),
             vec![original("kept", "K"), original("imported", "Q")],
         ));
-        store.save(imported).unwrap();
+        store.publish(imported).unwrap();
         exit(store);
-        let draft_path = dir.join("draft.json");
+        let draft_path = dir.join("active.json");
         let mut draft: serde_json::Value =
             serde_json::from_slice(&fs::read(&draft_path).unwrap()).unwrap();
         draft["rules"][1]["enabled"] = serde_json::json!("not a bool");
@@ -304,21 +316,27 @@ mod tests {
         // An unrelated save.
         let mut store = Store::load(dir.clone());
         assert_eq!(store.safe_mode(), None);
-        assert_eq!(store.draft.rules.len(), 1);
-        assert_eq!(store.draft.unreadable_rules[0].id(), Some("imported"));
-        let mut edited = store.draft.clone();
+        assert_eq!(store.active.rules.len(), 1);
+        assert_eq!(store.active.unreadable_rules[0].id(), Some("imported"));
+        let mut edited = store.active.clone();
         edited.rules[0].description = "unrelated edit".into();
-        store.save(edited).unwrap();
-        assert_eq!(metadata_sources(store.unresolved.clone()), expected);
-        assert_eq!(on_disk("migration-unresolved.json"), expected);
+        store.publish(edited).unwrap();
+        assert_eq!(metadata_sources(store.active_unresolved.clone()), expected);
+        assert_eq!(
+            on_disk(&format!(
+                "revisions/{}.metadata.json",
+                store.active.revision
+            )),
+            expected
+        );
         exit(store);
 
         // A restart, then an export.
         let mut store = Store::load(dir.clone());
-        assert_eq!(metadata_sources(store.unresolved.clone()), expected);
-        assert_eq!(store.draft.unreadable_rules[0].raw, raw);
+        assert_eq!(metadata_sources(store.active_unresolved.clone()), expected);
+        assert_eq!(store.active.unreadable_rules[0].raw, raw);
         let target = elsewhere.join("backup.json");
-        store.export_draft(&target).unwrap();
+        store.export_active(&target).unwrap();
         let package: serde_json::Value =
             serde_json::from_slice(&fs::read(&target).unwrap()).unwrap();
         let exported: Vec<MigrationItem> =
@@ -327,10 +345,16 @@ mod tests {
         assert_eq!(package["config"]["rules"][1], raw);
 
         // A publish keeps it in the active metadata, also after a restart.
-        store.publish(store.draft.clone()).unwrap();
+        store.publish(store.active.clone()).unwrap();
         let revision = store.active.revision;
         assert_eq!(metadata_sources(store.active_unresolved.clone()), expected);
-        assert_eq!(on_disk("active-migration-unresolved.json"), expected);
+        assert_eq!(
+            on_disk(&format!(
+                "revisions/{}.metadata.json",
+                store.active.revision
+            )),
+            expected
+        );
         assert_eq!(
             on_disk(&format!("revisions/{revision}.metadata.json")),
             expected
@@ -339,8 +363,8 @@ mod tests {
         let mut store = Store::load(dir.clone());
         assert_eq!(store.safe_mode(), None);
         assert_eq!(metadata_sources(store.active_unresolved.clone()), expected);
-        store.discard().unwrap();
-        assert_eq!(metadata_sources(store.unresolved.clone()), expected);
+        store.rollback_previous().unwrap();
+        assert_eq!(metadata_sources(store.active_unresolved.clone()), expected);
         exit(store);
         fs::remove_dir_all(dir).unwrap();
         fs::remove_dir_all(elsewhere).unwrap();

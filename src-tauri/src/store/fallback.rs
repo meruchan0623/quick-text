@@ -116,7 +116,6 @@ pub struct LoadReport {
     pub active_on_disk: bool,
     /// `active` compiled rule by rule; rules that failed stay off (B-43).
     pub compiled: CompiledConfig,
-    pub draft: Config,
     pub previous: Option<Config>,
     /// SHA-256 of `active.json` as read; `None` when it was not the source.
     pub disk_hash: Option<Vec<u8>>,
@@ -163,7 +162,7 @@ impl LoadReport {
 ///    another candidate that stays unreadable is skipped.
 /// 3. Only content that does not parse is quarantined (renamed to
 ///    `<name>.corrupt-<time>.json`); if that rename fails nothing may
-///    overwrite the file, so `active.json` and `draft.json` then also mean
+///    overwrite the file, so a locked `active.json` also means
 ///    SafeMode(Locked). A newer schema is SafeMode(NewerSchema): read-only.
 ///    Until `store-meta.json` says the pre-0.4 backup has been dealt with
 ///    (absent or unreadable mark), the rename waits for that backup: the
@@ -285,15 +284,6 @@ pub fn load_or_fallback(dir: &Path, env: &StoreEnv) -> LoadReport {
     log_read_diagnostics(&stored.diagnostics);
     let active = stored.config;
 
-    let draft = match loader.candidate(&dir.join("draft.json")) {
-        Candidate::Loaded(stored, _) => stored.config,
-        Candidate::Missing | Candidate::Corrupt { quarantined: true } => active.clone(),
-        // An unpublished draft we could not read must not be overwritten.
-        Candidate::Unreadable | Candidate::Corrupt { quarantined: false } => {
-            return loader.read_only(SafeModeReason::Locked, meta)
-        }
-        Candidate::Newer => return loader.read_only(SafeModeReason::NewerSchema, meta),
-    };
     let previous = loader.previous(
         &active,
         &meta.previous_revisions,
@@ -362,7 +352,6 @@ pub fn load_or_fallback(dir: &Path, env: &StoreEnv) -> LoadReport {
         active,
         active_on_disk,
         compiled,
-        draft,
         previous,
         disk_hash,
         problems,
@@ -757,7 +746,6 @@ impl<'a> Loader<'a> {
         problems.extend(self.problems);
         LoadReport {
             outcome: LoadOutcome::SafeMode(reason),
-            draft: active.clone(),
             compiled,
             active,
             active_on_disk: false,

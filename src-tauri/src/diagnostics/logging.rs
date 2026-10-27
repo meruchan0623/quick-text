@@ -154,6 +154,7 @@
 //! | `store.meta_readonly` | warn | store-meta.json is left untouched; the run marker and crash count are kept in memory |
 //! | `store.meta_reset` | warn | store-meta.json did not parse; it was quarantined and rebuilt |
 //! | `store.meta_write_failed` | warn | store-meta.json was not written; error |
+//! | `store.legacy_preserve_failed` | warn | legacy unconfirmed configuration could not be copied to its archive |
 //! | `store.metadata_snapshot_failed` | warn | the active metadata was not snapshotted; error |
 //! | `store.newer_schema` | warn | a file written by a newer release; opened read-only; file name, schema `version` |
 //! | `store.no_valid_config_kept` | warn | no configuration to load, and the candidates an earlier launch quarantined are all that is left: SafeMode(NoValidConfig) again; number `quarantined` |

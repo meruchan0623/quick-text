@@ -4,7 +4,9 @@ use rust_xlsxwriter::{
     TableStyle, Workbook, XlsxError,
 };
 pub fn template() -> Result<Vec<u8>, Vec<Diagnostic>> {
-    build().map_err(|_| vec![error("填写说明", 1, "文件", "无法生成 Excel 模板")])
+    build()
+        .and_then(|mut book| book.save_to_buffer())
+        .map_err(|_| vec![error("填写说明", 1, "文件", "无法生成 Excel 模板")])
 }
 fn numeric_column(header: &str) -> bool {
     matches!(
@@ -19,7 +21,7 @@ fn numeric_column(header: &str) -> bool {
             | "重放倍速"
     )
 }
-fn build() -> Result<Vec<u8>, XlsxError> {
+pub(super) fn build() -> Result<Workbook, XlsxError> {
     let mut book = Workbook::new();
     book.define_name("RuleIds", "='指令'!$A$2:$A$501")?;
     let title = Format::new()
@@ -285,5 +287,5 @@ fn build() -> Result<Vec<u8>, XlsxError> {
             }
         }
     }
-    book.save_to_buffer()
+    Ok(book)
 }

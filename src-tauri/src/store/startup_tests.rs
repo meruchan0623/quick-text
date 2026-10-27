@@ -346,8 +346,8 @@ fn locked_active_is_read_only_until_it_unlocks() {
         })
     ));
     assert!(store.engine.paused.load(Ordering::SeqCst));
-    assert!(store.save(config_at(5)).is_err());
-    assert!(store.discard().is_err());
+    assert!(store.publish(config_at(5)).is_err());
+    assert!(store.rollback_previous().is_err());
     assert!(store.publish(config_at(5)).is_err());
     store.meta.clear_run_marker();
     assert!(retry_locked(&dir, &env(&world)).is_none());
@@ -493,7 +493,7 @@ fn no_valid_config_keeps_protecting_a_surviving_draft() {
     let draft_bytes = fs::read(dir.join("draft.json")).unwrap();
     let store = Store::load_with(dir.path(), &env(&world));
     assert_no_valid_config(&store);
-    assert_eq!(store.draft, drafted);
+    assert_eq!(store.active, Config::default());
     clean_exit(store, &world);
 
     let refused = |result: Result<(), CommandError>| {
@@ -510,10 +510,10 @@ fn no_valid_config_keeps_protecting_a_surviving_draft() {
     for _ in 0..2 {
         let mut store = Store::load_with(dir.path(), &env(&world));
         assert_no_valid_config(&store);
-        assert_eq!(store.draft, drafted);
-        refused(store.discard());
-        refused(store.save(metadata_config(&["edited"])));
-        refused(store.publish(store.draft.clone()));
+        assert_eq!(store.active, Config::default());
+        refused(store.rollback_previous());
+        refused(store.publish(metadata_config(&["edited"])));
+        refused(store.publish(store.active.clone()));
         refused(store.rollback_previous());
         refused(store.mark_last_good(1));
         refused(store.ensure_writable());
@@ -541,8 +541,7 @@ fn published_import_ends_no_valid_config_for_good() {
         let mut store = Store::load_with(dir.path(), &env(&world));
         assert_no_valid_config(&store);
         store.pending_import = Some((imported.clone(), vec![]));
-        store.save(imported.clone()).unwrap();
-        store.publish(store.draft.clone()).unwrap();
+        store.publish(imported.clone()).unwrap();
         assert_eq!(store.safe_mode(), None);
         assert!(dir.join("active.json").exists());
         clean_exit(store, &world);
@@ -614,10 +613,9 @@ fn interrupted_recovery_publish_stays_no_valid_config() {
     assert_no_valid_config(&store);
     let imported = metadata_config(&["imported"]);
     store.pending_import = Some((imported.clone(), vec![]));
-    store.save(imported.clone()).unwrap();
-    let blocker = dir.join("active-migration-unresolved.json");
+    let blocker = dir.join("active.json.tmp");
     fs::create_dir(&blocker).unwrap();
-    assert!(store.publish(store.draft.clone()).is_err());
+    assert!(store.publish(imported.clone()).is_err());
     assert_no_valid_config(&store);
     assert!(!dir.join("active.json").exists());
     assert_eq!(revision_numbers(&dir), Vec::<u64>::new());
@@ -626,23 +624,22 @@ fn interrupted_recovery_publish_stays_no_valid_config() {
     for _ in 0..2 {
         let mut store = Store::load_with(dir.path(), &env(&world));
         assert_no_valid_config(&store);
-        assert_eq!(store.draft.rules, imported.rules);
-        let draft_bytes = fs::read(dir.join("draft.json")).unwrap();
-        refused_no_valid_config(store.discard());
-        refused_no_valid_config(store.save(Config::default()));
+        assert!(store.active.rules.is_empty());
+        assert!(store.pending_import.is_none());
+        refused_no_valid_config(store.rollback_previous());
+        refused_no_valid_config(store.publish(Config::default()));
         refused_no_valid_config(store.rollback_previous());
         refused_no_valid_config(store.mark_last_good(0));
         refused_no_valid_config(store.set_manual_pause(false, || true));
-        assert_eq!(fs::read(dir.join("draft.json")).unwrap(), draft_bytes);
+        assert!(!dir.join("draft.json").exists());
         clean_exit(store, &world);
     }
 
     fs::remove_dir(&blocker).unwrap();
     let mut store = Store::load_with(dir.path(), &env(&world));
     assert_no_valid_config(&store);
-    store.pending_import = Some((store.draft.clone(), vec![]));
-    store.save(store.draft.clone()).unwrap();
-    store.publish(store.draft.clone()).unwrap();
+    store.pending_import = Some((imported.clone(), vec![]));
+    store.publish(imported.clone()).unwrap();
     assert_eq!(store.safe_mode(), None);
     clean_exit(store, &world);
     let mut store = Store::load_with(dir.path(), &env(&world));
@@ -750,9 +747,9 @@ fn unlistable_evidence_keeps_no_valid_config_and_the_draft() {
         for _ in 0..2 {
             let mut store = Store::load_with(dir.path(), &env(&world));
             assert_no_valid_config(&store);
-            assert_eq!(store.draft, drafted, "{candidate}");
-            refused_no_valid_config(store.discard());
-            refused_no_valid_config(store.save(Config::default()));
+            assert_eq!(store.active, Config::default(), "{candidate}");
+            refused_no_valid_config(store.rollback_previous());
+            refused_no_valid_config(store.publish(Config::default()));
             refused_no_valid_config(store.rollback_previous());
             refused_no_valid_config(store.set_manual_pause(false, || true));
             assert_eq!(fs::read(dir.join("draft.json")).unwrap(), draft_bytes);
@@ -907,7 +904,7 @@ fn rollback_target_survives_a_restart_after_recovery() {
     assert_eq!(store.active.revision, 4);
     assert_eq!(store.active.rules, one.rules);
     let restored = BTreeMap::from([("one".to_string(), "one".to_string())]);
-    assert_eq!(metadata_sources(store.unresolved.clone()), restored);
+    assert_eq!(metadata_sources(store.active_unresolved.clone()), restored);
     assert_eq!(store.previous.as_ref().unwrap().rules, three.rules);
     let target = rollback_target(&store);
     clean_exit(store, &world);
@@ -1172,24 +1169,30 @@ fn recovers_in_plan_order_and_publishes_past_every_revision() {
 /// Before the pre-0.4 backup the corrupt draft stays where it is, listed
 /// for the store to rename once the backup holds it (review I-B1).
 #[test]
-fn corrupt_draft_is_quarantined_and_restarts_from_active() {
+fn legacy_corrupt_draft_is_archived_without_affecting_active() {
     let dir = TempDir::new();
     let world = world();
     write(&dir, "active.json", &bytes(&config_at(1)));
     write(&dir, "draft.json", TRUNCATED);
     let report = load_or_fallback(&dir, &env(&world));
     assert_eq!(report.outcome, LoadOutcome::Normal);
-    assert_eq!(report.draft, config_at(1));
+    assert_eq!(report.active, config_at(1));
     assert!(quarantined(&kinds(&report)).is_empty());
     let deferred: Vec<_> = report.deferred.iter().map(|d| &d.path).collect();
-    assert_eq!(deferred, [&dir.join("draft.json")]);
+    assert!(deferred.is_empty());
     assert_eq!(fs::read(dir.join("draft.json")).unwrap(), TRUNCATED);
 
     settled(&dir);
     let report = load_or_fallback(&dir, &env(&world));
     assert_eq!(report.outcome, LoadOutcome::Normal);
-    assert_eq!(report.draft, config_at(1));
-    assert_eq!(quarantined(&kinds(&report)), ["draft.json"]);
+    assert_eq!(report.active, config_at(1));
+    assert!(quarantined(&kinds(&report)).is_empty());
+    let store = Store::load_with(dir.path(), &env(&world));
+    assert_eq!(store.active, config_at(1));
+    assert_eq!(
+        fs::read(dir.join("legacy-unconfirmed/draft.json")).unwrap(),
+        TRUNCATED
+    );
     assert!(report.deferred.is_empty());
 }
 
@@ -1314,10 +1317,10 @@ fn safe_mode_refuses_writes_and_import_leaves_it() {
         assert!(matches!(result, Err(CommandError::SafeMode { reason: r }) if r == reason));
     };
     let before = files(&dir);
-    // save_draft, apply_settings, discard_draft, rollback, LKG marking.
-    refused(store.save(metadata_config(&["edited"])));
-    refused(store.publish(store.draft.clone()));
-    refused(store.discard());
+    // Confirmed save, rollback, and LKG marking.
+    refused(store.publish(metadata_config(&["edited"])));
+    refused(store.publish(store.active.clone()));
+    refused(store.rollback_previous());
     refused(store.rollback_previous());
     refused(store.mark_last_good(2));
     // The gate of set_paused(false), execute_action and set_autostart.
@@ -1326,12 +1329,9 @@ fn safe_mode_refuses_writes_and_import_leaves_it() {
     // A draft that is not the previewed import stays refused.
     let imported = metadata_config(&["imported"]);
     store.pending_import = Some((imported.clone(), vec![]));
-    refused(store.save(metadata_config(&["other"])));
-
-    store.save(imported.clone()).unwrap();
-    assert_eq!(store.safe_mode(), Some(reason));
     refused(store.publish(metadata_config(&["other"])));
-    store.publish(store.draft.clone()).unwrap();
+
+    store.publish(imported.clone()).unwrap();
     assert_eq!(store.safe_mode(), None);
     assert_eq!(store.active.rules, imported.rules);
     assert_eq!(store.active.revision, 3);
@@ -1359,7 +1359,7 @@ fn read_only_safe_modes_refuse_import_commit() {
     let imported = metadata_config(&["imported"]);
     store.pending_import = Some((imported.clone(), vec![]));
     assert!(matches!(
-        store.save(imported),
+        store.publish(imported),
         Err(CommandError::SafeMode {
             reason: SafeModeReason::NewerSchema
         })
@@ -1593,7 +1593,7 @@ fn export_never_writes_into_the_data_dir() {
             "revisions/1.json",
             META_FILE,
         ] {
-            let result = store.export_draft(&dir.join(name));
+            let result = store.export_active(&dir.join(name));
             match mode {
                 None | Some(SafeModeReason::CrashLoop) => {
                     let label = Path::new(name).file_name().unwrap().to_string_lossy();
@@ -1629,10 +1629,10 @@ fn crash_loop_exports_outside_the_data_dir() {
         let sibling = TempDir(PathBuf::from(format!("{}-backup", dir.display())));
         fs::create_dir_all(&sibling.0).unwrap();
         for target in [elsewhere.join("backup.json"), sibling.join("backup.json")] {
-            store.export_draft(&target).unwrap();
+            store.export_active(&target).unwrap();
             let package = fs::read_to_string(&target).unwrap();
             let imported = import_package(&package).unwrap();
-            assert_eq!(imported.config.rules, store.draft.rules, "{mode:?}");
+            assert_eq!(imported.config.rules, store.active.rules, "{mode:?}");
         }
     }
 }
@@ -1660,6 +1660,33 @@ fn generated_bytes_share_export_safety_and_preserve_exact_content() {
             }
         }
     }
+}
+
+#[test]
+fn exported_snapshot_uses_native_lossless_import_and_refuses_oversized_packages() {
+    let (_dir, _world, mut store) = store_in(None);
+    store
+        .active
+        .extra
+        .insert("future".into(), serde_json::json!({"x":"保留"}));
+    store
+        .active
+        .globals
+        .extra
+        .insert("future".into(), serde_json::json!(3));
+    let snapshot = store.export_snapshot().unwrap();
+    let imported = crate::config_package::import(&snapshot).unwrap();
+    assert_eq!(imported.config.extra, store.active.extra);
+    assert_eq!(imported.config.globals, store.active.globals);
+    let elsewhere = TempDir::new();
+    let target = elsewhere.join("backup.json");
+    fs::write(&target, b"previous").unwrap();
+    store
+        .active
+        .extra
+        .insert("large".into(), serde_json::json!("x".repeat(16_777_216)));
+    assert!(store.export_active(&target).is_err());
+    assert_eq!(fs::read(&target).unwrap(), b"previous");
 }
 
 /// Other spellings of a path inside the data directory are refused too.
@@ -1695,7 +1722,7 @@ fn export_refuses_other_spellings_of_the_data_dir() {
         ]);
     }
     for target in variants {
-        let result = store.export_draft(&target);
+        let result = store.export_active(&target);
         assert!(refused_as_data_dir(result), "{}", target.display());
     }
     assert_eq!(files(&dir), before);
@@ -1775,7 +1802,7 @@ fn export_refuses_a_temp_file_that_lands_in_the_data_dir() {
             lands_in: Some(dir.join("revisions")),
             ..Seams::default()
         };
-        let result = store.export_draft_with(&target, &mut seams);
+        let result = store.export_active_with(&target, &mut seams);
         assert!(refused_as_data_dir(result), "{mode:?}");
         assert_eq!(seams.checked, 0, "{mode:?}: nothing written");
         assert_eq!(export_temps(&elsewhere), Vec::<String>::new());
@@ -1812,7 +1839,7 @@ fn export_replaces_a_swapped_target_instead_of_writing_through_it() {
             } else {
                 alias(kind, &active, &target).unwrap();
             }
-            let result = store.export_draft_with(&target, &mut seams);
+            let result = store.export_active_with(&target, &mut seams);
             if kind == "symlink" && !swap_after_check {
                 // The pathname check already resolves the link.
                 assert!(refused_as_data_dir(result), "{case}");
@@ -1824,7 +1851,7 @@ fn export_replaces_a_swapped_target_instead_of_writing_through_it() {
                     .is_symlink());
                 let package = fs::read_to_string(&target).unwrap();
                 let imported = import_package(&package).unwrap();
-                assert_eq!(imported.config.rules, store.draft.rules, "{case}");
+                assert_eq!(imported.config.rules, store.active.rules, "{case}");
             }
             assert_eq!(files(&dir), before, "{case}");
             assert_eq!(export_temps(&elsewhere), Vec::<String>::new(), "{case}");
@@ -1845,7 +1872,7 @@ fn failed_export_leaves_the_target_and_no_temp_file() {
         fail_write: true,
         ..Seams::default()
     };
-    let result = store.export_draft_with(&target, &mut seams);
+    let result = store.export_active_with(&target, &mut seams);
     assert!(
         matches!(
             result,
@@ -1863,7 +1890,7 @@ fn failed_export_leaves_the_target_and_no_temp_file() {
     let folder = elsewhere.join("folder.json");
     fs::create_dir_all(&folder).unwrap();
     fs::write(folder.join("keep.txt"), b"keep").unwrap();
-    let result = store.export_draft(&folder);
+    let result = store.export_active(&folder);
     assert!(
         matches!(
             result,
@@ -1943,9 +1970,12 @@ fn autostart_repair_waits_until_the_store_is_writable() {
                 assert_eq!(item.writes(), 0, "{mode:?}");
                 let imported = metadata_config(&["imported"]);
                 store.pending_import = Some((imported.clone(), vec![]));
-                store.save(imported).unwrap();
-                assert_eq!(item.writes(), 0, "{mode:?}: committed, not published");
-                store.publish(store.draft.clone()).unwrap();
+                store.publish(imported).unwrap();
+                assert_eq!(
+                    item.writes(),
+                    1,
+                    "{mode:?}: confirmation publishes immediately"
+                );
             }
         }
         assert_eq!(store.safe_mode(), None, "{mode:?}");
@@ -2187,7 +2217,7 @@ fn a_locked_retry_after_a_snapshot_arrives_as_store_state() {
     // Any other cause: a publish, then a rollback (a new revision too).
     {
         let mut store = t.managed.lock();
-        let draft = store.draft.clone();
+        let draft = store.active.clone();
         store.publish(draft).unwrap();
     }
     t.marker();
@@ -2438,14 +2468,14 @@ fn first_write_backs_up_a_031_directory_byte_for_byte() {
 
     // Without the backup, the next writes do not make it again.
     fs::remove_dir_all(backup_dir(&dir)).unwrap();
-    store.save(metadata_config(&["b"])).unwrap();
-    store.discard().unwrap();
+    store.publish(metadata_config(&["b"])).unwrap();
+    store.rollback_previous().unwrap();
     store.publish(metadata_config(&["b"])).unwrap();
     store.rollback_previous().unwrap();
     assert!(!backup_dir(&dir).exists());
     clean_exit(store, &world);
     let store = Store::load_with(dir.path(), &env(&world));
-    assert_eq!(store.active.revision, 5);
+    assert_eq!(store.active.revision, 7);
     assert!(!backup_dir(&dir).exists());
     assert!(backup_temps(&dir).is_empty());
 }
@@ -2505,8 +2535,8 @@ fn failed_backup_refuses_writes_until_it_succeeds() {
             Err(CommandError::Io { path: Some(ref path), .. }) if path == "backup-pre-0.4"
         )
     };
-    assert!(refused(store.save(metadata_config(&["b"]))));
-    assert!(refused(store.discard()));
+    assert!(refused(store.publish(metadata_config(&["b"]))));
+    assert!(refused(store.rollback_previous()));
     assert!(refused(store.publish(metadata_config(&["b"]))));
     assert_eq!(data_files(), before);
     assert!(!backup_dir(&dir).exists());
@@ -2954,18 +2984,17 @@ fn a_failed_backup_leaves_a_corrupt_active_in_place() {
             Err(CommandError::Io { path: Some(ref path), .. }) if path == "backup-pre-0.4"
         )
     };
-    assert!(refused(store.save(metadata_config(&["b"]))));
+    assert!(refused(store.publish(metadata_config(&["b"]))));
     assert!(refused(store.publish(metadata_config(&["b"]))));
     assert_eq!(data_files(), before);
 
     fs::remove_dir(dir.join("prefs.json")).unwrap();
-    store.save(metadata_config(&["b"])).unwrap();
+    store.publish(metadata_config(&["b"])).unwrap();
     assert_eq!(backup_failed(&store), 0);
     let backup = assert_valid_backup(&backup_dir(&dir));
     assert_eq!(backup[&rel("active.json")], LEGACY_CUT_SHORT);
-    assert!(!dir.join("active.json").exists());
+    assert!(dir.join("active.json").exists());
     assert_eq!(quarantined(&problem_kinds(&store)), ["active.json"]);
-    store.publish(store.draft.clone()).unwrap();
     // Review R7-2: 0.3.1's `revisions/3.metadata.json` keeps the number
     // taken (the lost revision 3), and keeps its bytes.
     assert_eq!(store.active.revision, 4);
@@ -3168,7 +3197,7 @@ fn a_deferred_snapshot_that_cannot_be_renamed_refuses_the_mark_and_the_publish_u
     assert_eq!(deferred(&store), [rel("revisions/4.json")]);
     for _ in 0..2 {
         refused(store.mark_last_good(4));
-        refused(store.publish(store.draft.clone()));
+        refused(store.publish(store.active.clone()));
         assert_eq!(deferred(&store), [rel("revisions/4.json")], "still listed");
         assert_eq!(fs::read(&snapshot).unwrap(), TRUNCATED);
         assert_eq!(store.active, four);
@@ -3191,7 +3220,7 @@ fn a_deferred_snapshot_that_cannot_be_renamed_refuses_the_mark_and_the_publish_u
     assert_eq!(read_config(&snapshot).unwrap(), four);
     assert_eq!(store.meta.get().last_good_revision, Some(4));
     assert_eq!(meta_on_disk(&dir).last_good_revision, Some(4));
-    store.publish(store.draft.clone()).unwrap();
+    store.publish(store.active.clone()).unwrap();
     assert_eq!(store.active.revision, 5);
     assert_eq!(read_config(&dir.join("active.json")).unwrap().revision, 5);
     assert_eq!(read_config(&snapshot).unwrap(), four);
@@ -3235,7 +3264,7 @@ fn a_deferred_file_no_write_replaces_is_retried_without_refusing_writes() {
         assert_eq!(store.active, four);
         assert_eq!(deferred(&store), [rel("revisions/5.json")]);
         store.mark_last_good(4).unwrap();
-        store.publish(store.draft.clone()).unwrap();
+        store.publish(store.active.clone()).unwrap();
         store
     });
     drop(built.guard);
@@ -3254,7 +3283,7 @@ fn a_deferred_file_no_write_replaces_is_retried_without_refusing_writes() {
     assert!(!log.contains("event=\"command.io\""), "{log}");
 
     drop(holder);
-    store.save(metadata_config(&["b"])).unwrap();
+    store.publish(metadata_config(&["b"])).unwrap();
     assert!(deferred(&store).is_empty());
     assert!(!held.exists());
     assert!(quarantined(&problem_kinds(&store)).contains(&"5.json".to_string()));
@@ -3328,8 +3357,7 @@ fn a_recovery_import_backs_up_the_corrupt_candidates() {
         assert_no_valid_config(&store);
         let imported = metadata_config(&["imported"]);
         store.pending_import = Some((imported.clone(), vec![]));
-        store.save(imported).unwrap();
-        store.publish(store.draft.clone()).unwrap();
+        store.publish(imported).unwrap();
         assert_eq!(store.safe_mode(), None);
         assert_eq!(meta_value(dir)["backup_pre_0_4"], true);
         let backup = assert_valid_backup(&backup_dir(dir));

@@ -1,4 +1,4 @@
-//! Configuration store: draft, active and previous configurations plus their
+//! Configuration store: active and previous configurations plus their
 //! files in the data directory (§7.1 「数据目录」).
 mod atomic;
 mod backup;
@@ -24,7 +24,6 @@ use crate::{
     startup::{ProblemKind, StartupProblem},
 };
 use meta::MetaHandle;
-use metadata::metadata_for_config;
 use quicker_domain::*;
 use quicker_platform::{health::PauseReasons, runtime::Runtime, Shared};
 use std::{
@@ -43,7 +42,6 @@ pub const SNAPSHOT_MISMATCH: &str = "snapshot_mismatch";
 
 pub struct Store {
     dir: PathBuf,
-    pub draft: Config,
     pub active: Config,
     /// Whether `active` was read from a file or published by this store.
     /// False for the empty configuration that stands in when there is none
@@ -61,10 +59,10 @@ pub struct Store {
     /// and health (P5 item 2). `engine.paused` is only its derived value;
     /// nothing in the shell writes it.
     pub runtime: Arc<Runtime>,
-    pub unresolved: Vec<MigrationItem>,
-    active_unresolved: Vec<MigrationItem>,
+    pub active_unresolved: Vec<MigrationItem>,
     previous_unresolved: Vec<MigrationItem>,
     pub pending_import: Option<(Config, Vec<MigrationItem>)>,
+    pending_import_token: Option<String>,
     safe_mode: Option<SafeModeReason>,
     startup_problems: Vec<StartupProblem>,
     /// Corrupt files the load left in place until the pre-0.4 backup holds
@@ -72,9 +70,6 @@ pub struct Store {
     /// (d), `Store::quarantine_deferred`).
     deferred: Vec<fallback::DeferredQuarantine>,
     meta: MetaHandle,
-    /// In safe mode: the draft was committed from an import and may be
-    /// published, which ends safe mode.
-    safe_import: bool,
     /// Work waiting for the store to become writable (see
     /// [`Store::when_writable`]).
     writable_hooks: Vec<(&'static str, WritableHook)>,
@@ -267,7 +262,6 @@ impl Store {
             }
         }
         self.safe_mode = reason;
-        self.safe_import = false;
         if reason.is_none() {
             for (key, hook) in std::mem::take(&mut self.writable_hooks) {
                 self.writable_done.push(key);
@@ -344,54 +338,41 @@ impl Store {
         );
         Ok(())
     }
-    /// Writes the draft. A configuration with error-level diagnostics is
-    /// rejected with `Validation` and nothing is written (B-42). In safe mode
-    /// only committing a previewed import is allowed (see
-    /// [`import_leaves_safe_mode`]). Like every write of a file 0.3.1 reads,
-    /// it waits for the pre-0.4 backup and is refused while that fails (R6,
-    /// `store::backup`).
-    pub fn save(&mut self, config: Config) -> Result<(), CommandError> {
-        if let Some(reason) = self.safe_mode {
-            let importing = self
-                .pending_import
-                .as_ref()
-                .is_some_and(|(preview, _)| preview == &config);
-            if !(importing && import_leaves_safe_mode(reason)) {
-                return Err(CommandError::SafeMode { reason });
-            }
+    /// Validate and publish one configuration, using its revision as a compare-and-swap token.
+    /// Import previews remain in memory until this succeeds.
+    pub fn save_config(
+        &mut self,
+        config: Config,
+        import_token: Option<String>,
+    ) -> Result<(), CommandError> {
+        if config.revision != self.active.revision {
+            return Err(CommandError::RevisionConflict {
+                current: self.active.revision,
+            });
         }
-        if let Err(diagnostics) = compile_config(&config) {
-            if diagnostics.iter().any(|d| d.severity == Severity::Error) {
-                return Err(CommandError::validation(diagnostics));
+        if let Some(token) = import_token {
+            if self.pending_import_token.as_deref() != Some(token.as_str())
+                || !self
+                    .pending_import
+                    .as_ref()
+                    .is_some_and(|(preview, _)| preview == &config)
+            {
+                return Err(CommandError::TokenExpired);
             }
+            self.publish(config)
+        } else {
+            self.ensure_writable()?;
+            let metadata = metadata::metadata_for_config(&config, &self.active_unresolved);
+            self.publish_with_metadata(config, metadata)
         }
-        let metadata = self
-            .pending_import
-            .as_ref()
-            .filter(|(preview, _)| preview == &config)
-            .map(|(_, metadata)| metadata.clone())
-            .unwrap_or_else(|| metadata_for_config(&config, &self.unresolved));
-        self.backup_before_write()?;
-        self.write_data(&self.dir.join("draft.json"), &config)?;
-        self.write_data(&self.dir.join("migration-unresolved.json"), &metadata)?;
-        self.unresolved = metadata;
-        self.pending_import = None;
-        self.draft = config;
-        self.safe_import = self.safe_mode.is_some();
-        Ok(())
     }
-    pub fn discard(&mut self) -> Result<(), CommandError> {
-        self.ensure_writable()?;
-        self.backup_before_write()?;
-        self.write_data(&self.dir.join("draft.json"), &self.active)?;
-        self.write_data(
-            &self.dir.join("migration-unresolved.json"),
-            &self.active_unresolved,
-        )?;
-        self.draft = self.active.clone();
-        self.unresolved = self.active_unresolved.clone();
-        self.pending_import = None;
-        Ok(())
+
+    /// One live preview per store: making another explicitly expires the previous token.
+    pub fn preview_import(&mut self, config: Config, metadata: Vec<MigrationItem>) -> String {
+        let token = uuid::Uuid::new_v4().to_string();
+        self.pending_import = Some((config, metadata));
+        self.pending_import_token = Some(token.clone());
+        token
     }
 }
 
@@ -528,52 +509,51 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
-    fn discard_import_restores_published_originals_after_reload() {
+    fn rollback_import_restores_published_originals_after_reload() {
         let dir =
             std::env::temp_dir().join(format!("quicker-metadata-test-{}", uuid::Uuid::new_v4()));
         let mut store = Store::load(dir.clone());
         let a = metadata_config(&["shared"]);
         store.pending_import = Some((a.clone(), vec![original("shared", "A")]));
-        store.save(a).unwrap();
-        store.publish(store.draft.clone()).unwrap();
+        store.publish(a).unwrap();
         let mut b = metadata_config(&["shared"]);
         b.rules[0].description = "synthetic replacement".into();
         store.pending_import = Some((b.clone(), vec![original("shared", "B")]));
-        store.save(b.clone()).unwrap();
+        store.publish(b.clone()).unwrap();
         drop(store);
         let mut store = Store::load(dir.clone());
-        assert_eq!(store.unresolved[0].original["synthetic_source"], "B");
+        assert_eq!(store.active_unresolved[0].original["synthetic_source"], "B");
         store.pending_import = Some((b, vec![original("shared", "pending")]));
-        store.discard().unwrap();
+        store.rollback_previous().unwrap();
         assert!(store.pending_import.is_none());
-        assert_eq!(store.unresolved[0].original["synthetic_source"], "A");
-        assert_eq!(store.draft, store.active);
+        assert_eq!(store.active_unresolved[0].original["synthetic_source"], "A");
+        assert_eq!(store.active, store.active);
         drop(store);
         let store = Store::load(dir.clone());
-        assert_eq!(store.unresolved[0].original["synthetic_source"], "A");
+        assert_eq!(store.active_unresolved[0].original["synthetic_source"], "A");
         fs::remove_dir_all(dir).unwrap();
     }
-    /// B-42: `save_draft` validates first; an invalid draft is not written.
+    /// Invalid configuration is rejected before publishing.
     #[test]
-    fn save_rejects_drafts_with_error_diagnostics() {
+    fn save_rejects_config_with_error_diagnostics() {
         let dir = std::env::temp_dir().join(format!("quicktext-test-{}", uuid::Uuid::new_v4()));
         let mut store = Store::load(dir.clone());
         let valid = metadata_config(&["kept"]);
-        store.save(valid.clone()).unwrap();
+        store.publish(valid.clone()).unwrap();
         let mut invalid = metadata_config(&["kept", "broken"]);
         invalid.rules[1].match_spec.value.clear();
         invalid.globals.terminators.push(String::new());
         store.pending_import = Some((invalid.clone(), vec![original("broken", "pending")]));
-        let Err(CommandError::Validation { diagnostics }) = store.save(invalid) else {
-            panic!("an invalid draft must be rejected with Validation");
+        let Err(CommandError::Validation { diagnostics }) = store.publish(invalid) else {
+            panic!("an invalid configuration must be rejected with Validation");
         };
         assert!(diagnostics.iter().any(|d| d.code == "match_empty"));
         assert!(diagnostics.iter().any(|d| d.path == "globals.terminators"));
         assert!(diagnostics.iter().all(|d| d.severity == Severity::Error));
-        assert_eq!(store.draft, valid);
+        assert_eq!(store.active.rules, valid.rules);
         assert!(store.pending_import.is_some());
         drop(store);
-        assert_eq!(Store::load(dir.clone()).draft, valid);
+        assert_eq!(Store::load(dir.clone()).active.rules, valid.rules);
         fs::remove_dir_all(dir).unwrap();
     }
 }

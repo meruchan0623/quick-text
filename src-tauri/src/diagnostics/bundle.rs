@@ -455,7 +455,6 @@ fn read_tail(path: &Path, max_bytes: u64) -> io::Result<String> {
 #[derive(Serialize)]
 pub struct ConfigSummary {
     pub active: ConfigFile,
-    pub draft: ConfigFile,
     pub prefs: FileState,
     pub revisions_on_disk: usize,
     pub quarantined_files: usize,
@@ -480,7 +479,7 @@ pub enum FileState {
     /// Position only: the parser's message quotes the offending value.
     /// `category` is serde's (`io`, `syntax`, `data`, `eof`) for prefs.json,
     /// and the store loader's reason code (`config_malformed`,
-    /// `schema_version`) for active.json and draft.json. `kind` is there for
+    /// `schema_version`) for active.json. `kind` is there for
     /// `config_malformed` only: the loader's `utf8`, `syntax`, `eof` (cut
     /// short, as a torn write leaves it) or `shape`, which `store.corrupt`
     /// logs with the same line and column.
@@ -491,7 +490,7 @@ pub enum FileState {
         line: usize,
         column: usize,
     },
-    /// active.json or draft.json written by a newer release. It is not
+    /// active.json written by a newer release. It is not
     /// damaged: the app opens read-only (SafeMode(NewerSchema)) and keeps it.
     NewerSchema {
         version: u64,
@@ -535,7 +534,6 @@ pub fn summarize(data_dir: &Path) -> ConfigSummary {
         .count();
     ConfigSummary {
         active: config_file(&data_dir.join("active.json")),
-        draft: config_file(&data_dir.join("draft.json")),
         // Not under the `PREFS_FILE` lock (store/prefs.rs): this only reads.
         // prefs.json is only ever replaced whole (`atomic_json`: temp file,
         // `sync_all`, then rename over it), so the read gets the old file or
@@ -552,7 +550,7 @@ pub fn summarize(data_dir: &Path) -> ConfigSummary {
     }
 }
 
-/// active.json and draft.json are read by the store loader's own reader,
+/// active.json is read by the store loader's own reader,
 /// `read_stored_config` (lenient, past a UTF-8 BOM), so the bundle shows
 /// what startup concludes about the same bytes. Only the reading is shared:
 /// nothing is migrated, written back or quarantined here.
@@ -980,9 +978,7 @@ mod tests {
         assert_eq!(counts["global_terminators"]["semicolon"], 1);
         assert_eq!(counts["diagnostics"][0]["severity"], "error");
         assert!(counts["diagnostics"][0]["count"].as_u64().unwrap() >= 1);
-        assert_eq!(summary["draft"]["file"]["status"], "unparsable");
-        assert_eq!(summary["draft"]["file"]["line"], 1);
-        assert!(summary["draft"].get("counts").is_none());
+        assert!(summary.get("draft").is_none());
         assert_eq!(summary["prefs"]["status"], "ok");
         assert_eq!(summary["revisions_on_disk"], 1);
         assert_eq!(summary["quarantined_files"], 1);
@@ -1337,13 +1333,16 @@ mod tests {
                 fs::write(dir.join(name), [bom, &json[..]].concat()).unwrap();
             }
             let summary = serde_json::to_value(summarize(&dir)).unwrap();
-            // Startup reads the same two files, uses both and keeps them.
+            // Startup uses active only and archives obsolete unconfirmed content.
             let store = Store::load(dir.clone());
             assert_eq!(store.safe_mode(), None, "BOM: {with_bom}");
             assert_eq!(store.active.rules.len(), 2, "BOM: {with_bom}");
-            assert_eq!(store.draft.rules.len(), 3, "BOM: {with_bom}");
+            assert_ne!(
+                store.active.rules, draft.rules,
+                "legacy draft is never loaded"
+            );
             assert_eq!(summarize(&dir).quarantined_files, 0, "BOM: {with_bom}");
-            for (name, loaded) in [("active", &store.active), ("draft", &store.draft)] {
+            for (name, loaded) in [("active", &store.active)] {
                 let entry = &summary[name];
                 assert_eq!(entry["file"]["status"], "ok", "{name}, BOM: {with_bom}");
                 assert_eq!(
@@ -1353,7 +1352,8 @@ mod tests {
                 );
             }
             assert_eq!(summary["active"]["counts"]["rules"], 2);
-            assert_eq!(summary["draft"]["counts"]["rules"], 3);
+            assert!(summary.get("draft").is_none());
+            assert!(dir.join("legacy-unconfirmed/draft.json").exists());
             drop(store);
             fs::remove_dir_all(dir).unwrap();
         }
@@ -1391,7 +1391,7 @@ mod tests {
             fs::write(dir.join("draft.json"), &bytes).unwrap();
             let loader = read_stored_config(&bytes).unwrap_err().diagnostic();
             let summary = serde_json::to_value(summarize(&dir)).unwrap();
-            for name in ["active", "draft"] {
+            for name in ["active"] {
                 let file = &summary[name]["file"];
                 assert_eq!(file["status"], "unparsable", "{name}, BOM: {with_bom}");
                 assert_eq!(file["category"], loader.code, "{name}, BOM: {with_bom}");
@@ -1460,7 +1460,7 @@ mod tests {
                 });
                 drop(built.guard);
                 let log = read_logs(&log_dir(&dir));
-                for name in ["active", "draft"] {
+                for name in ["active"] {
                     let at = format!("{name}, {category} {kind:?}, BOM: {with_bom}");
                     let file = &summary[name]["file"];
                     assert_eq!(file["status"], "unparsable", "{at}");
@@ -1468,7 +1468,6 @@ mod tests {
                     assert_eq!(file.get("kind").and_then(|k| k.as_str()), kind, "{at}");
                     assert_eq!(file["line"], line, "{at}");
                     assert_eq!(file["column"], column, "{at}");
-                    // Startup logs the same for the same file.
                     let logged = |field| corrupt_field(&log, &format!("{name}.json"), field);
                     assert_eq!(logged("code"), Some(category), "{at}\n{log}");
                     assert_eq!(logged("kind"), kind, "{at}\n{log}");
@@ -1600,10 +1599,10 @@ mod tests {
             config.rules[0].notification.message = format!("notify-{SENTINEL}");
             config.rules[1].match_spec.value = format!("literal-{SENTINEL}");
             config.rules[1].match_spec.kind = MatchKind::Literal;
-            store.save(config.clone()).unwrap();
+            store.publish(config.clone()).unwrap();
             store.publish(config.clone()).unwrap();
             config.rules[0].description = format!("edited-{SENTINEL}");
-            store.save(config.clone()).unwrap();
+            store.publish(config.clone()).unwrap();
             store.publish(config.clone()).unwrap();
             store.rollback_previous().unwrap();
             let mut invalid = config.clone();
@@ -1611,7 +1610,7 @@ mod tests {
                 kind: MatchKind::Regex,
                 value: format!("({SENTINEL}"),
             };
-            assert!(store.save(invalid).is_err());
+            assert!(store.publish(invalid).is_err());
             store.active.revision = u64::MAX;
             assert!(store.publish(config).is_err());
 

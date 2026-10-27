@@ -1,8 +1,11 @@
 //! Native, bounded XLSX interchange. Parsing never executes an action.
+mod config;
 mod parse;
 mod template;
 #[cfg(test)]
 mod tests;
+pub use config::{export_config, read_config};
+#[cfg(test)]
 pub use parse::read;
 use quicker_domain::{Diagnostic, SourceSpan};
 pub use template::template;

@@ -78,10 +78,12 @@ impl Row {
         }
     }
 }
+#[cfg(test)]
 pub fn read(path: &Path) -> Result<Vec<Rule>, Vec<Diagnostic>> {
-    read_inner(path).map_err(|e| vec![e])
+    let mut book = open_book(path).map_err(|e| vec![e])?;
+    read_rules(&mut book, false).map_err(|e| vec![e])
 }
-fn read_inner(path: &Path) -> Result<Vec<Rule>, E> {
+pub(super) fn open_book(path: &Path) -> Result<Xlsx<std::io::BufReader<File>>, E> {
     let mut file = File::open(path).map_err(|_| error("文件", 1, "文件", "无法读取文件"))?;
     check_zip(
         file.try_clone()
@@ -110,17 +112,23 @@ fn read_inner(path: &Path) -> Result<Vec<Rule>, E> {
             ));
         }
     }
+    Ok(book)
+}
+pub(super) fn read_rules<RS: Read + Seek>(
+    book: &mut Xlsx<RS>,
+    full_config: bool,
+) -> Result<Vec<Rule>, E> {
     let version = book
         .worksheet_range("选项")
         .map_err(|_| error("选项", 1, "版本", "缺少模板版本信息"))?;
     if version.get_value((0, 0)) != Some(&Data::String(TEMPLATE_VERSION.into())) {
         return Err(error("选项", 1, "版本", "模板版本不兼容，请重新导出模板"));
     }
-    let mut rules = rows(&mut book, "指令", RULE_HEADERS)?;
-    let mut steps = rows(&mut book, "操作步骤", STEP_HEADERS)?;
-    let mut params = rows(&mut book, "调用参数", PARAM_HEADERS)?;
-    let mut captures = rows(&mut book, "捕获参数", CAPTURE_HEADERS)?;
-    if rules.is_empty() {
+    let mut rules = rows(book, "指令", RULE_HEADERS)?;
+    let mut steps = rows(book, "操作步骤", STEP_HEADERS)?;
+    let mut params = rows(book, "调用参数", PARAM_HEADERS)?;
+    let mut captures = rows(book, "捕获参数", CAPTURE_HEADERS)?;
+    if rules.is_empty() && !full_config {
         return Err(error("指令", 2, "缩写或正则*", "模板中没有可导入的指令"));
     }
     let mut ids = BTreeMap::new();
@@ -320,8 +328,10 @@ fn read_inner(path: &Path) -> Result<Vec<Rule>, E> {
             ],
         )?;
         let action = action(row, &ids, &mut step_map, &mut parameter_map, &key)?;
-        validate_parameters(&action)
-            .map_err(|_| row.err("高级动作JSON", "复用参数仅支持文本、数字、布尔或空值"))?;
+        if !full_config {
+            validate_parameters(&action)
+                .map_err(|_| row.err("高级动作JSON", "复用参数仅支持文本、数字、布尔或空值"))?;
+        }
         let group = row.get("分组");
         let trigger_default = if kind == "regex" || !cfg!(windows) {
             "terminator"
@@ -329,12 +339,17 @@ fn read_inner(path: &Path) -> Result<Vec<Rule>, E> {
             "immediate"
         };
         let value = json!({"id":id,"enabled":row.boolean("启用",true)?,"group":if group.is_empty(){"默认"}else{&group},"description":row.get("说明"),"ignore_case":row.boolean("忽略大小写",false)?,"match":{"kind":kind,"value":match_value},"trigger_mode":row.choice("触发方式",trigger_default,&[("结束键触发","terminator"),("立即触发","immediate")])?,"terminator":terminator,"ime_erasure":if ime=="inherit"{Value::Null}else{json!(ime)},"parameter":parameter,"notification":{"enabled":row.boolean("通知",false)?,"message":row.get("通知内容")},"action":action});
-        validate_numbers(&value)
-            .map_err(|_| row.err("高级动作JSON", "整数超出JavaScript安全范围，请改用文本保存"))?;
+        if !full_config {
+            validate_numbers(&value).map_err(|_| {
+                row.err("高级动作JSON", "整数超出JavaScript安全范围，请改用文本保存")
+            })?;
+        }
         row.finish()?;
         let rule: Rule = serde_json::from_value(value)
             .map_err(|_| row.err("动作类型", "字段类型或高级JSON与当前版本不兼容"))?;
-        validate_rule(&rule, row, &steps, &key)?;
+        if !full_config {
+            validate_rule(&rule, row, &steps, &key)?;
+        }
         result.push(rule);
     }
     if let Some((_, (_, n))) = step_map.values().flat_map(|v| v.iter()).next() {
@@ -363,7 +378,10 @@ fn read_inner(path: &Path) -> Result<Vec<Rule>, E> {
     }
     Ok(result)
 }
-fn check_zip(mut file: File) -> Result<(), E> {
+pub(super) fn check_generated(bytes: &[u8]) -> Result<(), E> {
+    check_zip(std::io::Cursor::new(bytes))
+}
+fn check_zip(mut file: impl Read + Seek) -> Result<(), E> {
     let fail = || {
         error(
             "文件",
@@ -372,9 +390,10 @@ fn check_zip(mut file: File) -> Result<(), E> {
             "文件过大或压缩结构不安全（16MiB文件/64MiB展开/256条目）",
         )
     };
-    if file.metadata().map_err(|_| fail())?.len() > 16 * 1024 * 1024 {
+    if file.seek(std::io::SeekFrom::End(0)).map_err(|_| fail())? > 16 * 1024 * 1024 {
         return Err(fail());
     }
+    file.seek(std::io::SeekFrom::Start(0)).map_err(|_| fail())?;
     let mut zip = zip::ZipArchive::new(&mut file).map_err(|_| fail())?;
     if zip.len() > 256 {
         return Err(fail());
@@ -807,6 +826,7 @@ fn rows<RS: Read + Seek>(
     sheet: &str,
     headers: &[&str],
 ) -> Result<Vec<Row>, E> {
+    let long_values = super::config::long_values(book)?;
     let range = book
         .worksheet_range(sheet)
         .map_err(|_| error(sheet, 1, "表头", "缺少工作表或无法读取"))?;
@@ -829,7 +849,7 @@ fn rows<RS: Read + Seek>(
         for (c, h) in positions.iter().zip(headers) {
             let v = match range.get_value((r as u32, *c as u32)) {
                 None | Some(Data::Empty) => String::new(),
-                Some(Data::String(s)) => s.clone(),
+                Some(Data::String(s)) => long_values.get(s).cloned().unwrap_or_else(|| s.clone()),
                 Some(Data::Int(n)) => n.to_string(),
                 Some(Data::Float(n)) if n.is_finite() => n.to_string(),
                 Some(Data::Bool(b)) => if *b { "是" } else { "否" }.into(),

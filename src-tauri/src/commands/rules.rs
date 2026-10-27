@@ -28,7 +28,7 @@ pub fn test_rule(
     input: String,
     store: State<Managed>,
 ) -> Result<serde_json::Value, CommandError> {
-    let globals = store.lock().draft.globals.clone();
+    let globals = store.lock().active.globals.clone();
     let terminator = rule
         .terminator
         .as_ref()

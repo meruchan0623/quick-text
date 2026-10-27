@@ -30,10 +30,8 @@ pub const PLATFORM: &str = std::env::consts::OS;
 
 #[derive(Clone, Serialize)]
 pub struct AppState {
-    draft: Config,
     active: Config,
     revision: u64,
-    dirty: bool,
     paused: bool,
     engine_status: String,
     last_result: Option<ExecutionResult>,
@@ -58,10 +56,8 @@ impl Store {
         let engine = self.runtime.engine_state();
         let health = self.runtime.health();
         AppState {
-            draft: self.draft.clone(),
             active: self.active.clone(),
             revision: self.active.revision,
-            dirty: self.draft != self.active,
             paused: !engine.listening,
             // The same mapping as the legacy `engine-status` event.
             engine_status: events::legacy_status(&engine).into(),

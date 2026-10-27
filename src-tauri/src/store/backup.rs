@@ -539,6 +539,9 @@ impl Store {
             self.report_problem(&problem);
             self.startup_problems.push(problem);
         }
+        if result.is_ok() {
+            self.preserve_legacy_unconfirmed();
+        }
         result
     }
     /// Renames the corrupt files the load left in place (I-B1) to
@@ -614,9 +617,7 @@ impl Store {
     }
     /// Whether a write command of this store may replace `path`; checked
     /// against the targets of `write_data`:
-    /// - `draft.json` and `migration-unresolved.json` (save, discard, and
-    ///   publish, rollback and the import, which saves then publishes);
-    /// - `active.json` and `active-migration-unresolved.json` (publish);
+    /// - `active.json` (confirmed save and rollback);
     /// - `revisions/<active>.json`: read, and written when missing, by
     ///   publish (the snapshot of the revision it replaces) and
     ///   [`Store::mark_last_good`];
@@ -630,19 +631,14 @@ impl Store {
     fn replaced_by_writes(&self, path: &Path) -> bool {
         let revisions = self.dir.join("revisions");
         let active = self.active.revision;
-        [
-            "active.json",
-            "draft.json",
-            "migration-unresolved.json",
-            "active-migration-unresolved.json",
-        ]
-        .iter()
-        .map(|name| self.dir.join(name))
-        .chain([
-            revisions.join(format!("{active}.json")),
-            revisions.join(format!("{active}.metadata.json")),
-        ])
-        .any(|written| written == path)
+        ["active.json"]
+            .iter()
+            .map(|name| self.dir.join(name))
+            .chain([
+                revisions.join(format!("{active}.json")),
+                revisions.join(format!("{active}.metadata.json")),
+            ])
+            .any(|written| written == path)
     }
     /// Lists `backup_failed` once while the backup fails. Once it succeeds
     /// the problem is dropped and the metadata snapshot that the load could

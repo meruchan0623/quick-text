@@ -40,22 +40,20 @@ impl Store {
         runtime.attach(&engine);
         let mut store = Self {
             dir,
-            draft: Config::default(),
             active: Config::default(),
             active_on_disk: false,
             previous: None,
             disk_hash: None,
             engine,
             runtime,
-            unresolved: vec![],
             active_unresolved: vec![],
             previous_unresolved: vec![],
             pending_import: None,
+            pending_import_token: None,
             safe_mode: None,
             startup_problems: vec![],
             deferred: vec![],
             meta,
-            safe_import: false,
             writable_hooks: vec![],
             writable_done: vec![],
             problem_sink: None,
@@ -85,9 +83,9 @@ impl Store {
         self.disk_hash = report.disk_hash;
         self.active = report.active;
         self.active_on_disk = report.active_on_disk;
-        self.draft = report.draft;
         self.previous = report.previous;
         self.pending_import = None;
+        self.pending_import_token = None;
         self.deferred = report.deferred;
         let mut problems = report.problems;
         // R6: the metadata snapshot is the first write into a directory
@@ -103,6 +101,9 @@ impl Store {
             let _ = self.quarantine_deferred(&mut problems);
         }
         self.load_metadata(backed_up == Some(true));
+        if backed_up == Some(true) {
+            self.preserve_legacy_unconfirmed();
+        }
         // Problems found outside the load (autostart, the startup self-test)
         // survive a reload.
         let before = std::mem::take(&mut self.startup_problems);
@@ -130,11 +131,35 @@ impl Store {
         // in one report, under the lock the caller holds.
         self.report_store_state();
     }
-    /// Migration metadata of the draft, active and previous configurations.
+    /// Move obsolete unconfirmed files aside once after the legacy backup gate.
+    /// Never replace an earlier archive, even when an older app recreated a file.
+    pub(super) fn preserve_legacy_unconfirmed(&self) {
+        for name in ["draft.json", "migration-unresolved.json"] {
+            let source = self.dir.join(name);
+            if !source.is_file() {
+                continue;
+            }
+            let folder = self.dir.join("legacy-unconfirmed");
+            let mut target = folder.join(name);
+            if target.exists() {
+                target = folder.join(format!("{}-{name}", uuid::Uuid::new_v4()));
+            }
+            let result = fs::create_dir_all(&folder).and_then(|()| fs::rename(&source, &target));
+            if let Err(error) = result {
+                tracing::warn!(event = "store.legacy_preserve_failed", %error);
+            }
+        }
+    }
+    /// Migration metadata of the active and previous configurations.
     /// Outside safe mode the active one is also snapshotted.
     fn load_metadata(&mut self, write_snapshot: bool) {
         let dir = &self.dir;
-        let unresolved = read_metadata(&dir.join("migration-unresolved.json"));
+        let legacy_metadata = dir.join("migration-unresolved.json");
+        let unresolved = read_metadata(&if legacy_metadata.exists() {
+            legacy_metadata
+        } else {
+            dir.join("legacy-unconfirmed/migration-unresolved.json")
+        });
         let active_metadata_path = dir
             .join("revisions")
             .join(format!("{}.metadata.json", self.active.revision));
@@ -159,7 +184,6 @@ impl Store {
                 }
             })
             .unwrap_or_default();
-        self.unresolved = unresolved;
         self.active_unresolved = active_unresolved;
         self.previous_unresolved = previous_unresolved;
         if write_snapshot {
@@ -167,8 +191,7 @@ impl Store {
         }
     }
     /// Writes the active metadata as `revisions/<n>.metadata.json`: the
-    /// legacy fallback is persisted before a later draft import can replace
-    /// `migration-unresolved.json`. Also called once the pre-0.4 backup
+    /// legacy fallback is persisted before legacy metadata is archived. Also called once the pre-0.4 backup
     /// succeeds after the load could not write this (`Store::note_backup`).
     pub(super) fn snapshot_active_metadata(&self) {
         let revisions = self.dir.join("revisions");
@@ -248,7 +271,7 @@ mod tests {
     use super::super::{atomic::atomic_json, test_support::*};
     use super::*;
     #[test]
-    fn legacy_metadata_is_snapshotted_before_replacing_draft() {
+    fn legacy_metadata_is_snapshotted_before_direct_import() {
         let dir =
             std::env::temp_dir().join(format!("quicker-metadata-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
@@ -261,11 +284,14 @@ mod tests {
         .unwrap();
         let mut store = Store::load(dir.clone());
         store.pending_import = Some((a.clone(), vec![original("shared", "B")]));
-        store.save(a).unwrap();
+        store.publish(a).unwrap();
         drop(store);
         let mut store = Store::load(dir.clone());
-        store.discard().unwrap();
-        assert_eq!(store.unresolved[0].original["synthetic_source"], "legacy-A");
+        store.rollback_previous().unwrap();
+        assert_eq!(
+            store.active_unresolved[0].original["synthetic_source"],
+            "legacy-A"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 }

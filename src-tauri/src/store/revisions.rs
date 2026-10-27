@@ -14,18 +14,28 @@ use std::{fs, io, path::Path, sync::atomic::Ordering};
 
 impl Store {
     pub fn publish(&mut self, config: Config) -> Result<(), CommandError> {
-        let metadata = metadata_for_config(&config, &self.unresolved);
+        let metadata = self
+            .pending_import
+            .as_ref()
+            .filter(|(preview, _)| preview == &config)
+            .map(|(_, metadata)| metadata.clone())
+            .unwrap_or_else(|| metadata_for_config(&config, &self.active_unresolved));
         self.publish_with_metadata(config, metadata)
     }
-    /// In safe mode only the draft committed from an import may be
-    /// published; that ends safe mode.
-    fn publish_with_metadata(
+    /// In recoverable safe mode, only the exact previewed import may be
+    /// confirmed; publishing it ends safe mode.
+    pub(super) fn publish_with_metadata(
         &mut self,
         mut config: Config,
         metadata: Vec<MigrationItem>,
     ) -> Result<(), CommandError> {
         if let Some(reason) = self.safe_mode {
-            if !(self.safe_import && config == self.draft) {
+            if !(super::import_leaves_safe_mode(reason)
+                && self
+                    .pending_import
+                    .as_ref()
+                    .is_some_and(|(preview, _)| preview == &config))
+            {
                 return Err(CommandError::SafeMode { reason });
             }
         }
@@ -102,16 +112,12 @@ impl Store {
                     &self.active_unresolved,
                 )?;
             }
-            self.write_data(&self.dir.join("draft.json"), &config)?;
             self.write_data(
                 &revisions.join(format!("{}.metadata.json", config.revision)),
                 &metadata,
             )?;
-            self.write_data(&self.dir.join("migration-unresolved.json"), &metadata)?;
-            self.write_data(
-                &self.dir.join("active-migration-unresolved.json"),
-                &metadata,
-            )?;
+            // Revision metadata is staged first; active.json is the commit pointer.
+            // Failed saves leave the previous revision's metadata authoritative.
             // R3: the predecessor is recorded before the new revision becomes
             // active, so that after a restart rollback returns where it would
             // now. If it is not written (store-meta.json read-only this
@@ -147,9 +153,8 @@ impl Store {
             self.previous_unresolved = vec![];
         }
         self.active_unresolved = metadata.clone();
-        self.unresolved = metadata;
         self.pending_import = None;
-        self.draft = config;
+        self.pending_import_token = None;
         self.disk_hash = Some(Sha256::digest(&new_bytes).to_vec());
         restore(self);
         if self.safe_mode.is_some() {
@@ -235,6 +240,171 @@ mod tests {
     use super::super::{atomic::atomic_json, test_support::*};
     use super::*;
     #[test]
+    fn save_config_updates_engine_immediately_and_rejects_stale_revision() {
+        let dir = std::env::temp_dir().join(format!("quicktext-direct-{}", uuid::Uuid::new_v4()));
+        let mut store = Store::load(dir.clone());
+        let first = metadata_config(&["first"]);
+        store.save_config(first.clone(), None).unwrap();
+        assert_eq!(store.active.revision, 1);
+        assert_eq!(*store.engine.config.lock().unwrap(), store.active);
+        assert_eq!(store.active.rules, first.rules);
+        let committed = fs::read(dir.join("active.json")).unwrap();
+        assert!(matches!(
+            store.save_config(first, None),
+            Err(CommandError::RevisionConflict { current: 1 })
+        ));
+        assert_eq!(fs::read(dir.join("active.json")).unwrap(), committed);
+        assert_eq!(*store.engine.config.lock().unwrap(), store.active);
+        assert!(!dir.join("draft.json").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn preview_is_memory_only_and_failed_confirmation_keeps_active_originals() {
+        let dir =
+            std::env::temp_dir().join(format!("quicktext-direct-import-{}", uuid::Uuid::new_v4()));
+        let mut store = Store::load(dir.clone());
+        let first = metadata_config(&["shared"]);
+        let token = store.preview_import(first.clone(), vec![original("shared", "A")]);
+        store.save_config(first, Some(token)).unwrap();
+        let committed = fs::read(dir.join("active.json")).unwrap();
+        let metadata = fs::read(dir.join("revisions/1.metadata.json")).unwrap();
+        let mut preview = store.active.clone();
+        preview.rules[0].description = "imported preview".into();
+        let token = store.preview_import(preview.clone(), vec![original("shared", "B")]);
+        assert_eq!(fs::read(dir.join("active.json")).unwrap(), committed);
+        assert_eq!(store.active_unresolved[0].original["synthetic_source"], "A");
+        let exported: serde_json::Value =
+            serde_json::from_str(&store.export_snapshot().unwrap()).unwrap();
+        assert_ne!(
+            exported["config"]["rules"][0]["description"],
+            "imported preview"
+        );
+        fs::create_dir(dir.join("active.json.tmp")).unwrap();
+        assert!(store
+            .save_config(preview.clone(), Some(token.clone()))
+            .is_err());
+        assert_eq!(fs::read(dir.join("active.json")).unwrap(), committed);
+        assert_eq!(
+            fs::read(dir.join("revisions/1.metadata.json")).unwrap(),
+            metadata
+        );
+        assert_eq!(store.active_unresolved[0].original["synthetic_source"], "A");
+        assert_eq!(*store.engine.config.lock().unwrap(), store.active);
+        assert!(store.pending_import.is_some());
+        fs::remove_dir(dir.join("active.json.tmp")).unwrap();
+        store.meta.clear_run_marker();
+        let reloaded = Store::load(dir.clone());
+        assert_eq!(
+            reloaded.active_unresolved[0].original["synthetic_source"],
+            "A"
+        );
+        reloaded.meta.clear_run_marker();
+        drop(reloaded);
+        store.save_config(preview, Some(token)).unwrap();
+        assert!(store.pending_import.is_none());
+        assert_eq!(store.active_unresolved[0].original["synthetic_source"], "B");
+        store.meta.clear_run_marker();
+        drop(store);
+        let reloaded = Store::load(dir.clone());
+        assert_eq!(reloaded.active.rules[0].description, "imported preview");
+        assert_eq!(
+            reloaded.active_unresolved[0].original["synthetic_source"],
+            "B"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn import_tokens_bind_the_exact_preview_and_expire_when_replaced() {
+        let dir = std::env::temp_dir().join(format!("quicktext-tokens-{}", uuid::Uuid::new_v4()));
+        let mut store = Store::load(dir.clone());
+        let config = metadata_config(&["shared"]);
+        let a = store.preview_import(config.clone(), vec![original("shared", "A")]);
+        let b = store.preview_import(config.clone(), vec![original("shared", "B")]);
+        assert!(matches!(
+            store.save_config(config.clone(), Some(a)),
+            Err(CommandError::TokenExpired)
+        ));
+        assert!(!dir.join("active.json").exists());
+        let mut changed = config.clone();
+        changed.enabled = false;
+        assert!(matches!(
+            store.save_config(changed, Some(b.clone())),
+            Err(CommandError::TokenExpired)
+        ));
+        store.save_config(config, Some(b)).unwrap();
+        assert_eq!(store.active_unresolved[0].original["synthetic_source"], "B");
+        let current = store.active.clone();
+        let token = store.preview_import(current.clone(), vec![original("shared", "unconfirmed")]);
+        store.save_config(current, None).unwrap();
+        assert_eq!(store.active_unresolved[0].original["synthetic_source"], "B");
+        let current = store.active.clone();
+        assert!(matches!(
+            store.save_config(current, Some(token)),
+            Err(CommandError::TokenExpired)
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ordinary_save_cannot_claim_the_safe_mode_import_exemption() {
+        let dir =
+            std::env::temp_dir().join(format!("quicktext-safe-import-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("active.json"), b"{").unwrap();
+        let mut store = Store::load(dir.clone());
+        let config = metadata_config(&["recovery"]);
+        let token = store.preview_import(config.clone(), vec![original("recovery", "R")]);
+        assert!(matches!(
+            store.save_config(config.clone(), None),
+            Err(CommandError::SafeMode { .. })
+        ));
+        store.save_config(config, Some(token)).unwrap();
+        assert_eq!(store.safe_mode(), None);
+        assert_eq!(store.active_unresolved[0].original["synthetic_source"], "R");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_unconfirmed_content_is_archived_once_and_never_activated() {
+        let dir = std::env::temp_dir().join(format!("quicktext-legacy-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let active = metadata_config(&["active"]);
+        let unconfirmed = metadata_config(&["unconfirmed"]);
+        atomic_json(&dir.join("active.json"), &active).unwrap();
+        atomic_json(&dir.join("draft.json"), &unconfirmed).unwrap();
+        atomic_json(
+            &dir.join("migration-unresolved.json"),
+            &vec![original("unconfirmed", "legacy")],
+        )
+        .unwrap();
+        let legacy = fs::read(dir.join("draft.json")).unwrap();
+        for _ in 0..2 {
+            let store = Store::load(dir.clone());
+            assert_eq!(store.active, active);
+            assert_eq!(*store.engine.config.lock().unwrap(), active);
+            assert_eq!(
+                fs::read(dir.join("legacy-unconfirmed/draft.json")).unwrap(),
+                legacy
+            );
+            assert!(!dir.join("draft.json").exists());
+            assert!(!dir.join("migration-unresolved.json").exists());
+            assert_eq!(
+                fs::read_dir(dir.join("legacy-unconfirmed"))
+                    .unwrap()
+                    .count(),
+                2
+            );
+            let state = serde_json::to_value(store.state()).unwrap();
+            assert!(state.get("draft").is_none());
+            assert!(state.get("dirty").is_none());
+            store.meta.clear_run_marker();
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn rollback_restores_revision_originals_after_reload() {
         let dir =
             std::env::temp_dir().join(format!("quicker-metadata-test-{}", uuid::Uuid::new_v4()));
@@ -243,15 +413,14 @@ mod tests {
             let mut config = metadata_config(&["shared"]);
             config.rules[0].description = marker.into();
             store.pending_import = Some((config.clone(), vec![original("shared", marker)]));
-            store.save(config).unwrap();
-            store.publish(store.draft.clone()).unwrap();
+            store.publish(config).unwrap();
         }
         drop(store);
         let mut store = Store::load(dir.clone());
         store.rollback_previous().unwrap();
         assert_eq!(store.active.revision, 3);
         assert_eq!(store.active.rules[0].description, "A");
-        assert_eq!(store.unresolved[0].original["synthetic_source"], "A");
+        assert_eq!(store.active_unresolved[0].original["synthetic_source"], "A");
         drop(store);
         let store = Store::load(dir.clone());
         assert_eq!(store.active_unresolved[0].original["synthetic_source"], "A");
@@ -283,8 +452,7 @@ mod tests {
         let old = s.active.clone();
         listening(&s);
         assert!(!s.engine.paused.load(Ordering::SeqCst));
-        fs::remove_file(dir.join("draft.json")).unwrap();
-        fs::create_dir(dir.join("draft.json")).unwrap();
+        fs::create_dir(dir.join("active.json.tmp")).unwrap();
         let mut next = old.clone();
         next.enabled = false;
         assert!(s.publish(next).is_err());

@@ -72,6 +72,26 @@ pub fn export_excel_template(
     Ok(Some(target.to_string_lossy().into_owned()))
 }
 
+/// Export the active configuration; generation uses a coherent JSON-equivalent snapshot.
+#[tauri::command]
+pub fn export_excel_config(
+    path: Option<String>,
+    store: tauri::State<crate::app_state::Managed>,
+) -> Result<Option<String>, CommandError> {
+    let target = path.map(std::path::PathBuf::from).or_else(|| {
+        dialog(&[("Excel 配置", &["xlsx"])])
+            .set_file_name("quicktext-config.xlsx")
+            .save_file()
+    });
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    let snapshot = store.lock().export_snapshot()?;
+    let bytes = crate::excel::export_config(&snapshot).map_err(CommandError::validation)?;
+    store.lock().export_bytes(&target, &bytes)?;
+    Ok(Some(target.to_string_lossy().into_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

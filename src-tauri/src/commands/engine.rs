@@ -301,7 +301,7 @@ mod tests {
         runtime.publish_health(healthy.clone());
         let revision = {
             let mut store = managed.lock();
-            let draft = store.draft.clone();
+            let draft = store.active.clone();
             store.publish(draft).unwrap();
             store.active.revision
         };
