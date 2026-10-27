@@ -2,7 +2,15 @@ import { Fragment, useId, useRef, useState } from 'react';
 import { call } from './ipc/transport';
 import { diagnosticText, parseCommandError } from './ipc/errors';
 import { choiceCapability, choiceOffer, findCapability } from './lib/capabilities';
-import { actionChoice, actionLabel, actionOptions, clone, Data, Rule } from './model';
+import {
+  actionChoice,
+  actionLabel,
+  actionOptions,
+  clone,
+  Data,
+  offeredChoices,
+  Rule,
+} from './model';
 import { moveItem, withoutKey } from './lib/list';
 import {
   actionDiagnostics,
@@ -513,6 +521,8 @@ export default function ActionEditor({
           value={actionChoice(a)}
           platform={platform}
           options={actionOptions.flatMap(([k, v]) => {
+            // Types not offered for new rules keep an entry on a rule that has one.
+            if (!offeredChoices.has(k) && k !== actionChoice(a)) return [];
             const { hidden, disabled, note } = offer(k);
             return hidden ? [] : [{ value: k, label: `${v}${note}`, disabled }];
           })}
@@ -532,25 +542,28 @@ export default function ActionEditor({
       </label>
       {(a.type === 'text' || a.type === 'send_keys') && (
         <>
-          <div className="inline">
-            <label>
-              要输出的文字来自哪里{' '}
-              <select
-                value={a.source.type}
-                onChange={(e) =>
-                  edit({
-                    source:
-                      e.target.value === 'file'
-                        ? { type: 'file', path: '', encoding: 'utf8' }
-                        : { type: 'inline', value: '' },
-                  })
-                }
-              >
-                <option value="inline">在这里填写文字</option>
-                <option value="file">读取文字文件</option>
-              </select>
-            </label>
-          </div>
+          {/* Reading a text file is kept for rules that already do; new rules type the text here. */}
+          {a.source.type === 'file' && (
+            <div className="inline">
+              <label>
+                要输出的文字来自哪里{' '}
+                <select
+                  value={a.source.type}
+                  onChange={(e) =>
+                    edit({
+                      source:
+                        e.target.value === 'file'
+                          ? { type: 'file', path: '', encoding: 'utf8' }
+                          : { type: 'inline', value: '' },
+                    })
+                  }
+                >
+                  <option value="inline">在这里填写文字</option>
+                  <option value="file">读取文字文件</option>
+                </select>
+              </label>
+            </div>
+          )}
           {a.source.type === 'file' ? (
             <>
               <label className="field">
@@ -631,7 +644,8 @@ export default function ActionEditor({
               <small>这些按钮会加入一个标记，执行指令时再换成当时的文字、日期或时间。</small>
             </>
           )}
-          {a.type === 'send_keys' && (
+          {/* Only for a rule already running copied text as key commands: turned off, the block goes. */}
+          {a.type === 'send_keys' && (a.syntax_variables ?? []).length > 0 && (
             <div className="dynamic-source">
               <h4>来自剪贴板或选中文字的处理方式</h4>
               {[
@@ -844,21 +858,26 @@ export default function ActionEditor({
           <button onClick={() => choosePath('file', (p) => edit({ target: p[0] }))}>
             选择文件或应用
           </button>
-          <label className="field">
-            <span>启动程序时附带的内容（每行一项，通常留空）</span>
-            <textarea
-              rows={3}
-              value={a.args.join('\n')}
-              onChange={(e) => edit({ args: e.target.value ? e.target.value.split('\n') : [] })}
-            />
-          </label>
-          <label className="field">
-            <span>程序启动时使用的文件夹（通常留空）</span>
-            <input
-              value={a.working_directory ?? ''}
-              onChange={(e) => edit({ working_directory: e.target.value || null })}
-            />
-          </label>
+          {/* Kept visible only on a rule that already has them, so they can be cleared. */}
+          {a.args.length > 0 && (
+            <label className="field">
+              <span>启动程序时附带的内容（每行一项，通常留空）</span>
+              <textarea
+                rows={3}
+                value={a.args.join('\n')}
+                onChange={(e) => edit({ args: e.target.value ? e.target.value.split('\n') : [] })}
+              />
+            </label>
+          )}
+          {a.working_directory && (
+            <label className="field">
+              <span>程序启动时使用的文件夹（通常留空）</span>
+              <input
+                value={a.working_directory ?? ''}
+                onChange={(e) => edit({ working_directory: e.target.value || null })}
+              />
+            </label>
+          )}
         </>
       )}
       {a.type === 'common' && (

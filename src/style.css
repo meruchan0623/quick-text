@@ -959,8 +959,10 @@ dd {
 .settings table tr:last-child td {
   border-bottom: 0;
 }
-.fixed-value {
-  font-size: 13px;
+.advanced-settings > summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
 }
 .license {
   max-width: 640px;

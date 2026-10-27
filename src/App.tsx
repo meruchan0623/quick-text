@@ -174,7 +174,6 @@ export default function App() {
     [tab, setTab] = useState('manage'),
     [search, setSearch] = useState(''),
     [group, setGroup] = useState('全部'),
-    [hide, setHide] = useState(false),
     [selected, setSelected] = useState<string[]>([]),
     [editing, setEditingState] = useState<Rule | null>(null),
     [busy, setBusy] = useState(false),
@@ -186,7 +185,6 @@ export default function App() {
       importConfig?: Config;
       importToken?: string;
     } | null>(null),
-    [sort, setSort] = useState<'match' | 'group'>('match'),
     [localDirty, setLocalDirty] = useState(false),
     [autoListenMissing, setAutoListenMissing] = useState(false);
   const [editingErrors, setEditingErrors] = useState<Data[]>([]);
@@ -746,11 +744,7 @@ export default function App() {
           .toLowerCase()
           .includes(needle),
     )
-    .sort((a, b) =>
-      (sort === 'match' ? a.match.value : groupKey(a.group)).localeCompare(
-        sort === 'match' ? b.match.value : groupKey(b.group),
-      ),
-    );
+    .sort((a, b) => a.match.value.localeCompare(b.match.value));
   const unreadableRows =
     group === '全部'
       ? unreadable.filter((u) => `无法读取的规则 ${u.id ?? ''}`.toLowerCase().includes(needle))
@@ -796,17 +790,15 @@ export default function App() {
       if (!p?.length) return;
       const strategy = await askValue({
         title: '遇到重复的指令时怎么处理？',
-        detail:
-          '更新相同编号会替换对应指令并保留其他规则；替换全部会移除未包含在导入文件中的规则。',
+        detail: '用文件更新会替换编号相同的指令并保留其他指令；替换全部会移除文件中没有的指令。',
         confirm: '导入',
         input: {
-          label: '冲突策略',
+          label: '重复的指令',
           value: 'merge',
           options: [
-            { value: 'merge', label: '保留现有（merge）' },
-            { value: 'overwrite', label: '更新相同编号（overwrite）' },
-            { value: 'keep_both', label: '保留两份（keep_both）' },
-            { value: 'replace', label: '替换全部（replace）' },
+            { value: 'merge', label: '保留现有指令，只添加新的' },
+            { value: 'overwrite', label: '用文件中的内容更新' },
+            { value: 'replace', label: '替换全部指令' },
           ],
         },
       });
@@ -1003,10 +995,6 @@ export default function App() {
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
               />
-              <label>
-                <input type="checkbox" checked={hide} onChange={(e) => setHide(e.target.checked)} />
-                隐藏摘要
-              </label>
               <button
                 className="primary"
                 disabled={!editable}
@@ -1093,9 +1081,6 @@ export default function App() {
               >
                 删除
               </button>
-              <button onClick={() => setSort(sort === 'match' ? 'group' : 'match')}>
-                排序：{sort === 'match' ? '缩写' : '分组'}
-              </button>
             </div>
             <div className="table-wrap">
               <table>
@@ -1114,7 +1099,7 @@ export default function App() {
                     <th>说明</th>
                     <th>分组</th>
                     <th>操作类型</th>
-                    {!hide && <th>摘要</th>}
+                    <th>摘要</th>
                     <th>停用</th>
                     <th>操作</th>
                   </tr>
@@ -1164,7 +1149,7 @@ export default function App() {
                       <td>{r.description || '—'}</td>
                       <td>{groupKey(r.group)}</td>
                       <td>{actionLabel(r.action)}</td>
-                      {!hide && <td className="summary">{summarizeAction(r.action)}</td>}
+                      <td className="summary">{summarizeAction(r.action)}</td>
                       <td>
                         <input
                           aria-label={`停用 ${r.match.value}`}
@@ -1202,7 +1187,7 @@ export default function App() {
                   {unreadableRows.map((u) => (
                     <tr key={`unreadable-${u.index}`} className="unreadable-row">
                       <td />
-                      <td colSpan={hide ? 7 : 8}>
+                      <td colSpan={8}>
                         <strong>无法读取的规则</strong>
                         {u.id && <span className="unreadable-id">{u.id}</span>}
                         {/* Read-only here means only that this UI cannot edit the entry safely; the
@@ -1268,22 +1253,9 @@ export default function App() {
                 onChange={(v) => change({ ...config.globals, terminators: v })}
               />
             </Field>
-            <Field label="词分隔符" hint="空格、Tab、换行用于确定触发边界。">
-              <input
-                value={config.globals.word_separators}
-                onChange={(e) => change({ ...config.globals, word_separators: e.target.value })}
-              />
-            </Field>
-            {fixedImeErasure(platform) ? (
-              // Principle 5 (S-16): the Windows input backend only erases by Backspace, so the Esc
-              // method it never runs is not offered; a stored `escape` is kept for other platforms.
-              <Field
-                label="默认输入法删除方式"
-                hint="Windows 版固定按缩写长度退格删除，不提供其他方式。中文选字中的数字或空格可能选择候选词，建议切到英文输入后使用。"
-              >
-                <span className="fixed-value">按缩写长度退格删除</span>
-              </Field>
-            ) : (
+            {/* Principle 5 (S-16): the Windows input backend only erases by Backspace, so there is
+                nothing to choose there; a stored `escape` is kept for other platforms. */}
+            {!fixedImeErasure(platform) && (
               <Field
                 label="默认输入法删除方式"
                 hint="中文选字中的数字或空格可能选择候选词，建议切到英文输入后使用。"
@@ -1307,6 +1279,15 @@ export default function App() {
                 onChange={(blacklist) => change({ ...config.globals, blacklist })}
               />
             </Field>
+            <details className="advanced-settings">
+              <summary>高级设置（通常不用修改）</summary>
+              <Field label="词分隔符" hint="空格、Tab、换行用于确定触发边界。">
+                <input
+                  value={config.globals.word_separators}
+                  onChange={(e) => change({ ...config.globals, word_separators: e.target.value })}
+                />
+              </Field>
+            </details>
           </fieldset>
           <button
             disabled={!editable}
@@ -1388,8 +1369,6 @@ export default function App() {
                   state?.engine_status ||
                   '尚未连接')}
             </dd>
-            <dt>当前生效版本</dt>
-            <dd>{state?.revision ?? 0}</dd>
           </dl>
           <div className="inline">
             <button onClick={() => refresh('refresh')}>刷新状态</button>
@@ -1507,20 +1486,26 @@ export default function App() {
                     />
                     英文不区分大小写（如 abc 和 ABC）
                   </label>
-                  <label>
-                    <input
-                      type="checkbox"
-                      disabled={editing.trigger_mode === 'immediate'}
-                      checked={editing.match.kind === 'regex'}
-                      onChange={(e) =>
-                        setEditing({
-                          ...editing,
-                          match: { ...editing.match, kind: e.target.checked ? 'regex' : 'literal' },
-                        })
-                      }
-                    />
-                    用文字匹配规则（正则表达式，高级）
-                  </label>
+                  {/* Regular expressions are not offered for new rules; one that has it can turn it off. */}
+                  {editing.match.kind === 'regex' && (
+                    <label>
+                      <input
+                        type="checkbox"
+                        disabled={editing.trigger_mode === 'immediate'}
+                        checked
+                        onChange={(e) =>
+                          setEditing({
+                            ...editing,
+                            match: {
+                              ...editing.match,
+                              kind: e.target.checked ? 'regex' : 'literal',
+                            },
+                          })
+                        }
+                      />
+                      用正则表达式匹配（取消后按普通缩写匹配）
+                    </label>
+                  )}
                 </div>
                 <Field label="说明" hint="写下这条指令的用途，方便以后查找。">
                   <input
@@ -1552,7 +1537,7 @@ export default function App() {
                 >
                   <select value={editing.trigger_mode} onChange={(e) => changeMode(e.target.value)}>
                     <option value="terminator">输入缩写后，再按空格、分号等指定键执行</option>
-                    <option value="immediate">缩写输入完成后立即执行（不支持匹配规则）</option>
+                    <option value="immediate">缩写输入完成后立即执行</option>
                   </select>
                 </Field>
                 {editing.trigger_mode === 'terminator' && (
@@ -1603,13 +1588,14 @@ export default function App() {
                     )}
                   </>
                 )}
-                {!fixedImeErasure(platform) && (
+                {/* Each rule follows the default; an override from an older version stays editable. */}
+                {!fixedImeErasure(platform) && editing.ime_erasure !== null && (
                   <Field
                     label="如何清除输入法中的缩写"
                     hint="通常使用默认设置；输出后请查看目标结果。"
                   >
                     <select
-                      value={editing.ime_erasure ?? 'inherit'}
+                      value={editing.ime_erasure}
                       onChange={(e) =>
                         setEditing({
                           ...editing,
@@ -1629,31 +1615,34 @@ export default function App() {
                     </select>
                   </Field>
                 )}
-                <Field
-                  label="传给操作的内容来自哪里"
-                  hint="通常保持默认。调用另一条指令或打开链接时，可把匹配到的文字作为附带内容传过去。"
-                >
-                  <select
-                    value={editing.parameter.type}
-                    onChange={(e) =>
-                      setEditing({
-                        ...editing,
-                        parameter:
-                          e.target.value === 'fixed'
-                            ? { type: 'fixed', value: '' }
-                            : e.target.value === 'capture_template'
-                              ? { type: 'capture_template', template: '' }
-                              : { type: e.target.value },
-                      })
-                    }
+                {/* Not offered for new rules; a rule that already sets it can change it back. */}
+                {editing.parameter.type !== 'default_match' && (
+                  <Field
+                    label="传给操作的内容来自哪里"
+                    hint="通常保持默认。调用另一条指令或打开链接时，可把匹配到的文字作为附带内容传过去。"
                   >
-                    <option value="default_match">这次匹配到的文字（默认）</option>
-                    <option value="fixed">每次使用相同内容</option>
-                    <option value="first_capture">匹配规则中第一对括号里的文字（高级）</option>
-                    <option value="capture_template">组合匹配规则中括号里的文字（高级）</option>
-                    <option value="null">不传入内容</option>
-                  </select>
-                </Field>
+                    <select
+                      value={editing.parameter.type}
+                      onChange={(e) =>
+                        setEditing({
+                          ...editing,
+                          parameter:
+                            e.target.value === 'fixed'
+                              ? { type: 'fixed', value: '' }
+                              : e.target.value === 'capture_template'
+                                ? { type: 'capture_template', template: '' }
+                                : { type: e.target.value },
+                        })
+                      }
+                    >
+                      <option value="default_match">这次匹配到的文字（默认）</option>
+                      <option value="fixed">每次使用相同内容</option>
+                      <option value="first_capture">匹配规则中第一对括号里的文字（高级）</option>
+                      <option value="capture_template">组合匹配规则中括号里的文字（高级）</option>
+                      <option value="null">不传入内容</option>
+                    </select>
+                  </Field>
+                )}
                 {editing.parameter.type === 'fixed' && (
                   <input
                     aria-label="每次传入的固定内容"

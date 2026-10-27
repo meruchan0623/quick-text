@@ -621,14 +621,31 @@ describe('rule list, editor and settings (F-04)', () => {
       await click(mounted, '文本指令参数设置');
       const settings = container.querySelector('.settings')?.textContent ?? '';
       expect(settings.includes('按 Esc')).toBe(platform !== 'windows');
-      expect(settings.includes('按缩写长度退格删除')).toBe(platform === 'windows');
+      // Windows has nothing to choose, so nothing is shown there.
+      expect(settings.includes('按缩写长度退格删除')).toBe(false);
       expect(settings.includes('macOS 版尚未经过实机验收')).toBe(platform === 'macos');
       await click(mounted, '文本指令管理');
       await click(mounted, '编辑');
       const editor = dialog(container, '编辑文本指令')?.textContent ?? '';
       expect(editor).toMatch(/编辑文本指令|触发/);
+      // A rule follows the default unless it already overrides it.
+      expect(editor.includes('如何清除输入法中的缩写')).toBe(false);
+    },
+  );
+
+  it.each(['windows', 'macos'] as const)(
+    "keeps a rule's own IME erasure editable where it runs: %s",
+    async (platform) => {
+      const mounted = await mount({ platform }, (backend) => {
+        (backend.active.rules[0] as { ime_erasure: string | null }).ime_erasure = 'backspace';
+      });
+      const { container } = mounted;
+      await waitFor(mounted, () => {
+        expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
+      });
+      await click(mounted, '编辑');
+      const editor = dialog(container, '编辑文本指令')?.textContent ?? '';
       expect(editor.includes('如何清除输入法中的缩写')).toBe(platform !== 'windows');
-      expect(editor.includes('按 Esc')).toBe(platform !== 'windows');
     },
   );
 
@@ -788,13 +805,15 @@ describe('rule list, editor and settings (F-04)', () => {
         expect(dialog(mounted.container, '遇到重复的指令时怎么处理？')).not.toBeNull();
       });
       const strategyDialog = dialog(mounted.container, '遇到重复的指令时怎么处理？');
-      expect(strategyDialog?.textContent).toContain('保留其他规则');
+      expect(strategyDialog?.textContent).toContain('保留其他指令');
       const select = strategyDialog?.querySelector('select');
       if (!(select instanceof HTMLSelectElement)) throw new Error('no import strategy');
       expect(select.value).toBe('merge');
       expect(select.querySelector('option[value="overwrite"]')?.textContent).toBe(
-        '更新相同编号（overwrite）',
+        '用文件中的内容更新',
       );
+      // Two copies of the same command only confuse; that choice is not offered.
+      expect(select.querySelector('option[value="keep_both"]')).toBeNull();
       await mounted.act(() => {
         select.value = 'overwrite';
         select.dispatchEvent(new Event('change', { bubbles: true }));
@@ -2990,15 +3009,9 @@ describe('action types by capability status (S-16, principle 5)', () => {
       text: `粘贴纯文本${unavailable}`,
       disabled: true,
     });
-    expect(options.html).toEqual({
-      text: `粘贴带格式的文字${unavailable}`,
-      disabled: true,
-    });
-    // Experimental (macOS): selectable, tagged.
-    expect(options.replay).toEqual({
-      text: '重放鼠标和键盘操作（实验性）',
-      disabled: false,
-    });
+    // Not offered for new actions: not listed on a rule that does not have the type.
+    for (const type of ['html', 'replay', 'common', 'reusable', 'none'])
+      expect(options[type], type).toBeUndefined();
     // Never provided: not listed.
     expect(options.quicker).toBeUndefined();
     // Needing no capability: plain.
@@ -3009,6 +3022,23 @@ describe('action types by capability status (S-16, principle 5)', () => {
     expect(typeSelect(mounted).value).toBe('text_keys');
   });
 
+  it('keeps listing a type not offered for new actions on a rule that has it', async () => {
+    const action = {
+      type: 'replay',
+      plan: { version: 1, dialect: 'structured', source: null, steps: [] },
+      speed: 1,
+    };
+    const mounted = await editRule('macos', action);
+    expect(typeSelect(mounted).value).toBe('replay');
+    // Experimental (macOS): selectable, tagged.
+    expect(offered(mounted).replay).toEqual({
+      text: '重放鼠标和键盘操作（实验性）',
+      disabled: false,
+    });
+    expect(offered(mounted).html).toBeUndefined();
+    expect(await save(mounted)).toEqual(action);
+  });
+
   it('keeps an action type that is unavailable for now when the rule is opened and saved', async () => {
     const action = { type: 'text', method: 'paste', source: { type: 'inline', value: 'hi' } };
     const mounted = await editRule('windows', action);
@@ -3016,7 +3046,7 @@ describe('action types by capability status (S-16, principle 5)', () => {
     expect(select.value).toBe('text_paste');
     expect(offered(mounted).text_paste?.disabled).toBe(false);
     expect(offered(mounted).text_paste?.text).toMatch(/^粘贴纯文本（暂不可用：.+）$/);
-    expect(offered(mounted).html?.disabled).toBe(true);
+    expect(offered(mounted).html).toBeUndefined();
     expect(dialog(mounted.container, EDITOR)?.querySelector('.capability-warning')).not.toBeNull();
     expect(await save(mounted)).toEqual(action);
   });
@@ -3553,30 +3583,6 @@ describe('number fields of the editor', () => {
     return found;
   }
 
-  async function choose(mounted: Mounted, label: string, value: string): Promise<void> {
-    if (label === '操作类型') {
-      await mounted.act(() => {
-        dialog(mounted.container, EDITOR)
-          ?.querySelector<HTMLButtonElement>('[role="combobox"]')
-          ?.click();
-      });
-      await mounted.act(() => {
-        dialog(mounted.container, EDITOR)
-          ?.querySelector<HTMLElement>(`[role="option"][data-value="${value}"]`)
-          ?.click();
-      });
-      return;
-    }
-    const select = dialog(mounted.container, EDITOR)?.querySelector<HTMLSelectElement>(
-      `select[aria-label="${label}"]`,
-    );
-    if (!select) throw new Error(`no select 「${label}」`);
-    await mounted.act(() => {
-      select.value = value;
-      select.dispatchEvent(new Event('change', { bubbles: true }));
-    });
-  }
-
   /** Mount with `extra` rules (matched `;a-…`, so listed first) and open the first one. */
   async function editFirst(...extra: ReturnType<typeof rule>[]): Promise<Mounted> {
     const mounted = await mount({}, (backend) => {
@@ -3648,44 +3654,7 @@ describe('number fields of the editor', () => {
     return rules.at(-1)?.action;
   }
 
-  it('refuses a reusable number parameter past 2^53−1 in a new rule, keeping it editable', async () => {
-    const mounted = await mount();
-    const { backend, container } = mounted;
-    await waitFor(mounted, () => {
-      expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
-    });
-    await click(mounted, '＋ 添加指令');
-    const editor = dialog(container, EDITOR);
-    await type(mounted, field(editor ?? container, '缩写词'), ';big');
-    await choose(mounted, '操作类型', 'reusable');
-    await choose(mounted, '复用已保存指令', 'mock-rule-1');
-    await clickIn(mounted, editor, '＋ 添加参数');
-    await choose(mounted, '参数类型', 'number');
-    await type(mounted, input(editor, '参数值'), '9007199254740993');
-    // Not turned into 9007199254740992 by Number().
-    expectInvalid(input(editor, '参数值'), '9007199254740993', `请输入 ${JSON_RANGE}。`);
-
-    await clickIn(mounted, editor, '测试动作（真实执行）');
-    await waitFor(mounted, () => {
-      expect(container.querySelector('.alert.error')?.textContent).toMatch(/有数值需要修改/);
-    });
-    expect(callsOf(backend, 'execute_action')).toHaveLength(0);
-    const listed = `操作设置 · 参数「param1」的值应为 ${JSON_RANGE}。`;
-    await expectSaveRefused(mounted, listed);
-    expect(backend.active.rules).toHaveLength(3);
-    expectNoMarkerSent(backend);
-    // Still editable: the largest safe integer goes through as typed.
-    expectInvalid(input(editor, '参数值'), '9007199254740993', `请输入 ${JSON_RANGE}。`);
-    await type(mounted, input(editor, '参数值'), '9007199254740991');
-    expect(input(editor, '参数值').getAttribute('aria-invalid')).toBeNull();
-    expect(await save(mounted)).toEqual({
-      type: 'reusable',
-      action_id: 'mock-rule-1',
-      parameters: { param1: 9007199254740991 },
-    });
-  });
-
-  it('refuses the same when editing an existing reusable rule, which stays editable', async () => {
+  it('refuses a reusable number parameter past 2^53−1 on an existing rule, which stays editable', async () => {
     const reuse = rule(';a-reuse', {
       type: 'reusable',
       action_id: 'mock-rule-1',
@@ -3697,6 +3666,11 @@ describe('number fields of the editor', () => {
     expect(input(editor, '参数值').value).toBe('5');
     await type(mounted, input(editor, '参数值'), '9007199254740993');
     expectInvalid(input(editor, '参数值'), '9007199254740993', `请输入 ${JSON_RANGE}。`);
+    await clickIn(mounted, editor, '测试动作（真实执行）');
+    await waitFor(mounted, () => {
+      expect(container.querySelector('.alert.error')?.textContent).toMatch(/有数值需要修改/);
+    });
+    expect(callsOf(backend, 'execute_action')).toHaveLength(0);
     await expectSaveRefused(mounted, `操作设置 · 参数「count」的值应为 ${JSON_RANGE}。`);
     expect(backend.active.rules.at(-1)).toEqual(reuse);
     // 检查这段文字能否触发 sends the rule too: refused before it asks for the text.
