@@ -22,6 +22,7 @@ import {
   State,
 } from './model';
 import ActionEditor from './ActionEditor';
+import ExportMenu from './ExportMenu';
 import CaptureTemplate from './CaptureTemplate';
 import RuntimeStatus from './RuntimeStatus';
 import { useAsk } from './Ask';
@@ -45,6 +46,7 @@ import {
 import { effectiveTerminators, unsupportedTerminators } from './lib/terminators';
 import { fixedImeErasure } from './lib/capabilities';
 import { ruleEditDiagnostics } from './lib/numberFields';
+import { describeMatch } from './lib/describe';
 
 // `null` from describe() means the user cancelled: show nothing.
 const errorText = (e: unknown) => describe(e) ?? '';
@@ -68,11 +70,11 @@ const STALE_READ = '读到的仍是较早的版本';
 const stale = (shown: number | undefined, caught: number | null) =>
   shown !== undefined && caught !== null && shown < caught;
 /** Commands that write the store and answer with the whole state. */
-type StoreWrite = 'save_draft' | 'apply_settings' | 'discard_draft' | 'rollback';
-/** How a save changes the config it is given (review C7 §4, see `conclude`). */
+type StoreWrite = 'save_config' | 'rollback';
+/** A confirmed rule/list operation applied to the configuration. */
 type Change = (c: Config) => Config;
 /** The writes that publish a revision of their own, and how a notice about it names them. */
-const MADE_BY = { rollback: '恢复上一个版本', apply_settings: '应用设置' } as const;
+const MADE_BY = { rollback: '恢复上一个版本', save_config: '保存配置' } as const;
 type Own = keyof typeof MADE_BY;
 /** State fields a command answers alone, without the state around them. */
 const SETTINGS = ['autostart', 'auto_listen_on_start'] as const;
@@ -174,18 +176,21 @@ export default function App() {
     [group, setGroup] = useState('全部'),
     [hide, setHide] = useState(false),
     [selected, setSelected] = useState<string[]>([]),
-    [editing, setEditing] = useState<Rule | null>(null),
+    [editing, setEditingState] = useState<Rule | null>(null),
     [busy, setBusy] = useState(false),
     [message, setMessage] = useState('正在连接桌面引擎…'),
     [error, setError] = useState(''),
-    [dialog, setDialog] = useState<{ title: string; data: any; importConfig?: Config } | null>(
-      null,
-    ),
+    [dialog, setDialog] = useState<{
+      title: string;
+      data: any;
+      importConfig?: Config;
+      importToken?: string;
+    } | null>(null),
     [sort, setSort] = useState<'match' | 'group'>('match'),
     [localDirty, setLocalDirty] = useState(false),
     [autoListenMissing, setAutoListenMissing] = useState(false);
   const [editingErrors, setEditingErrors] = useState<Data[]>([]);
-  // The import's save in flight, from 「确认导入草稿」 until it is done or failed: its dialog
+  // The import's save in flight, from 「确认导入并生效」 until it is done or failed: its dialog
   // cannot be closed meanwhile (review C10, see there).
   const [importing, setImporting] = useState(false);
   // Clear the editor's validation errors when another rule is opened.
@@ -199,6 +204,11 @@ export default function App() {
   const sync = runtimeSync();
   const runtime = useRuntime(sync);
   const live = liveStatus(runtime);
+  const editingCurrent = useRef<Rule | null>(null);
+  const setEditing = (value: Rule | null) => {
+    editingCurrent.current = value;
+    setEditingState(value);
+  };
   const edited = useRef(false);
   // Counts every local edit (`change`), so a write can tell whether any came after it was sent.
   const edits = useRef(0);
@@ -231,20 +241,10 @@ export default function App() {
       setEditing({ ...editing, trigger_mode: value, ...(cache ?? {}) });
     }
   };
-  // The revision of the state the editor's config was taken from, and a newer one the editor has
-  // not taken in, shown as a notice until the user decides: one a load read while the editor held
-  // unsaved edits, or one whose draft a save then replaced (`saved`; save_draft has no revision
-  // check). Saving, applying and the other answers leave the notice standing (review C5); it goes
-  // with its buttons, or when the editor takes in the store's config: a load of a later revision,
-  // 放弃未应用草稿, 恢复上一个版本, a save whose answer a later view overtook (see `conclude`).
-  // `by`: the command of this window that made the revision, said instead of 「后台」, which is for
-  // revisions made elsewhere.
+  // The revision this window's unconfirmed settings are based on.
   const editorRevision = useRef<number | null>(null);
-  const [newer, setNewer] = useState<{ revision: number; saved: boolean; by: Own | null } | null>(
-    null,
-  );
-  // The revisions this window's 恢复上一个版本 and 应用设置 made. Each publishes one revision, above
-  // every other (see `install`), and answers with it: no other command or window makes it.
+  const [newer, setNewer] = useState<{ revision: number; by: Own | null } | null>(null);
+  // Revisions published by this window identify delayed answers and their own runtime events.
   const made = useRef(new Map<number, Own>());
   const madeBy = (revision: number) => made.current.get(revision) ?? null;
   // The state shown, as soon as it is set: a write whose answer was not installed puts what is
@@ -254,53 +254,36 @@ export default function App() {
     shown.current = s;
     setState(s);
   };
-  // So is the editor's config: a save's change is made again on it (review C7 §4, `conclude`), and
+  // So is the editor's config: a save's change is reconciled after a publication, and
   // an edit made after an await changes the config as it is then (`change`).
   const editorConfig = useRef(config);
   const putConfig = (c: Config) => {
     editorConfig.current = c;
     setConfig(c);
   };
-  // Where the view the editor's config was taken from stands in the order of `install`.
-  const adopted = useRef({ revision: -1, request: 0 });
   const receive = (s: State) => {
     show(s);
     // A rule field with a serde default may be absent; the editor reads it filled in, as Rust does.
-    const draft = completeConfig(s.draft);
-    putConfig(draft);
+    const active = completeConfig(s.active);
+    putConfig(active);
     // Rules removed by a delete, rollback or import must not stay selected (F-04).
-    setSelected((current) => pruneSelection(current, draft.rules));
+    setSelected((current) => pruneSelection(current, active.rules));
     setLocalDirty(false);
     edited.current = false;
     editorRevision.current = s.revision;
-    // The view received is the one shown: the latest installed.
-    adopted.current = installed.current;
   };
   /** Say a store revision newer than the one the editor's unsaved edits are based on. */
   const sayNewer = (revision: number) => {
     // Unsaved local edits are never replaced by an answer. When the store moved on under them, say
-    // so; the user loads the new config or keeps editing (and saving overwrites).
+    // so; the user loads the new config or keeps editing with the original expected revision.
     const base = editorRevision.current;
     if (base !== null && revision > base) {
       const by = madeBy(revision);
-      setNewer((n) => (n !== null && n.revision >= revision ? n : { revision, saved: false, by }));
+      setNewer((n) => (n !== null && n.revision >= revision ? n : { revision, by }));
     }
   };
-  // Review C6: one rule installs every answer that carries the state: load_state, save_draft,
-  // apply_settings, discard_draft, rollback, set_paused. Each request takes the next request id as
-  // it is sent; its answer is installed only over an earlier view: a later store revision, or the
-  // same revision and a later request. The revision is the authority: while the app runs the
-  // backend never lowers it (a publish, a rollback too, takes one above every revision on disk; the
-  // SafeMode(Locked) retry starts from the 0 of the read-only state), so an answer with a lower one
-  // read the store before the view shown did.
-  // Within a revision, the order sent stands for the order run. The premise (review C7): each of
-  // these commands, and set_autostart and set_auto_listen, ordered by request id below, is a
-  // synchronous `#[tauri::command] fn` (src-tauri/src/commands), which Tauri 2 runs on the main
-  // thread one at a time, in the order the calls arrive; no async command takes part. Only their
-  // answers may reach the window out of order, a delayed one after a later one: what this rule is
-  // for. Were one of them made async, the order sent would no longer say which one ran last.
-  // An answer not installed changes nothing shown; its command still succeeded, resolves as usual
-  // and ends its part in the editor all the same (`conclude`).
+  // Install by monotonic revision first and request order second. A delayed response may
+  // complete its caller, but cannot replace a later authoritative state.
   const requests = useRef(0);
   const installed = useRef({ revision: -1, request: 0 });
   // set_autostart and set_auto_listen answer with the value alone, without a revision; it is
@@ -332,20 +315,7 @@ export default function App() {
     settings.current[field] = { request, value };
     if (shown.current) show({ ...shown.current, [field]: value });
   };
-  // Review C5: the store revision this window has caught up with, by an installed load_state or by
-  // the installed answer of a write that made that revision (apply_settings, rollback) or took the
-  // active one in (discard_draft). Not by save_draft or set_paused: they answer with the active
-  // revision, but the editor has not taken its config in, so a revision published elsewhere would
-  // pass as read. Only installed answers count, and the installed revision never goes down, so
-  // neither does this; should a view older than it ever be shown, `behind` reads again.
-  //
-  // Review I6: with the revision, the safe mode of the view caught up with (`reconciledSafe`). A
-  // view read in Locked or NewerSchema is a placeholder (an empty revision-0 config), not the
-  // store's; the Locked retry that recovers installs the real config at the same revision, which
-  // may be 0. So a change of safe mode makes the view stale whatever the revision: `behind` reads
-  // again until a view of the runtime's safe mode is caught up with, and no config write is sent
-  // meanwhile (`editable`, `write`). Called in install order, so at an equal revision the later
-  // view's safe mode stands.
+  // Last revision and safe mode read by this window; runtime events reconcile through load_state.
   const [reconciled, setReconciled] = useState<number | null>(null);
   const reconciledRef = useRef<number | null>(null);
   const [reconciledSafe, setReconciledSafe] = useState<SafeModeReason | null>(null);
@@ -370,149 +340,63 @@ export default function App() {
   // This window's writes of the store in flight. The store-state a write causes may arrive before
   // its answer; the answer carries the new revision, so no reload is needed for it (see below).
   const [writing, setWriting] = useState(0);
-  // A save with a change (`op`) in flight, until concluded or failed (review C10). The editor does
-  // not have the change until then: a save sent meanwhile would send the editor's config without
-  // it and undo it; 放弃未应用草稿 or 恢复上一个版本 would undo it, and the change would then be
-  // made again over them. So no store write is sent meanwhile, for one IPC round trip: the entries
-  // are disabled (`writable`), and `write` refuses again, from the ref, which is never behind.
+  // All configuration publications are serialized for one IPC round trip.
   const changePending = useRef(false);
   const [changing, setChanging] = useState(false);
-  /**
-   * The editor's part of write `command` that succeeded with answer `s`, done whether or not the
-   * answer was installed (`answerShown`, review C7): a dropped answer must not leave behind edits
-   * the command did away with, nor an editor without what it saved. `untouched`: no local edit
-   * since the request was sent.
-   *
-   * Untouched, the editor takes the latest view installed, whatever the command: the answer, or
-   * the view that overtook it. So for every save (of the editor's config, or of another one: a
-   * rule committed, a list changed, 总开关, an import), 放弃未应用草稿 and 恢复上一个版本. An
-   * answer is dropped only for a view installed with a higher revision, or the same revision and a
-   * later request (`install`).
-   * The store commands are synchronous and run one at a time in the order they arrive, and the
-   * revision never goes down while the app runs: that view is of a read run after this write, so
-   * it has the write's outcome, and maybe later changes from elsewhere. Taking it ends where the
-   * answers in order would have: this answer, then that view.
-   *
-   * Edits made since the request was sent are kept, never replaced by an answer, as with a load;
-   * the editor stays dirty. A save of a config other than the editor's (a rule committed, a list
-   * changed, 总开关, an import) has its change `op` made again on the editor's config, over those
-   * edits, installed or not (review C7 §4). The editor is the draft it took in and the edits made
-   * since; that draft was read before the save ran, so without the change the editor would lack
-   * what was saved, and its next save would undo it. Exact: edits change the globals alone (see
-   * `change`), these saves the rules or 总开关 (an import all of it, see there). No store write of
-   * this window is sent while such a save runs (`write`), so a view read after it ran is a load's,
-   * and has its outcome; the editor that took one in (「放弃修改，载入新配置」) does not have the
-   * change made again over it, nor over what undid it elsewhere (review C10). A save that failed is
-   * not concluded, so its change is not made again.
-   */
-  const conclude = (
-    command: StoreWrite,
-    s: State,
-    request: number,
-    answerShown: boolean,
-    untouched: boolean,
-    op?: Change,
-  ) => {
-    const now = shown.current;
-    // Never null: every write waits for the first snapshot.
-    if (now === null) return;
-    if (untouched) {
-      receive(now);
-      // The store's config is in the editor now: a notice about a newer revision is moot.
-      if (command === 'discard_draft' || command === 'rollback') setNewer(null);
-      // A save or apply leaves a notice standing (review C5), but not one the overtaking view
-      // raised over the edits this write saved: there are none left to keep.
-      else if (!answerShown)
-        setNewer((n) => (n !== null && !n.saved && n.revision <= now.revision ? null : n));
-    } else if (command === 'save_draft' || command === 'apply_settings') {
-      // The revision answering this window's save or apply has the editor's config, as sent: not
-      // newer than it. A view of the revision applied, installed first, said it was; in order, it
-      // would not have.
-      editorRevision.current = Math.max(editorRevision.current ?? s.revision, s.revision);
-      if (command === 'apply_settings')
-        setNewer((n) => (n !== null && !n.saved && n.revision === s.revision ? null : n));
-      else if (op !== undefined) {
-        const taken = adopted.current;
-        if (
-          taken.revision < s.revision ||
-          (taken.revision === s.revision && taken.request < request)
-        ) {
-          const next = op(editorConfig.current);
-          // Not an edit: `edits` is for edits alone, and the editor holds what the store does not.
-          putConfig(next);
-          setSelected((current) => pruneSelection(current, next.rules));
-          setLocalDirty(true);
-          edited.current = true;
-        }
-      }
-    } else if (answerShown) sayNewer(s.revision);
-  };
-  /**
-   * Write `command`; `op`: how a save of a config other than the editor's changes it. None while
-   * such a save is in flight (`changePending`).
-   */
+  /** Publish once; delayed answers never replace a newer installed state or later input. */
   const write = async (command: StoreWrite, args?: Record<string, unknown>, op?: Change) => {
     if (changePending.current) throw new Error(SAVE_PENDING);
-    // Review I6: the editor holds a view of another safe mode (Locked's placeholder, say) until the
-    // read `behind` sends installs one of this; a config sent meanwhile would be made of it. The
-    // entries are disabled; this refuses again, from the refs.
     if (reconciledSafeRef.current !== currentSafeMode()) throw new Error(SAFE_MODE_CHANGED);
-    if (op) {
-      changePending.current = true;
-      setChanging(true);
-    }
+    changePending.current = true;
+    setChanging(true);
     setWriting((n) => n + 1);
-    // As the request is sent: the revision the editor's config is based on (review C6), and the
-    // local edits so far (review C7). Applying publishes the store's draft, without the editor's
-    // unsaved edits (made while 应用设置 saved): they count as made since.
     const request = ++requests.current;
-    const base = editorRevision.current;
     const sent = edits.current;
-    const unsaved = command === 'apply_settings' && edited.current;
+    // Rule/list saves must preserve, but do not publish, unconfirmed settings inputs.
+    const keepSettings = op !== undefined && edited.current;
     try {
       const s = await call<State>(command, args);
+      made.current.set(s.revision, command);
       const view = install(s, request);
       if (view !== null) {
         show(view);
-        // Not save_draft's: its config is not the editor's yet (see `reconciled`).
-        if (command !== 'save_draft') reconcileTo(s.revision, s.safe_mode ?? null);
+        reconcileTo(s.revision, s.safe_mode ?? null);
       }
-      if (command === 'rollback' || command === 'apply_settings') {
-        made.current.set(s.revision, command);
-        // A view of this revision, installed before this answer, said it came from elsewhere.
-        setNewer((n) => (n !== null && n.revision === s.revision ? { ...n, by: command } : n));
+      const now = shown.current;
+      if (now === null) return s;
+      if (edits.current === sent && !keepSettings) {
+        receive(now);
+        setNewer(null);
+      } else if ((editorRevision.current ?? -1) <= s.revision) {
+        // Keep settings typed before an unrelated write or after this request. Their next
+        // confirmation still compares against the revision this publication actually made.
+        const globals = editorConfig.current.globals;
+        const next = { ...completeConfig(s.active), globals };
+        putConfig(next);
+        editorRevision.current = s.revision;
+        setSelected((current) => pruneSelection(current, next.rules));
+        setLocalDirty(true);
+        edited.current = true;
+        setNewer(null);
+        if (now.revision > s.revision) sayNewer(now.revision);
       }
-      if (command === 'save_draft') {
-        // Active revision newer than the editor's config: the save replaced the draft of a revision
-        // this window never took in. Said until acknowledged, as is a save over a notice standing,
-        // whether or not the answer is shown. A save that ran before the notice's revision was
-        // published did not overwrite it: that publish replaced the save.
-        const over = { revision: s.revision, saved: true, by: madeBy(s.revision) };
-        setNewer((n) =>
-          n !== null
-            ? s.revision >= n.revision
-              ? over
-              : n
-            : base !== null && s.revision > base
-              ? over
-              : null,
-        );
-      }
-      // After the notice about the save: the editor may take in the view that overtook it.
-      conclude(command, s, request, view !== null, !unsaved && edits.current === sent, op);
       return s;
-    } finally {
-      // In the same step as the answer, so no render sees the write done without its answer; and
-      // with `conclude` done (or the save failed), the change is in the editor (or nowhere).
-      setWriting((n) => n - 1);
-      if (op) {
-        changePending.current = false;
-        setChanging(false);
+    } catch (error) {
+      const parsed = parseCommandError(error);
+      if (parsed.code === 'revision_conflict') {
+        sayNewer(parsed.detail.current);
+        // Read the latest authoritative state, retaining any unconfirmed settings input.
+        void load().catch(() => undefined);
       }
+      throw error;
+    } finally {
+      setWriting((n) => n - 1);
+      changePending.current = false;
+      setChanging(false);
     }
   };
   // Until the first load_state snapshot is applied, `config` is emptyConfig, not the user's: a write
-  // would replace their draft or settings with it. Every write is disabled until then (`ready`) and
+  // would replace their active configuration with it. Every write is disabled until then (`ready`) and
   // refused again by its handler (`requireReady`, read from the ref, which is never behind).
   const loaded = useRef(false);
   const [ready, setReady] = useState(false);
@@ -526,7 +410,7 @@ export default function App() {
   const safeMode: SafeModeReason | null =
     runtime.status === 'ready' ? runtime.safeMode : (state?.safe_mode ?? null);
   // The writes safe mode refuses (ipc-contract §4: all but importing) are disabled with it, and
-  // enabled again when it ends. Import, confirming the import and 应用设置 stay, as committing and
+  // enabled again when it ends. Import, confirming the import and 保存配置 stay, as committing and
   // publishing an import is the way out of CrashLoop and NoValidConfig; so does 导出 (allowed in
   // CrashLoop). The backend decides: the handlers do not check safe mode, and a write made before
   // the event arrives is refused there with the reason.
@@ -557,7 +441,7 @@ export default function App() {
     loaded.current = true;
     setReady(true);
     setLoadFailure('');
-    setMessage('已连接 · 保存写入草稿，应用设置后生效');
+    setMessage('已连接 · 保存后立即生效');
   };
   /**
    * load_state, applied; resolves whether it was. Its answer is installed by the rule above. One
@@ -622,7 +506,7 @@ export default function App() {
   useEffect(() => {
     void loadFirstRef.current();
   }, []);
-  // The legacy load_state fields (target observation, capabilities, draft flags) have no event:
+  // The legacy load_state fields (target observation, capabilities, configuration) have no event:
   // reload them when the window regains focus and on 「刷新状态」. Unsaved local edits are kept.
   const reload = load;
   const reloadRef = useRef(reload);
@@ -736,7 +620,7 @@ export default function App() {
   const togglePause = () =>
     run(async () => {
       const manual = live ? live.manualPause : !!state?.paused;
-      // set_paused only toggles the manual reason; the unsaved draft in the editor stays untouched.
+      // set_paused only toggles the manual reason; the unconfirmed settings input in the editor stays untouched.
       const request = ++requests.current;
       const view = install(await call<State>('set_paused', { paused: !manual }), request);
       if (view !== null) show(view);
@@ -793,8 +677,10 @@ export default function App() {
     });
   // The rule as opened, to tell whether closing the editor would lose changes (F-04).
   const editingBase = useRef('');
+  const editingRevision = useRef<number | null>(null);
   const openEditor = (rule: Rule) => {
     editingBase.current = JSON.stringify(rule);
+    editingRevision.current = editorRevision.current;
     setEditing(rule);
   };
   const closeEditor = async () => {
@@ -803,7 +689,7 @@ export default function App() {
       JSON.stringify(editing) !== editingBase.current &&
       !(await confirmAction({
         title: '放弃未保存的改动？',
-        detail: '这条指令的改动还没有保存到草稿，关闭后会丢失。',
+        detail: '这条指令的改动还没有保存，关闭后会丢失。',
         confirm: '放弃改动',
       }))
     )
@@ -812,7 +698,7 @@ export default function App() {
   };
   // A local edit: the globals, given whole. Local edits change nothing else; the rules and 总开关
   // change by saves alone (a rule committed, a list changed, 总开关, an import), whose change is made
-  // again on the editor after edits made while they ran (`conclude`). That is exact only because
+  // to the authoritative active revision while settings edits remain local. That is exact only because
   // the two change different fields: should an edit come to change the rules or 总开关, think the
   // replay through again.
   const change = (globals: Config['globals']) => {
@@ -826,20 +712,18 @@ export default function App() {
     edited.current = true;
     edits.current += 1;
   };
-  /**
-   * Save the editor's config, or with `op` the config it makes of the editor's: its change, made
-   * again on the editor's config after edits made while it ran (`conclude`). Every path that
-   * submits the config ends here (rules, settings, 总开关, import, export, apply).
-   *
-   * Made of the editor's config as it is when the save is sent, not as the caller's render had it:
-   * the caller may have awaited since (a rule committed waits for validate_config), and edits made
-   * meanwhile go with the save. `write` takes the count of edits as it sends, so they are not
-   * edits made since.
-   */
-  const save = async (op?: Change) => {
+  // A list/rule change publishes against the editor's base revision while settings inputs
+  // remain local until their own save. Import confirmation uses the preview's exact config.
+  const save = async (op?: Change, expectedRevision = editorRevision.current) => {
     requireReady();
     const now = editorConfig.current;
-    return write('save_draft', { config: op ? op(now) : now }, op);
+    const base = op && shown.current ? { ...now, globals: shown.current.active.globals } : now;
+    const next = op ? op(base) : base;
+    return write(
+      'save_config',
+      { config: { ...next, revision: expectedRevision ?? next.revision } },
+      op,
+    );
   };
   const selectedSet = new Set(selected);
   // Rules the UI can show and edit. Any other entry (one the backend could not read, B-43, or one
@@ -893,14 +777,15 @@ export default function App() {
           ...c,
           rules: replaceReadable(c.rules, fn(clone(c.rules.filter(isRule)))),
         })),
-      '草稿已保存 · 请应用设置',
+      '指令已保存并立即生效',
     );
   const choose = async (kind = 'file') => call<string[] | null>('choose_file', { kind });
-  const exportData = () =>
+  const exportData = (format: 'json' | 'xlsx' = 'json') =>
     run(async () => {
       requireReady();
-      if (localDirty) await save();
-      const path = await call<string | null>('export_config');
+      const path = await call<string | null>(
+        format === 'xlsx' ? 'export_excel_config' : 'export_config',
+      );
       // null: the save dialog was cancelled; say nothing (ipc-contract §4).
       if (path) setMessage(`已导出：${path}`);
     });
@@ -928,17 +813,13 @@ export default function App() {
       if (!strategy) return;
       const r = await call('import_config', { path: p[0], strategy });
       if (!r) return; // cancelled
-      setDialog({ title: '导入预览 · 确认后写入草稿', data: r.report, importConfig: r.config });
+      setDialog({
+        title: '导入预览 · 确认后立即生效',
+        data: r.report,
+        importConfig: r.config,
+        importToken: r.token,
+      });
       setMessage('请核对导入报告后确认');
-    });
-  const exportExcelTemplate = () =>
-    run(async () => {
-      requireReady();
-      const path = await call<string | null>('export_excel_template');
-      if (path)
-        setMessage(
-          `Excel 填写模板已导出：${path}；在 Excel 中填写后，点击「导入」导回，核对预览并应用设置。`,
-        );
     });
   // 关闭, ✕ and Esc; ignored while the import's save is in flight (`importing`).
   const closeReport = () => {
@@ -970,16 +851,23 @@ export default function App() {
       const v = await call('validate_config', { config: commit(editorConfig.current) });
       if (!v.valid) throw reject(v.errors);
       try {
-        await save(commit);
+        const saved = await save(commit, editingRevision.current);
+        editingRevision.current = saved.revision;
       } catch (e) {
-        // save_draft validates too (B-42); its diagnostics go to the same place.
+        // save_config validates too (B-42); its diagnostics go to the same place.
         const error = parseCommandError(e);
         if (error.code === 'validation' && error.detail.diagnostics.length > 0)
           throw reject(error.detail.diagnostics);
         throw e;
       }
-      setEditing(null);
-    }, '指令已保存到草稿');
+      if (JSON.stringify(editingCurrent.current) === JSON.stringify(rule)) {
+        setEditing(null);
+        setMessage('指令已保存并立即生效');
+      } else {
+        editingBase.current = JSON.stringify(rule);
+        setMessage('已保存的内容立即生效；保存期间新增的修改尚未保存');
+      }
+    });
   return (
     <div className="app">
       <header>
@@ -1034,7 +922,7 @@ export default function App() {
         <button className={tab === 'status' ? 'active' : ''} onClick={() => setTab('status')}>
           运行状态与恢复
         </button>
-        {(state?.dirty || localDirty) && <span className="revision">草稿待应用</span>}
+        {localDirty && <span className="revision">参数有未保存修改</span>}
       </nav>
       <BannerStack view={runtime} onOpenDataDir={() => openDir('open_data_dir')} />
       {!ready && loadFailure && (
@@ -1049,7 +937,7 @@ export default function App() {
         // Not blocking either: were saving refused until a read succeeds, failing reads would lock
         // the editor. Saving is not silent: the notice stands until a load catches up.
         <div className="alert notice" role="status">
-          {`后台配置已更新为 v${unread}，但未能读取最新配置（${readFailure ?? ''}）。此时保存会以编辑器中的配置覆盖后台较新的配置。`}
+          {`后台配置已更新为 v${unread}，但未能读取最新配置（${readFailure ?? ''}）。保存前请重新读取；版本冲突时不会覆盖后台配置。`}
           <button disabled={busy} onClick={() => refresh('reread')}>
             重新读取
           </button>
@@ -1061,29 +949,24 @@ export default function App() {
           {newer.by === null
             ? `配置已在后台更新为 v${newer.revision}`
             : `配置已更新为 v${newer.revision}（${MADE_BY[newer.by]}）`}
-          {newer.saved
-            ? '，保存已用编辑器中的配置覆盖了它的草稿。'
-            : '。编辑器中未保存的修改仍然保留，保存时会以它们覆盖草稿。'}
+          {'。未保存的修改已保留；请载入新配置后重新编辑，避免覆盖其他窗口的修改。'}
           <button
             onClick={() => {
-              editorRevision.current = Math.max(editorRevision.current ?? 0, newer.revision);
               setNewer(null);
             }}
           >
-            {newer.saved ? '知道了' : '保留我的修改'}
+            保留我的修改
           </button>
-          {!newer.saved && (
-            <button
-              disabled={busy || !state}
-              onClick={() => {
-                if (!state) return;
-                receive(state);
-                setNewer(null);
-              }}
-            >
-              放弃修改，载入新配置
-            </button>
-          )}
+          <button
+            disabled={busy || !state}
+            onClick={() => {
+              if (!state) return;
+              receive(state);
+              setNewer(null);
+            }}
+          >
+            放弃修改，载入新配置
+          </button>
         </div>
       )}
       {error && (
@@ -1107,7 +990,7 @@ export default function App() {
                     // Taken now: the change may be made again later (see `save`), when the box shows
                     // config.enabled again. Set to it, not turned over.
                     const on = e.target.checked;
-                    void run(() => save((c) => ({ ...c, enabled: on })), '总开关已保存到草稿');
+                    void run(() => save((c) => ({ ...c, enabled: on })), '总开关已立即生效');
                   }}
                 />
                 <span />
@@ -1131,19 +1014,18 @@ export default function App() {
               >
                 ＋ 添加指令
               </button>
-              <button disabled={!ready} onClick={importData}>
+              <button
+                disabled={!ready}
+                onClick={importData}
+                title="导入 JSON 或 Excel（.xlsx）配置文件"
+              >
                 导入
               </button>
-              <button disabled={!ready || changing} onClick={exportData}>
-                导出
-              </button>
-              <button
-                disabled={!ready || changing || (safeMode !== null && safeMode !== 'crash_loop')}
-                title="导出空白 .xlsx 填写模板；填写后用「导入」导回。当前配置备份请用「导出」。"
-                onClick={exportExcelTemplate}
-              >
-                Excel 填写模板
-              </button>
+              <ExportMenu
+                disabled={!ready || changing}
+                excelDisabled={safeMode !== null && safeMode !== 'crash_loop'}
+                onExport={exportData}
+              />
             </div>
             <div className="group-tabs">
               {groups.map((g) => (
@@ -1202,7 +1084,7 @@ export default function App() {
                   if (
                     await confirmAction({
                       title: `删除所选 ${selected.length} 条指令？`,
-                      detail: '此操作保存至草稿。',
+                      detail: '确认后立即生效。',
                       confirm: '删除',
                     })
                   )
@@ -1346,7 +1228,7 @@ export default function App() {
                 <div className="empty">
                   <div className="empty-art" aria-hidden="true" />
                   <strong>{search ? '没有匹配的指令' : '建立你的第一条文本指令'}</strong>
-                  <p>设置缩写、触发条件和操作，保存后应用设置。</p>
+                  <p>设置缩写、触发条件和操作，保存后立即生效。</p>
                   <button
                     className="primary"
                     disabled={!editable}
@@ -1363,7 +1245,7 @@ export default function App() {
       {tab === 'settings' && (
         <section className="settings">
           <h2>文本指令参数设置</h2>
-          <p className="muted">以下选项与指令草稿一并发布，单条指令可覆盖触发字符。</p>
+          <p className="muted">确认保存后立即生效，单条指令可覆盖触发字符。</p>
           {platform === 'macos' && (
             <p className="muted">
               <span className="capability-tag experimental">实验性</span> macOS
@@ -1376,7 +1258,7 @@ export default function App() {
               配置中含超出可安全保存范围的数值，保存时可能被改写。
             </p>
           )}
-          {/* Edits here only become a write on 「保存参数草稿」, but made before the config is read
+          {/* Edits here only become a write on 「保存参数设置」, but made before the config is read
               they would be edits of emptyConfig, dropped by the first snapshot. */}
           <fieldset className="settings-fields" disabled={!editable}>
             <Field label="默认触发字符">
@@ -1470,9 +1352,19 @@ export default function App() {
           <button
             className="primary"
             disabled={!writable}
-            onClick={() => run(() => save(), '参数已保存到草稿')}
+            onClick={() => run(() => save(), '参数已保存并立即生效')}
           >
-            保存参数草稿
+            保存参数设置
+          </button>
+          <button
+            disabled={!writable || !localDirty}
+            onClick={() => {
+              if (shown.current) receive(shown.current);
+              setNewer(null);
+              setMessage('已取消未保存的参数修改');
+            }}
+          >
+            取消修改
           </button>
           <h3>许可证与第三方声明</h3>
           <p className="muted license">
@@ -1498,23 +1390,9 @@ export default function App() {
             </dd>
             <dt>当前生效版本</dt>
             <dd>{state?.revision ?? 0}</dd>
-            <dt>草稿状态</dt>
-            <dd>{state?.dirty || localDirty ? '存在未应用的设置' : '与生效版本一致'}</dd>
           </dl>
           <div className="inline">
             <button onClick={() => refresh('refresh')}>刷新状态</button>
-            <button
-              disabled={!writable}
-              onClick={async () => {
-                if (await confirmAction({ title: '放弃全部未应用草稿？', confirm: '放弃草稿' }))
-                  void run(async () => {
-                    requireReady();
-                    await write('discard_draft');
-                  });
-              }}
-            >
-              放弃未应用草稿
-            </button>
             <button
               disabled={!writable}
               onClick={async () => {
@@ -1570,19 +1448,6 @@ export default function App() {
         <span className="status-text" aria-live="polite">
           {busy ? '正在处理…' : message}
         </span>
-        <button
-          disabled={busy || !ready || changing || !safeModeRead}
-          className="primary"
-          onClick={() =>
-            run(async () => {
-              requireReady();
-              if (localDirty) await save();
-              await write('apply_settings');
-            }, '设置已应用，生效版本已更新')
-          }
-        >
-          应用设置
-        </button>
       </footer>
       {editing && (
         <Modal title="编辑文本指令" className="overlay" onClose={() => void closeEditor()}>
@@ -1828,7 +1693,10 @@ export default function App() {
                       void run(async () =>
                         setDialog({
                           title: '查看是否匹配及附带内容',
-                          data: await call('test_rule', { rule: editing, input }),
+                          data: describeMatch(
+                            await call('test_rule', { rule: editing, input }),
+                            input,
+                          ),
                         }),
                       );
                   }}
@@ -1879,7 +1747,7 @@ export default function App() {
               </div>
             </div>
             <div className="modal-footer">
-              <span>保存后还需点击主窗口的“应用设置”，指令才会生效</span>
+              <span>保存后立即生效</span>
               <button onClick={() => void closeEditor()}>取消</button>
               <button disabled={busy || !writable} className="primary" onClick={commitEdit}>
                 保存
@@ -1910,22 +1778,20 @@ export default function App() {
                     if (!imported) return;
                     setImporting(true);
                     void run(async () => {
-                      // The whole config replaced, the globals too, also when made again over
-                      // edits made while it was saved (see `conclude`). None can be: this dialog
-                      // is modal (the rest of the window inert), and stays open until the save is
-                      // done or failed, its change made in the editor (`importing`: 关闭 and ✕
-                      // disabled, Esc ignored, a close the browser forces undone by `Modal`; its
-                      // backdrop does not close it). Review C10.
+                      // Keep the preview modal until its atomic publication completes.
                       try {
-                        await save(() => imported);
+                        await write('save_config', {
+                          config: imported,
+                          importToken: dialog.importToken,
+                        });
                         setDialog(null);
                       } finally {
                         setImporting(false);
                       }
-                    }, '导入草稿已保存，请应用设置');
+                    }, '导入配置已确认并立即生效');
                   }}
                 >
-                  确认导入草稿
+                  确认导入并生效
                 </button>
               )}
               <button disabled={importing} onClick={closeReport}>

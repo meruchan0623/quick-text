@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MockBackend, MockOptions } from './ipc/mock';
 import type { Component, HealthState, ReasonCode } from './ipc/types';
 import { reasonNames } from './ipc/labels';
+import { isRule } from './model';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -93,6 +94,31 @@ async function waitFor(
 
 const headerStatus = (container: HTMLElement) =>
   container.querySelector('.header-status [role="status"]')?.textContent ?? '';
+
+it('publishes a manually added hhhh immediately with one save', async () => {
+  const mounted = await mount({ platform: 'windows' });
+  const { backend, container } = mounted;
+  await waitFor(mounted, () => expect(container.querySelectorAll('tbody tr')).toHaveLength(3));
+  await click(mounted, '＋ 添加指令');
+  const editor = dialog(container, '编辑文本指令');
+  await type(mounted, field(editor ?? container, '缩写词'), 'hhhh');
+  const content = editor?.querySelector<HTMLTextAreaElement>('textarea[aria-label="操作正文"]');
+  if (!content) throw new Error('missing action text editor');
+  await type(mounted, content, '测试文字{0:yyyy-MM-dd}');
+  await clickIn(mounted, editor, '保存');
+  await waitFor(mounted, () => expect(dialog(container, '编辑文本指令')).toBeNull());
+  expect(
+    backend.active.rules.filter(isRule).find((rule) => rule.match.value === 'hhhh')?.trigger_mode,
+  ).toBe('immediate');
+  expect(backend.active.revision).toBe(2);
+  expect(
+    backend.active.rules.filter(isRule).some((rule) => rule.match.value === 'hhhh' && rule.enabled),
+  ).toBe(true);
+  expect(container.querySelector('.status-text')?.textContent).toContain('立即生效');
+  expect(button(container, '应用设置')).toBeUndefined();
+  expect(container.textContent).not.toContain('草稿');
+  expect(callsOf(backend, 'save_config')).toHaveLength(1);
+});
 
 function button(container: HTMLElement, text: string): HTMLButtonElement | undefined {
   return [...container.querySelectorAll('button')].find((b) => b.textContent === text);
@@ -501,11 +527,11 @@ describe('rule list, editor and settings (F-04)', () => {
     expect(blacklist.value).toBe('a.exe\n');
     await type(mounted, blacklist, 'a.exe\n b.exe \n');
     expect(blacklist.value).toBe('a.exe\n b.exe \n');
-    await click(mounted, '保存参数草稿');
+    await click(mounted, '保存参数设置');
     await waitFor(mounted, () => {
-      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+      expect(callsOf(backend, 'save_config')).toHaveLength(1);
     });
-    const saved = callsOf(backend, 'save_draft')[0]?.args.config as {
+    const saved = callsOf(backend, 'save_config')[0]?.args.config as {
       globals: { blacklist: string[]; terminators: string[] };
     };
     expect(saved.globals.blacklist).toEqual(['a.exe', 'b.exe']);
@@ -547,12 +573,12 @@ describe('rule list, editor and settings (F-04)', () => {
     await waitFor(mounted, () => {
       expect(dialog(container, '编辑文本指令')).toBeNull();
     });
-    expect(callsOf(backend, 'save_draft')).toHaveLength(0);
+    expect(callsOf(backend, 'save_config')).toHaveLength(0);
   });
 
   it('grays out Tab and 回车 on Windows and lets an old config uncheck them', async () => {
     const mounted = await mount({}, (backend) => {
-      backend.draft.globals.terminators = ['space', 'tab'];
+      backend.active.globals.terminators = ['space', 'tab'];
     });
     const { backend, container } = mounted;
     await waitFor(mounted, () => {
@@ -606,14 +632,14 @@ describe('rule list, editor and settings (F-04)', () => {
     },
   );
 
-  it('shows save_draft validation in the editor and keeps it open', async () => {
+  it('shows save_config validation in the editor and keeps it open', async () => {
     const mounted = await mount();
     const { backend, container } = mounted;
     await waitFor(mounted, () => {
       expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
     });
     await click(mounted, '编辑');
-    backend.failures.set('save_draft', {
+    backend.failures.set('save_config', {
       code: 'validation',
       detail: {
         diagnostics: [
@@ -672,43 +698,60 @@ describe('rule list, editor and settings (F-04)', () => {
     });
   });
 
-  it('exports a blank Excel template without saving edits or exporting JSON', async () => {
+  it('offers JSON and Excel from the export arrow and closes after selection', async () => {
+    const mounted = await mount();
+    expect(button(mounted.container, '导出 JSON 文件')).toBeUndefined();
+    await click(mounted, '▾');
+    expect(button(mounted.container, '导出 Excel 文件')).toBeDefined();
+    await click(mounted, '导出 JSON 文件');
+    await waitFor(mounted, () => {
+      expect(callsOf(mounted.backend, 'export_config')).toHaveLength(1);
+    });
+    expect(button(mounted.container, '导出 Excel 文件')).toBeUndefined();
+    expect(callsOf(mounted.backend, 'export_excel_config')).toHaveLength(0);
+  });
+
+  it('exports saved Excel configuration without publishing unconfirmed settings', async () => {
     const mounted = await mount();
     await click(mounted, '文本指令参数设置');
     await type(mounted, field(mounted.container, '黑名单程序'), 'unsaved.exe');
     await click(mounted, '文本指令管理');
-    await click(mounted, 'Excel 填写模板');
+    await click(mounted, '▾');
+    await click(mounted, '导出 Excel 文件');
     await waitFor(mounted, () => {
-      expect(statusText(mounted.container)).toContain('mock://quicktext-template.xlsx');
+      expect(statusText(mounted.container)).toContain('mock://quicktext-config.xlsx');
     });
-    expect(statusText(mounted.container)).toContain('导入');
-    expect(callsOf(mounted.backend, 'save_draft')).toHaveLength(0);
+    expect(button(mounted.container, 'Excel 填写模板')).toBeUndefined();
+    expect(callsOf(mounted.backend, 'save_config')).toHaveLength(0);
+    expect(mounted.backend.active.globals.blacklist).toEqual([]);
     expect(callsOf(mounted.backend, 'export_config')).toHaveLength(0);
   });
 
   it('leaves the status unchanged when the Excel save dialog is cancelled', async () => {
     const mounted = await mount({ dialog: 'cancel' });
     const before = statusText(mounted.container);
-    await click(mounted, 'Excel 填写模板');
+    await click(mounted, '▾');
+    await click(mounted, '导出 Excel 文件');
     await waitFor(mounted, () => {
-      expect(callsOf(mounted.backend, 'export_excel_template')).toHaveLength(1);
+      expect(callsOf(mounted.backend, 'export_excel_config')).toHaveLength(1);
     });
     expect(statusText(mounted.container)).toBe(before);
     expect(mounted.container.querySelector('.alert.error')).toBeNull();
   });
 
   it.each(['locked', 'newer_schema', 'no_valid_config'] as const)(
-    'disables Excel template export in %s safe mode',
+    'disables Excel export in %s safe mode',
     async (safeMode) => {
       const mounted = await mount({ safeMode });
-      expect(button(mounted.container, 'Excel 填写模板')?.disabled).toBe(true);
-      await click(mounted, 'Excel 填写模板');
-      expect(callsOf(mounted.backend, 'export_excel_template')).toHaveLength(0);
+      await click(mounted, '▾');
+      expect(button(mounted.container, '导出 Excel 文件')?.disabled).toBe(true);
+      await click(mounted, '导出 Excel 文件');
+      expect(callsOf(mounted.backend, 'export_excel_config')).toHaveLength(0);
     },
   );
 
   it.each(['json', 'xlsx'] as const)(
-    'previews %s before confirming the imported draft',
+    'previews %s then publishes exactly once when confirmed',
     async (importFormat) => {
       const mounted = await mount({ importFormat });
       await click(mounted, '导入');
@@ -717,15 +760,18 @@ describe('rule list, editor and settings (F-04)', () => {
       });
       await clickIn(mounted, dialog(mounted.container, '遇到重复的指令时怎么处理？'), '导入');
       await waitFor(mounted, () => {
-        expect(button(mounted.container, '确认导入草稿')).toBeDefined();
+        expect(button(mounted.container, '确认导入并生效')).toBeDefined();
       });
       expect(callsOf(mounted.backend, 'import_config')[0]?.args.path).toContain(`.${importFormat}`);
-      expect(callsOf(mounted.backend, 'save_draft')).toHaveLength(0);
-      await click(mounted, '确认导入草稿');
+      expect(callsOf(mounted.backend, 'save_config')).toHaveLength(0);
+      await click(mounted, '确认导入并生效');
       await waitFor(mounted, () => {
-        expect(callsOf(mounted.backend, 'save_draft')).toHaveLength(1);
+        expect(callsOf(mounted.backend, 'save_config')).toHaveLength(1);
       });
       expect(callsOf(mounted.backend, 'apply_settings')).toHaveLength(0);
+      expect(mounted.backend.active.revision).toBe(2);
+      expect(mounted.backend.active.rules).toHaveLength(5);
+      expect(callsOf(mounted.backend, 'save_config')[0]?.args.importToken).toBeDefined();
     },
   );
 
@@ -733,7 +779,7 @@ describe('rule list, editor and settings (F-04)', () => {
     'offers overwrite for %s while keeping unrelated rules',
     async (importFormat) => {
       const mounted = await mount({ importFormat }, (backend) => {
-        const first = backend.draft.rules[0] as { id: string; description: string };
+        const first = backend.active.rules[0] as { id: string; description: string };
         first.id = 'mock-import-1';
         first.description = '将被更新的旧内容';
       });
@@ -755,16 +801,18 @@ describe('rule list, editor and settings (F-04)', () => {
       });
       await clickIn(mounted, strategyDialog, '导入');
       await waitFor(mounted, () => {
-        expect(button(mounted.container, '确认导入草稿')).toBeDefined();
+        expect(button(mounted.container, '确认导入并生效')).toBeDefined();
       });
       expect(callsOf(mounted.backend, 'import_config')[0]?.args.strategy).toBe('overwrite');
-      expect(callsOf(mounted.backend, 'save_draft')).toHaveLength(0);
-      await click(mounted, '确认导入草稿');
+      expect(callsOf(mounted.backend, 'save_config')).toHaveLength(0);
+      await click(mounted, '确认导入并生效');
       await waitFor(mounted, () => {
-        expect(callsOf(mounted.backend, 'save_draft')).toHaveLength(1);
+        expect(callsOf(mounted.backend, 'save_config')).toHaveLength(1);
       });
-      expect(mounted.backend.draft.rules).toHaveLength(4);
-      expect(mounted.backend.draft.rules[0]).not.toMatchObject({ description: '将被更新的旧内容' });
+      expect(mounted.backend.active.rules).toHaveLength(4);
+      expect(mounted.backend.active.rules[0]).not.toMatchObject({
+        description: '将被更新的旧内容',
+      });
     },
   );
 
@@ -981,7 +1029,7 @@ describe('启动时自动开始监听 (S-09)', () => {
 describe('writes wait for the first load_state snapshot (review C2 follow-up)', () => {
   /** Commands that write the backend or submit the config, and the ones only their entries send. */
   const WRITES = [
-    'save_draft',
+    'save_config',
     'apply_settings',
     'discard_draft',
     'rollback',
@@ -989,7 +1037,7 @@ describe('writes wait for the first load_state snapshot (review C2 follow-up)', 
     'set_auto_listen',
     'import_config',
     'export_config',
-    'export_excel_template',
+    'export_excel_config',
     'choose_file',
     'get_foreground',
   ];
@@ -1008,20 +1056,14 @@ describe('writes wait for the first load_state snapshot (review C2 follow-up)', 
         button(container, '＋ 添加指令'),
         button(container, '导入'),
         button(container, '导出'),
-        button(container, 'Excel 填写模板'),
-        button(container, '应用设置'),
+        button(container, '▾'),
       ],
       settings: () => [
-        button(container, '保存参数草稿'),
+        button(container, '保存参数设置'),
         button(container, '选择当前窗口加入黑名单'),
         checkbox(container, '开机时启动'),
-        button(container, '应用设置'),
       ],
-      status: () => [
-        button(container, '放弃未应用草稿'),
-        button(container, '恢复上一个版本'),
-        button(container, '应用设置'),
-      ],
+      status: () => [button(container, '恢复上一个版本')],
     };
     return entries[page]().map((entry) => entry ?? null);
   }
@@ -1110,7 +1152,7 @@ describe('writes wait for the first load_state snapshot (review C2 follow-up)', 
     expect(statusText(container)).toBe('未能读取当前配置');
     expect(container.querySelectorAll('tbody tr')).toHaveLength(0);
     expect(writeEntries(container, 'manage').map((entry) => entry?.disabled)).toEqual(
-      Array<boolean>(6).fill(true),
+      Array<boolean>(5).fill(true),
     );
 
     await click(mounted, '重试');
@@ -1121,7 +1163,7 @@ describe('writes wait for the first load_state snapshot (review C2 follow-up)', 
     expect(alerts(container)).not.toContain('未能读取当前配置');
     expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
     expect(writeEntries(container, 'manage').map((entry) => entry?.disabled)).toEqual(
-      Array<boolean>(6).fill(false),
+      Array<boolean>(5).fill(false),
     );
   });
 
@@ -1141,11 +1183,11 @@ describe('writes wait for the first load_state snapshot (review C2 follow-up)', 
     expect(field(container, '词分隔符').matches(':disabled')).toBe(false);
     await type(mounted, field(container, '词分隔符'), ' ;');
     expect(field(container, '词分隔符').value).toBe(' ;');
-    await click(mounted, '保存参数草稿');
+    await click(mounted, '保存参数设置');
     await waitFor(mounted, () => {
-      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+      expect(callsOf(backend, 'save_config')).toHaveLength(1);
     });
-    const saved = callsOf(backend, 'save_draft')[0]?.args.config as {
+    const saved = callsOf(backend, 'save_config')[0]?.args.config as {
       rules: unknown[];
       globals: { word_separators: string };
     };
@@ -1202,7 +1244,7 @@ describe('writes wait for the first load_state snapshot (review C2 follow-up)', 
     });
     expect(statusText(container)).not.toContain('状态已刷新');
     // The config read first stays; the writes stay usable.
-    expect(button(container, '保存参数草稿')?.disabled).toBe(false);
+    expect(button(container, '保存参数设置')?.disabled).toBe(false);
   });
 
   it('stays silent when commands overtake every load of a focus reload', async () => {
@@ -1265,9 +1307,9 @@ describe('store revision and safe mode pushed with store-state', () => {
     await click(mounted, '文本指令参数设置');
     const before = field(container, '词分隔符').value;
     await type(mounted, field(container, '词分隔符'), ',');
-    await click(mounted, '应用设置');
+    await click(mounted, '保存参数设置');
     await waitFor(mounted, () => {
-      expect(statusText(container)).toBe('设置已应用，生效版本已更新');
+      expect(statusText(container)).toBe('参数已保存并立即生效');
     });
     await click(mounted, '运行状态与恢复');
     await click(mounted, '恢复上一个版本');
@@ -1278,49 +1320,34 @@ describe('store revision and safe mode pushed with store-state', () => {
     });
     await settle(mounted);
     // The mock pushes each store-state before the answer, the earliest it can arrive.
-    expect(callsOf(backend, 'apply_settings')).toHaveLength(1);
+    expect(callsOf(backend, 'save_config')).toHaveLength(1);
     expect(callsOf(backend, 'rollback')).toHaveLength(1);
     expect(callsOf(backend, 'load_state')).toHaveLength(1);
     expect(notice(container)).toBe('');
   });
 
-  it('keeps unsaved settings edits over a revision published elsewhere and says so', async () => {
+  it('keeps unconfirmed settings but refuses to overwrite a newer published revision', async () => {
     const mounted = await mountReady();
     const { backend, container } = mounted;
     await click(mounted, '文本指令参数设置');
     await type(mounted, field(container, '词分隔符'), ' ;');
-    await mounted.act(() => {
-      backend.publishExternally((config) => {
-        config.globals.word_separators = ',';
-      });
-    });
-    await waitFor(mounted, () => {
-      expect(notice(container)).toContain('配置已在后台更新为 v2');
-    });
-    expect(callsOf(backend, 'load_state')).toHaveLength(2);
-    expect(field(container, '词分隔符').value).toBe(' ;');
-    expect(revisionText(container)).toBe('草稿待应用');
-    // Keep: the notice goes and the edit stays; saving it overwrites the newer draft.
+    await mounted.act(() =>
+      backend.publishExternally((c) => {
+        c.globals.word_separators = ',';
+      }),
+    );
+    await waitFor(mounted, () => expect(notice(container)).toContain('v2'));
     await click(mounted, '保留我的修改');
-    expect(notice(container)).toBe('');
+    await click(mounted, '保存参数设置');
+    await waitFor(mounted, () =>
+      expect(container.querySelector('.alert.error')?.textContent).toContain('版本'),
+    );
+    expect(backend.active.revision).toBe(2);
+    expect(backend.active.globals.word_separators).toBe(',');
     expect(field(container, '词分隔符').value).toBe(' ;');
-    await click(mounted, '保存参数草稿');
-    await waitFor(mounted, () => {
-      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
-    });
-    const saved = callsOf(backend, 'save_draft')[0]?.args.config as {
-      globals: { word_separators: string };
-    };
-    expect(saved.globals.word_separators).toBe(' ;');
-    // With nothing unsaved, the next revision is loaded straight away.
-    await mounted.act(() => {
-      backend.publishExternally((config) => {
-        config.globals.word_separators = '|';
-      });
-    });
-    await waitFor(mounted, () => {
-      expect(field(container, '词分隔符').value).toBe('|');
-    });
+    expect(revisionText(container)).toBe('参数有未保存修改');
+    await click(mounted, '放弃修改，载入新配置');
+    expect(field(container, '词分隔符').value).toBe(',');
     expect(notice(container)).toBe('');
   });
 
@@ -1341,7 +1368,7 @@ describe('store revision and safe mode pushed with store-state', () => {
     await click(mounted, '放弃修改，载入新配置');
     expect(notice(container)).toBe('');
     expect(field(container, '词分隔符').value).toBe(',');
-    expect(callsOf(backend, 'save_draft')).toHaveLength(0);
+    expect(callsOf(backend, 'save_config')).toHaveLength(0);
   });
 
   it('keeps the rule being edited over a revision published elsewhere', async () => {
@@ -1362,10 +1389,16 @@ describe('store revision and safe mode pushed with store-state', () => {
     expect(field(container, '说明').value).toBe('改过的说明');
     await clickIn(mounted, dialog(container, '编辑文本指令'), '保存');
     await waitFor(mounted, () => {
-      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+      expect(callsOf(backend, 'save_config')).toHaveLength(1);
     });
+    expect(backend.active.revision).toBe(2);
+    expect(dialog(container, '编辑文本指令')).not.toBeNull();
+    expect(container.querySelector('.alert.error')?.textContent).toContain('版本');
+    expect(backend.active.rules.filter(isRule).some((r) => r.description === '改过的说明')).toBe(
+      false,
+    );
     // The edited rule goes into the config read just now.
-    const saved = callsOf(backend, 'save_draft')[0]?.args.config as {
+    const saved = callsOf(backend, 'save_config')[0]?.args.config as {
       enabled: boolean;
       rules: { description: string }[];
     };
@@ -1384,9 +1417,8 @@ describe('store revision and safe mode pushed with store-state', () => {
     expect(manage()).toEqual([true, true]);
     // Importing, and publishing what was imported, is the way out of crash_loop: never disabled.
     expect(button(container, '导入')?.disabled).toBe(false);
-    expect(button(container, '应用设置')?.disabled).toBe(false);
     await click(mounted, '文本指令参数设置');
-    expect(button(container, '保存参数草稿')?.disabled).toBe(true);
+    expect(button(container, '保存参数设置')?.disabled).toBe(true);
     expect(checkbox(container, '开机时启动')?.disabled).toBe(true);
     // Not a write safe mode refuses (ipc-contract §5 set_auto_listen).
     expect(checkbox(container, '启动时自动开始监听')?.disabled).toBe(false);
@@ -1407,7 +1439,7 @@ describe('store revision and safe mode pushed with store-state', () => {
     expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
     expect(container.querySelector('.revision')).toBeNull();
     await click(mounted, '文本指令参数设置');
-    expect(button(container, '保存参数草稿')?.disabled).toBe(false);
+    expect(button(container, '保存参数设置')?.disabled).toBe(false);
     expect(checkbox(container, '开机时启动')?.disabled).toBe(false);
     expect(checkbox(container, '启动时自动开始监听')?.disabled).toBe(false);
     expect(field(container, '词分隔符').matches(':disabled')).toBe(false);
@@ -1424,8 +1456,7 @@ describe('store revision and safe mode pushed with store-state', () => {
       const disk = backend.disk;
       if (disk === null) throw new Error('Locked keeps the store on disk');
       backend.disk = {
-        active: { ...disk.active, revision: 0, rules: [] },
-        draft: { ...disk.draft, revision: 0 },
+        active: { ...disk.active, revision: 0 },
       };
       hold.attach(backend);
     });
@@ -1449,38 +1480,33 @@ describe('store revision and safe mode pushed with store-state', () => {
     expect(hold.held).toHaveLength(1);
     expect(button(container, '＋ 添加指令')?.disabled).toBe(true);
     expect(checkbox(container, '启用文本指令')?.disabled).toBe(true);
-    expect(button(container, '应用设置')?.disabled).toBe(true);
     await click(mounted, '文本指令参数设置');
-    expect(button(container, '保存参数草稿')?.disabled).toBe(true);
+    expect(button(container, '保存参数设置')?.disabled).toBe(true);
     expect(field(container, '词分隔符').matches(':disabled')).toBe(true);
     // Nor do the handlers themselves.
-    await callHandler(mounted, button(container, '保存参数草稿'), 'onClick');
+    await callHandler(mounted, button(container, '保存参数设置'), 'onClick');
     await settle(mounted);
-    expect(callsOf(backend, 'save_draft')).toHaveLength(0);
+    expect(callsOf(backend, 'save_config')).toHaveLength(0);
     expect(container.querySelector('.alert.error')?.textContent).toContain('安全模式状态已变化');
-    await callHandler(mounted, button(container, '应用设置'), 'onClick');
-    await settle(mounted);
-    expect(callsOf(backend, 'apply_settings')).toHaveLength(0);
     // The read installs the recovered store: its rules are in the editor, and the writes are back.
     await answerHeld(mounted, hold, 0);
-    expect(button(container, '保存参数草稿')?.disabled).toBe(false);
-    expect(button(container, '应用设置')?.disabled).toBe(false);
+    expect(button(container, '保存参数设置')?.disabled).toBe(false);
     await click(mounted, '文本指令管理');
     expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
     // Saving the parameters keeps the rules.
     await click(mounted, '文本指令参数设置');
     await type(mounted, field(container, '词分隔符'), ' ;');
-    await click(mounted, '保存参数草稿');
+    await click(mounted, '保存参数设置');
     await waitFor(mounted, () => {
-      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+      expect(callsOf(backend, 'save_config')).toHaveLength(1);
     });
-    const saved = callsOf(backend, 'save_draft')[0]?.args.config as {
+    const saved = callsOf(backend, 'save_config')[0]?.args.config as {
       rules: unknown[];
       globals: { word_separators: string };
     };
     expect(saved.globals.word_separators).toBe(' ;');
     expect(saved.rules).toHaveLength(3);
-    expect(backend.draft.rules).toHaveLength(3);
+    expect(backend.active.rules).toHaveLength(3);
     expect(callsOf(backend, 'load_state')).toHaveLength(2);
   });
 
@@ -1489,7 +1515,7 @@ describe('store revision and safe mode pushed with store-state', () => {
       const disk = backend.disk;
       if (disk === null) throw new Error('Locked keeps the store on disk');
       disk.active.globals.word_separators = ',';
-      disk.draft.globals.word_separators = ',';
+      disk.active.globals.word_separators = ',';
     });
     const { backend, container } = mounted;
     await click(mounted, '文本指令参数设置');
@@ -1516,7 +1542,7 @@ describe('store revision and safe mode pushed with store-state', () => {
     expect(field(container, '黑名单程序').value).toBe('');
     expect(container.querySelector('.revision')).toBeNull();
     expect(notice(container)).toBe('');
-    expect(callsOf(backend, 'save_draft')).toHaveLength(0);
+    expect(callsOf(backend, 'save_config')).toHaveLength(0);
   });
 
   it('leaves crash_loop by importing and applying, without reading the state again', async () => {
@@ -1528,19 +1554,15 @@ describe('store revision and safe mode pushed with store-state', () => {
     });
     await clickIn(mounted, dialog(container, '遇到重复的指令时怎么处理？'), '导入');
     await waitFor(mounted, () => {
-      expect(button(container, '确认导入草稿')).toBeDefined();
+      expect(button(container, '确认导入并生效')).toBeDefined();
     });
-    await click(mounted, '确认导入草稿');
+    await click(mounted, '确认导入并生效');
     await waitFor(mounted, () => {
-      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+      expect(callsOf(backend, 'save_config')).toHaveLength(1);
     });
     await settle(mounted);
     expect(container.querySelector('.alert.error')).toBeNull();
-    await click(mounted, '应用设置');
-    await waitFor(mounted, () => {
-      expect(statusText(container)).toBe('设置已应用，生效版本已更新');
-    });
-    await settle(mounted);
+    expect(statusText(container)).toBe('导入配置已确认并立即生效');
     expect(container.querySelector('.alert.error')).toBeNull();
     expect(container.querySelector('.banner')).toBeNull();
     expect(container.querySelectorAll('tbody tr')).toHaveLength(5);
@@ -1552,7 +1574,6 @@ describe('store revision and safe mode pushed with store-state', () => {
 describe('catching up with a revision published elsewhere (review C5)', () => {
   const UNREAD = '未能读取最新配置';
   const LOAD_FAILURE = '桌面引擎没有响应';
-  const OVERWRITTEN = '配置已在后台更新为 v2，保存已用编辑器中的配置覆盖了它的草稿';
   const revisionText = (container: HTMLElement) =>
     container.querySelector('.revision')?.textContent ?? '';
   const notices = (container: HTMLElement) =>
@@ -1629,12 +1650,12 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       },
       3000,
     );
-    expect(notices(container)).toContain('此时保存会以编辑器中的配置覆盖后台较新的配置');
+    expect(notices(container)).toContain('版本冲突时不会覆盖后台配置');
     expect(callsOf(backend, 'load_state')).toHaveLength(4);
     expect(separators(container)).toBe(before);
     expect(container.querySelector('.revision')).toBeNull();
     // Not blocking: saving stays possible. And no more reads by themselves.
-    expect(button(container, '保存参数草稿')?.disabled).toBe(false);
+    expect(button(container, '保存参数设置')?.disabled).toBe(false);
     await outwait(mounted);
     expect(callsOf(backend, 'load_state')).toHaveLength(4);
     await click(mounted, '重新读取');
@@ -1740,68 +1761,42 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
     expect(callsOf(backend, 'load_state')).toHaveLength(3);
   });
 
-  it('keeps the unread notice through an unrelated save, and says the save overwrote', async () => {
+  it('a stale unrelated save fails closed and refreshes an unread revision', async () => {
     const mounted = await mountReady();
     const { backend, container } = mounted;
     failLoads(backend, 3);
     await publish(mounted, ',');
-    await waitFor(
-      mounted,
-      () => {
-        expect(notices(container)).toContain(UNREAD);
-      },
-      3000,
+    await waitFor(mounted, () => expect(notices(container)).toContain(UNREAD), 3000);
+    await mounted.act(() => checkbox(container, '启用文本指令')?.click());
+    await waitFor(mounted, () =>
+      expect(container.querySelector('.alert.error')?.textContent).toContain('版本'),
     );
-    // 总开关 saves the editor's whole config, over the draft of v2.
-    await mounted.act(() => {
-      checkbox(container, '启用文本指令')?.click();
-    });
-    await waitFor(mounted, () => {
-      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
-    });
-    await settle(mounted);
-    expect(notices(container)).toContain(`后台配置已更新为 v2，但${UNREAD}`);
-    expect(notices(container)).toContain(OVERWRITTEN);
-    expect(callsOf(backend, 'load_state')).toHaveLength(4);
-    // Caught up: the unread notice goes; the one about the save stays until acknowledged.
-    await click(mounted, '重新读取');
-    await waitFor(mounted, () => {
-      expect(notices(container)).not.toContain(UNREAD);
-    });
-    expect(notices(container)).toContain(OVERWRITTEN);
-    await click(mounted, '知道了');
-    expect(notices(container)).toBe('');
+    expect(backend.active.revision).toBe(2);
+    expect(backend.active.enabled).toBe(true);
+    expect(backend.active.globals.word_separators).toBe(',');
+    await click(mounted, '文本指令参数设置');
+    await waitFor(mounted, () => expect(separators(container)).toBe(','));
+    expect(callsOf(backend, 'save_config')).toHaveLength(1);
   });
 
-  it('keeps the notice about unsaved edits through an unrelated save, and says it overwrote', async () => {
+  it('keeps unconfirmed settings when an unrelated stale save conflicts', async () => {
     const mounted = await mountReady();
     const { backend, container } = mounted;
     await click(mounted, '文本指令参数设置');
     await type(mounted, field(container, '词分隔符'), ' ;');
     await publish(mounted, ',');
-    await waitFor(mounted, () => {
-      expect(notices(container)).toContain('配置已在后台更新为 v2。编辑器中未保存的修改仍然保留');
-    });
+    await waitFor(mounted, () => expect(notices(container)).toContain('v2'));
     await click(mounted, '文本指令管理');
-    await mounted.act(() => {
-      checkbox(container, '启用文本指令')?.click();
-    });
-    await waitFor(mounted, () => {
-      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
-    });
-    await settle(mounted);
-    const saved = callsOf(backend, 'save_draft')[0]?.args.config as {
-      globals: { word_separators: string };
-    };
-    expect(saved.globals.word_separators).toBe(' ;');
-    expect(notices(container)).toContain(OVERWRITTEN);
-    // Nor does a reload of the same revision take it away.
+    await mounted.act(() => checkbox(container, '启用文本指令')?.click());
+    await waitFor(mounted, () =>
+      expect(container.querySelector('.alert.error')?.textContent).toContain('版本'),
+    );
+    expect(backend.active.enabled).toBe(true);
+    expect(backend.active.revision).toBe(2);
+    await click(mounted, '文本指令参数设置');
+    expect(separators(container)).toBe(' ;');
     await focus(mounted);
-    await settle(mounted);
-    expect(notices(container)).toContain(OVERWRITTEN);
-    expect(callsOf(backend, 'load_state')).toHaveLength(3);
-    await click(mounted, '知道了');
-    expect(notices(container)).toBe('');
+    expect(separators(container)).toBe(' ;');
   });
 
   describe('one install rule for load and write answers (review C6)', () => {
@@ -1810,7 +1805,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
      * v2 and a focus load shows it. Then the save answers.
      */
     async function answerSaveLate(): Promise<Mounted> {
-      const hold = holdAnswers('save_draft');
+      const hold = holdAnswers('save_config');
       const mounted = await mountReady(hold);
       const { backend, container } = mounted;
       hold.arm();
@@ -1849,7 +1844,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       const mounted = await answerSaveLate();
       const { container } = mounted;
       // The caller had its result: busy ended with the success message, and no error.
-      expect(statusText(container)).toBe('总开关已保存到草稿');
+      expect(statusText(container)).toBe('总开关已立即生效');
       expect(container.querySelector('.alert.error')).toBeNull();
       // The write is no longer in flight: the next revision published elsewhere is read.
       await publish(mounted, '|');
@@ -1859,73 +1854,61 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       expect(notices(container)).toBe('');
     });
 
-    it('says a save sent at v1 overwrote v2, though a load showed v2 before it answered', async () => {
-      const hold = holdAnswers('save_draft');
-      const mounted = await mountReady(hold);
+    it('rejects a save when another window publishes between request and execution', async () => {
+      const mounted = await mountReady();
       const { backend, container } = mounted;
-      // Another window publishes v2 between the save being sent and its running.
       const handle = backend.handle.bind(backend);
       let published = false;
       backend.handle = (...[command, args]: Parameters<MockBackend['handle']>) => {
-        if (command === 'save_draft' && !published) {
+        if (command === 'save_config' && !published) {
           published = true;
-          backend.publishExternally((config) => {
-            config.globals.word_separators = ',';
+          backend.publishExternally((c) => {
+            c.globals.word_separators = ',';
           });
         }
         return handle(command, args);
       };
-      hold.arm();
-      await mounted.act(() => {
-        checkbox(container, '启用文本指令')?.click();
-      });
-      await waitFor(mounted, () => {
-        expect(hold.held[0]?.read).toBe(true);
-      });
-      await focus(mounted);
-      await waitFor(mounted, () => {
-        expect(checkbox(container, '启用文本指令')?.checked).toBe(false);
-      });
-      await answerHeld(mounted, hold, 0);
-      // The editor's config was of v1 when the save was sent: it replaced the draft of v2.
-      expect(notices(container)).toContain(OVERWRITTEN);
-      expect(revisionText(container)).toBe('草稿待应用');
+      await mounted.act(() => checkbox(container, '启用文本指令')?.click());
+      await waitFor(mounted, () =>
+        expect(container.querySelector('.alert.error')?.textContent).toContain('版本'),
+      );
+      expect(backend.active.enabled).toBe(true);
+      expect(backend.active.revision).toBe(2);
+      expect(backend.active.globals.word_separators).toBe(',');
+      expect(callsOf(backend, 'save_config')).toHaveLength(1);
     });
 
-    it('shows the later of two saves of one revision when the earlier one answers last', async () => {
-      const hold = holdAnswers('save_draft');
+    it('serializes settings saves and preserves edits made while the first answer is delayed', async () => {
+      const hold = holdAnswers('save_config');
       const mounted = await mountReady(hold);
       const { backend, container } = mounted;
       await click(mounted, '文本指令参数设置');
-      hold.arm(2);
+      hold.arm();
       await type(mounted, field(container, '词分隔符'), ' ;');
-      await click(mounted, '保存参数草稿');
-      await waitFor(mounted, () => {
-        expect(hold.held[0]?.read).toBe(true);
-      });
+      await click(mounted, '保存参数设置');
+      await waitFor(mounted, () => expect(hold.held[0]?.read).toBe(true));
       await type(mounted, field(container, '词分隔符'), ' |');
-      await click(mounted, '保存参数草稿');
-      await waitFor(mounted, () => {
-        expect(hold.held[1]?.read).toBe(true);
-      });
-      await answerHeld(mounted, hold, 1);
-      expect(separators(container)).toBe(' |');
+      expect(button(container, '保存参数设置')?.disabled).toBe(true);
+      await click(mounted, '保存参数设置');
+      expect(callsOf(backend, 'save_config')).toHaveLength(1);
       await answerHeld(mounted, hold, 0);
       expect(separators(container)).toBe(' |');
-      expect(backend.draft.globals.word_separators).toBe(' |');
-      expect(revisionText(container)).toBe('草稿待应用');
-      expect(statusText(container)).toBe('参数已保存到草稿');
+      expect(backend.active.globals.word_separators).toBe(' ;');
       expect(notices(container)).toBe('');
+      await click(mounted, '保存参数设置');
+      await waitFor(mounted, () => expect(backend.active.globals.word_separators).toBe(' |'));
+      expect(backend.active.revision).toBe(3);
+      expect(revisionText(container)).toBe('');
     });
 
     it('keeps a setting changed after a save was sent when the save answers', async () => {
-      const hold = holdAnswers('save_draft');
+      const hold = holdAnswers('save_config');
       const mounted = await mountReady(hold);
       const { backend, container } = mounted;
       await click(mounted, '文本指令参数设置');
       const before = checkbox(container, '开机时启动')?.checked;
       hold.arm();
-      await click(mounted, '保存参数草稿');
+      await click(mounted, '保存参数设置');
       await waitFor(mounted, () => {
         expect(hold.held[0]?.read).toBe(true);
       });
@@ -1983,7 +1966,6 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
 
   describe('the editor ends each write, its answer installed or not (review C7)', () => {
     type Confirmed = readonly [button: string, title: string, confirm: string];
-    const DISCARD: Confirmed = ['放弃未应用草稿', '放弃全部未应用草稿？', '放弃草稿'];
     const ROLLBACK: Confirmed = ['恢复上一个版本', '回滚到上一个生效版本？', '回滚'];
 
     /** Press `button` on 「运行状态与恢复」, confirm, and go back to the settings. */
@@ -1994,19 +1976,19 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       await click(mounted, '文本指令参数设置');
     }
 
-    /** The word separators the last save_draft sent. */
+    /** The word separators the last save_config sent. */
     const sentSeparators = (backend: MockBackend) =>
       (
-        callsOf(backend, 'save_draft').at(-1)?.args.config as
+        callsOf(backend, 'save_config').at(-1)?.args.config as
           { globals: { word_separators: string } } | undefined
       )?.globals.word_separators;
 
     /** Save from the settings and wait for it. */
     async function saveSettings(mounted: Mounted) {
-      const count = callsOf(mounted.backend, 'save_draft').length;
-      await click(mounted, '保存参数草稿');
+      const count = callsOf(mounted.backend, 'save_config').length;
+      await click(mounted, '保存参数设置');
       await waitFor(mounted, () => {
-        expect(callsOf(mounted.backend, 'save_draft')).toHaveLength(count + 1);
+        expect(callsOf(mounted.backend, 'save_config')).toHaveLength(count + 1);
       });
       await settle(mounted);
     }
@@ -2042,22 +2024,26 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       await answerHeld(mounted, hold, 0);
     }
 
-    it('puts the discarded draft in the editor when the answer of 放弃未应用草稿 is dropped', async () => {
-      const hold = holdAnswers('discard_draft');
-      const mounted = await mountReady(hold);
+    it('editing and deleting a saved rule publish immediately', async () => {
+      const mounted = await mountReady();
       const { backend, container } = mounted;
-      await click(mounted, '文本指令参数设置');
-      const before = separators(container);
-      // The field shows it without the line break.
-      const stored = backend.draft.globals.word_separators;
-      await type(mounted, field(container, '词分隔符'), ' ;');
-      await dropAnswer(mounted, hold, DISCARD);
-      expect(separators(container)).toBe(before);
-      expect(container.querySelector('.revision')).toBeNull();
-      // Saving does not bring the discarded edit back.
-      await saveSettings(mounted);
-      expect(sentSeparators(backend)).toBe(stored);
-      expect(backend.draft.globals.word_separators).toBe(stored);
+      await click(mounted, '编辑');
+      await type(mounted, field(container, '说明'), '已修改并生效');
+      await clickIn(mounted, dialog(container, '编辑文本指令'), '保存');
+      await waitFor(mounted, () => expect(dialog(container, '编辑文本指令')).toBeNull());
+      expect(backend.active.revision).toBe(2);
+      expect(
+        backend.active.rules.filter(isRule).some((r) => r.description === '已修改并生效'),
+      ).toBe(true);
+      await mounted.act(() =>
+        container.querySelector<HTMLInputElement>('input[aria-label="选择 ;s1"]')?.click(),
+      );
+      await clickIn(mounted, container.querySelector('.batch'), '删除');
+      await clickIn(mounted, dialog(container, '删除所选 1 条指令？'), '删除');
+      await waitFor(mounted, () => expect(backend.active.revision).toBe(3));
+      expect(backend.active.rules.filter(isRule).some((r) => r.match.value === ';s1')).toBe(false);
+      expect(container.querySelectorAll('tbody tr')).toHaveLength(2);
+      expect(button(container, '应用设置')).toBeUndefined();
     });
 
     it('puts the restored config in the editor when the answer of 恢复上一个版本 is dropped', async () => {
@@ -2066,7 +2052,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       const { backend, container } = mounted;
       await click(mounted, '文本指令参数设置');
       const before = separators(container);
-      const stored = backend.draft.globals.word_separators;
+      const stored = backend.active.globals.word_separators;
       // v2 published elsewhere, so there is a v1 to go back to.
       await publish(mounted, ',');
       await waitFor(mounted, () => {
@@ -2086,27 +2072,24 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
     });
 
     it('marks the editor saved when the answer of its save is dropped', async () => {
-      const hold = holdAnswers('save_draft');
+      const hold = holdAnswers('save_config');
       const mounted = await mountReady(hold);
       const { backend, container } = mounted;
       await click(mounted, '文本指令参数设置');
       await type(mounted, field(container, '词分隔符'), ' ;');
       hold.arm();
-      await click(mounted, '保存参数草稿');
+      await click(mounted, '保存参数设置');
       await waitFor(mounted, () => {
         expect(hold.held[0]?.read).toBe(true);
       });
       await focusLoad(mounted);
       await answerHeld(mounted, hold, 0);
       expect(separators(container)).toBe(' ;');
-      expect(statusText(container)).toBe('参数已保存到草稿');
+      expect(statusText(container)).toBe('参数已保存并立即生效');
       expect(notices(container)).toBe('');
-      // Nothing left to save: 应用设置 applies at once.
-      await click(mounted, '应用设置');
-      await waitFor(mounted, () => {
-        expect(statusText(container)).toBe('设置已应用，生效版本已更新');
-      });
-      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+      // The one save already published; there is no separate apply action.
+      expect(button(container, '应用设置')).toBeUndefined();
+      expect(callsOf(backend, 'save_config')).toHaveLength(1);
       expect(backend.active.globals.word_separators).toBe(' ;');
       // Nor an unsaved edit to keep: a revision published elsewhere is taken straight in.
       await publish(mounted, '|');
@@ -2116,19 +2099,25 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       expect(notices(container)).toBe('');
     });
 
-    it('keeps edits made after 放弃未应用草稿 was sent when its answer is dropped', async () => {
-      const hold = holdAnswers('discard_draft');
-      const mounted = await mountReady(hold);
+    it('a failed rule save retains input and can be retried without losing edits', async () => {
+      const mounted = await mountReady();
       const { backend, container } = mounted;
-      await click(mounted, '文本指令参数设置');
-      await type(mounted, field(container, '词分隔符'), ' ;');
-      await dropAnswer(mounted, hold, DISCARD, () =>
-        type(mounted, field(container, '词分隔符'), ' |'),
+      await click(mounted, '编辑');
+      await type(mounted, field(container, '说明'), '失败后仍可重试');
+      backend.failures.set('save_config', '配置文件无法写入');
+      await clickIn(mounted, dialog(container, '编辑文本指令'), '保存');
+      await waitFor(mounted, () =>
+        expect(container.querySelector('.alert.error')?.textContent).toContain('无法写入'),
       );
-      expect(separators(container)).toBe(' |');
-      expect(revisionText(container)).toContain('草稿待应用');
-      await saveSettings(mounted);
-      expect(sentSeparators(backend)).toBe(' |');
+      expect(dialog(container, '编辑文本指令')).not.toBeNull();
+      expect(field(container, '说明').value).toBe('失败后仍可重试');
+      expect(backend.active.revision).toBe(1);
+      await clickIn(mounted, dialog(container, '编辑文本指令'), '保存');
+      await waitFor(mounted, () => expect(dialog(container, '编辑文本指令')).toBeNull());
+      expect(backend.active.revision).toBe(2);
+      expect(
+        backend.active.rules.filter(isRule).some((r) => r.description === '失败后仍可重试'),
+      ).toBe(true);
     });
 
     it('keeps edits made while 恢复上一个版本 ran, and says the revision it made', async () => {
@@ -2136,7 +2125,6 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       const mounted = await mountReady(hold);
       const { container } = mounted;
       await click(mounted, '文本指令参数设置');
-      const before = separators(container);
       await publish(mounted, ',');
       await waitFor(mounted, () => {
         expect(separators(container)).toBe(',');
@@ -2150,78 +2138,66 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       // Installed: v3 is newer than anything shown.
       await answerHeld(mounted, hold, 0);
       expect(separators(container)).toBe(' |');
-      expect(revisionText(container)).toBe('草稿待应用');
+      expect(revisionText(container)).toBe('参数有未保存修改');
       // This window made v3: not said to come from 「后台」.
-      expect(notices(container)).toContain(
-        '配置已更新为 v3（恢复上一个版本）。编辑器中未保存的修改仍然保留',
-      );
-      expect(notices(container)).not.toContain('后台');
-      await click(mounted, '放弃修改，载入新配置');
-      expect(separators(container)).toBe(before);
       expect(notices(container)).toBe('');
+      await saveSettings(mounted);
+      expect(separators(container)).toBe(' |');
     });
 
     it('keeps edits made while 应用设置 saved, unsaved, over the revision it applied', async () => {
-      const hold = holdAnswers('save_draft');
+      const hold = holdAnswers('save_config');
       const mounted = await mountReady(hold);
       const { backend, container } = mounted;
       await click(mounted, '文本指令参数设置');
       await type(mounted, field(container, '词分隔符'), ' ;');
       hold.arm();
-      await click(mounted, '应用设置');
+      await click(mounted, '保存参数设置');
       await waitFor(mounted, () => {
         expect(hold.held[0]?.read).toBe(true);
       });
       await type(mounted, field(container, '词分隔符'), ' |');
       await answerHeld(mounted, hold, 0);
       await waitFor(mounted, () => {
-        expect(statusText(container)).toBe('设置已应用，生效版本已更新');
+        expect(statusText(container)).toBe('参数已保存并立即生效');
       });
       await settle(mounted);
       // What was saved is applied; the later edit stays in the editor, still to be saved.
       expect(backend.active.globals.word_separators).toBe(' ;');
       expect(separators(container)).toBe(' |');
-      expect(revisionText(container)).toContain('草稿待应用');
+      expect(revisionText(container)).toContain('参数有未保存修改');
       // v2 is this window's own: loading it says nothing newer.
       await focusLoad(mounted);
       expect(notices(container)).toBe('');
       expect(separators(container)).toBe(' |');
     });
 
-    it('names 恢复上一个版本 in the notice a load raised before its dropped answer came', async () => {
+    it('an overtaken rollback answer preserves later input without claiming an external update', async () => {
       const hold = holdAnswers('rollback');
       const mounted = await mountReady(hold);
-      const { container } = mounted;
+      const { backend, container } = mounted;
       await click(mounted, '文本指令参数设置');
       await publish(mounted, ',');
-      await waitFor(mounted, () => {
-        expect(separators(container)).toBe(',');
-      });
-      // The load shows v3 over the later edit, before the answer says this window made it.
+      await waitFor(mounted, () => expect(separators(container)).toBe(','));
       await dropAnswer(mounted, hold, ROLLBACK, () =>
         type(mounted, field(container, '词分隔符'), ' |'),
       );
       expect(separators(container)).toBe(' |');
-      expect(notices(container)).toContain(
-        '配置已更新为 v3（恢复上一个版本）。编辑器中未保存的修改仍然保留',
-      );
-      expect(notices(container)).not.toContain('后台');
-      // Saving over it names it the same way.
+      expect(notices(container)).toBe('');
+      expect(backend.active.revision).toBe(3);
       await saveSettings(mounted);
-      expect(notices(container)).toContain(
-        '配置已更新为 v3（恢复上一个版本），保存已用编辑器中的配置覆盖了它的草稿',
-      );
-      expect(notices(container)).not.toContain('后台');
+      expect(backend.active.revision).toBe(4);
+      expect(backend.active.globals.word_separators).toBe(' |');
     });
 
     it('says nothing newer of the revision 应用设置 made when its answer is dropped', async () => {
-      const hold = holdAnswers('apply_settings');
+      const hold = holdAnswers('save_config');
       const mounted = await mountReady(hold);
       const { backend, container } = mounted;
       await click(mounted, '文本指令参数设置');
       await type(mounted, field(container, '词分隔符'), ' ;');
       hold.arm();
-      await click(mounted, '应用设置');
+      await click(mounted, '保存参数设置');
       await waitFor(mounted, () => {
         expect(hold.held[0]?.read).toBe(true);
       });
@@ -2229,10 +2205,10 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       await focusLoad(mounted);
       await answerHeld(mounted, hold, 0);
       expect(backend.active.globals.word_separators).toBe(' ;');
-      expect(statusText(container)).toBe('设置已应用，生效版本已更新');
+      expect(statusText(container)).toBe('参数已保存并立即生效');
       // As had the answer come first: the later edit kept, over v2, which is this window's own.
       expect(separators(container)).toBe(' |');
-      expect(revisionText(container)).toContain('草稿待应用');
+      expect(revisionText(container)).toContain('参数有未保存修改');
       expect(notices(container)).toBe('');
       await focusLoad(mounted);
       expect(notices(container)).toBe('');
@@ -2241,9 +2217,9 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
 
     /** 总开关 as its checkbox shows it. */
     const enabled = (container: HTMLElement) => checkbox(container, '启用文本指令')?.checked;
-    /** What the last save_draft sent for 总开关. */
+    /** What the last save_config sent for 总开关. */
     const sentEnabled = (backend: MockBackend) =>
-      (callsOf(backend, 'save_draft').at(-1)?.args.config as { enabled: boolean } | undefined)
+      (callsOf(backend, 'save_config').at(-1)?.args.config as { enabled: boolean } | undefined)
         ?.enabled;
 
     /**
@@ -2267,7 +2243,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
     }
 
     it('puts what 总开关 saved in the editor when its answer is dropped for a later load', async () => {
-      const hold = holdAnswers('save_draft');
+      const hold = holdAnswers('save_config');
       const mounted = await mountReady(hold);
       const { backend, container } = mounted;
       const before = await toggleHeld(mounted, hold);
@@ -2284,7 +2260,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
         expect(callsOf(backend, 'export_config')).toHaveLength(1);
       });
       await settle(mounted);
-      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+      expect(callsOf(backend, 'save_config')).toHaveLength(1);
       await click(mounted, '文本指令参数设置');
       expect(separators(container)).toBe(' ;');
       // A save from the editor keeps what 总开关 saved.
@@ -2294,7 +2270,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
     });
 
     it('keeps edits made after 总开关 saved when its answer is dropped for a later load', async () => {
-      const hold = holdAnswers('save_draft');
+      const hold = holdAnswers('save_config');
       const mounted = await mountReady(hold);
       const { container } = mounted;
       const before = await toggleHeld(mounted, hold);
@@ -2303,7 +2279,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       await focusLoad(mounted);
       await answerHeld(mounted, hold, 0);
       expect(separators(container)).toBe(' |');
-      expect(revisionText(container)).toContain('草稿待应用');
+      expect(revisionText(container)).toContain('参数有未保存修改');
       // With what 总开关 saved, under the edit (review C7 §4).
       await click(mounted, '文本指令管理');
       expect(enabled(container)).toBe(!before);
@@ -2311,41 +2287,26 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       // Still unsaved: a revision published elsewhere does not replace it.
       await publish(mounted, ',');
       await waitFor(mounted, () => {
-        expect(notices(container)).toContain('配置已在后台更新为 v2。编辑器中未保存的修改仍然保留');
+        expect(notices(container)).toContain('配置已在后台更新为 v3。未保存的修改已保留');
       });
       expect(separators(container)).toBe(' |');
     });
 
-    it('takes in what was published after a save ran when its answer is dropped', async () => {
-      const hold = holdAnswers('save_draft');
+    it('takes in a newer publication when a successful older save answer is dropped', async () => {
+      const hold = holdAnswers('save_config');
       const mounted = await mountReady(hold);
       const { backend, container } = mounted;
-      // Another window publishes v2 just before the save runs, and v3 after.
-      const handle = backend.handle.bind(backend);
-      let published = false;
-      backend.handle = (...[command, args]: Parameters<MockBackend['handle']>) => {
-        if (command === 'save_draft' && !published) {
-          published = true;
-          backend.publishExternally((config) => {
-            config.globals.word_separators = ',';
-          });
-        }
-        return handle(command, args);
-      };
       await click(mounted, '文本指令参数设置');
       await type(mounted, field(container, '词分隔符'), ' ;');
       hold.arm();
-      await click(mounted, '保存参数草稿');
-      await waitFor(mounted, () => {
-        expect(hold.held[0]?.read).toBe(true);
-      });
+      await click(mounted, '保存参数设置');
+      await waitFor(mounted, () => expect(hold.held[0]?.read).toBe(true));
       await publish(mounted, '|');
-      // Shown over the edit being saved, so said newer.
       await focusLoad(mounted);
-      expect(notices(container)).toContain('配置已在后台更新为 v3');
+      expect(notices(container)).toContain('v3');
       await answerHeld(mounted, hold, 0);
-      // As had the answer come first: the save over v2 said, then v3 taken in, which makes both moot.
       expect(separators(container)).toBe('|');
+      expect(backend.active.revision).toBe(3);
       expect(container.querySelector('.revision')).toBeNull();
       expect(notices(container)).toBe('');
     });
@@ -2354,21 +2315,29 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       const FAILURE = '草稿文件无法写入';
 
       /** 导出, which saves the editor's config first when it has unsaved edits: whether it did. */
-      async function exportSaves(mounted: Mounted): Promise<boolean> {
-        const { backend } = mounted;
-        const saves = callsOf(backend, 'save_draft').length;
+      async function confirmSettingsAfterExport(mounted: Mounted): Promise<boolean> {
+        const { backend, container } = mounted;
+        const hasInput = container.querySelector('.revision') !== null;
+        const wasSettings = button(container, '保存参数设置') !== undefined;
+        const saves = callsOf(backend, 'save_config').length;
         const exports = callsOf(backend, 'export_config').length;
         await click(mounted, '导出');
         await waitFor(mounted, () => {
           expect(callsOf(backend, 'export_config')).toHaveLength(exports + 1);
         });
         await settle(mounted);
-        return callsOf(backend, 'save_draft').length > saves;
+        expect(callsOf(backend, 'save_config')).toHaveLength(saves);
+        if (hasInput) {
+          await click(mounted, '文本指令参数设置');
+          await saveSettings(mounted);
+          if (!wasSettings) await click(mounted, '文本指令管理');
+        }
+        return hasInput;
       }
 
-      /** The config the last save_draft sent. */
+      /** The config the last save_config sent. */
       const sent = (backend: MockBackend) =>
-        callsOf(backend, 'save_draft').at(-1)?.args.config as
+        callsOf(backend, 'save_config').at(-1)?.args.config as
           { rules: { match: { value: string } }[]; globals: { blacklist: string[] } } | undefined;
       /** The abbreviations of the rules listed. */
       const listed = (container: HTMLElement) =>
@@ -2411,7 +2380,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       }
 
       it('puts what 总开关 saved under edits made while it ran, its answer installed', async () => {
-        const hold = holdAnswers('save_draft');
+        const hold = holdAnswers('save_config');
         const mounted = await mountReady(hold);
         const { backend, container } = mounted;
         const before = await toggleHeld(mounted, hold);
@@ -2422,13 +2391,13 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
         await click(mounted, '文本指令管理');
         expect(enabled(container)).toBe(!before);
         // The edit is still unsaved, and the editor's next save has both.
-        expect(await exportSaves(mounted)).toBe(true);
+        expect(await confirmSettingsAfterExport(mounted)).toBe(true);
         expect(sentEnabled(backend)).toBe(!before);
         expect(sentSeparators(backend)).toBe(' |');
       });
 
       it('puts what 总开关 saved under edits made while it ran, its answer dropped', async () => {
-        const hold = holdAnswers('save_draft');
+        const hold = holdAnswers('save_config');
         const mounted = await mountReady(hold);
         const { backend, container } = mounted;
         const before = await toggleHeld(mounted, hold);
@@ -2440,56 +2409,35 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
         expect(notices(container)).toBe('');
         await click(mounted, '文本指令管理');
         expect(enabled(container)).toBe(!before);
-        expect(await exportSaves(mounted)).toBe(true);
+        expect(await confirmSettingsAfterExport(mounted)).toBe(true);
         expect(sentEnabled(backend)).toBe(!before);
         expect(sentSeparators(backend)).toBe(' |');
       });
 
-      it('sets 总开关 as the click chose, over a view taken in that turned it elsewhere', async () => {
-        const hold = holdAnswers('save_draft');
-        const mounted = await mountReady(hold);
+      it('a stale toggle cannot overwrite another window while settings are unconfirmed', async () => {
+        const mounted = await mountReady();
         const { backend, container } = mounted;
         await click(mounted, '文本指令参数设置');
         await type(mounted, field(container, '词分隔符'), ' ;');
-        // Another window turns 总开关, read over the edit: the editor keeps its own.
-        await mounted.act(() => {
-          backend.publishExternally((config) => {
-            config.enabled = !config.enabled;
-          });
-        });
-        await waitFor(mounted, () => {
-          expect(notices(container)).toContain(
-            '配置已在后台更新为 v2。编辑器中未保存的修改仍然保留',
-          );
-        });
+        await mounted.act(() =>
+          backend.publishExternally((c) => {
+            c.enabled = false;
+          }),
+        );
+        await waitFor(mounted, () => expect(notices(container)).toContain('v2'));
         await click(mounted, '文本指令管理');
-        const before = enabled(container);
-        hold.arm();
         await toggle(mounted);
-        await waitFor(mounted, () => {
-          expect(hold.held[0]?.read).toBe(true);
-        });
-        expect(sentEnabled(backend)).toBe(!before);
+        await waitFor(mounted, () =>
+          expect(container.querySelector('.alert.error')?.textContent).toContain('版本'),
+        );
+        expect(backend.active.enabled).toBe(false);
+        expect(backend.active.revision).toBe(2);
         await click(mounted, '文本指令参数设置');
-        await type(mounted, field(container, '词分隔符'), ' |');
-        // Another command done meanwhile leaves the notice's buttons usable.
-        await mounted.act(() => {
-          checkbox(container, '开机时启动')?.click();
-        });
-        await waitFor(mounted, () => {
-          expect(button(container, '放弃修改，载入新配置')?.disabled).toBe(false);
-        });
-        // v2, read before the save ran, has 总开关 as the click set it: turned over, it is undone.
-        await click(mounted, '放弃修改，载入新配置');
-        await answerHeld(mounted, hold, 0);
-        await click(mounted, '文本指令管理');
-        expect(enabled(container)).toBe(!before);
-        expect(await exportSaves(mounted)).toBe(true);
-        expect(sentEnabled(backend)).toBe(!before);
+        expect(separators(container)).toBe(' ;');
       });
 
       it('deletes the selected rules under edits made while the delete ran, and unselects them', async () => {
-        const hold = holdAnswers('save_draft');
+        const hold = holdAnswers('save_config');
         const mounted = await mountReady(hold);
         const { backend, container } = mounted;
         for (const label of ['选择 ;s1', '选择 ;s3']) {
@@ -2516,7 +2464,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
         await click(mounted, '文本指令管理');
         expect(listed(container)).toEqual([';s2']);
         expect(batch(container)).toBe('共 1 条 · 已选 0 条');
-        expect(await exportSaves(mounted)).toBe(true);
+        expect(await confirmSettingsAfterExport(mounted)).toBe(true);
         expect(sent(backend)?.rules.map((r) => r.match.value)).toEqual([';s2']);
         expect(sentSeparators(backend)).toBe(' |');
       });
@@ -2524,7 +2472,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       // Not a path of the app, where the rule editor is a modal dialog: no edit can be made while
       // it saves. jsdom's dialog is not modal; kept as cover of `conclude` for a rule committed.
       it('puts a rule committed under edits made while it was saved (unit cover: modal in the app)', async () => {
-        const hold = holdAnswers('save_draft');
+        const hold = holdAnswers('save_config');
         const mounted = await mountReady(hold);
         const { backend, container } = mounted;
         await click(mounted, '＋ 添加指令');
@@ -2542,7 +2490,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
         expect(separators(container)).toBe(' |');
         await click(mounted, '文本指令管理');
         expect(listed(container)).toContain(';new');
-        expect(await exportSaves(mounted)).toBe(true);
+        expect(await confirmSettingsAfterExport(mounted)).toBe(true);
         expect(sent(backend)?.rules.map((r) => r.match.value)).toEqual([
           ';s1',
           ';s2',
@@ -2569,10 +2517,10 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
         await type(mounted, field(container, '词分隔符'), ' |');
         await answerHeld(mounted, check, 0);
         await waitFor(mounted, () => {
-          expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+          expect(callsOf(backend, 'save_config')).toHaveLength(1);
         });
         await settle(mounted);
-        expect(sentSeparators(backend)).toBe(' |');
+        expect(sentSeparators(backend)).toBe(' \t\n');
         expect(sent(backend)?.rules.map((r) => r.match.value)).toEqual([
           ';s1',
           ';s2',
@@ -2581,13 +2529,13 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
         ]);
         // Saved, not made since: the editor has the store's config, with nothing left to save.
         expect(separators(container)).toBe(' |');
-        expect(backend.draft.globals.word_separators).toBe(' |');
+        expect(backend.active.globals.word_separators).toBe(' \t\n');
         await click(mounted, '文本指令管理');
-        expect(await exportSaves(mounted)).toBe(false);
+        expect(await confirmSettingsAfterExport(mounted)).toBe(true);
       });
 
       it('makes nothing again of a save that failed, keeping edits made while it ran', async () => {
-        const hold = holdFailures('save_draft', FAILURE);
+        const hold = holdFailures('save_config', FAILURE);
         const mounted = await mountReady(hold);
         const { backend, container } = mounted;
         const before = await toggleHeld(mounted, hold);
@@ -2598,7 +2546,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
         expect(separators(container)).toBe(' |');
         await click(mounted, '文本指令管理');
         expect(enabled(container)).toBe(before);
-        expect(await exportSaves(mounted)).toBe(true);
+        expect(await confirmSettingsAfterExport(mounted)).toBe(true);
         expect(sentEnabled(backend)).toBe(before);
         expect(sentSeparators(backend)).toBe(' |');
       });
@@ -2606,7 +2554,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
       // No store write is sent while the save runs (review C10): another window undoes it, and a
       // load reads that after the save ran, which the editor takes in.
       it('makes nothing again over a view read after the save ran, undoing it, taken in', async () => {
-        const hold = holdAnswers('save_draft');
+        const hold = holdAnswers('save_config');
         const mounted = await mountReady(hold);
         const { backend, container } = mounted;
         const before = await toggleHeld(mounted, hold);
@@ -2618,7 +2566,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
           });
         });
         await focusLoad(mounted);
-        expect(notices(container)).toContain('配置已在后台更新为 v2。编辑器中未保存的修改仍然保留');
+        expect(notices(container)).toContain('配置已在后台更新为 v3。未保存的修改已保留');
         // Another command done meanwhile leaves the notice's buttons usable.
         await mounted.act(() => {
           checkbox(container, '开机时启动')?.click();
@@ -2628,19 +2576,19 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
         });
         await click(mounted, '放弃修改，载入新配置');
         // v2: the draft the save left (with the edit it sent), 总开关 turned back.
-        expect(separators(container)).toBe(' ;');
+        expect(separators(container)).toBe(' \t');
         // Dropped: v2 is newer. The view taken in stays as it is.
         await answerHeld(mounted, hold, 0);
-        expect(separators(container)).toBe(' ;');
+        expect(separators(container)).toBe(' \t');
         await click(mounted, '文本指令管理');
         expect(enabled(container)).toBe(before);
-        expect(await exportSaves(mounted)).toBe(false);
+        expect(await confirmSettingsAfterExport(mounted)).toBe(false);
       });
 
       // As above, the view read after the save ran comes after its answer: the change is made again
       // under the edits, and the view, said newer, takes the editor when asked to.
       it('lets a view read after the save ran take the editor, asked to, after the change is made again', async () => {
-        const hold = holdAnswers('save_draft');
+        const hold = holdAnswers('save_config');
         const mounted = await mountReady(hold);
         const { backend, container } = mounted;
         const before = await toggleHeld(mounted, hold);
@@ -2654,63 +2602,37 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
         });
         await answerHeld(mounted, hold, 0);
         await waitFor(mounted, () => {
-          expect(notices(container)).toContain(
-            '配置已在后台更新为 v2。编辑器中未保存的修改仍然保留',
-          );
+          expect(notices(container)).toContain('配置已在后台更新为 v3。未保存的修改已保留');
         });
         expect(separators(container)).toBe(' |');
         await click(mounted, '文本指令管理');
         expect(enabled(container)).toBe(!before);
         await click(mounted, '放弃修改，载入新配置');
         expect(enabled(container)).toBe(before);
-        expect(await exportSaves(mounted)).toBe(false);
+        expect(await confirmSettingsAfterExport(mounted)).toBe(false);
         await click(mounted, '文本指令参数设置');
-        expect(separators(container)).toBe(' ;');
+        expect(separators(container)).toBe(' \t');
       });
 
-      it('keeps the editor unsaved when a save is made again over a view read before it ran', async () => {
-        const hold = holdAnswers('save_draft');
-        const mounted = await mountReady(hold);
+      it('keeps a later settings input when a stale toggle is refused', async () => {
+        const mounted = await mountReady();
         const { backend, container } = mounted;
         await click(mounted, '文本指令参数设置');
         await type(mounted, field(container, '词分隔符'), ' ;');
-        // v2, read over the edit before 总开关 saves.
         await publish(mounted, ',');
-        await waitFor(mounted, () => {
-          expect(notices(container)).toContain(
-            '配置已在后台更新为 v2。编辑器中未保存的修改仍然保留',
-          );
-        });
-        await click(mounted, '文本指令管理');
-        const before = enabled(container);
-        hold.arm();
-        await toggle(mounted);
-        await waitFor(mounted, () => {
-          expect(hold.held[0]?.read).toBe(true);
-        });
-        await click(mounted, '文本指令参数设置');
+        await waitFor(mounted, () => expect(notices(container)).toContain('v2'));
         await type(mounted, field(container, '词分隔符'), ' |');
-        // Another command done meanwhile leaves the notice's buttons usable.
-        await mounted.act(() => {
-          checkbox(container, '开机时启动')?.click();
-        });
-        await waitFor(mounted, () => {
-          expect(button(container, '放弃修改，载入新配置')?.disabled).toBe(false);
-        });
+        await click(mounted, '文本指令管理');
+        await toggle(mounted);
+        await waitFor(mounted, () =>
+          expect(container.querySelector('.alert.error')?.textContent).toContain('版本'),
+        );
+        await click(mounted, '文本指令参数设置');
+        expect(separators(container)).toBe(' |');
+        expect(backend.active.globals.word_separators).toBe(',');
         await click(mounted, '放弃修改，载入新配置');
         expect(separators(container)).toBe(',');
-        await answerHeld(mounted, hold, 0);
-        // v2 with what 总开关 saved: not what the store has (the save replaced v2's draft).
-        expect(notices(container)).toContain('保存已用编辑器中的配置覆盖了它的草稿');
-        expect(separators(container)).toBe(',');
-        // Unsaved: a load does not replace it, and 导出 saves it first.
-        await focusLoad(mounted);
-        expect(separators(container)).toBe(',');
-        await click(mounted, '文本指令管理');
-        expect(enabled(container)).toBe(!before);
-        expect(await exportSaves(mounted)).toBe(true);
-        expect(sentEnabled(backend)).toBe(!before);
-        expect(sentSeparators(backend)).toBe(',');
+        expect(container.querySelector('.revision')).toBeNull();
       });
 
       it('adds the window to 黑名单 over what 总开关 saved while it was asked for', async () => {
@@ -2734,7 +2656,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
         await answerHeld(mounted, foreground, 0);
         await clickIn(mounted, dialog(container, '窗口信息'), '关闭');
         expect(enabled(container)).toBe(!before);
-        expect(await exportSaves(mounted)).toBe(true);
+        expect(await confirmSettingsAfterExport(mounted)).toBe(true);
         expect(sentEnabled(backend)).toBe(!before);
         expect(sent(backend)?.globals.blacklist).toContain('notepad.exe');
       });
@@ -2749,19 +2671,19 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
           );
 
         it('sends no other save while 总开关 saves, and saves again once it answers', async () => {
-          const hold = holdAnswers('save_draft');
+          const hold = holdAnswers('save_config');
           const mounted = await mountReady(hold);
           const { backend, container } = mounted;
           const before = await toggleHeld(mounted, hold);
           await click(mounted, '文本指令参数设置');
           await type(mounted, field(container, '词分隔符'), ' |');
-          const saveButton = () => button(container, '保存参数草稿');
+          const saveButton = () => button(container, '保存参数设置');
           expect(saveButton()?.disabled).toBe(true);
           // Sent, it would have the edits without 总开关 turned, and undo it.
           await callHandler(mounted, saveButton(), 'onClick');
           await settle(mounted);
           expect(errorShown(container)).toContain(PENDING);
-          expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+          expect(callsOf(backend, 'save_config')).toHaveLength(1);
           await answerHeld(mounted, hold, 0);
           expect(saveButton()?.disabled).toBe(false);
           await saveSettings(mounted);
@@ -2770,7 +2692,7 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
         });
 
         it('deletes nothing while 总开关 saves its change', async () => {
-          const hold = holdAnswers('save_draft');
+          const hold = holdAnswers('save_config');
           const mounted = await mountReady(hold);
           const { backend, container } = mounted;
           for (const label of ['选择 ;s1', '选择 ;s3']) {
@@ -2794,123 +2716,91 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
           await clickIn(mounted, dialog(container, question), '删除');
           await settle(mounted);
           expect(errorShown(container)).toContain(PENDING);
-          expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+          expect(callsOf(backend, 'save_config')).toHaveLength(1);
           await answerHeld(mounted, hold, 0);
           expect(listed(container)).toEqual([';s1', ';s2', ';s3']);
           expect(enabled(container)).toBe(!before);
           expect(batchDelete(container)?.disabled).toBe(false);
         });
 
-        it("leaves 总开关 usable while a save of the editor's config is in flight", async () => {
-          const hold = holdAnswers('save_draft');
+        it('keeps 总开关 disabled until a settings publication has answered', async () => {
+          const hold = holdAnswers('save_config');
           const mounted = await mountReady(hold);
           const { backend, container } = mounted;
           await click(mounted, '文本指令参数设置');
           await type(mounted, field(container, '词分隔符'), ' ;');
           hold.arm();
-          await click(mounted, '保存参数草稿');
+          await click(mounted, '保存参数设置');
           await waitFor(mounted, () => {
             expect(hold.held[0]?.read).toBe(true);
           });
           await click(mounted, '文本指令管理');
           const before = enabled(container);
-          expect(checkbox(container, '启用文本指令')?.disabled).toBe(false);
+          expect(checkbox(container, '启用文本指令')?.disabled).toBe(true);
+          await toggle(mounted);
+          expect(callsOf(backend, 'save_config')).toHaveLength(1);
+          await answerHeld(mounted, hold, 0);
           await toggle(mounted);
           await waitFor(mounted, () => {
-            expect(callsOf(backend, 'save_draft')).toHaveLength(2);
+            expect(callsOf(backend, 'save_config')).toHaveLength(2);
           });
           await settle(mounted);
           // Sent after the save of the edit, and with it.
           expect(sentEnabled(backend)).toBe(!before);
           expect(sentSeparators(backend)).toBe(' ;');
-          await answerHeld(mounted, hold, 0);
           expect(errorShown(container)).toBe('');
           expect(enabled(container)).toBe(!before);
-          expect(backend.draft.enabled).toBe(!before);
+          expect(backend.active.enabled).toBe(!before);
         });
 
         it('allows the writes again once a save of a change fails', async () => {
-          const hold = holdFailures('save_draft', FAILURE);
+          const hold = holdFailures('save_config', FAILURE);
           const mounted = await mountReady(hold);
           const { backend, container } = mounted;
           const before = await toggleHeld(mounted, hold);
           expect(checkbox(container, '启用文本指令')?.disabled).toBe(true);
           expect(button(container, '导出')?.disabled).toBe(true);
-          expect(button(container, 'Excel 填写模板')?.disabled).toBe(true);
+          expect(button(container, '▾')?.disabled).toBe(true);
           await answerHeld(mounted, hold, 0);
           expect(errorShown(container)).toContain(FAILURE);
           expect(checkbox(container, '启用文本指令')?.disabled).toBe(false);
           expect(button(container, '导出')?.disabled).toBe(false);
-          expect(button(container, 'Excel 填写模板')?.disabled).toBe(false);
-          const saves = callsOf(backend, 'save_draft').length;
+          expect(button(container, '▾')?.disabled).toBe(false);
+          const saves = callsOf(backend, 'save_config').length;
           await toggle(mounted);
           await waitFor(mounted, () => {
-            expect(callsOf(backend, 'save_draft')).toHaveLength(saves + 1);
+            expect(callsOf(backend, 'save_config')).toHaveLength(saves + 1);
           });
           await settle(mounted);
           expect(sentEnabled(backend)).toBe(!before);
-          expect(backend.draft.enabled).toBe(!before);
+          expect(backend.active.enabled).toBe(!before);
         });
 
-        it('sends no 放弃未应用草稿, 恢复上一个版本 or 应用设置 while 总开关 saves its change', async () => {
-          const hold = holdAnswers('save_draft');
+        it('serializes rollback and settings publication while a toggle answer is pending', async () => {
+          const hold = holdAnswers('save_config');
           const mounted = await mountReady(hold);
           const { backend, container } = mounted;
+          await toggleHeld(mounted, hold);
           await click(mounted, '文本指令参数设置');
-          const original = separators(container);
-          await click(mounted, '文本指令管理');
-          const before = enabled(container);
-          hold.arm();
-          await toggle(mounted);
-          await waitFor(mounted, () => {
-            expect(hold.held[0]?.read).toBe(true);
-          });
-          // 应用设置 is disabled while busy too: another command done meanwhile ends that.
-          await click(mounted, '文本指令参数设置');
-          await mounted.act(() => {
-            checkbox(container, '开机时启动')?.click();
-          });
-          await waitFor(mounted, () => {
-            expect(callsOf(backend, 'set_autostart')).toHaveLength(1);
-          });
-          await settle(mounted);
-          expect(statusText(container)).not.toBe('正在处理…');
-          const apply = () => button(container, '应用设置');
-          expect(apply()?.disabled).toBe(true);
-          // Nothing unsaved: it would publish the draft at once.
-          await callHandler(mounted, apply(), 'onClick');
+          expect(button(container, '保存参数设置')?.disabled).toBe(true);
+          await callHandler(mounted, button(container, '保存参数设置'), 'onClick');
           await settle(mounted);
           expect(errorShown(container)).toContain(PENDING);
-          // An edit, then the commands that would undo the save, its change made again over them.
-          await type(mounted, field(container, '词分隔符'), ' |');
+          expect(callsOf(backend, 'save_config')).toHaveLength(1);
           await click(mounted, '运行状态与恢复');
-          for (const [text, title, confirm] of [DISCARD, ROLLBACK]) {
-            expect(button(container, text)?.disabled).toBe(true);
-            await callHandler(mounted, button(container, text), 'onClick');
-            await waitFor(mounted, () => {
-              expect(dialog(container, title)).not.toBeNull();
-            });
-            await clickIn(mounted, dialog(container, title), confirm);
-            await settle(mounted);
-          }
-          for (const command of ['apply_settings', 'discard_draft', 'rollback'])
-            expect(callsOf(backend, command)).toEqual([]);
-          expect(errorShown(container)).toContain(PENDING);
+          expect(button(container, '恢复上一个版本')?.disabled).toBe(true);
+          await callHandler(mounted, button(container, '恢复上一个版本'), 'onClick');
+          await clickIn(mounted, dialog(container, '回滚到上一个生效版本？'), '回滚');
+          await settle(mounted);
+          expect(callsOf(backend, 'rollback')).toHaveLength(0);
           await answerHeld(mounted, hold, 0);
-          for (const text of ['放弃未应用草稿', '恢复上一个版本', '应用设置'])
-            expect(button(container, text)?.disabled).toBe(false);
-          // Sent now, 放弃未应用草稿 puts in the editor the draft as discarded: the active config.
-          await confirmOnStatus(mounted, DISCARD);
-          await waitFor(mounted, () => {
-            expect(separators(container)).toBe(original);
-          });
-          await click(mounted, '文本指令管理');
-          expect(enabled(container)).toBe(before);
-          expect(await exportSaves(mounted)).toBe(false);
+          expect(button(container, '恢复上一个版本')?.disabled).toBe(false);
+          await confirmOnStatus(mounted, ROLLBACK);
+          await waitFor(mounted, () => expect(backend.active.revision).toBe(3));
         });
 
         it('keeps the import dialog open until its save is done, the editor then the import', async () => {
-          const hold = holdAnswers('save_draft');
+          const hold = holdAnswers('save_config');
           const mounted = await mountReady(hold);
           const { backend, container } = mounted;
           const strategy = '遇到重复的指令时怎么处理？';
@@ -2920,15 +2810,15 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
           });
           await clickIn(mounted, dialog(container, strategy), '导入');
           await waitFor(mounted, () => {
-            expect(button(container, '确认导入草稿')).toBeDefined();
+            expect(button(container, '确认导入并生效')).toBeDefined();
           });
           hold.arm();
-          await click(mounted, '确认导入草稿');
+          await click(mounted, '确认导入并生效');
           await waitFor(mounted, () => {
             expect(hold.held[0]?.read).toBe(true);
           });
           // Closed, it would let the editor be edited, and the import replace the edits.
-          const report = () => dialog(container, '导入预览 · 确认后写入草稿');
+          const report = () => dialog(container, '导入预览 · 确认后立即生效');
           const close = () =>
             [...(report()?.querySelectorAll('button') ?? [])].find((b) => b.textContent === '关闭');
           expect(close()?.disabled).toBe(true);
@@ -2949,20 +2839,21 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
             modal?.dispatchEvent(new Event('close'));
           });
           expect(report()?.open).toBe(true);
-          expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+          expect(callsOf(backend, 'save_config')).toHaveLength(1);
           await answerHeld(mounted, hold, 0);
           await waitFor(mounted, () => {
             expect(report()).toBeNull();
           });
           expect(errorShown(container)).toBe('');
           expect(container.querySelectorAll('tbody tr')).toHaveLength(5);
-          expect(revisionText(container)).toContain('草稿待应用');
+          expect(revisionText(container)).toBe('');
+          expect(backend.active.revision).toBe(2);
           // As saved: nothing unsaved.
-          expect(await exportSaves(mounted)).toBe(false);
+          expect(await confirmSettingsAfterExport(mounted)).toBe(false);
         });
 
         it('lets the import dialog be closed once its save fails', async () => {
-          const hold = holdFailures('save_draft', FAILURE);
+          const hold = holdFailures('save_config', FAILURE);
           const mounted = await mountReady(hold);
           const { container } = mounted;
           const strategy = '遇到重复的指令时怎么处理？';
@@ -2972,18 +2863,18 @@ describe('catching up with a revision published elsewhere (review C5)', () => {
           });
           await clickIn(mounted, dialog(container, strategy), '导入');
           await waitFor(mounted, () => {
-            expect(button(container, '确认导入草稿')).toBeDefined();
+            expect(button(container, '确认导入并生效')).toBeDefined();
           });
           hold.arm();
-          await click(mounted, '确认导入草稿');
+          await click(mounted, '确认导入并生效');
           await waitFor(mounted, () => {
             expect(hold.held[0]?.read).toBe(true);
           });
-          const report = () => dialog(container, '导入预览 · 确认后写入草稿');
+          const report = () => dialog(container, '导入预览 · 确认后立即生效');
           await answerHeld(mounted, hold, 0);
           expect(errorShown(container)).toContain(FAILURE);
           // Still open, to try again or close.
-          expect(button(container, '确认导入草稿')?.disabled).toBe(false);
+          expect(button(container, '确认导入并生效')?.disabled).toBe(false);
           await clickIn(mounted, report(), '关闭');
           expect(report()).toBeNull();
           expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
@@ -3028,7 +2919,7 @@ describe('action types by capability status (S-16, principle 5)', () => {
   /** Mount with the rule (listed first) and the lowered health, and open the rule. */
   async function editRule(platform: 'windows' | 'macos', action: Record<string, unknown>) {
     const mounted = await mount({ platform }, (backend) => {
-      backend.draft.rules.push(structuredClone(rule(action)));
+      backend.active.rules.push(structuredClone(rule(action)));
       backend.health = structuredClone(lowered);
     });
     await waitFor(mounted, () => {
@@ -3063,10 +2954,10 @@ describe('action types by capability status (S-16, principle 5)', () => {
   async function save(mounted: Mounted): Promise<unknown> {
     await clickIn(mounted, dialog(mounted.container, EDITOR), '保存');
     await waitFor(mounted, () => {
-      expect(callsOf(mounted.backend, 'save_draft')).toHaveLength(1);
+      expect(callsOf(mounted.backend, 'save_config')).toHaveLength(1);
       expect(dialog(mounted.container, EDITOR)).toBeNull();
     });
-    const { rules } = callsOf(mounted.backend, 'save_draft')[0]?.args.config as {
+    const { rules } = callsOf(mounted.backend, 'save_config')[0]?.args.config as {
       rules: { id: string; action: unknown }[];
     };
     return rules.find((r) => r.id === 'rule-a-capability')?.action;
@@ -3149,7 +3040,7 @@ describe('tolerant reading (B-43)', () => {
     rules: unknown[];
   };
   const lastSaved = (backend: MockBackend) =>
-    callsOf(backend, 'save_draft').at(-1)?.args.config as Saved;
+    callsOf(backend, 'save_config').at(-1)?.args.config as Saved;
 
   async function mountSample(): Promise<Mounted> {
     const mounted = await mount({ unreadable: true });
@@ -3193,13 +3084,13 @@ describe('tolerant reading (B-43)', () => {
   it('writes raw entries and unknown keys back as the values received when rules change', async () => {
     const mounted = await mountSample();
     const { backend, container } = mounted;
-    const before = structuredClone(backend.draft);
+    const before = structuredClone(backend.active);
     const toggle = container.querySelector<HTMLInputElement>('input[aria-label="停用 ;s2"]');
     await mounted.act(() => {
       toggle?.click();
     });
     await waitFor(mounted, () => {
-      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+      expect(callsOf(backend, 'save_config')).toHaveLength(1);
     });
     const saved = lastSaved(backend);
     expect(saved.rules).toHaveLength(6);
@@ -3226,7 +3117,7 @@ describe('tolerant reading (B-43)', () => {
     });
     await clickIn(mounted, dialog(container, question), '删除');
     await waitFor(mounted, () => {
-      expect(callsOf(backend, 'save_draft')).toHaveLength(2);
+      expect(callsOf(backend, 'save_config')).toHaveLength(2);
     });
     const ids = lastSaved(backend).rules.map((r) =>
       typeof r === 'object' && r !== null ? (r as { id?: unknown }).id : r,
@@ -3251,7 +3142,7 @@ describe('tolerant reading (B-43)', () => {
     });
     await clickIn(mounted, dialog(container, question), '删除');
     await waitFor(mounted, () => {
-      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+      expect(callsOf(backend, 'save_config')).toHaveLength(1);
     });
     const ids = lastSaved(backend).rules.map((r) =>
       typeof r === 'object' && r !== null ? (r as { id?: unknown }).id : r,
@@ -3306,7 +3197,7 @@ describe('tolerant reading (B-43)', () => {
       { ...rule('bad-notification'), notification: null },
     ];
     const mounted = await mount({}, (backend) => {
-      backend.draft.rules.splice(1, 0, ...structuredClone(malformed));
+      backend.active.rules.splice(1, 0, ...structuredClone(malformed));
     });
     const { backend, container } = mounted;
     await waitFor(mounted, () => {
@@ -3326,7 +3217,7 @@ describe('tolerant reading (B-43)', () => {
       toggle?.click();
     });
     await waitFor(mounted, () => {
-      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+      expect(callsOf(backend, 'save_config')).toHaveLength(1);
     });
     const saved = lastSaved(backend).rules;
     expect(saved).toHaveLength(3 + malformed.length);
@@ -3337,7 +3228,7 @@ describe('tolerant reading (B-43)', () => {
   it('keeps unknown keys of the edited rule, the globals and the config', async () => {
     const mounted = await mountSample();
     const { backend, container } = mounted;
-    const before = structuredClone(backend.draft);
+    const before = structuredClone(backend.active);
     await click(mounted, '编辑');
     expect(container.querySelector('.extra-keys')?.textContent).toBe(
       '含有本版本不认识的字段（future_rule_field），保存时会保留。',
@@ -3345,7 +3236,7 @@ describe('tolerant reading (B-43)', () => {
     await type(mounted, field(container, '说明'), '新说明');
     await clickIn(mounted, dialog(container, '编辑文本指令'), '保存');
     await waitFor(mounted, () => {
-      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+      expect(callsOf(backend, 'save_config')).toHaveLength(1);
     });
     // Warnings about the unreadable entries do not show up as the edit's field errors.
     expect(container.querySelector('.field-errors')).toBeNull();
@@ -3354,9 +3245,9 @@ describe('tolerant reading (B-43)', () => {
     expect(saved.rules.slice(1)).toEqual(before.rules.slice(1));
 
     await click(mounted, '文本指令参数设置');
-    await click(mounted, '保存参数草稿');
+    await click(mounted, '保存参数设置');
     await waitFor(mounted, () => {
-      expect(callsOf(backend, 'save_draft')).toHaveLength(2);
+      expect(callsOf(backend, 'save_config')).toHaveLength(2);
     });
     expect(lastSaved(backend).globals.future_global).toBe('kept');
     expect(lastSaved(backend).future_setting).toEqual({ sample: true });
@@ -3383,9 +3274,9 @@ describe('tolerant reading (B-43)', () => {
       notification: { enabled: false, message: '' },
     };
     const mounted = await mount({ unreadable: true }, (backend) => {
-      const [first] = backend.draft.rules as Record<string, unknown>[];
+      const [first] = backend.active.rules as Record<string, unknown>[];
       // A rule-level key of a newer version in the middle of the known ones.
-      backend.draft.rules[0] = Object.fromEntries(
+      backend.active.rules[0] = Object.fromEntries(
         Object.entries({
           ...first,
           action: { type: 'send_keys', source: { type: 'inline', value: 'hi' } },
@@ -3398,13 +3289,13 @@ describe('tolerant reading (B-43)', () => {
             : [[k, v]],
         ),
       );
-      backend.draft.rules.splice(2, 0, structuredClone(nested));
+      backend.active.rules.splice(2, 0, structuredClone(nested));
     });
     const { backend, container } = mounted;
     await waitFor(mounted, () => {
       expect(container.querySelectorAll('tbody tr')).toHaveLength(7);
     });
-    const before = structuredClone(backend.draft);
+    const before = structuredClone(backend.active);
     const raw = [...container.querySelectorAll('tbody tr.unreadable-row')].find(
       (r) => r.querySelector('.unreadable-id')?.textContent === 'nested-unknown',
     );
@@ -3421,7 +3312,7 @@ describe('tolerant reading (B-43)', () => {
     await clickIn(mounted, editor, '添加普通文字');
     await clickIn(mounted, editor, '保存');
     await waitFor(mounted, () => {
-      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+      expect(callsOf(backend, 'save_config')).toHaveLength(1);
     });
     const saved = lastSaved(backend);
     const edited = saved.rules[0] as Record<string, unknown>;
@@ -3441,9 +3332,9 @@ describe('tolerant reading (B-43)', () => {
     // The globals and the config keep their unknown keys, in place, through a settings edit.
     await click(mounted, '文本指令参数设置');
     await type(mounted, field(container, '词分隔符'), ' ;');
-    await click(mounted, '保存参数草稿');
+    await click(mounted, '保存参数设置');
     await waitFor(mounted, () => {
-      expect(callsOf(backend, 'save_draft')).toHaveLength(2);
+      expect(callsOf(backend, 'save_config')).toHaveLength(2);
     });
     const settings = lastSaved(backend);
     expect(settings.globals.word_separators).toBe(' ;');
@@ -3472,7 +3363,7 @@ describe('tolerant reading (B-43)', () => {
       '"action":{"type":"reusable","action_id":"a","parameters":{"count":9007199254740993}}}';
     const mounted = await mount({}, (backend) => {
       const raw = JSON.parse(`[${hugeText},${safeText},${parameterText}]`) as unknown[];
-      backend.draft.rules.splice(1, 0, ...raw);
+      backend.active.rules.splice(1, 0, ...raw);
     });
     const { backend, container } = mounted;
     await waitFor(mounted, () => {
@@ -3505,10 +3396,10 @@ describe('tolerant reading (B-43)', () => {
       toggle?.click();
     });
     await waitFor(mounted, () => {
-      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+      expect(callsOf(backend, 'save_config')).toHaveLength(1);
     });
     await waitFor(mounted, () => {
-      expect(backend.draft.rules.at(-2)).toMatchObject({ id: 'mock-rule-2', enabled: false });
+      expect(backend.active.rules.at(-2)).toMatchObject({ id: 'mock-rule-2', enabled: false });
     });
     expect(container.querySelector('.alert.error')).toBeNull();
     const saved = lastSaved(backend).rules;
@@ -3529,7 +3420,7 @@ describe('tolerant reading (B-43)', () => {
     async function mountWith(n: string): Promise<Mounted> {
       const mounted = await mount({}, (backend) => {
         Object.assign(
-          level === 'config' ? backend.draft : backend.draft.globals,
+          level === 'config' ? backend.active : backend.active.globals,
           JSON.parse(text(n)),
         );
       });
@@ -3540,9 +3431,9 @@ describe('tolerant reading (B-43)', () => {
       return mounted;
     }
     async function saveSettings(mounted: Mounted): Promise<string> {
-      await click(mounted, '保存参数草稿');
+      await click(mounted, '保存参数设置');
       await waitFor(mounted, () => {
-        expect(callsOf(mounted.backend, 'save_draft')).toHaveLength(1);
+        expect(callsOf(mounted.backend, 'save_config')).toHaveLength(1);
       });
       expect(mounted.container.querySelector('.alert.error')).toBeNull();
       const saved = lastSaved(mounted.backend);
@@ -3575,7 +3466,7 @@ describe('tolerant reading (B-43)', () => {
       action: { type: 'steps', plan: { steps: [{ operation: { type: 'delay', ms: 5 } }] } },
     };
     const mounted = await mount({}, (backend) => {
-      backend.draft.rules.push(structuredClone(sparse));
+      backend.active.rules.push(structuredClone(sparse));
     });
     const { backend, container } = mounted;
     await waitFor(mounted, () => {
@@ -3589,7 +3480,7 @@ describe('tolerant reading (B-43)', () => {
     await type(mounted, field(editor ?? container, '说明'), '补全');
     await clickIn(mounted, editor, '保存');
     await waitFor(mounted, () => {
-      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+      expect(callsOf(backend, 'save_config')).toHaveLength(1);
     });
     expect(lastSaved(backend).rules.at(-1)).toStrictEqual({
       id: 'sparse',
@@ -3689,7 +3580,7 @@ describe('number fields of the editor', () => {
   /** Mount with `extra` rules (matched `;a-…`, so listed first) and open the first one. */
   async function editFirst(...extra: ReturnType<typeof rule>[]): Promise<Mounted> {
     const mounted = await mount({}, (backend) => {
-      backend.draft.rules.push(...structuredClone(extra));
+      backend.active.rules.push(...structuredClone(extra));
     });
     await waitFor(mounted, () => {
       expect(mounted.container.querySelectorAll('tbody tr')).toHaveLength(3 + extra.length);
@@ -3720,7 +3611,7 @@ describe('number fields of the editor', () => {
     expect(items).toContain(listed);
     expect(dialog(container, EDITOR)).not.toBeNull();
     expect(callsOf(backend, 'validate_config')).toHaveLength(0);
-    expect(callsOf(backend, 'save_draft')).toHaveLength(0);
+    expect(callsOf(backend, 'save_config')).toHaveLength(0);
   }
 
   /** No call reached the backend with the editor's invalid-number marker in it. */
@@ -3746,12 +3637,12 @@ describe('number fields of the editor', () => {
   async function save(mounted: Mounted): Promise<unknown> {
     await clickIn(mounted, dialog(mounted.container, EDITOR), '保存');
     await waitFor(mounted, () => {
-      expect(callsOf(mounted.backend, 'save_draft')).toHaveLength(1);
+      expect(callsOf(mounted.backend, 'save_config')).toHaveLength(1);
     });
     await waitFor(mounted, () => {
       expect(dialog(mounted.container, EDITOR)).toBeNull();
     });
-    const { rules } = callsOf(mounted.backend, 'save_draft')[0]?.args.config as {
+    const { rules } = callsOf(mounted.backend, 'save_config')[0]?.args.config as {
       rules: { action: unknown }[];
     };
     return rules.at(-1)?.action;
@@ -3781,7 +3672,7 @@ describe('number fields of the editor', () => {
     expect(callsOf(backend, 'execute_action')).toHaveLength(0);
     const listed = `操作设置 · 参数「param1」的值应为 ${JSON_RANGE}。`;
     await expectSaveRefused(mounted, listed);
-    expect(backend.draft.rules).toHaveLength(3);
+    expect(backend.active.rules).toHaveLength(3);
     expectNoMarkerSent(backend);
     // Still editable: the largest safe integer goes through as typed.
     expectInvalid(input(editor, '参数值'), '9007199254740993', `请输入 ${JSON_RANGE}。`);
@@ -3807,7 +3698,7 @@ describe('number fields of the editor', () => {
     await type(mounted, input(editor, '参数值'), '9007199254740993');
     expectInvalid(input(editor, '参数值'), '9007199254740993', `请输入 ${JSON_RANGE}。`);
     await expectSaveRefused(mounted, `操作设置 · 参数「count」的值应为 ${JSON_RANGE}。`);
-    expect(backend.draft.rules.at(-1)).toEqual(reuse);
+    expect(backend.active.rules.at(-1)).toEqual(reuse);
     // 检查这段文字能否触发 sends the rule too: refused before it asks for the text.
     await clickIn(mounted, editor, '检查这段文字能否触发（不会执行操作）');
     await mounted.act(() => new Promise((resolve) => setTimeout(resolve, 20)));
@@ -3949,8 +3840,8 @@ describe('number fields of the editor', () => {
     const kept = { ...rule(';a-wide', steps({ type: 'delay', ms: 100 })), future_list: wide() };
     const raw = { id: 'raw-wide', match: 42, future_list: wide() };
     const mounted = await mount({}, (backend) => {
-      backend.draft.future_setting = wide();
-      backend.draft.rules.push(structuredClone(kept), structuredClone(raw));
+      backend.active.future_setting = wide();
+      backend.active.rules.push(structuredClone(kept), structuredClone(raw));
     });
     const { backend, container } = mounted;
     await waitFor(mounted, () => {
@@ -3965,12 +3856,12 @@ describe('number fields of the editor', () => {
     await type(mounted, input(editor, '等待时间（毫秒）'), '200');
     await clickIn(mounted, editor, '保存');
     await waitFor(mounted, () => {
-      expect(callsOf(backend, 'save_draft')).toHaveLength(1);
+      expect(callsOf(backend, 'save_config')).toHaveLength(1);
     });
     await waitFor(mounted, () => {
       expect(dialog(container, EDITOR)).toBeNull();
     });
-    const saved = callsOf(backend, 'save_draft')[0]?.args.config as {
+    const saved = callsOf(backend, 'save_config')[0]?.args.config as {
       rules: unknown[];
       future_setting: unknown;
     };
@@ -4014,5 +3905,128 @@ describe('production build outside the desktop app', () => {
     });
     expect(headerStatus(container)).toBe('未连接');
     expect((globalThis as { quickerMock?: unknown }).quickerMock).toBeUndefined();
+  });
+});
+
+describe('direct publication confirmations', () => {
+  async function preview(mounted: Mounted) {
+    await click(mounted, '导入');
+    await clickIn(mounted, dialog(mounted.container, '遇到重复的指令时怎么处理？'), '导入');
+    await waitFor(mounted, () => expect(button(mounted.container, '确认导入并生效')).toBeDefined());
+  }
+
+  it.each(['json', 'xlsx'] as const)(
+    'cancelling a %s preview changes no active configuration',
+    async (importFormat) => {
+      const mounted = await mount({ importFormat });
+      const before = structuredClone(mounted.backend.active);
+      await preview(mounted);
+      await clickIn(mounted, dialog(mounted.container, '导入预览 · 确认后立即生效'), '关闭');
+      expect(mounted.backend.active).toEqual(before);
+      expect(callsOf(mounted.backend, 'save_config')).toHaveLength(0);
+      expect(dialog(mounted.container, '导入预览 · 确认后立即生效')).toBeNull();
+    },
+  );
+
+  it('refuses a preview superseded by another window and leaves the report open', async () => {
+    const mounted = await mount();
+    const { backend, container } = mounted;
+    await preview(mounted);
+    await mounted.act(() =>
+      backend
+        .handle('import_config', { path: 'other-window.xlsx', strategy: 'replace' })
+        .then(() => undefined),
+    );
+    await click(mounted, '确认导入并生效');
+    await waitFor(mounted, () =>
+      expect(container.querySelector('.alert.error')?.textContent).toContain('过期'),
+    );
+    expect(backend.active.revision).toBe(1);
+    expect(backend.active.rules).toHaveLength(3);
+    expect(dialog(container, '导入预览 · 确认后立即生效')).not.toBeNull();
+    expect(button(container, '确认导入并生效')?.disabled).toBe(false);
+    await clickIn(mounted, dialog(container, '导入预览 · 确认后立即生效'), '关闭');
+    await preview(mounted);
+    await click(mounted, '确认导入并生效');
+    await waitFor(mounted, () => expect(backend.active.revision).toBe(2));
+    expect(backend.active.rules).toHaveLength(5);
+  });
+
+  it('refuses an import preview based on a stale revision without overriding another window', async () => {
+    const mounted = await mount();
+    const { backend, container } = mounted;
+    await preview(mounted);
+    await mounted.act(() =>
+      backend.publishExternally((c) => {
+        c.enabled = false;
+      }),
+    );
+    await click(mounted, '确认导入并生效');
+    await waitFor(mounted, () =>
+      expect(container.querySelector('.alert.error')?.textContent).toContain('版本'),
+    );
+    expect(backend.active.revision).toBe(2);
+    expect(backend.active.enabled).toBe(false);
+    expect(backend.active.rules).toHaveLength(3);
+    expect(dialog(container, '导入预览 · 确认后立即生效')).not.toBeNull();
+  });
+
+  it('cancels settings input locally without sending a configuration write', async () => {
+    const mounted = await mount();
+    const { backend, container } = mounted;
+    await click(mounted, '文本指令参数设置');
+    const before = field(container, '词分隔符').value;
+    await type(mounted, field(container, '词分隔符'), ' ;');
+    await click(mounted, '取消修改');
+    expect(field(container, '词分隔符').value).toBe(before);
+    expect(callsOf(backend, 'save_config')).toHaveLength(0);
+    expect(backend.active.revision).toBe(1);
+    expect(container.querySelector('.revision')).toBeNull();
+  });
+
+  it('retains rule input typed while a successful save answer is delayed', async () => {
+    const hold = holdAnswers('save_config');
+    const mounted = await mount({}, (backend) => hold.attach(backend));
+    const { backend, container } = mounted;
+    await click(mounted, '编辑');
+    await type(mounted, field(container, '说明'), '第一个已确认版本');
+    hold.arm();
+    await clickIn(mounted, dialog(container, '编辑文本指令'), '保存');
+    await waitFor(mounted, () => expect(hold.held[0]?.read).toBe(true));
+    await type(mounted, field(container, '说明'), '保存期间新增的输入');
+    await answerHeld(mounted, hold, 0);
+    expect(dialog(container, '编辑文本指令')).not.toBeNull();
+    expect(field(container, '说明').value).toBe('保存期间新增的输入');
+    expect(
+      backend.active.rules.filter(isRule).some((r) => r.description === '第一个已确认版本'),
+    ).toBe(true);
+    expect(
+      backend.active.rules.filter(isRule).some((r) => r.description === '保存期间新增的输入'),
+    ).toBe(false);
+    await clickIn(mounted, dialog(container, '编辑文本指令'), '保存');
+    await waitFor(mounted, () => expect(dialog(container, '编辑文本指令')).toBeNull());
+    expect(backend.active.revision).toBe(3);
+    expect(
+      backend.active.rules.filter(isRule).some((r) => r.description === '保存期间新增的输入'),
+    ).toBe(true);
+  });
+
+  it('publishes bulk disable and enable immediately', async () => {
+    const mounted = await mount();
+    const { backend, container } = mounted;
+    await mounted.act(() =>
+      container.querySelector<HTMLInputElement>('input[aria-label="选择 ;s1"]')?.click(),
+    );
+    await clickIn(mounted, container.querySelector('.batch'), '停用');
+    await waitFor(mounted, () => expect(backend.active.revision).toBe(2));
+    expect(backend.active.rules.filter(isRule).find((r) => r.match.value === ';s1')?.enabled).toBe(
+      false,
+    );
+    await clickIn(mounted, container.querySelector('.batch'), '启用');
+    await waitFor(mounted, () => expect(backend.active.revision).toBe(3));
+    expect(backend.active.rules.filter(isRule).find((r) => r.match.value === ';s1')?.enabled).toBe(
+      true,
+    );
+    expect(callsOf(backend, 'save_config')).toHaveLength(2);
   });
 });

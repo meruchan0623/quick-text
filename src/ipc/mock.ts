@@ -268,15 +268,14 @@ export class MockBackend {
   /** Set to make the next command of that name reject with this value. */
   readonly failures = new Map<string, unknown>();
 
-  draft: MockConfig;
   active: MockConfig;
   /**
    * In Locked and NewerSchema, the store on disk, which the backend did not load: it serves an
-   * empty revision-0 placeholder as active and draft instead (src-tauri store/fallback.rs
+   * empty revision-0 placeholder as active instead (src-tauri store/fallback.rs
    * `read_only`). The Locked retry that succeeds installs this (`endSafeMode`). Tests may replace
    * it before that.
    */
-  disk: { active: MockConfig; draft: MockConfig } | null = null;
+  disk: { active: MockConfig } | null = null;
   previous: MockConfig[] = [];
   health: HealthSnapshot;
   engine: EngineState;
@@ -292,10 +291,9 @@ export class MockBackend {
   readonly #handlers = new Map<string, Set<(payload: unknown) => void>>();
   /** What the last store-state said (or the start); store-state is sent only on a change. */
   #store: { revision: number; safeMode: SafeModeReason | null };
-  /** The config import_config last previewed (as JSON), until the next save_draft. */
-  #pendingImport: string | null = null;
-  /** In safe mode, the draft is a committed import: apply_settings may publish it. */
-  #safeImport = false;
+  /** The config import_config last previewed (as JSON), until the next save_config. */
+  #pendingImport: { json: string; token: string } | null = null;
+  #importSequence = 0;
 
   constructor(options: MockOptions = {}) {
     this.options = {
@@ -322,10 +320,9 @@ export class MockBackend {
     if (this.options.unreadable) addTolerantSample(config);
     this.safeMode = options.safeMode ?? null;
     if (this.safeMode === 'locked' || this.safeMode === 'newer_schema') {
-      this.disk = { active: config, draft: clone(config) };
+      this.disk = { active: config };
       this.active = placeholderConfig();
     } else this.active = config;
-    this.draft = clone(this.active);
     this.health = this.#healthOf(this.options.health);
     this.engine = {
       listening: false,
@@ -405,15 +402,13 @@ export class MockBackend {
   }
 
   /**
-   * A revision published from outside this window (another instance, say): the draft is replaced
-   * by it, as after apply_settings. `edit` changes the published config.
+   * A revision published from outside this window (another instance, say): active config is published. `edit` changes the published config.
    */
   publishExternally(edit?: (config: MockConfig) => void): void {
-    const next = { ...clone(this.draft), revision: this.active.revision + 1 };
+    const next = { ...clone(this.active), revision: this.active.revision + 1 };
     edit?.(next);
     this.previous.push(this.active);
     this.active = next;
-    this.draft = clone(next);
     this.#emitStore();
   }
 
@@ -422,19 +417,17 @@ export class MockBackend {
    * store is read again (at `revision`, when given), the safe_mode pause and problem go, and the
    * changes are pushed. A problem going is never pushed (contract §3).
    *
-   * From Locked, the store read replaces the placeholder active and draft with the ones on disk
+   * From Locked, the store read replaces the placeholder active with the ones on disk
    * (src-tauri store/load.rs `install`), whose revision may be the placeholder's: store-state then
    * says the same revision, with safe mode null (review I6).
    */
   endSafeMode(revision?: number): void {
     if (this.disk !== null) {
       this.active = this.disk.active;
-      this.draft = this.disk.draft;
       this.disk = null;
     }
     if (revision !== undefined && revision !== this.active.revision) {
       this.active = { ...clone(this.active), revision };
-      this.draft = clone(this.active);
     }
     this.#leaveSafeMode();
     this.#emitStore();
@@ -457,7 +450,7 @@ export class MockBackend {
     if (!handler) throw notFound(command);
     const answer = handler(args);
     // A command that changed the revision or safe mode pushes store-state before it answers, so the
-    // event may reach the window first (apply_settings, rollback).
+    // event may reach the window first (save_config, rollback).
     this.#emitStore();
     return answer;
   }
@@ -475,11 +468,16 @@ export class MockBackend {
 
   readonly #shared: Record<string, (args: CommandArgs) => unknown> = {
     load_state: () => this.#state(),
-    save_draft: (args) => {
+    save_config: (args) => {
       const config = clone(args.config as MockConfig);
       // In safe mode only the previewed import may be committed, and only where importing is the
       // way out (src-tauri store/mod.rs).
-      const importing = this.#pendingImport === JSON.stringify(config);
+      const importing =
+        args.importToken !== undefined &&
+        this.#pendingImport?.token === args.importToken &&
+        this.#pendingImport.json === JSON.stringify(config);
+      if (args.importToken !== undefined && !importing)
+        this.#fail({ code: 'token_expired' }, 'Import preview expired');
       if (!(importing && (this.safeMode === 'crash_loop' || this.safeMode === 'no_valid_config')))
         this.#guardSafeMode();
       if (!this.options.legacy) {
@@ -487,26 +485,15 @@ export class MockBackend {
         if (errors.length > 0)
           this.#fail({ code: 'validation', detail: { diagnostics: errors } }, '');
       }
-      this.draft = config;
+      if (config.revision !== this.active.revision)
+        this.#fail(
+          { code: 'revision_conflict', detail: { current: this.active.revision } },
+          'Configuration changed',
+        );
+      this.previous.push(clone(this.active));
+      this.active = { ...config, revision: this.active.revision + 1 };
       this.#pendingImport = null;
-      this.#safeImport = this.safeMode !== null;
-      return this.#state();
-    },
-    apply_settings: () => {
-      // In safe mode only the committed import may be published; that ends safe mode.
-      if (!this.#safeImport) this.#guardSafeMode();
-      const errors = validate(this.draft).filter((d) => d.severity === 'error');
-      if (errors.length > 0)
-        this.#fail({ code: 'validation', detail: { diagnostics: errors } }, JSON.stringify(errors));
-      this.previous.push(this.active);
-      this.active = { ...clone(this.draft), revision: this.active.revision + 1 };
-      this.draft = clone(this.active);
       if (this.safeMode) this.#leaveSafeMode();
-      return this.#state();
-    },
-    discard_draft: () => {
-      this.#guardSafeMode();
-      this.draft = clone(this.active);
       return this.#state();
     },
     rollback: () => {
@@ -518,7 +505,6 @@ export class MockBackend {
           'No previous revision',
         );
       this.active = { ...previous, revision: this.active.revision + 1 };
-      this.draft = clone(this.active);
       return this.#state();
     },
     set_paused: (args) => {
@@ -612,13 +598,19 @@ export class MockBackend {
         this.#fail({ code: 'safe_mode', detail: { reason: this.safeMode } }, '');
       return 'mock://quicktext-template.xlsx';
     },
+    export_excel_config: () => {
+      if (this.options.dialog === 'cancel') return null;
+      if (this.safeMode && this.safeMode !== 'crash_loop')
+        this.#fail({ code: 'safe_mode', detail: { reason: this.safeMode } }, '');
+      return 'mock://quicktext-config.xlsx';
+    },
     import_config: (args) => {
       const incoming = syntheticRules(2).map((rule, i) => ({
         ...rule,
         id: `mock-import-${i + 1}`,
         group: '导入示例',
       }));
-      const config = clone(this.draft);
+      const config = clone(this.active);
       if (args.strategy === 'replace') config.rules = incoming;
       else if (args.strategy === 'overwrite') {
         for (const rule of incoming) {
@@ -629,9 +621,11 @@ export class MockBackend {
           else config.rules[index] = rule;
         }
       } else for (const rule of incoming) config.rules.push(rule);
-      this.#pendingImport = JSON.stringify(config);
+      const token = `mock-import-${++this.#importSequence}`;
+      this.#pendingImport = { json: JSON.stringify(config), token };
       return {
         config,
+        token,
         report: [`2 条合成示例规则；策略：${String(args.strategy)}`, '0 conflicts'],
       };
     },
@@ -744,10 +738,8 @@ export class MockBackend {
   #state() {
     const paused = this.engine.paused_reasons.length > 0;
     const legacy = {
-      draft: clone(this.draft),
       active: clone(this.active),
       revision: this.active.revision,
-      dirty: JSON.stringify(this.draft) !== JSON.stringify(this.active),
       paused,
       engine_status: this.engine.busy ? 'running' : paused ? 'paused' : 'listening',
       last_result: null,
@@ -821,7 +813,6 @@ export class MockBackend {
   #leaveSafeMode(): void {
     if (!this.safeMode) return;
     this.safeMode = null;
-    this.#safeImport = false;
     this.problems = this.problems.filter((p) => p.kind !== 'safe_mode');
     this.#togglePause('safe_mode', false);
     if (!this.engine.paused_reasons.includes('manual')) this.#togglePause('manual', true);

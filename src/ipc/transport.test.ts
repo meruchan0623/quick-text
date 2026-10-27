@@ -76,7 +76,7 @@ describe('the last check before sending', () => {
     const refused: [string, Record<string, unknown>, string][] = [
       ['execute_action', { action: { type: 'reusable', parameters: { n: marker } } }, 'action'],
       ['test_rule', { rule: { action: { plan: { steps: [{ ms: NaN }] } } } }, 'rule'],
-      ['save_draft', { config: { rules: [{ speed: Infinity }] } }, 'config'],
+      ['save_config', { config: { rules: [{ speed: Infinity }] } }, 'config'],
     ];
     for (const [command, args, at] of refused) {
       const error: unknown = await transport.invoke(command, args).catch((e: unknown) => e);
@@ -110,8 +110,8 @@ describe('the last check before sending', () => {
         { id: 'raw', match: 42, future: wide() },
       ],
     };
-    await expect(transport.invoke('save_draft', { config })).resolves.toBe(null);
-    expect(received).toEqual([['save_draft', { config }]]);
+    await expect(transport.invoke('save_config', { config })).resolves.toBe(null);
+    expect(received).toEqual([['save_config', { config }]]);
   });
 });
 
@@ -119,8 +119,8 @@ describe('development', () => {
   it('outside Tauri the preview mock answers', async () => {
     const transport = await freshTransport({ dev: true });
     expect(transport.usesMock).toBe(true);
-    const state = await transport.invoke<{ draft: { rules: unknown[] } }>('load_state');
-    expect(state.draft.rules.length).toBeGreaterThan(0);
+    const state = await transport.invoke<{ active: { rules: unknown[] } }>('load_state');
+    expect(state.active.rules.length).toBeGreaterThan(0);
     expect(globals.quickerMock).toBeDefined();
   });
 

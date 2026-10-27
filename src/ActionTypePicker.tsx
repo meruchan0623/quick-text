@@ -145,7 +145,7 @@ export function ActionTypePicker({ options, value, onChange, platform }: Props) 
                   Windows：切换目标、继续按键或停止动作会中断后续输入；已执行的操作无法自动撤销。输入框不提供正文时，结果可能显示“目标处理结果未知”，请查看目标是否收到。
                 </p>
               )}
-              <small>设置完成后，先点编辑窗口的“保存”，再点主窗口的“应用设置”。</small>
+              <small>设置完成后，点击编辑窗口的“保存”即可立即生效。</small>
             </section>
             <div id={id} role="listbox" aria-label="操作类型选项" className="action-type-options">
               {options.map((option) => (

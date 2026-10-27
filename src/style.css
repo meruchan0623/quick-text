@@ -1623,3 +1623,36 @@ input[aria-invalid='true'] {
   padding: 3px 12px 3px 0;
   vertical-align: top;
 }
+
+.export-menu {
+  position: relative;
+  display: inline-flex;
+}
+.export-menu > button:first-child {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.export-menu > button:nth-child(2) {
+  border-left: 0;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  padding-inline: 9px;
+}
+.export-options {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 20;
+  display: grid;
+  gap: 4px;
+  min-width: 168px;
+  padding: 6px;
+  border: 1px solid var(--border, #d5d9e0);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 4px 16px #0002;
+}
+.export-options button {
+  text-align: left;
+  white-space: nowrap;
+}

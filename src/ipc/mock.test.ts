@@ -22,9 +22,8 @@ afterEach(() => {
 });
 
 interface LegacyState {
-  draft: MockConfig;
+  active: MockConfig;
   revision: number;
-  dirty: boolean;
   paused: boolean;
   engine_status: string;
   health?: unknown;
@@ -43,28 +42,28 @@ function throughTauri(backend: MockBackend) {
 }
 
 describe('mock backend through mockIPC and the Tauri transport', () => {
-  it('round-trips draft, apply and rollback', async () => {
+  it('publishes once and round-trips rollback', async () => {
     throughTauri(new MockBackend({ rules: 3 }));
     const state = await invoke<LegacyState>('load_state');
-    expect(state.draft.rules).toHaveLength(3);
+    expect(state.active.rules).toHaveLength(3);
     expect(state.health).toBeDefined();
-    const config = { ...state.draft, rules: state.draft.rules.slice(1) };
-    const saved = await invoke<LegacyState>('save_draft', { config });
-    expect(saved.dirty).toBe(true);
-    const applied = await invoke<LegacyState>('apply_settings');
-    expect(applied.revision).toBe(2);
-    expect(applied.dirty).toBe(false);
+    const config = { ...state.active, rules: state.active.rules.slice(1) };
+    const saved = await invoke<LegacyState>('save_config', { config });
+    expect(saved.revision).toBe(2);
+    expect(saved.active.rules).toHaveLength(2);
+    expect(saved).not.toHaveProperty('draft');
+    expect(saved).not.toHaveProperty('dirty');
     const rolledBack = await invoke<LegacyState>('rollback');
-    expect(rolledBack.draft.rules).toHaveLength(3);
+    expect(rolledBack.active.rules).toHaveLength(3);
   });
 
   it('rejects with a CommandError object that parses back', async () => {
     throughTauri(new MockBackend({ rules: 1 }));
     const state = await invoke<LegacyState>('load_state');
-    const [rule] = state.draft.rules;
+    const [rule] = state.active.rules;
     if (!rule) throw new Error('missing rule');
-    const config = { ...state.draft, rules: [{ ...rule, match: { kind: 'literal', value: '' } }] };
-    const error: unknown = await invoke('save_draft', { config }).catch((e: unknown) => e);
+    const config = { ...state.active, rules: [{ ...rule, match: { kind: 'literal', value: '' } }] };
+    const error: unknown = await invoke('save_config', { config }).catch((e: unknown) => e);
     const parsed = parseCommandError(error);
     expect(parsed.code).toBe('validation');
     if (parsed.code === 'validation')
@@ -300,7 +299,9 @@ describe('mock backend commands', () => {
   it('refuses writes in safe mode', async () => {
     const backend = new MockBackend({ rules: 0, safeMode: 'locked' });
     use(backend);
-    const error: unknown = await invoke('apply_settings').catch((e: unknown) => e);
+    const error: unknown = await invoke('save_config', { config: backend.active }).catch(
+      (e: unknown) => e,
+    );
     expect(error).toEqual({ code: 'safe_mode', detail: { reason: 'locked' } });
   });
 
@@ -311,14 +312,13 @@ describe('mock backend commands', () => {
     const locked = await invoke<LegacyState & { active: MockConfig }>('load_state');
     expect(locked.revision).toBe(0);
     expect(locked.active.rules).toEqual([]);
-    expect(locked.draft.rules).toEqual([]);
+    expect(locked.active.rules).toEqual([]);
     // A store whose active revision is 0 too (rules saved, never applied): the retry's store-state
     // says the same revision, with safe mode null (store/load.rs `install`, review I6).
     const disk = backend.disk;
     if (disk === null) throw new Error('Locked keeps the store on disk');
     backend.disk = {
-      active: { ...disk.active, revision: 0, rules: [] },
-      draft: { ...disk.draft, revision: 0 },
+      active: { ...disk.active, revision: 0 },
     };
     const pushed: unknown[] = [];
     backend.on('store-state', (payload) => pushed.push(payload));
@@ -327,8 +327,7 @@ describe('mock backend commands', () => {
     expect(backend.disk).toBeNull();
     const recovered = await invoke<LegacyState & { active: MockConfig }>('load_state');
     expect(recovered.revision).toBe(0);
-    expect(recovered.active.rules).toEqual([]);
-    expect(recovered.draft.rules).toHaveLength(2);
+    expect(recovered.active.rules).toHaveLength(2);
     expect(recovered.safe_mode).toBeNull();
   });
 
@@ -337,11 +336,8 @@ describe('mock backend commands', () => {
     use(backend);
     const pushed: unknown[] = [];
     backend.on('store-state', (payload) => pushed.push(payload));
-    const { draft } = await invoke<LegacyState>('load_state');
-    await invoke('save_draft', { config: { ...draft, enabled: false } });
-    await invoke('discard_draft');
-    expect(pushed).toEqual([]); // the draft is not the store's revision
-    await invoke('apply_settings');
+    const { active } = await invoke<LegacyState>('load_state');
+    await invoke('save_config', { config: { ...active, enabled: false } });
     const applied = backend.seq;
     await invoke('rollback');
     backend.publishExternally();
@@ -357,13 +353,11 @@ describe('mock backend commands', () => {
     const states: unknown[] = [];
     crashed.on('store-state', (payload) => states.push(payload));
     expect(await invoke('rollback').catch((e: unknown) => e)).toMatchObject({ code: 'safe_mode' });
-    const preview = await invoke<{ config: MockConfig }>('import_config', {
+    const preview = await invoke<{ config: MockConfig; token: string }>('import_config', {
       path: 'mock://import.json',
       strategy: 'replace',
     });
-    await invoke('save_draft', { config: preview.config });
-    expect(states).toEqual([]);
-    await invoke('apply_settings');
+    await invoke('save_config', { config: preview.config, importToken: preview.token });
     expect(states).toEqual([{ seq: crashed.seq, revision: 2, safe_mode: null }]);
     expect(crashed.problems).toEqual([]);
     expect(crashed.engine.paused_reasons).toEqual(['manual']);
@@ -436,22 +430,77 @@ describe('synthetic data', () => {
 describe('B-43 sample', () => {
   it('mixes unreadable entries and unknown keys into the config', () => {
     const backend = new MockBackend({ rules: 2, unreadable: true });
-    const { rules } = backend.draft;
+    const { rules } = backend.active;
     expect(rules.map(isMockRule)).toEqual([true, false, true, false, false]);
     expect(rules[1]).toEqual({ id: 'mock-unreadable-1', match: 42, future_kind: 'from 0.6' });
-    expect(backend.draft.future_setting).toEqual({ sample: true });
-    expect(backend.draft.globals.future_global).toBe('kept');
+    expect(backend.active.future_setting).toEqual({ sample: true });
+    expect(backend.active.globals.future_global).toBe('kept');
     expect(rules[0]).toHaveProperty('future_rule_field');
     expect(mockOptionsFromQuery('?mock-unreadable=1')).toEqual({ unreadable: true });
   });
 
   it('reports unreadable entries as warnings that do not block saving', () => {
     const backend = new MockBackend({ rules: 2, unreadable: true });
-    expect(validate(backend.draft).map((d) => [d.code, d.path, d.severity])).toEqual([
+    expect(validate(backend.active).map((d) => [d.code, d.path, d.severity])).toEqual([
       ['rule_unreadable', 'rules[1]', 'warning'],
       ['rule_unreadable', 'rules[3]', 'warning'],
       ['rule_unreadable', 'rules[4]', 'warning'],
     ]);
-    return expect(backend.handle('save_draft', { config: backend.draft })).resolves.toBeDefined();
+    return expect(backend.handle('save_config', { config: backend.active })).resolves.toBeDefined();
   });
+});
+
+describe('atomic active configuration contract', () => {
+  it('refuses stale saves and leaves active and rollback history intact', async () => {
+    const backend = new MockBackend({ rules: 2 });
+    const stale = structuredClone(backend.active);
+    backend.publishExternally((c) => {
+      c.enabled = false;
+    });
+    const before = structuredClone(backend.active);
+    const previous = structuredClone(backend.previous);
+    await expect(backend.handle('save_config', { config: stale })).rejects.toEqual({
+      code: 'revision_conflict',
+      detail: { current: 2 },
+    });
+    expect(backend.active).toEqual(before);
+    expect(backend.previous).toEqual(previous);
+  });
+
+  it('binds import confirmation to the latest preview token and exact configuration', async () => {
+    const backend = new MockBackend({ rules: 2 });
+    const a = (await backend.handle('import_config', { strategy: 'replace' })) as {
+      config: MockConfig;
+      token: string;
+    };
+    const b = (await backend.handle('import_config', { strategy: 'merge' })) as {
+      config: MockConfig;
+      token: string;
+    };
+    await expect(
+      backend.handle('save_config', { config: a.config, importToken: a.token }),
+    ).rejects.toEqual({ code: 'token_expired' });
+    await expect(
+      backend.handle('save_config', {
+        config: { ...b.config, enabled: false },
+        importToken: b.token,
+      }),
+    ).rejects.toEqual({ code: 'token_expired' });
+    expect(backend.active.revision).toBe(1);
+    await backend.handle('save_config', { config: b.config, importToken: b.token });
+    expect(backend.active.revision).toBe(2);
+    expect(backend.active.rules).toHaveLength(4);
+    await expect(
+      backend.handle('save_config', { config: b.config, importToken: b.token }),
+    ).rejects.toEqual({ code: 'token_expired' });
+  });
+
+  it.each(['save_draft', 'apply_settings', 'discard_draft'])(
+    'does not expose removed command %s',
+    async (command) => {
+      const backend = new MockBackend({ rules: 1 });
+      await expect(backend.handle(command)).rejects.toMatch('not found');
+      expect(backend.active.revision).toBe(1);
+    },
+  );
 });

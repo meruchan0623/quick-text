@@ -44,10 +44,8 @@ export const settingsHaveUnsafeNumber = (config: Config): boolean =>
     Object.entries(config).flatMap(([key, value]) => (key === 'rules' ? [] : [value])),
   );
 export interface State extends Data {
-  draft: Config;
   active: Config;
   revision: number;
-  dirty: boolean;
   paused: boolean;
   engine_status: string;
   last_result: any;
@@ -79,7 +77,7 @@ export const newRule = (platform?: string): Rule => ({
   trigger_mode: platform === 'windows' ? 'immediate' : 'terminator',
   terminator: null,
   ime_erasure: null,
-  action: { type: 'text', method: 'keys', source: { type: 'inline', value: '' } },
+  action: { type: 'text', method: 'paste', source: { type: 'inline', value: '' } },
   parameter: { type: 'default_match' },
   notification: { enabled: false, message: '' },
 });

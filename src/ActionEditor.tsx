@@ -16,6 +16,7 @@ import { inRange, ranges } from './lib/ruleShape';
 import { ActionTypePicker } from './ActionTypePicker';
 import { LinesInput } from './LinesInput';
 import { NumberField } from './NumberField';
+import { describeExecution } from './lib/describe';
 type Props = {
   platform?: string | undefined;
   rules: Rule[];
@@ -325,8 +326,7 @@ export default function ActionEditor({
   run,
   show,
 }: Props) {
-  const [diagnostics, setDiagnostics] = useState<Data[]>([]),
-    [selectionPreview, setSelectionPreview] = useState<string | null>(null);
+  const [diagnostics, setDiagnostics] = useState<Data[]>([]);
   const sourceEditor = useRef<HTMLTextAreaElement>(null),
     stepForm = useRef<HTMLDivElement>(null);
   const perform = async (command: string, args: Data) => {
@@ -1035,7 +1035,7 @@ export default function ActionEditor({
                 ＋ 添加参数
               </button>
               <small>
-                执行时会使用已应用设置的那条指令。如果两条指令互相调用，或最终调用回自己，软件会停止执行。
+                执行时会使用当前已保存的那条指令。如果两条指令互相调用，或最终调用回自己，软件会停止执行。
               </small>
             </div>
           )}
@@ -1524,18 +1524,20 @@ export default function ActionEditor({
                           run(async () =>
                             show({
                               title: '单步执行结果',
-                              data: await execute(
-                                {
-                                  type: 'steps',
-                                  plan: {
-                                    version: 1,
-                                    dialect: 'structured',
-                                    source: null,
-                                    steps: [current],
+                              data: describeExecution(
+                                await execute(
+                                  {
+                                    type: 'steps',
+                                    plan: {
+                                      version: 1,
+                                      dialect: 'structured',
+                                      source: null,
+                                      steps: [current],
+                                    },
                                   },
-                                },
-                                actionDiagnostics(a).filter((d) =>
-                                  d.path.startsWith(`plan.steps[${stepIndex}].`),
+                                  actionDiagnostics(a).filter((d) =>
+                                    d.path.startsWith(`plan.steps[${stepIndex}].`),
+                                  ),
                                 ),
                               ),
                             }),
@@ -1579,35 +1581,14 @@ export default function ActionEditor({
           )}
         </>
       )}
-      <div className="selection-capture">
-        <button
-          onClick={() =>
-            run(async () => {
-              const result = await call('capture_selection');
-              if (result.status !== 'success')
-                throw new Error(result.message || '无法读取该窗口选中的文字');
-              setSelectionPreview(result.text);
-            }, '已读取选中的文字')
-          }
-        >
-          读取其他窗口选中的文字
-        </button>
-        <small>
-          本窗口会暂时隐藏 3
-          秒，请到要操作的窗口选中文字。软件会尝试读取并预览；无法读取时会提示。真正触发指令时，会重新读取当时选中的文字。
-        </small>
-        {selectionPreview !== null && (
-          <details>
-            <summary>查看这次读取的文字</summary>
-            <pre>{selectionPreview.slice(0, 1000)}</pre>
-          </details>
-        )}
-      </div>
       <div className="action-test">
         <button
           onClick={() =>
             run(async () =>
-              show({ title: '动作测试结果', data: await execute(a, actionDiagnostics(a)) }),
+              show({
+                title: '动作测试结果',
+                data: describeExecution(await execute(a, actionDiagnostics(a))),
+              }),
             )
           }
         >
