@@ -1,6 +1,6 @@
 # 0.4 IPC 约定（前后端共同依据）
 
-本文是 `docs/development-plan.md` §7.4（B-44、B-45）在 0.4 范围内的落地细化，供后端（`src-tauri`）与前端（`src/ipc/`）并行实现时对齐。两边都以本文为准；与计划冲突时以计划为准并回改本文。
+本文是 `docs/development-plan.md` §7.4（B-44、B-45）在 0.4 范围内的落地细化。2026-10-27 起配置提交机制更新为[保存即生效](direct-save.md)：`load_state` 只有 `active` 和 `revision`，不再返回 `draft`、`dirty`；`save_config` 取代保存草稿与单独应用。关于配置提交的冲突，以这项新约定为准；其余运行状态协议沿用本文。
 
 Rust 侧的共享类型在 `crates/platform/src/health.rs`，JSON 形状由其 serde 派生决定；下文的 TypeScript 写法只是那些派生结果的手写镜像（0.5 起由 tauri-specta 生成，B-46）。
 
@@ -125,7 +125,7 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 | `set_paused(paused)` | 只置位或清除 `manual`；其他暂停原因仍在时，返回的状态仍是暂停。恢复（`paused: false`）在安全模式下返回 `safe_mode`；Health 不是 `healthy` / `degraded` 时返回 `engine_unavailable { health }`；录制中恢复不再返回 `busy`，而是清除 `manual` 后仍因 `recording` 保持暂停。托盘菜单项走同一逻辑：监听中显示「暂停监听」，否则显示「恢复监听」；托盘恢复被拒绝时发系统通知说明原因（安全模式、引擎启动中、恢复中、已停止） |
 | `start_recording`、`stop_recording` | 录制期间置位 `recording` 暂停原因，录制结束即清除；结束后引擎回到其他原因决定的状态（录制前已手动暂停的仍暂停，原来在监听的恢复监听） |
 | `load_state.paused`、`engine_status` | 由运行时推导：`paused` = 不在监听（任何暂停原因，或 Health 不接受恢复）；`engine_status` 为 `running`（执行中）、`paused` 或 `listening` |
-| `save_draft(config)` | 先做校验，存在 error 级诊断时返回 `validation`（B-42） |
+| `save_config(config)` | `config.revision` 必须等于当前版本，否则返回 `revision_conflict { current }`。校验存在 error 级诊断时返回 `validation`；成功一次提交磁盘及引擎并返回新 `AppState`，没有第二次应用步骤。移除 `save_draft`、`apply_settings`、`discard_draft` |
 | `export_config` | 用户取消保存对话框时返回 `null`（原来是错误） |
 | `choose_file`、`import_config` | 对话框按扩展名过滤；取消返回 `null` |
 | 安全模式下的写命令 | 返回 `safe_mode`；导入和打开数据目录除外 |
