@@ -3063,6 +3063,201 @@ describe('action types by capability status (S-16, principle 5)', () => {
   });
 });
 
+describe('settings kept for rules that have them stay for the whole edit (Codex review)', () => {
+  const EDITOR = '编辑文本指令';
+  const rule = (action: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
+    id: 'rule-a-kept',
+    enabled: true,
+    group: '默认',
+    description: '',
+    ignore_case: false,
+    match: { kind: 'literal', value: ';a-kept' },
+    trigger_mode: 'terminator',
+    terminator: null,
+    ime_erasure: null,
+    action,
+    parameter: { type: 'default_match' },
+    notification: { enabled: false, message: '' },
+    ...extra,
+  });
+  const text = { type: 'text', method: 'paste', source: { type: 'inline', value: 'hi' } };
+
+  /** Mount on macOS with the rule (listed first) and open it. */
+  async function editKept(kept: ReturnType<typeof rule>): Promise<Mounted> {
+    const mounted = await mount({ platform: 'macos' }, (backend) => {
+      backend.active.rules.push(structuredClone(kept));
+    });
+    await waitFor(mounted, () => {
+      expect(mounted.container.querySelectorAll('tbody tr')).toHaveLength(4);
+    });
+    await click(mounted, '编辑');
+    return mounted;
+  }
+  const editor = (mounted: Mounted): HTMLElement => {
+    const found = dialog(mounted.container, EDITOR);
+    if (!found) throw new Error('no editor');
+    return found;
+  };
+  /** The select of the `<Field>` (or plain label) whose text starts with `label`, if shown. */
+  const selectOf = (mounted: Mounted, label: string) =>
+    [...editor(mounted).querySelectorAll('label')]
+      .find((l) =>
+        (l.querySelector(':scope > span')?.textContent ?? l.textContent).startsWith(label),
+      )
+      ?.querySelector('select') ?? null;
+  async function pick(mounted: Mounted, label: string, value: string): Promise<void> {
+    const select = selectOf(mounted, label);
+    if (!select) throw new Error(`no select 「${label}」`);
+    await mounted.act(() => {
+      select.value = value;
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  }
+  async function chooseType(mounted: Mounted, value: string): Promise<void> {
+    await mounted.act(() => {
+      editor(mounted).querySelector<HTMLButtonElement>('[role="combobox"]')?.click();
+    });
+    const option = editor(mounted).querySelector<HTMLElement>(
+      `[role="option"][data-value="${value}"]`,
+    );
+    if (!option) throw new Error(`no option 「${value}」`);
+    await mounted.act(() => {
+      option.click();
+    });
+  }
+  const regexBox = (mounted: Mounted) =>
+    [...editor(mounted).querySelectorAll('label')]
+      .find((l) => l.textContent.startsWith('用正则表达式匹配'))
+      ?.querySelector('input') ?? null;
+  /** 保存 goes through; the rule saved. */
+  async function save(mounted: Mounted): Promise<Record<string, unknown> | undefined> {
+    await clickIn(mounted, editor(mounted), '保存');
+    await waitFor(mounted, () => {
+      expect(callsOf(mounted.backend, 'save_config')).toHaveLength(1);
+      expect(dialog(mounted.container, EDITOR)).toBeNull();
+    });
+    const { rules } = callsOf(mounted.backend, 'save_config')[0]?.args.config as {
+      rules: (Record<string, unknown> & { id: string })[];
+    };
+    return rules.find((r) => r.id === 'rule-a-kept');
+  }
+
+  const ARGS = '启动程序时附带的内容（每行一项，通常留空）';
+  const FOLDER = '程序启动时使用的文件夹（通常留空）';
+  const launch = {
+    type: 'open',
+    target: 'C:\\app.exe',
+    args: ['--old'],
+    working_directory: 'C:\\old',
+  };
+
+  it('keeps the launch arguments and folder while they are cleared and retyped', async () => {
+    const mounted = await editKept(rule(launch));
+    await type(mounted, field(editor(mounted), ARGS), '');
+    await type(mounted, field(editor(mounted), FOLDER), '');
+    // Cleared, and still there to type the replacement into.
+    expect(field(editor(mounted), ARGS).value).toBe('');
+    expect(field(editor(mounted), FOLDER).value).toBe('');
+    await type(mounted, field(editor(mounted), ARGS), '--new');
+    await type(mounted, field(editor(mounted), FOLDER), 'C:\\new');
+    expect((await save(mounted))?.action).toEqual({
+      ...launch,
+      args: ['--new'],
+      working_directory: 'C:\\new',
+    });
+  });
+
+  it('saves the launch arguments and folder cleared', async () => {
+    const mounted = await editKept(rule(launch));
+    await type(mounted, field(editor(mounted), ARGS), '');
+    await type(mounted, field(editor(mounted), FOLDER), '');
+    expect((await save(mounted))?.action).toEqual({
+      ...launch,
+      args: [],
+      working_directory: null,
+    });
+  });
+
+  it('shows neither launch field on an open action that has none', async () => {
+    const mounted = await editKept(rule({ ...launch, args: [], working_directory: null }));
+    expect(() => field(editor(mounted), ARGS)).toThrow();
+    expect(() => field(editor(mounted), FOLDER)).toThrow();
+  });
+
+  it('keeps a type not offered for new actions listed after switching away from it', async () => {
+    const replay = {
+      type: 'replay',
+      plan: { version: 1, dialect: 'structured', source: null, steps: [] },
+      speed: 1,
+    };
+    const mounted = await editKept(rule(replay));
+    await chooseType(mounted, 'text_paste');
+    await chooseType(mounted, 'replay');
+    expect((await save(mounted))?.action).toMatchObject({ type: 'replay' });
+  });
+
+  it('keeps the text source choice of a file-reading rule after switching to inline', async () => {
+    const mounted = await editKept(
+      rule({ ...text, source: { type: 'file', path: 'C:\\reply.txt', encoding: 'utf8' } }),
+    );
+    await pick(mounted, '要输出的文字来自哪里', 'inline');
+    expect(selectOf(mounted, '要输出的文字来自哪里')?.value).toBe('inline');
+    await pick(mounted, '要输出的文字来自哪里', 'file');
+    expect(selectOf(mounted, '要输出的文字来自哪里')?.value).toBe('file');
+  });
+
+  it('keeps the key-command choices of a send_keys rule after the last one is turned off', async () => {
+    const mounted = await editKept(
+      rule({
+        type: 'send_keys',
+        source: { type: 'inline', value: 'hi' },
+        syntax_variables: ['cliptext'],
+      }),
+    );
+    await pick(mounted, '已复制的文字', 'literal');
+    expect(selectOf(mounted, '已复制的文字')?.value).toBe('literal');
+    await pick(mounted, '已复制的文字', 'syntax');
+    expect((await save(mounted))?.action).toMatchObject({ syntax_variables: ['cliptext'] });
+  });
+
+  it('keeps the regex switch, IME erasure and parameter while they are reset', async () => {
+    const mounted = await editKept(
+      rule(text, {
+        match: { kind: 'regex', value: ';a-(\\d+)' },
+        ime_erasure: 'backspace',
+        parameter: { type: 'first_capture' },
+      }),
+    );
+    await mounted.act(() => {
+      regexBox(mounted)?.click();
+    });
+    await pick(mounted, '如何清除输入法中的缩写', 'inherit');
+    await pick(mounted, '传给操作的内容来自哪里', 'default_match');
+    // Back to the defaults, and still on screen to be taken back.
+    expect(regexBox(mounted)?.checked).toBe(false);
+    expect(selectOf(mounted, '如何清除输入法中的缩写')?.value).toBe('inherit');
+    expect(selectOf(mounted, '传给操作的内容来自哪里')?.value).toBe('default_match');
+    await mounted.act(() => {
+      regexBox(mounted)?.click();
+    });
+    await pick(mounted, '如何清除输入法中的缩写', 'backspace');
+    await pick(mounted, '传给操作的内容来自哪里', 'first_capture');
+    expect(await save(mounted)).toMatchObject({
+      match: { kind: 'regex', value: ';a-(\\d+)' },
+      ime_erasure: 'backspace',
+      parameter: { type: 'first_capture' },
+    });
+  });
+
+  it('shows none of them on a rule that uses the defaults', async () => {
+    const mounted = await editKept(rule(text));
+    expect(regexBox(mounted)).toBeNull();
+    expect(selectOf(mounted, '如何清除输入法中的缩写')).toBeNull();
+    expect(selectOf(mounted, '传给操作的内容来自哪里')).toBeNull();
+    expect(selectOf(mounted, '要输出的文字来自哪里')).toBeNull();
+  });
+});
+
 describe('tolerant reading (B-43)', () => {
   // Rules are [;s1 (with an unknown field), unreadable with id, ;s2, ;s3, 'not a rule', null].
   type Saved = Record<string, unknown> & {

@@ -335,6 +335,15 @@ export default function ActionEditor({
   show,
 }: Props) {
   const [diagnostics, setDiagnostics] = useState<Data[]>([]);
+  // What the action had when the editor opened. Choices and fields kept only for rules that use them
+  // stay on screen for the whole edit, so clearing one or switching away can be taken back.
+  const [opened] = useState(() => ({
+    choice: actionChoice(a),
+    fileSource: a.source?.type === 'file',
+    syntaxVariables: (a.syntax_variables ?? []).length > 0,
+    args: (a.args ?? []).length > 0,
+    workingDirectory: Boolean(a.working_directory),
+  }));
   const sourceEditor = useRef<HTMLTextAreaElement>(null),
     stepForm = useRef<HTMLDivElement>(null);
   const perform = async (command: string, args: Data) => {
@@ -522,7 +531,7 @@ export default function ActionEditor({
           platform={platform}
           options={actionOptions.flatMap(([k, v]) => {
             // Types not offered for new rules keep an entry on a rule that has one.
-            if (!offeredChoices.has(k) && k !== actionChoice(a)) return [];
+            if (!offeredChoices.has(k) && k !== actionChoice(a) && k !== opened.choice) return [];
             const { hidden, disabled, note } = offer(k);
             return hidden ? [] : [{ value: k, label: `${v}${note}`, disabled }];
           })}
@@ -543,7 +552,7 @@ export default function ActionEditor({
       {(a.type === 'text' || a.type === 'send_keys') && (
         <>
           {/* Reading a text file is kept for rules that already do; new rules type the text here. */}
-          {a.source.type === 'file' && (
+          {(opened.fileSource || a.source.type === 'file') && (
             <div className="inline">
               <label>
                 要输出的文字来自哪里{' '}
@@ -644,49 +653,50 @@ export default function ActionEditor({
               <small>这些按钮会加入一个标记，执行指令时再换成当时的文字、日期或时间。</small>
             </>
           )}
-          {/* Only for a rule already running copied text as key commands: turned off, the block goes. */}
-          {a.type === 'send_keys' && (a.syntax_variables ?? []).length > 0 && (
-            <div className="dynamic-source">
-              <h4>来自剪贴板或选中文字的处理方式</h4>
-              {[
-                ...new Set([
-                  'cliptext',
-                  'selection',
-                  ...(a.source.type === 'inline'
-                    ? [...String(a.source.value).matchAll(/\{(param:[^}]+)\}/g)].map((m) => m[1])
-                    : []),
-                  ...(a.syntax_variables ?? []),
-                ]),
-              ].map((token) => (
-                <label className="field" key={token}>
-                  <span>
-                    {token === 'cliptext'
-                      ? '已复制的文字'
-                      : token === 'selection'
-                        ? '选中的文字'
-                        : `传入的内容：${token.replace('param:', '')}`}
-                  </span>
-                  <select
-                    value={(a.syntax_variables ?? []).includes(token) ? 'syntax' : 'literal'}
-                    onChange={(e) =>
-                      edit({
-                        syntax_variables:
-                          e.target.value === 'syntax'
-                            ? [...new Set([...(a.syntax_variables ?? []), token])]
-                            : (a.syntax_variables ?? []).filter((x: string) => x !== token),
-                      })
-                    }
-                  >
-                    <option value="literal">直接输出文字（推荐）</option>
-                    <option value="syntax">作为按键命令执行（先检查格式）</option>
-                  </select>
-                </label>
-              ))}
-              <small>
-                默认把复制或选中的内容当作普通文字。只有选择“作为按键命令执行”的项目才会触发按键操作。此操作类型读取文件时，也会把文件内容当作按键命令检查和执行。
-              </small>
-            </div>
-          )}
+          {/* Only for a rule already running copied text as key commands. */}
+          {a.type === 'send_keys' &&
+            (opened.syntaxVariables || (a.syntax_variables ?? []).length > 0) && (
+              <div className="dynamic-source">
+                <h4>来自剪贴板或选中文字的处理方式</h4>
+                {[
+                  ...new Set([
+                    'cliptext',
+                    'selection',
+                    ...(a.source.type === 'inline'
+                      ? [...String(a.source.value).matchAll(/\{(param:[^}]+)\}/g)].map((m) => m[1])
+                      : []),
+                    ...(a.syntax_variables ?? []),
+                  ]),
+                ].map((token) => (
+                  <label className="field" key={token}>
+                    <span>
+                      {token === 'cliptext'
+                        ? '已复制的文字'
+                        : token === 'selection'
+                          ? '选中的文字'
+                          : `传入的内容：${token.replace('param:', '')}`}
+                    </span>
+                    <select
+                      value={(a.syntax_variables ?? []).includes(token) ? 'syntax' : 'literal'}
+                      onChange={(e) =>
+                        edit({
+                          syntax_variables:
+                            e.target.value === 'syntax'
+                              ? [...new Set([...(a.syntax_variables ?? []), token])]
+                              : (a.syntax_variables ?? []).filter((x: string) => x !== token),
+                        })
+                      }
+                    >
+                      <option value="literal">直接输出文字（推荐）</option>
+                      <option value="syntax">作为按键命令执行（先检查格式）</option>
+                    </select>
+                  </label>
+                ))}
+                <small>
+                  默认把复制或选中的内容当作普通文字。只有选择“作为按键命令执行”的项目才会触发按键操作。此操作类型读取文件时，也会把文件内容当作按键命令检查和执行。
+                </small>
+              </div>
+            )}
           {a.type === 'send_keys' && a.source.type === 'inline' && (
             <div className="builder">
               <h4>用按钮组合文字和按键</h4>
@@ -858,8 +868,8 @@ export default function ActionEditor({
           <button onClick={() => choosePath('file', (p) => edit({ target: p[0] }))}>
             选择文件或应用
           </button>
-          {/* Kept visible only on a rule that already has them, so they can be cleared. */}
-          {a.args.length > 0 && (
+          {/* Shown only on a rule that had them when opened, so they can be changed or cleared. */}
+          {(opened.args || a.args.length > 0) && (
             <label className="field">
               <span>启动程序时附带的内容（每行一项，通常留空）</span>
               <textarea
@@ -869,7 +879,7 @@ export default function ActionEditor({
               />
             </label>
           )}
-          {a.working_directory && (
+          {(opened.workingDirectory || a.working_directory) && (
             <label className="field">
               <span>程序启动时使用的文件夹（通常留空）</span>
               <input

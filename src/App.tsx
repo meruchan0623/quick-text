@@ -676,9 +676,17 @@ export default function App() {
   // The rule as opened, to tell whether closing the editor would lose changes (F-04).
   const editingBase = useRef('');
   const editingRevision = useRef<number | null>(null);
+  // Settings not offered for new rules, shown when the rule had them as opened: they stay on screen
+  // for the whole edit, so clearing or switching one off can be taken back.
+  const [editingShown, setEditingShown] = useState({ regex: false, ime: false, parameter: false });
   const openEditor = (rule: Rule) => {
     editingBase.current = JSON.stringify(rule);
     editingRevision.current = editorRevision.current;
+    setEditingShown({
+      regex: rule.match.kind === 'regex',
+      ime: rule.ime_erasure !== null,
+      parameter: rule.parameter.type !== 'default_match',
+    });
     setEditing(rule);
   };
   const closeEditor = async () => {
@@ -1487,12 +1495,12 @@ export default function App() {
                     英文不区分大小写（如 abc 和 ABC）
                   </label>
                   {/* Regular expressions are not offered for new rules; one that has it can turn it off. */}
-                  {editing.match.kind === 'regex' && (
+                  {editingShown.regex && (
                     <label>
                       <input
                         type="checkbox"
                         disabled={editing.trigger_mode === 'immediate'}
-                        checked
+                        checked={editing.match.kind === 'regex'}
                         onChange={(e) =>
                           setEditing({
                             ...editing,
@@ -1503,7 +1511,7 @@ export default function App() {
                           })
                         }
                       />
-                      用正则表达式匹配（取消后按普通缩写匹配）
+                      用正则表达式匹配（不勾选则按普通缩写匹配）
                     </label>
                   )}
                 </div>
@@ -1589,13 +1597,13 @@ export default function App() {
                   </>
                 )}
                 {/* Each rule follows the default; an override from an older version stays editable. */}
-                {!fixedImeErasure(platform) && editing.ime_erasure !== null && (
+                {!fixedImeErasure(platform) && editingShown.ime && (
                   <Field
                     label="如何清除输入法中的缩写"
                     hint="通常使用默认设置；输出后请查看目标结果。"
                   >
                     <select
-                      value={editing.ime_erasure}
+                      value={editing.ime_erasure ?? 'inherit'}
                       onChange={(e) =>
                         setEditing({
                           ...editing,
@@ -1616,7 +1624,7 @@ export default function App() {
                   </Field>
                 )}
                 {/* Not offered for new rules; a rule that already sets it can change it back. */}
-                {editing.parameter.type !== 'default_match' && (
+                {editingShown.parameter && (
                   <Field
                     label="传给操作的内容来自哪里"
                     hint="通常保持默认。调用另一条指令或打开链接时，可把匹配到的文字作为附带内容传过去。"
@@ -1696,6 +1704,8 @@ export default function App() {
               <div className="action-panel">
                 <h3>操作内容</h3>
                 <ActionEditor
+                  // Remembers what the action had when opened (fields shown for the whole edit).
+                  key={editing.id}
                   platform={state?.platform ?? state?.engine_detail?.platform}
                   diagnostics={editingDiagnostics.action}
                   capabilities={state?.capabilities ?? []}
