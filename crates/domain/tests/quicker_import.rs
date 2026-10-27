@@ -141,13 +141,308 @@ fn supported_terminator_keys_and_disabled_source_flag() {
         entry["IsDisabled"] = json!(true);
         let report = import(vec![entry]);
         assert!(!report.config.rules[0].enabled);
-        assert_eq!(report.items[0].status, MigrationStatus::Compatible);
+        assert_eq!(
+            report.items[0].status,
+            if matches!(key, 9 | 13) {
+                MigrationStatus::NeedsRewrite
+            } else {
+                MigrationStatus::Compatible
+            }
+        );
         assert_eq!(report.config.rules[0].trigger_mode, TriggerMode::Terminator);
         assert_eq!(
             report.config.rules[0].terminator.as_ref().unwrap().keys,
             [name]
         );
     }
+}
+
+#[test]
+fn native_hotkey_encoding_preserves_windows_keys_and_requires_review() {
+    let originals = vec![
+        command("ctrl-a", 1, "2|65"),
+        command("all-modifiers", 1, "15|112"),
+    ];
+    let report = import(originals.clone());
+    assert!(
+        matches!(&report.config.rules[0].action, Action::Hotkey { keys } if keys == &vec![Key::named("CTRL"), Key::WindowsCode { code: 65 }])
+    );
+    assert!(matches!(&report.config.rules[1].action, Action::Hotkey { keys } if keys.len() == 5));
+    for (index, item) in report.items.iter().enumerate() {
+        assert_eq!(item.status, MigrationStatus::Compatible);
+        assert!(!report.config.rules[index].enabled);
+        assert_eq!(item.original, originals[index]);
+        assert!(item
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "import_confirmation"));
+        assert!(item
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "quicker_windows_keycode" && d.severity == Severity::Warning));
+    }
+    for data in ["Ctrl+A", "16|65", "2|0", "2|256", "2|65|66", "-1|65"] {
+        let report = import(vec![command("invalid", 1, data)]);
+        assert_eq!(report.items[0].status, MigrationStatus::NeedsRewrite);
+        assert!(!report.config.rules[0].enabled);
+        assert!(report.items[0]
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "quicker_hotkey"));
+    }
+}
+
+#[test]
+fn common_operations_use_verified_exact_keys_only() {
+    for (data, function) in [
+        ("windows_volume_up", "volume_up"),
+        ("windows_volume_down", "volume_down"),
+        ("windows_volume_mute", "volume_mute"),
+        ("windows_media_next_track", "media_next"),
+        ("windows_media_prev_track", "media_previous"),
+        ("windows_media_play_pause", "media_play_pause"),
+        ("windows_browser_back", "browser_back"),
+        ("windows_browser_forward", "browser_forward"),
+        ("operation_copy", "copy"),
+        ("operation_paste", "paste"),
+    ] {
+        let report = import(vec![command("common", 11, data)]);
+        assert!(
+            matches!(&report.config.rules[0].action, Action::Common { function: actual } if actual == function)
+        );
+        assert_eq!(report.items[0].status, MigrationStatus::Compatible);
+        assert!(!report.config.rules[0].enabled);
+    }
+    for data in [
+        "windows_media_stop",
+        "windows_browser_refresh",
+        "windows_window_close_tab",
+    ] {
+        let report = import(vec![command("hotkey", 11, data)]);
+        assert!(matches!(
+            &report.config.rules[0].action,
+            Action::Hotkey { .. }
+        ));
+        assert!(!report.config.rules[0].enabled);
+        assert_eq!(report.items[0].status, MigrationStatus::Compatible);
+        assert!(report.items[0]
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "quicker_windows_operation"));
+    }
+    for (data, reason) in [
+        ("quicker_show_search", "私有运行时"),
+        ("windows_ime_zh", "输入法"),
+        ("monitor_brightness_increase", "显示器亮度"),
+        ("windows_window_max", "窗口"),
+        ("operation_copy_or_paste", "分支状态"),
+        ("copy", "未在已核实"),
+    ] {
+        let report = import(vec![command("unmapped", 11, data)]);
+        assert_eq!(report.items[0].status, MigrationStatus::NeedsRewrite);
+        assert!(report.items[0]
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "quicker_common" && d.message.contains(reason)));
+    }
+}
+
+#[test]
+fn replay_uses_documented_text_and_default_speed_without_execution() {
+    let original = command("replay", 13, "0;KP;#65;\n10;MV;None,100,200,0;\n0;DL;;");
+    let report = import(vec![original.clone()]);
+    assert!(
+        matches!(&report.config.rules[0].action, Action::Replay { plan, speed } if *speed == 1.0 && plan.dialect == Dialect::Replay && !plan.steps.is_empty())
+    );
+    assert_eq!(report.items[0].status, MigrationStatus::Compatible);
+    assert!(!report.config.rules[0].enabled);
+    assert_eq!(report.items[0].original, original);
+    let invalid = import(vec![command("invalid", 13, "0;UNKNOWN;data;")]);
+    assert_eq!(invalid.items[0].status, MigrationStatus::NeedsRewrite);
+    assert!(invalid.items[0]
+        .diagnostics
+        .iter()
+        .any(|d| d.code == "replay" && d.message.contains("键鼠回放")));
+}
+
+#[test]
+fn file_sources_and_html_are_reconstructed_but_require_explicit_completion() {
+    for action_type in [2, 3, 6] {
+        let original = command(
+            "file",
+            action_type,
+            "file:C:\\missing-private-synthetic.txt",
+        );
+        let report = import(vec![original.clone()]);
+        let source = match &report.config.rules[0].action {
+            Action::Text { source, .. } | Action::SendKeys { source, .. } => source,
+            _ => panic!("file source action was lost"),
+        };
+        assert!(
+            matches!(source, ContentSource::File { path, encoding: Encoding::Utf8 } if path == "C:\\missing-private-synthetic.txt")
+        );
+        assert_eq!(report.items[0].status, MigrationStatus::NeedsRewrite);
+        assert!(!report.config.rules[0].enabled);
+        assert!(report.items[0]
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "quicker_file_source" && d.message.contains("编码")));
+        assert_eq!(report.items[0].original, original);
+    }
+    let report = import(vec![command("html", 4, "<b>sample &amp; content</b>")]);
+    assert!(
+        matches!(&report.config.rules[0].action, Action::Html { html, plain_text } if html == "<b>sample &amp; content</b>" && plain_text.is_empty())
+    );
+    assert_eq!(report.items[0].status, MigrationStatus::NeedsRewrite);
+    assert!(!report.config.rules[0].enabled);
+    assert!(report.items[0]
+        .diagnostics
+        .iter()
+        .any(|d| d.message.contains("纯文本回退")));
+}
+
+#[test]
+fn open_maps_static_targets_but_never_guesses_arguments_or_runs_scripts() {
+    for target in [
+        "https://example.com/synthetic",
+        "https://example.com/search?q=%E4%BD%A0",
+        "C:\\100% synthetic.txt",
+        "C:\\Program Files\\Synthetic\\app.exe",
+        "C:\\synthetic document.txt",
+        "C:\\synthetic\\",
+    ] {
+        let report = import(vec![command("open", 5, target)]);
+        assert!(
+            matches!(&report.config.rules[0].action, Action::Open { target: actual, args, working_directory: None } if actual == target && args.is_empty())
+        );
+        assert_eq!(report.items[0].status, MigrationStatus::Compatible);
+        assert!(!report.config.rules[0].enabled);
+    }
+    for (data, code) in [
+        (
+            "C:\\app.exe\n--flag \"two words\"",
+            "quicker_open_arguments",
+        ),
+        ("%LOCALAPPDATA%\\app.exe", "quicker_open_dynamic"),
+        ("https://example.com/{cliptext}", "quicker_open_dynamic"),
+        ("C:\\run.ps1", "quicker_open_target"),
+        ("C:\\Windows\\cmd.exe", "quicker_open_target"),
+        ("C:\\something.lnk", "quicker_open_target"),
+        ("javascript:alert(1)", "quicker_open_target"),
+        ("https://", "quicker_open_target"),
+        ("app.exe", "quicker_open_target"),
+    ] {
+        let original = command("unmapped", 5, data);
+        let report = import(vec![original.clone()]);
+        assert_eq!(report.items[0].status, MigrationStatus::NeedsRewrite);
+        assert!(!report.config.rules[0].enabled);
+        assert!(matches!(report.config.rules[0].action, Action::None));
+        assert!(report.items[0].diagnostics.iter().any(|d| d.code == code));
+        assert_eq!(report.items[0].original, original);
+    }
+}
+
+#[test]
+fn private_and_unverified_types_have_distinct_chinese_reasons_and_roundtrip() {
+    let types = [
+        (12, "私有运行时"),
+        (21, "轮盘"),
+        (22, "手势"),
+        (23, "面板"),
+        (24, "截图"),
+        (25, "窗口"),
+        (100, "全局"),
+        (999, "999"),
+    ];
+    let originals: Vec<_> = types
+        .iter()
+        .map(|(action, _)| command(&format!("type-{action}"), *action, "synthetic-native-data"))
+        .collect();
+    let report = import(originals.clone());
+    for (index, (_, reason)) in types.iter().enumerate() {
+        assert_eq!(report.items[index].status, MigrationStatus::NeedsRewrite);
+        assert!(!report.config.rules[index].enabled);
+        assert!(report.items[index]
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains(reason)));
+    }
+    let exported = export_package_with_unresolved(&report.config, report.unresolved).unwrap();
+    let restored = import_package(&exported).unwrap();
+    assert_eq!(
+        restored
+            .unresolved
+            .iter()
+            .map(|item| item.original.clone())
+            .collect::<Vec<_>>(),
+        originals
+    );
+}
+
+#[test]
+fn dynamic_inputscript_is_not_silently_treated_as_literal_steps() {
+    for data in [
+        "input:{cliptext}",
+        "input:{selection}",
+        "input:{0:yyyy}",
+        "FILE:C:\\synthetic.txt",
+    ] {
+        let report = import(vec![command("dynamic", 7, data)]);
+        assert!(!report.config.rules[0].enabled);
+        assert_eq!(report.items[0].status, MigrationStatus::NeedsRewrite);
+        assert!(report.items[0]
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "quicker_script_dynamic"));
+    }
+}
+
+#[test]
+fn dynamic_sendkeys_reports_original_syntax_expansion_difference() {
+    for data in ["{cliptext}", "{selection}", "{0:yyyy-MM-dd}"] {
+        let report = import(vec![command("dynamic", 2, data)]);
+        assert!(
+            matches!(&report.config.rules[0].action, Action::SendKeys { syntax_variables, .. } if syntax_variables.is_empty())
+        );
+        assert!(!report.config.rules[0].enabled);
+        assert_eq!(report.items[0].status, MigrationStatus::NeedsRewrite);
+        assert!(report.items[0]
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "quicker_sendkeys_dynamic" && d.message.contains("字面文字")));
+    }
+}
+
+#[test]
+fn native_validation_and_schema_diagnostics_are_localized_without_values() {
+    let mut malformed = command("malformed", 3, "private-data-must-not-appear");
+    malformed["IgnoreCase"] = json!("private-invalid-value");
+    let mut regex = command("regex", 3, "sample");
+    regex["UseRegex"] = json!(true);
+    regex["CmdText"] = json!("(?<=sample)x");
+    let report = import(vec![
+        malformed,
+        regex,
+        command("sendkeys", 2, "^a"),
+        command("bad-step", 7, "unknown:x"),
+    ]);
+    for item in &report.items {
+        for diagnostic in &item.diagnostics {
+            assert!(
+                diagnostic
+                    .message
+                    .chars()
+                    .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+                "diagnostic code {} must explain in Chinese",
+                diagnostic.code
+            );
+            assert!(!diagnostic.message.contains("private-"));
+        }
+    }
+    assert!(report.items[0]
+        .diagnostics
+        .iter()
+        .any(|d| d.code == "quicker_schema" && d.message.contains("IgnoreCase")));
 }
 
 #[test]

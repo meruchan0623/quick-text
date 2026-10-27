@@ -354,10 +354,10 @@ fn input_session_types_redact_the_detection_buffer() {
 }
 
 #[test]
-fn drafts_packages_and_exports_redact_serialized_content() {
-    let draft = DraftStore::new(config());
-    assert!(draft.base_serialized.contains("zqabbr"));
-    assert_redacted(&format!("{draft:?}"));
+fn configuration_packages_and_exports_redact_serialized_content() {
+    let store = ConfigStore::new(config());
+    assert!(store.base_serialized.contains("zqabbr"));
+    assert_redacted(&format!("{store:?}"));
     let export = export_espanso_subset(&config());
     assert!(export.yaml.contains("zqabbr") && export.yaml.contains("phrase-body"));
     let shown = format!("{export:?}");

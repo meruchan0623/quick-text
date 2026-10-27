@@ -649,26 +649,45 @@ fn clipboard_generation_preserves_new_copy() {
     assert!(!c.can_restore(6));
 }
 #[test]
-fn draft_publish_failure_keeps_active_and_draft() {
-    let mut store = DraftStore::new(config(vec![literal("r", "a")]));
-    store.draft.rules[0].description = "pending".into();
+fn direct_save_failure_keeps_active_and_allows_retry() {
+    let mut store = ConfigStore::new(config(vec![literal("r", "a")]));
+    let mut edited = store.active.clone();
+    edited.rules[0].description = "updated".into();
     let original = store.base_serialized.clone();
-    assert!(store.apply(&original, |_| Err("simulated".into())).is_err());
+    assert!(store
+        .save(edited.clone(), &original, |_| Err("simulated".into()))
+        .is_err());
     assert_eq!(store.active.revision, 0);
-    assert!(store.is_dirty());
+    assert_ne!(store.active.rules[0].description, "updated");
+    assert_eq!(store.base_serialized, original);
     assert_eq!(
-        store.apply(&original, |c| Ok(c.config.revision)).unwrap(),
+        store
+            .save(edited, &original, |c| Ok(c.config.revision))
+            .unwrap(),
         1
     );
-    assert!(!store.is_dirty());
+    assert_eq!(store.active.rules[0].description, "updated");
 }
 #[test]
-fn draft_external_edit_and_ack_mismatch() {
-    let mut store = DraftStore::new(Config::default());
-    assert!(store.apply("changed", |_| Ok(1)).is_err());
+fn direct_save_external_edit_stale_revision_and_ack_mismatch() {
+    let mut store = ConfigStore::new(Config::default());
+    assert!(store
+        .save(store.active.clone(), "changed", |_| Ok(1))
+        .is_err());
     let baseline = store.base_serialized.clone();
-    assert!(store.apply(&baseline, |_| Ok(99)).is_err());
+    assert!(store
+        .save(store.active.clone(), &baseline, |_| Ok(99))
+        .is_err());
     assert_eq!(store.active.revision, 0);
+    store
+        .save(store.active.clone(), &baseline, |c| Ok(c.config.revision))
+        .unwrap();
+    let current = store.base_serialized.clone();
+    assert!(store
+        .save(Config::default(), &current, |_| panic!(
+            "stale edits must not publish"
+        ))
+        .is_err());
 }
 #[test]
 fn package_roundtrip_full_fields() {

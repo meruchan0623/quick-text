@@ -310,56 +310,44 @@ impl ClipboardLease {
 }
 /// Configuration transaction in memory; the host performs durable pointer publishing through `publish`.
 #[derive(Clone)]
-pub struct DraftStore {
+pub struct ConfigStore {
     pub active: Config,
-    pub draft: Config,
     pub base_serialized: String,
 }
 /// The serialized base configuration holds every abbreviation and phrase, so it is
-/// redacted (B-09); the two configurations print through their own redacting `Debug`.
-impl std::fmt::Debug for DraftStore {
+/// redacted (B-09); the configuration prints through its own redacting `Debug`.
+impl std::fmt::Debug for ConfigStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DraftStore")
+        f.debug_struct("ConfigStore")
             .field("active", &self.active)
-            .field("draft", &self.draft)
             .field("base_serialized", &Redacted(&self.base_serialized))
             .finish()
     }
 }
-impl DraftStore {
+impl ConfigStore {
     pub fn new(active: Config) -> Self {
         let base_serialized = serde_json::to_string(&active).expect("config serialization");
         Self {
-            draft: active.clone(),
             active,
             base_serialized,
         }
     }
-    pub fn is_dirty(&self) -> bool {
-        self.active != self.draft
-    }
-    pub fn discard(&mut self) {
-        self.draft = self.active.clone();
-    }
-    pub fn save_draft(&mut self, draft: Config) {
-        self.draft = draft;
-    }
-    pub fn apply<F>(
+    pub fn save<F>(
         &mut self,
+        mut next: Config,
         current_serialized: &str,
         mut publish: F,
     ) -> Result<u64, Vec<Diagnostic>>
     where
         F: FnMut(&CompiledConfig) -> Result<u64, String>,
     {
-        if current_serialized != self.base_serialized {
+        if current_serialized != self.base_serialized || next.revision != self.active.revision {
             return Err(vec![Diagnostic::error(
                 "external_conflict",
-                "Active configuration changed outside this draft",
+                "Active configuration changed; reload before saving",
                 SourceSpan::default(),
             )]);
         }
-        let mut next = self.draft.clone();
         next.revision = self.active.revision.checked_add(1).ok_or_else(|| {
             vec![Diagnostic::error(
                 "revision_overflow",
@@ -382,8 +370,7 @@ impl DraftStore {
                 SourceSpan::default(),
             )]);
         }
-        self.active = next.clone();
-        self.draft = next;
+        self.active = next;
         self.base_serialized = serde_json::to_string(&self.active).expect("config serialization");
         Ok(ack)
     }
