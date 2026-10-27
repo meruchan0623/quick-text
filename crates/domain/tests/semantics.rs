@@ -279,6 +279,16 @@ fn sendkeys_punctuation_escape() {
     let p = parse_sendkeys(&source).unwrap();
     assert!(matches!(&p.steps[0].operation,Operation::Text{text,..} if text=="+^%~()[]{}你好"));
 }
+/// What the key recorder of 「文字与按键组合」 (src/lib/sendKeys.ts) writes.
+#[test]
+fn sendkeys_recorder_output() {
+    let p = parse_sendkeys(
+        "您好{Enter 3}{Backspace}{Escape}^{A}^+{OEMCOMMA}+{Tab}%{F4}{PgDn}{PgUp}{Apps}^{NumPad1}^{D1}{F16}^{Add}{Left}{Delete}",
+    )
+    .unwrap();
+    assert_eq!(p.steps.len(), 19);
+    assert!(validate_plan(&p).is_empty());
+}
 #[test]
 fn sendkeys_f16_supported_f17_not() {
     assert!(parse_sendkeys("{F16}").is_ok());

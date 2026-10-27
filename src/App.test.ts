@@ -3479,7 +3479,7 @@ describe('tolerant reading (B-43)', () => {
   });
 
   it('keeps a nested unknown key (same value, IPC number contract) and rule-level keys in place', async () => {
-    // Codex's case: 「添加普通文字」 rebuilds `source`, so a rule with an unknown key in it must not
+    // Codex's case: the key recorder rebuilds `source`, so a rule with an unknown key in it must not
     // reach the editor. Rule-level keys of a newer version are edited around, in place.
     const nested = {
       id: 'nested-unknown',
@@ -3528,13 +3528,13 @@ describe('tolerant reading (B-43)', () => {
     expect(raw).toBeDefined();
     expect(raw?.querySelector('input, button')).toBeNull();
 
-    // Edit ;s1 through the send_keys builder that dropped the key, then save from the editor.
+    // Edit ;s1 through the send_keys recorder that dropped the key, then save from the editor.
     await click(mounted, '编辑');
     const editor = dialog(container, '编辑文本指令');
-    const literal = editor?.querySelector<HTMLInputElement>('input[aria-label="要输入的普通文字"]');
-    if (!literal) throw new Error('no send_keys builder');
-    await type(mounted, literal, '!');
-    await clickIn(mounted, editor, '添加普通文字');
+    await clickIn(mounted, editor, '● 开始录制');
+    const recorder = editor?.querySelector<HTMLInputElement>('input[aria-label="录制区"]');
+    if (!recorder) throw new Error('no send_keys recorder');
+    await type(mounted, recorder, '!');
     await clickIn(mounted, editor, '保存');
     await waitFor(mounted, () => {
       expect(callsOf(backend, 'save_config')).toHaveLength(1);
@@ -4197,5 +4197,188 @@ describe('direct publication confirmations', () => {
       true,
     );
     expect(callsOf(backend, 'save_config')).toHaveLength(2);
+  });
+});
+
+describe('文字与按键组合 is recorded: typing and every key, until 停止录制', () => {
+  const EDITOR = '编辑文本指令';
+  const keysRule = (value: string) => ({
+    id: 'rule-keys',
+    enabled: true,
+    group: '默认',
+    description: '',
+    ignore_case: false,
+    match: { kind: 'literal', value: ';keys' },
+    trigger_mode: 'terminator',
+    terminator: null,
+    ime_erasure: null,
+    action: { type: 'send_keys', source: { type: 'inline', value } },
+    parameter: { type: 'default_match' },
+    notification: { enabled: false, message: '' },
+  });
+  /** Mount with a send_keys rule of `value` (listed first) and open it. */
+  async function editKeys(value: string): Promise<Mounted> {
+    const mounted = await mount({ platform: 'windows' }, (backend) => {
+      backend.active.rules.push(keysRule(value));
+    });
+    await waitFor(mounted, () => {
+      expect(mounted.container.querySelectorAll('tbody tr')).toHaveLength(4);
+    });
+    await click(mounted, '编辑');
+    return mounted;
+  }
+  const editor = (mounted: Mounted): HTMLElement => {
+    const found = dialog(mounted.container, EDITOR);
+    if (!found) throw new Error('no editor');
+    return found;
+  };
+  const recorder = (mounted: Mounted) =>
+    editor(mounted).querySelector<HTMLInputElement>('input[aria-label="录制区"]');
+  const blocks = (mounted: Mounted) =>
+    [...editor(mounted).querySelectorAll('.recorded-label')].map((b) => b.textContent);
+  const code = (mounted: Mounted) =>
+    editor(mounted).querySelector<HTMLTextAreaElement>('textarea[aria-label="操作正文"]')?.value;
+  async function start(mounted: Mounted): Promise<HTMLInputElement> {
+    await clickIn(mounted, editor(mounted), '● 开始录制');
+    const box = recorder(mounted);
+    if (!box) throw new Error('not recording');
+    return box;
+  }
+  /** Press a key in the recorder; whether the page's default for it was stopped. */
+  async function press(
+    mounted: Mounted,
+    box: HTMLInputElement,
+    init: KeyboardEventInit,
+  ): Promise<boolean> {
+    let stopped = false;
+    await mounted.act(() => {
+      stopped = !box.dispatchEvent(
+        new KeyboardEvent('keydown', { bubbles: true, cancelable: true, ...init }),
+      );
+    });
+    return stopped;
+  }
+  async function save(mounted: Mounted): Promise<Record<string, unknown> | undefined> {
+    await clickIn(mounted, editor(mounted), '保存');
+    await waitFor(mounted, () => {
+      expect(callsOf(mounted.backend, 'save_config')).toHaveLength(1);
+      expect(dialog(mounted.container, EDITOR)).toBeNull();
+    });
+    const { rules } = callsOf(mounted.backend, 'save_config')[0]?.args.config as {
+      rules: (Record<string, unknown> & { id: string })[];
+    };
+    return rules.find((r) => r.id === 'rule-keys');
+  }
+
+  it('records text, Enter, Backspace, Esc and Ctrl+A as they are; Esc keeps the editor open', async () => {
+    const mounted = await editKeys('');
+    expect(editor(mounted).textContent).toContain('还没有内容');
+    // The source box is for advanced use and starts folded.
+    expect(editor(mounted).querySelector('details.sendkeys-advanced')?.hasAttribute('open')).toBe(
+      false,
+    );
+    const box = await start(mounted);
+    await type(mounted, box, '您好');
+    expect(box.value).toBe('');
+    // A character is left to the box (Shift and input methods work as usual).
+    expect(await press(mounted, box, { key: 'a', code: 'KeyA' })).toBe(false);
+    expect(await press(mounted, box, { key: 'Enter' })).toBe(true);
+    expect(await press(mounted, box, { key: 'Backspace' })).toBe(true);
+    expect(await press(mounted, box, { key: 'Escape' })).toBe(true);
+    expect(dialog(mounted.container, EDITOR)).not.toBeNull();
+    expect(recorder(mounted)).not.toBeNull();
+    expect(await press(mounted, box, { key: 'Control', ctrlKey: true })).toBe(false);
+    expect(await press(mounted, box, { key: 'a', code: 'KeyA', ctrlKey: true })).toBe(true);
+    expect(await press(mounted, box, { key: 'Tab', shiftKey: true })).toBe(true);
+    // The Windows key cannot be sent this way: said, and not recorded.
+    expect(await press(mounted, box, { key: 'Meta', metaKey: true })).toBe(true);
+    expect(editor(mounted).querySelector('.recorder-notice')?.textContent).toContain(
+      '按顺序执行多个操作',
+    );
+    expect(blocks(mounted)).toEqual(['您好', '回车', '退格', 'Esc', 'Ctrl+A', 'Shift+Tab']);
+    await clickIn(mounted, editor(mounted), '■ 停止录制');
+    expect(recorder(mounted)).toBeNull();
+    expect(code(mounted)).toBe('您好{Enter}{Backspace}{Escape}^{A}+{Tab}');
+    const saved = await save(mounted);
+    expect(saved?.action).toMatchObject({
+      type: 'send_keys',
+      source: { type: 'inline', value: '您好{Enter}{Backspace}{Escape}^{A}+{Tab}' },
+    });
+  });
+
+  it('counts a key pressed again; takes back, deletes a block and inserts placeholders', async () => {
+    const mounted = await editKeys('hi');
+    expect(blocks(mounted)).toEqual(['hi']);
+    const box = await start(mounted);
+    for (let i = 0; i < 3; i += 1) await press(mounted, box, { key: 'Enter' });
+    expect(blocks(mounted)).toEqual(['hi', '回车 ×3']);
+    await clickIn(mounted, editor(mounted), '撤销上一步');
+    expect(blocks(mounted)).toEqual(['hi', '回车 ×2']);
+    const remove = editor(mounted).querySelector<HTMLButtonElement>(
+      'button[aria-label="删除“hi”"]',
+    );
+    await mounted.act(() => {
+      remove?.click();
+    });
+    await clickIn(mounted, editor(mounted), '插入已复制的文字');
+    expect(blocks(mounted)).toEqual(['回车 ×2', '已复制的文字']);
+    // Still recording after the buttons.
+    expect(recorder(mounted)).not.toBeNull();
+    await type(mounted, recorder(mounted) as HTMLInputElement, '1+1');
+    await clickIn(mounted, editor(mounted), '■ 停止录制');
+    expect(code(mounted)).toBe('{Enter 2}{cliptext}1{+}1');
+    const saved = await save(mounted);
+    expect((saved?.action as { source: unknown }).source).toEqual({
+      type: 'inline',
+      value: '{Enter 2}{cliptext}1{+}1',
+    });
+  });
+
+  it('takes an input method’s text when it is committed', async () => {
+    const mounted = await editKeys('');
+    const box = await start(mounted);
+    await mounted.act(() => {
+      box.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+    });
+    // Keys while composing belong to the input method.
+    expect(await press(mounted, box, { key: 'Process' })).toBe(false);
+    await type(mounted, box, 'ni');
+    expect(blocks(mounted)).toEqual([]);
+    expect(await press(mounted, box, { key: 'Enter', isComposing: true })).toBe(false);
+    await mounted.act(() => {
+      Reflect.set(HTMLInputElement.prototype, 'value', '你', box);
+      box.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '你' }));
+    });
+    expect(blocks(mounted)).toEqual(['你']);
+    expect(box.value).toBe('');
+    await press(mounted, box, { key: 'Enter' });
+    expect(code(mounted)).toBe('你{Enter}');
+  });
+
+  it('opens a source the recorder cannot show in the advanced box, where it is edited', async () => {
+    const mounted = await editKeys('^(ac)');
+    expect(editor(mounted).querySelector('.recorder-note')?.textContent).toContain('高级');
+    expect(editor(mounted).querySelector('details.sendkeys-advanced')?.hasAttribute('open')).toBe(
+      true,
+    );
+    const startButton = [...editor(mounted).querySelectorAll('button')].find(
+      (b) => b.textContent === '● 开始录制',
+    );
+    expect(startButton?.disabled).toBe(true);
+    const source = editor(mounted).querySelector<HTMLTextAreaElement>(
+      'textarea[aria-label="操作正文"]',
+    );
+    if (!source) throw new Error('no source box');
+    await type(mounted, source, '^a{Tab}');
+    expect(blocks(mounted)).toEqual(['Ctrl+A', 'Tab']);
+    // Still open: it does not fold away while being edited.
+    expect(editor(mounted).querySelector('details.sendkeys-advanced')?.hasAttribute('open')).toBe(
+      true,
+    );
+    const saved = await save(mounted);
+    expect((saved?.action as { source: unknown }).source).toEqual({
+      type: 'inline',
+      value: '^a{Tab}',
+    });
   });
 });

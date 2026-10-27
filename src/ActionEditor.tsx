@@ -25,6 +25,8 @@ import { ActionTypePicker } from './ActionTypePicker';
 import { LinesInput } from './LinesInput';
 import { NumberField } from './NumberField';
 import { describeExecution } from './lib/describe';
+import { parseRecording } from './lib/sendKeys';
+import { KeyRecorder } from './KeyRecorder';
 type Props = {
   platform?: string | undefined;
   rules: Rule[];
@@ -343,6 +345,11 @@ export default function ActionEditor({
     syntaxVariables: (a.syntax_variables ?? []).length > 0,
     args: (a.args ?? []).length > 0,
     workingDirectory: Boolean(a.working_directory),
+    // A source the recorder cannot show opens with the advanced source box expanded.
+    keysAdvanced:
+      a.type === 'send_keys' &&
+      a.source?.type === 'inline' &&
+      parseRecording(String(a.source.value)) === null,
   }));
   const sourceEditor = useRef<HTMLTextAreaElement>(null),
     stepForm = useRef<HTMLDivElement>(null);
@@ -396,7 +403,6 @@ export default function ActionEditor({
     [history, setHistory] = useState<Data[]>([]),
     [bText, setBText] = useState(''),
     [bKey, setBKey] = useState('Enter'),
-    [bGroup, setBGroup] = useState<Data[]>([]),
     [repeat, setRepeat] = useState<number | InvalidNumber>(1),
     [mods, setMods] = useState<string[]>([]),
     [recording, setRecording] = useState(false),
@@ -621,6 +627,62 @@ export default function ActionEditor({
                 </button>
               </div>
             </>
+          ) : a.type === 'send_keys' ? (
+            <>
+              <KeyRecorder
+                value={String(a.source.value)}
+                onChange={(value) => edit({ source: { ...a.source, value } })}
+              />
+              <details className="advanced-settings sendkeys-advanced" open={opened.keysAdvanced}>
+                <summary>高级：直接编辑按键代码</summary>
+                <textarea
+                  aria-label="操作正文"
+                  className="content code"
+                  value={a.source.value}
+                  onChange={(e) => edit({ source: { ...a.source, value: e.target.value } })}
+                />
+                <button
+                  onClick={() =>
+                    run(async () =>
+                      show({
+                        title: '按键内容检查结果',
+                        data: await parse('send_keys', a.source.value),
+                      }),
+                    )
+                  }
+                >
+                  检查并查看将按哪些键
+                </button>
+                <details className="sendkeys-cheatsheet">
+                  <summary>按键代码写法速查</summary>
+                  <table>
+                    <tbody>
+                      {[
+                        ['你好{Enter}', '输入“你好”，再按一次 Enter'],
+                        ['{Enter 3}', '连按 3 次 Enter（花括号内空格后写次数）'],
+                        ['{Tab}、{Esc}、{Backspace}', '按 Tab、Esc、退格；方向键写 {Left} {Up} 等'],
+                        ['^a', 'Ctrl+A（^ 代表 Ctrl）'],
+                        ['+{Tab}', 'Shift+Tab（+ 代表 Shift）'],
+                        ['%{F4}', 'Alt+F4（% 代表 Alt）'],
+                        ['^(ac)', '按住 Ctrl 依次按 A、C'],
+                        ['{+}、{%}、{{}', '原样输出 + % { 等特殊符号'],
+                      ].map(([code, meaning]) => (
+                        <tr key={code}>
+                          <td>
+                            <code>{code}</code>
+                          </td>
+                          <td>{meaning}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </details>
+                <small>
+                  上面的录制框和这里是同一份内容，改哪边都可以。需要 Windows 键、播放等媒体键或
+                  F17–F24 时，请选择“按顺序执行多个操作”。
+                </small>
+              </details>
+            </>
           ) : (
             <>
               <textarea
@@ -697,143 +759,6 @@ export default function ActionEditor({
                 </small>
               </div>
             )}
-          {a.type === 'send_keys' && a.source.type === 'inline' && (
-            <div className="builder">
-              <h4>用按钮组合文字和按键</h4>
-              <small>
-                上方正文会按从左到右的顺序执行：先添加文字，再插入按键，可反复交替。下方按钮只是帮你往正文末尾追加内容。
-              </small>
-              <div className="inline">
-                <input
-                  aria-label="要输入的普通文字"
-                  placeholder="输入要输出的文字"
-                  value={bText}
-                  onChange={(e) => setBText(e.target.value)}
-                />
-                <button
-                  onClick={() => {
-                    const literal = bText
-                      .split('')
-                      .map((c) => ('+^%~()[]{}'.includes(c) ? `{${c}}` : c))
-                      .join('');
-                    edit({ source: { type: 'inline', value: String(a.source.value) + literal } });
-                    setBText('');
-                  }}
-                >
-                  添加普通文字
-                </button>
-              </div>
-              <div className="inline">
-                {['Ctrl', 'Shift', 'Alt'].map((m) => (
-                  <label key={m}>
-                    <input
-                      type="checkbox"
-                      checked={mods.includes(m)}
-                      onChange={(e) =>
-                        setMods(e.target.checked ? [...mods, m] : mods.filter((x) => x !== m))
-                      }
-                    />
-                    {m}
-                  </label>
-                ))}
-                <input
-                  aria-label="要按的键"
-                  list="keynames"
-                  value={bKey}
-                  onChange={(e) => setBKey(e.target.value)}
-                />
-                <NumberField
-                  aria-label="重复次数"
-                  className="number"
-                  range={ranges.repeat}
-                  value={repeat}
-                  onChange={setRepeat}
-                />
-                <button
-                  disabled={!inRange(ranges.repeat, repeat)}
-                  onClick={() =>
-                    edit({
-                      source: {
-                        type: 'inline',
-                        value:
-                          String(a.source.value) +
-                          mods
-                            .map((m) => (m === 'Ctrl' ? '^' : m === 'Shift' ? '+' : '%'))
-                            .join('') +
-                          `{${bKey} ${numberText(repeat)}}`,
-                      },
-                    })
-                  }
-                >
-                  插入按键
-                </button>
-              </div>
-              <div className="builder-group">
-                <h4>按住 Ctrl、Shift 或 Alt，再依次按多个键</h4>
-                <Shortcut platform={platform} value={bGroup} onChange={setBGroup} />
-                <button
-                  disabled={!bGroup.length || bGroup.some(invalidKey)}
-                  onClick={() => {
-                    const prefix = mods
-                      .map((m) => (m === 'Ctrl' ? '^' : m === 'Shift' ? '+' : '%'))
-                      .join('');
-                    const groupSource =
-                      prefix + '(' + bGroup.map((k) => `{${keyValue(k)}}`).join('') + ')';
-                    edit({
-                      source: { type: 'inline', value: String(a.source.value) + groupSource },
-                    });
-                    setBGroup([]);
-                  }}
-                >
-                  添加这组按键
-                </button>
-                <small>
-                  先在上方勾选 Ctrl、Shift 或
-                  Alt，再选择要依次按的键。执行时会让每个键都与勾选的键组合；不勾选时就是依次按这几个键。
-                </small>
-              </div>
-              <button
-                onClick={() =>
-                  run(async () =>
-                    show({
-                      title: '按键内容检查结果',
-                      data: await parse('send_keys', a.source.value),
-                    }),
-                  )
-                }
-              >
-                检查并查看将按哪些键
-              </button>
-              <details className="sendkeys-cheatsheet">
-                <summary>正文写法速查</summary>
-                <table>
-                  <tbody>
-                    {[
-                      ['你好{Enter}', '输入“你好”，再按一次 Enter'],
-                      ['{Enter 3}', '连按 3 次 Enter（花括号内空格后写次数）'],
-                      ['{Tab}、{Esc}、{Backspace}', '按 Tab、Esc、退格；方向键写 {Left} {Up} 等'],
-                      ['^a', 'Ctrl+A（^ 代表 Ctrl）'],
-                      ['+{Tab}', 'Shift+Tab（+ 代表 Shift）'],
-                      ['%{F4}', 'Alt+F4（% 代表 Alt）'],
-                      ['^(ac)', '按住 Ctrl 依次按 A、C'],
-                      ['{+}、{%}、{{}', '原样输出 + % { 等特殊符号'],
-                    ].map(([code, meaning]) => (
-                      <tr key={code}>
-                        <td>
-                          <code>{code}</code>
-                        </td>
-                        <td>{meaning}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </details>
-              <small>
-                支持 Ctrl、Shift、Alt 组合。需要 Windows 键、播放等媒体键或 F17–F24
-                时，请选择“按顺序执行多个操作”。
-              </small>
-            </div>
-          )}
         </>
       )}
       {a.type === 'html' && (

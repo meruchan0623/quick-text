@@ -10,7 +10,7 @@
 //   check), and the editor keeps rule-level keys in place. A nested object (match, terminator,
 //   notification, action, source, plan, step, span, target, operation, key, parameter) with a key
 //   this version does not know makes the whole entry unreadable: the editor rebuilds those objects
-//   (「添加普通文字」 replaces `source`, for one) and would drop the key on save.
+//   (the key recorder of 「文字与按键组合」 replaces `source`, for one) and would drop the key on save.
 // - Absent fields. A field with a serde default (`#[serde(default)]` on the field or the struct)
 //   or of an `Option` type may be absent; `withRuleDefaults` fills in the same default Rust would.
 //   A field without one must be there. `null` is only valid for an `Option`.

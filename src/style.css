@@ -1244,7 +1244,6 @@ dialog.overlay::backdrop {
   flex-basis: 100%;
   line-height: 1.6;
 }
-.builder,
 .dynamic-source {
   padding: 14px;
   background: var(--surface-2);
@@ -1252,7 +1251,6 @@ dialog.overlay::backdrop {
   border-radius: var(--radius);
   margin-top: 12px;
 }
-.builder h4,
 .step-form h4,
 .dynamic-source h4 {
   font-size: 12.5px;
@@ -1608,6 +1606,88 @@ input[aria-invalid='true'] {
   .step-layout {
     grid-template-columns: 36% 64%;
   }
+}
+.recorder {
+  display: grid;
+  gap: 10px;
+}
+.recorder-blocks {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-height: 64px;
+  padding: 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.recorder-empty,
+.recorder-note {
+  color: var(--text-secondary);
+  margin: 0;
+  line-height: 1.6;
+}
+.recorder-note {
+  color: var(--warning);
+}
+.recorded {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 2px 2px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  line-height: 1.5;
+}
+.recorded-label {
+  white-space: pre-wrap;
+}
+.recorded.key {
+  font-family: var(--mono);
+  font-size: 12px;
+  border-color: var(--border-strong);
+  border-bottom-width: 3px;
+  background: var(--surface-3);
+}
+.recorded.token {
+  background: var(--accent-soft);
+  color: var(--accent-soft-text);
+  border-color: transparent;
+}
+.recorded button {
+  border: 0;
+  background: transparent;
+  padding: 0 6px;
+  min-height: 0;
+  color: var(--text-secondary);
+  box-shadow: none;
+}
+.recorder-capture {
+  position: relative;
+}
+.recorder-capture input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 2px solid var(--danger);
+}
+.recorder-paused {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  background: var(--warning-soft);
+  color: var(--warning);
+  border: 1px solid var(--warning-border);
+}
+.recorder-notice {
+  color: var(--warning);
+}
+.sendkeys-advanced {
+  margin-top: 12px;
+}
+.sendkeys-advanced > button {
+  margin-top: 8px;
 }
 .sendkeys-cheatsheet {
   margin: 8px 0;
