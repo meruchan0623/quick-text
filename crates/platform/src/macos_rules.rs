@@ -1,7 +1,8 @@
 //! The macOS backend's decisions that need no Apple API: how a key code edits
 //! the typed-key buffer, which conditions pause detection for now, which
 //! event a replayed mouse move becomes, how a Windows wheel delta scrolls,
-//! what a clipboard backup keeps, and the history verdict of a run. They are
+//! what a clipboard backup keeps, which focus the monitor keeps while an
+//! app is too busy to answer, and the history verdict of a run. They are
 //! compiled into the tests of every platform, so they are checked on the
 //! Windows CI too; `macos.rs` only applies them.
 use crate::health::{Outcome, ReasonCode};
@@ -102,6 +103,47 @@ pub(crate) fn released_within(wait: Duration, mut held: impl FnMut() -> bool) ->
         std::thread::sleep(Duration::from_millis(10));
     }
     true
+}
+
+/// Consecutive Accessibility timeouts the monitor rides out with the last
+/// known focus (about half a second of polling).
+const FOCUS_TIMEOUT_GRACE: u32 = 10;
+
+/// The focus the monitor publishes. An app busy with the keys just typed can
+/// miss the 20 ms Accessibility timeout; read as "no editable control", that
+/// would clear the buffer mid-word and stop pending work. While the same app
+/// stays in front, a timed-out read keeps the last known control, for at
+/// most [`FOCUS_TIMEOUT_GRACE`] reads in a row. The checks before sending
+/// input never use this: they read the focus again ([`crate::macos`]
+/// `verified_foreground`).
+#[derive(Debug, Default)]
+pub(crate) struct FocusTracker {
+    last: Option<crate::Foreground>,
+    misses: u32,
+}
+
+impl FocusTracker {
+    /// The focus to publish for one read: `probed`, unless it timed out.
+    pub(crate) fn observe(
+        &mut self,
+        probed: crate::Foreground,
+        timed_out: bool,
+    ) -> crate::Foreground {
+        if let Some(last) = &self.last {
+            if timed_out
+                && probed.id == 0
+                && last.id != 0
+                && last.process == probed.process
+                && self.misses < FOCUS_TIMEOUT_GRACE
+            {
+                self.misses += 1;
+                return last.clone();
+            }
+        }
+        self.misses = 0;
+        self.last = Some(probed.clone());
+        probed
+    }
 }
 
 /// Whether the plan's first clipboard step (`first`) may be written before
@@ -307,6 +349,38 @@ mod tests {
         assert_eq!(polls, 3);
         assert!(released_within(Duration::ZERO, || false));
         assert!(!released_within(Duration::from_millis(30), || true));
+    }
+
+    #[test]
+    fn a_busy_app_keeps_its_focus_for_a_while() {
+        let focus = |process: &str, id| crate::Foreground {
+            platform: "macos".into(),
+            bundle_id: process.into(),
+            id,
+            process: process.into(),
+            title: String::new(),
+        };
+        let mut tracker = FocusTracker::default();
+        assert_eq!(tracker.observe(focus("com.a", 7), false).id, 7);
+        // A timed-out read of the same app keeps the control...
+        for _ in 0..FOCUS_TIMEOUT_GRACE {
+            assert_eq!(tracker.observe(focus("com.a", 0), true).id, 7);
+        }
+        // ...for a limited number of reads in a row.
+        assert_eq!(tracker.observe(focus("com.a", 0), true).id, 0);
+        assert_eq!(tracker.observe(focus("com.a", 7), false).id, 7);
+        // An answer, another app or a non-editable control is taken as is.
+        assert_eq!(tracker.observe(focus("com.a", 0), false).id, 0);
+        assert_eq!(tracker.observe(focus("com.a", 7), false).id, 7);
+        assert_eq!(tracker.observe(focus("com.b", 0), true).id, 0);
+        assert_eq!(tracker.observe(focus("com.a", 7), false).id, 7);
+        assert_eq!(tracker.observe(focus("com.a", 9), true).id, 9);
+        // A good read resets the count.
+        tracker.observe(focus("com.a", 0), true);
+        tracker.observe(focus("com.a", 9), false);
+        for _ in 0..FOCUS_TIMEOUT_GRACE {
+            assert_eq!(tracker.observe(focus("com.a", 0), true).id, 9);
+        }
     }
 
     #[test]

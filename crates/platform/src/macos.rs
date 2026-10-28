@@ -42,6 +42,7 @@ extern "C" {
     fn AXIsProcessTrusted() -> bool;
     fn AXUIElementCreateApplication(pid: i32) -> CF;
     fn AXUIElementCopyAttributeValue(element: CF, attribute: CF, value: *mut CF) -> i32;
+    fn AXUIElementSetAttributeValue(element: CF, attribute: CF, value: CF) -> i32;
     fn AXUIElementSetMessagingTimeout(element: CF, seconds: f32) -> i32;
     fn CGPreflightListenEventAccess() -> bool;
     fn CGPreflightPostEventAccess() -> bool;
@@ -94,6 +95,7 @@ extern "C" {
     fn CFRunLoopRemoveSource(runloop: CF, source: CF, mode: CF);
     fn CFRunLoopRunInMode(mode: CF, seconds: f64, return_after_source: bool) -> i32;
     static kCFRunLoopDefaultMode: CF;
+    static kCFBooleanTrue: CF;
 }
 #[link(name = "Carbon", kind = "framework")]
 extern "C" {
@@ -167,11 +169,34 @@ unsafe fn string(value: CF) -> String {
     bytes.truncate(bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len()));
     String::from_utf8_lossy(&bytes).into_owned()
 }
+/// `kAXErrorCannotComplete`: the app did not answer within the messaging
+/// timeout (it is busy, often with the keys just typed).
+const AX_CANNOT_COMPLETE: i32 = -25204;
 unsafe fn attribute(element: CF, name: &str) -> Option<CF> {
+    attribute_or_timeout(element, name, &mut false)
+}
+/// [`attribute`], noting in `timed_out` when the app did not answer in time.
+unsafe fn attribute_or_timeout(element: CF, name: &str, timed_out: &mut bool) -> Option<CF> {
     let name = StringRef::new(name);
     let mut value = ptr::null();
-    (AXUIElementCopyAttributeValue(element, name.0, &mut value) == 0 && !value.is_null())
-        .then_some(value)
+    let status = AXUIElementCopyAttributeValue(element, name.0, &mut value);
+    *timed_out |= status == AX_CANNOT_COMPLETE;
+    (status == 0 && !value.is_null()).then_some(value)
+}
+static ACCESSIBILITY_ASKED: OnceLock<Mutex<BTreeSet<i32>>> = OnceLock::new();
+/// Electron apps (Slack, VS Code, Notion…) build their Accessibility tree only
+/// when asked through `AXManualAccessibility`; without it their focused input
+/// is never found and nothing expands there. Asked once per process; other
+/// apps ignore the attribute.
+unsafe fn request_accessibility(app: CF, pid: i32) {
+    let asked = ACCESSIBILITY_ASKED.get_or_init(Default::default);
+    if !asked.lock().unwrap().insert(pid) {
+        return;
+    }
+    let name = StringRef::new("AXManualAccessibility");
+    if AXUIElementSetAttributeValue(app, name.0, kCFBooleanTrue) == AX_CANNOT_COMPLETE {
+        asked.lock().unwrap().remove(&pid);
+    }
 }
 const MARK: i64 = 0x51545854;
 const SHIFT: u64 = 1 << 17;
@@ -314,18 +339,27 @@ pub fn capture_selection() -> Result<String, String> {
     Ok(result)
 }
 pub fn foreground() -> Foreground {
-    unsafe {
+    probe_foreground().0
+}
+/// The foreground, and whether an Accessibility read timed out: the focused
+/// control is then unknown (`id` 0) only because the app was busy.
+fn probe_foreground() -> (Foreground, bool) {
+    let mut timed_out = false;
+    let focus = unsafe {
         let _pool = Pool::new();
         let workspace = msg!(class("NSWorkspace"), "sharedWorkspace" => Id);
         let application = msg!(workspace, "frontmostApplication" => Id);
         if application.is_null() {
-            return Foreground {
-                platform: "macos".into(),
-                bundle_id: String::new(),
-                id: 0,
-                process: String::new(),
-                title: String::new(),
-            };
+            return (
+                Foreground {
+                    platform: "macos".into(),
+                    bundle_id: String::new(),
+                    id: 0,
+                    process: String::new(),
+                    title: String::new(),
+                },
+                false,
+            );
         }
         let pid = msg!(application, "processIdentifier" => i32);
         let bundle = string(msg!(application, "bundleIdentifier" => CF));
@@ -337,17 +371,18 @@ pub fn foreground() -> Foreground {
             title: String::new(),
         };
         if pid == std::process::id() as i32 || !AXIsProcessTrusted() {
-            return focus;
+            return (focus, false);
         }
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
-            return focus;
+            return (focus, false);
         }
         AXUIElementSetMessagingTimeout(app, 0.02);
-        let window = attribute(app, "AXFocusedWindow");
-        let element = attribute(app, "AXFocusedUIElement");
+        request_accessibility(app, pid);
+        let window = attribute_or_timeout(app, "AXFocusedWindow", &mut timed_out);
+        let element = attribute_or_timeout(app, "AXFocusedUIElement", &mut timed_out);
         if let (Some(window), Some(element)) = (window, element) {
-            let subrole = attribute(element, "AXSubrole");
+            let subrole = attribute_or_timeout(element, "AXSubrole", &mut timed_out);
             let secure = subrole
                 .map(|v| {
                     let secure = string(v) == "AXSecureTextField";
@@ -355,7 +390,7 @@ pub fn foreground() -> Foreground {
                     secure
                 })
                 .unwrap_or(false);
-            let editable_role = attribute(element, "AXRole")
+            let editable_role = attribute_or_timeout(element, "AXRole", &mut timed_out)
                 .map(|role| {
                     let allowed = matches!(string(role).as_str(), "AXTextArea" | "AXTextField");
                     CFRelease(role);
@@ -380,6 +415,21 @@ pub fn foreground() -> Foreground {
         }
         CFRelease(app);
         focus
+    };
+    (focus, timed_out)
+}
+/// [`foreground`] for the checks before sending input: a read that timed out
+/// is tried again a few times, so a target busy with the keys just sent does
+/// not stop the run as a focus change.
+fn verified_foreground() -> Foreground {
+    let mut attempt = 0;
+    loop {
+        let (focus, timed_out) = probe_foreground();
+        attempt += 1;
+        if !timed_out || focus.id != 0 || attempt >= 5 {
+            return focus;
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 fn layout_safe() -> bool {
@@ -935,11 +985,13 @@ pub fn start_engine(shared: Arc<Shared>) -> Result<(), String> {
     let monitor = shared.clone();
     std::thread::spawn(move || {
         let mut old = 0;
+        let mut tracker = crate::macos_rules::FocusTracker::default();
         // `None` until the first pass, so a PLATFORM pause left by an earlier
         // engine run is written over at once.
         let mut blocked: Option<Option<&str>> = None;
         while !monitor.shutdown.load(Ordering::SeqCst) {
-            let focus = foreground();
+            let (probed, timed_out) = probe_foreground();
+            let focus = tracker.observe(probed, timed_out);
             let safe = layout_safe();
             if old != focus.id && !monitor.busy.load(Ordering::SeqCst) {
                 monitor.generation.fetch_add(1, Ordering::SeqCst);
@@ -1892,7 +1944,7 @@ fn guarded(s: &Shared, target: &Foreground, generation: u64, revision: u64) -> R
     if s.config.lock().unwrap().revision != revision {
         return Err("Active revision changed; execution stopped".into());
     }
-    let now = foreground();
+    let now = verified_foreground();
     if target.id == 0 || now.id != target.id {
         return Err("Focused application/window/control changed or cannot be verified".into());
     }
@@ -2016,7 +2068,7 @@ pub fn execute(
                 break;
             }
             if let TargetPolicy::Declared { process } = &step.target {
-                let next = foreground();
+                let next = verified_foreground();
                 if next.id == 0 || next.process != *process {
                     failure =
                         Some("Declared bundle id is not the current foreground application".into());
