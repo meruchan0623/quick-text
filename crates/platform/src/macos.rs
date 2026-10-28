@@ -595,6 +595,8 @@ unsafe extern "C" fn tap(_: Id, kind: u32, event: Event, _: Id) -> Event {
         return event;
     }
     if kind == 14 {
+        // The callback runs on a thread without an autorelease pool.
+        let _pool = Pool::new();
         let native = msg!(class("NSEvent"), "eventWithCGEvent:" => Id, event => Event);
         if !native.is_null() && msg!(native, "subtype" => i16) == 8 {
             let data = msg!(native, "data1" => isize);
@@ -2128,6 +2130,10 @@ pub fn execute(
                                     return Err("CGEvent allocation failed".into());
                                 }
                                 CGEventKeyboardSetUnicodeString(event, utf16.len(), utf16.as_ptr());
+                                CGEventSetFlags(
+                                    event,
+                                    held.iter().fold(0, |f, c| f | modifier_flag(*c)),
+                                );
                                 post(event)?;
                             }
                         }
