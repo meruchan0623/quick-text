@@ -67,5 +67,5 @@ Windows 0.2.0 keys（包括手动动作测试）需要可靠UIAutomation provide
    - 已知风险（不是回归）：计划中「Cmd+C 再粘贴」的组合仍会因剪贴板被改动而以 `clipboard_changed` 失败。
 6. **前端。**
    - 「快捷键」录制改用 `KeyboardEvent.code` 识别物理键，Shift/Option 不再把键变成别的字符（`!`、`å`）；拿不到 code 时退回 `key`。
-   - 「文字与按键组合」录制器**没有**把 Cmd 录成 `$primary`：SendKeys 语法（`parse_sendkeys`）只有 `^ + %` 三种修饰符，没有 Cmd/Win，要支持需要扩展领域层的方言（会影响 Quicker 导入/导出兼容），待决定。目前按 Cmd 组合时提示改用「按顺序执行多个操作」中的快捷键步骤（`Ctrl / Cmd`）。
+   - 「文字与按键组合」录制器**没有**把 Cmd 录成 `$primary`：SendKeys 语法（`parse_sendkeys`）只有 `^ + %` 三种修饰符，没有 Cmd/Win，要支持需要扩展领域层的方言（会影响 Quicker 导入/导出兼容）。2026-10-28 决定暂不扩展。目前按 Cmd 组合时提示改用「按顺序执行多个操作」中的快捷键步骤（`Ctrl / Cmd`）。
 7. **应用外壳。** 处理 `RunEvent::Reopen`：点 Dock 图标时显示并聚焦主窗口。`bundle.macOS.minimumSystemVersion` 设为 `10.15`。src-tauri 无法在 Windows 上交叉编译 macOS，这部分代码未经编译器检查。
