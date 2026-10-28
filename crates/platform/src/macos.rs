@@ -1116,17 +1116,37 @@ pub fn finish_and_take(shared: &Arc<Shared>) -> Result<ActionPlan, String> {
         }
     })
 }
+/// Whether the user holds the key. A key-up the tap never saw (Secure Input
+/// hides key events from it; the tap may be reinstalled mid-press) would
+/// leave the key held for good and refuse every later run, so an ordinary
+/// key is also checked against the hardware state and dropped once it is up.
 fn physical(code: u16) -> bool {
-    PHYSICAL
-        .get()
-        .map(|set| set.lock().unwrap().contains(&code))
-        .unwrap_or(true)
+    let Some(set) = PHYSICAL.get() else {
+        return true;
+    };
+    if !set.lock().unwrap().contains(&code) {
+        return false;
+    }
+    if code < 256 && !unsafe { CGEventSourceKeyState(1, code) } {
+        set.lock().unwrap().remove(&code);
+        return false;
+    }
+    true
 }
+/// Whether the user holds the mouse button, checked against the hardware
+/// state like [`physical`].
 fn physical_button(code: u32) -> bool {
-    BUTTONS
-        .get()
-        .map(|set| set.lock().unwrap().contains(&code))
-        .unwrap_or(true)
+    let Some(set) = BUTTONS.get() else {
+        return true;
+    };
+    if !set.lock().unwrap().contains(&code) {
+        return false;
+    }
+    if !unsafe { CGEventSourceButtonState(1, code) } {
+        set.lock().unwrap().remove(&code);
+        return false;
+    }
+    true
 }
 fn modifier_flag(code: u16) -> u64 {
     match code {
@@ -1425,16 +1445,17 @@ fn press(code: u16, held: &BTreeSet<u16>) -> Result<(), String> {
     send_key(code, false, &next)
 }
 fn send_terminator(term: &str) -> Result<(), String> {
-    press(
-        match term {
-            "space" => 49,
-            "tab" => 48,
-            "enter" => 36,
-            "semicolon" => 41,
-            _ => return Err("Unknown terminator".into()),
-        },
-        &BTreeSet::new(),
-    )
+    let code = match term {
+        "space" => 49,
+        "tab" => 48,
+        "enter" => 36,
+        "semicolon" => 41,
+        _ => return Err("Unknown terminator".into()),
+    };
+    // The held-back terminator is often still down when a short action
+    // ends: wait for it to come up instead of losing it.
+    crate::macos_rules::released_within(MODIFIER_RELEASE_WAIT, || physical(code));
+    press(code, &BTreeSet::new())
 }
 fn hotkey(keys: &[Key], held: &BTreeSet<u16>) -> Result<(), String> {
     let codes = keys.iter().map(keycode).collect::<Result<Vec<_>, _>>()?;
@@ -1883,12 +1904,10 @@ fn guarded(s: &Shared, target: &Foreground, generation: u64, revision: u64) -> R
     }
     // The trigger's last character may be typed with Shift still held: give
     // the modifiers a moment to come up before refusing.
-    let deadline = Instant::now() + MODIFIER_RELEASE_WAIT;
-    while [54, 55, 56, 58, 59, 60, 61, 62].into_iter().any(physical) {
-        if Instant::now() >= deadline {
-            return Err("A physical modifier is held; execution stopped".into());
-        }
-        std::thread::sleep(Duration::from_millis(10));
+    if !crate::macos_rules::released_within(MODIFIER_RELEASE_WAIT, || {
+        [54, 55, 56, 58, 59, 60, 61, 62].into_iter().any(physical)
+    }) {
+        return Err("A physical modifier is held; execution stopped".into());
     }
     Ok(())
 }

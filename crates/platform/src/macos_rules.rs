@@ -8,6 +8,7 @@ use crate::health::{Outcome, ReasonCode};
 use crate::traits::RestorePolicy;
 use quicker_domain::{ActionPlan, KeyClass, Operation, OutputMethod, WheelAxis, WheelUnit};
 use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
 /// Class of a macOS virtual key code (Carbon `kVK_*`) for the shared buffer
 /// rules ([`quicker_domain::key_edit`]), matching the Windows table.
@@ -88,6 +89,19 @@ impl WheelSteps {
         *residue = total % WHEEL_DELTA;
         lines
     }
+}
+
+/// Waits up to `wait` for `held` to turn false (a key or modifier the user
+/// is still pressing), checking every 10 ms. Whether it came up in time.
+pub(crate) fn released_within(wait: Duration, mut held: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + wait;
+    while held() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
 }
 
 /// Whether the plan's first clipboard step (`first`) may be written before
@@ -281,6 +295,18 @@ mod tests {
         assert!(platform_block(true, false, true)
             .unwrap()
             .contains("event tap"));
+    }
+
+    #[test]
+    fn a_held_key_is_waited_for_up_to_the_limit() {
+        let mut polls = 0;
+        assert!(released_within(Duration::from_millis(200), || {
+            polls += 1;
+            polls < 3
+        }));
+        assert_eq!(polls, 3);
+        assert!(released_within(Duration::ZERO, || false));
+        assert!(!released_within(Duration::from_millis(30), || true));
     }
 
     #[test]
