@@ -414,7 +414,8 @@ impl ExecRig {
                 stamp,
                 generation: self.generation,
                 source: "fixture",
-                captured_allowed: true,
+                captured_block: None,
+                modified: false,
             };
             candidate = detect_candidate(&self.shared, &mut self.buffer, event, &self.foreground);
         }

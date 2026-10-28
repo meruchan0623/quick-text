@@ -175,6 +175,8 @@ const SHIFT: u64 = 1 << 17;
 const CTRL: u64 = 1 << 18;
 const ALT: u64 = 1 << 19;
 const CMD: u64 = 1 << 20;
+/// How long an action waits for held modifiers (the trigger's Shift) to come up.
+const MODIFIER_RELEASE_WAIT: Duration = Duration::from_millis(500);
 static ENGINE: OnceLock<Arc<Shared>> = OnceLock::new();
 static SENDER: OnceLock<mpsc::SyncSender<Candidate>> = OnceLock::new();
 static BUFFER: OnceLock<Mutex<Buffer>> = OnceLock::new();
@@ -634,7 +636,10 @@ unsafe extern "C" fn tap(_: Id, kind: u32, event: Event, _: Id) -> Event {
         }
         shared.cancel.store(true, Ordering::SeqCst);
     }
-    if kind == 11 {
+    // Shift (56, 60) and Caps Lock (57) only change the case of the next
+    // character (Windows' `Kind::Neutral`): they keep the buffer and the
+    // generation, so `Hi` or `x:` can match and run.
+    if kind == 11 || kind == 12 && matches!(code, 56 | 57 | 60) {
         return event;
     }
     let generation = shared.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -794,11 +799,15 @@ pub fn start_engine(shared: Arc<Shared>) -> Result<(), String> {
         };
         // Let the non-suppressed final immediate key reach the target before deletion.
         std::thread::sleep(Duration::from_millis(15));
+        let config = worker.config.lock().unwrap().clone();
+        let action = &candidate.rule.action;
         // Built first so `now` is still taken before the clipboard and selection reads.
         let base = VariableContext::default();
         let mut context = VariableContext {
-            clipboard: clipboard_text().ok(),
-            selection: capture_selection().ok(),
+            clipboard: crate::clipboard_variable(action_uses_variable(action, &config, "cliptext")),
+            selection: action_uses_variable(action, &config, "selection")
+                .then(capture_selection)
+                .and_then(Result::ok),
             ..base
         };
         context.parameters.insert(
@@ -809,7 +818,6 @@ pub fn start_engine(shared: Arc<Shared>) -> Result<(), String> {
                 .map(serde_json::Value::String)
                 .unwrap_or(serde_json::Value::Null),
         );
-        let config = worker.config.lock().unwrap().clone();
         let result = if config.revision != candidate.revision {
             Err("Revision changed before native action".into())
         } else {
@@ -1019,6 +1027,19 @@ pub fn finish_recording(shared: &Arc<Shared>) {
             ));
         }
     }
+}
+/// Ends the active recording and takes it: [`finish_recording`] (releases
+/// what is still held, or drops a recording that hit an error) followed by
+/// `stop_recording`. A dropped recording fails with its own reason, not
+/// "Recording is not active".
+pub fn finish_and_take(shared: &Arc<Shared>) -> Result<ActionPlan, String> {
+    finish_recording(shared);
+    crate::stop_recording(shared).map_err(|error| {
+        match shared.last.lock().ok().and_then(|last| last.clone()) {
+            Some(last) if last.id == "recording" && last.status == "failed" => last.message,
+            _ => error,
+        }
+    })
 }
 fn physical(code: u16) -> bool {
     PHYSICAL
@@ -1395,16 +1416,22 @@ fn common_keys(name: &str) -> Result<Vec<Key>, String> {
     Ok(keys.into_iter().map(Key::named).collect())
 }
 type Payload = Vec<Vec<(String, Vec<u8>)>>;
-fn clipboard_text() -> Result<String, String> {
+/// The pasteboard's plain text for `{cliptext}` (`crate::read_clipboard_text`).
+/// A string that does not convert is an error, not an empty `{cliptext}`.
+pub(crate) fn read_clipboard_text() -> Result<String, crate::ClipboardTextError> {
     unsafe {
         let _pool = Pool::new();
         let board = msg!(class("NSPasteboard"),"generalPasteboard"=>Id);
         let kind = StringRef::new("public.utf8-plain-text");
         let value = msg!(board,"stringForType:"=>CF,kind.0 as Id=>Id);
         if value.is_null() {
-            Err("Clipboard has no plain text".into())
+            return Err(crate::ClipboardTextError::NoText);
+        }
+        let text = string(value);
+        if text.is_empty() && CFStringGetLength(value) > 0 {
+            Err(crate::ClipboardTextError::Unreadable)
         } else {
-            Ok(string(value))
+            Ok(text)
         }
     }
 }
@@ -1766,8 +1793,14 @@ fn guarded(s: &Shared, target: &Foreground, generation: u64, revision: u64) -> R
                 .into(),
         );
     }
-    if [54, 55, 56, 58, 59, 60, 61, 62].into_iter().any(physical) {
-        return Err("A physical modifier is held; execution stopped".into());
+    // The trigger's last character may be typed with Shift still held: give
+    // the modifiers a moment to come up before refusing.
+    let deadline = Instant::now() + MODIFIER_RELEASE_WAIT;
+    while [54, 55, 56, 58, 59, 60, 61, 62].into_iter().any(physical) {
+        if Instant::now() >= deadline {
+            return Err("A physical modifier is held; execution stopped".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
     Ok(())
 }
@@ -1887,11 +1920,29 @@ pub fn execute(
                         text,
                         method: OutputMethod::Keys,
                     } => {
-                        for ch in text.chars() {
+                        let mut chars = text.chars().peekable();
+                        while let Some(ch) = chars.next() {
                             if started.elapsed() > Duration::from_secs(120) {
                                 return Err("Execution timeout".into());
                             }
                             guarded(&s, &target, generation, revision)?;
+                            // Line breaks and tabs are typed as Return and Tab, as on
+                            // Windows: `\r\n` is one Return, and forms submit or move on.
+                            let key = match ch {
+                                '\r' => {
+                                    chars.next_if_eq(&'\n');
+                                    Some(36)
+                                }
+                                '\n' => Some(36),
+                                '\t' => Some(48),
+                                _ => None,
+                            };
+                            if let Some(code) = key {
+                                step_effects = true;
+                                send_key(code, true, &held)?;
+                                send_key(code, false, &held)?;
+                                continue;
+                            }
                             let utf16 = ch.to_string().encode_utf16().collect::<Vec<_>>();
                             unsafe {
                                 let event = CGEventCreateKeyboardEvent(ptr::null(), 0, true);
@@ -1934,7 +1985,8 @@ pub fn execute(
                         guarded(&s, &target, generation, revision)?;
                         step_effects = true;
                         hotkey(&[Key::PlatformPrimary, Key::named("V")], &held)?;
-                        std::thread::sleep(Duration::from_millis(150));
+                        // The user's restore delay (B-08), as on Windows.
+                        std::thread::sleep(crate::clipboard_options::lease_options().restore_delay);
                     }
                     Operation::KeyDown { key } => {
                         let code = keycode(key)?;

@@ -49,6 +49,7 @@
 //! | `clipboard.owner_hung` | warn | the clipboard owner does not respond; the lease degrades instead of reading its formats |
 //! | `clipboard.read_timeout` | warn | a read on the clipboard backup worker did not finish in time; `wait_ms` |
 //! | `clipboard.skipped` | info | formats were left out of the clipboard backup; the skipped formats and the restore policy |
+//! | `clipboard.text_unavailable` | warn | a rule that uses `{cliptext}` got no clipboard text; reason (busy, no text, too large, unreadable), never the text |
 //! | `clipboard.slow` | warn | the clipboard was held open past its budget; `held_ms`, `budget_ms` |
 //! | `clipboard.unreadable` | warn | an enumerated clipboard format gave no data or unreadable memory; the backup is refused; format id |
 //! | `clipboard.worker_failed` | warn | the clipboard backup worker thread did not start; error |
@@ -159,6 +160,7 @@
 //! | `store.newer_schema` | warn | a file written by a newer release; opened read-only; file name, schema `version` |
 //! | `store.no_valid_config_kept` | warn | no configuration to load, and the candidates an earlier launch quarantined are all that is left: SafeMode(NoValidConfig) again; number `quarantined` |
 //! | `store.previous_unreadable` | warn | a file considered as the rollback target does not parse (`previous.json`: the guess goes on; any other file: rollback is unavailable); file name, error code |
+//! | `store.published` | info | configuration was committed to disk and engine; revision, enabled, rule_count and enabled_rule_count; no triggers or action content |
 //! | `store.read_failed` | warn | a file stayed unreadable after retries; file name, error |
 //! | `store.recovered` | warn | active.json was unusable and the configuration was recovered from another file; file name, source, revision |
 //! | `store.rules_skipped` | warn | unreadable rules stay off at runtime; `count` |

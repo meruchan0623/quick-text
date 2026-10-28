@@ -262,67 +262,180 @@ function Shortcut({
   onChange: (ks: Data[]) => void;
 }) {
   const [capturing, setCapturing] = useState(false);
+  const keyLabel = (name: string) =>
+    name === '$primary'
+      ? 'Ctrl / Cmd'
+      : /^D\d$/.test(name)
+        ? name.slice(1)
+        : ({ Left: '←', Right: '→', Up: '↑', Down: '↓', Space: '空格' } as Record<string, string>)[
+            name
+          ] || name;
+  const groups = [
+    {
+      label: '修饰键',
+      rows: [['Ctrl', 'Shift', 'Alt', platform === 'macos' ? 'Cmd' : 'Win']],
+    },
+    {
+      label: '字母与数字',
+      rows: [
+        ['D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7', 'D8', 'D9', 'D0'],
+        Array.from('QWERTYUIOP'),
+        Array.from('ASDFGHJKL'),
+        Array.from('ZXCVBNM'),
+      ],
+    },
+    { label: '功能键', rows: [Array.from({ length: 12 }, (_, i) => `F${i + 1}`)] },
+    {
+      label: '常用按键',
+      rows: [
+        ['Escape', 'Tab', 'Enter', 'Space', 'Backspace', 'Delete'],
+        ['Home', 'End', 'PgUp', 'PgDn', 'Left', 'Up', 'Down', 'Right'],
+      ],
+    },
+  ];
   return (
     <div className="shortcut">
-      {value.map((k, i) => (
-        <div key={i}>
-          <KeySelect value={k} onChange={(n) => onChange(value.map((x, j) => (i === j ? n : x)))} />
-          <button aria-label="删除按键" onClick={() => onChange(value.filter((_, j) => i !== j))}>
-            ×
-          </button>
+      <div className="shortcut-preview" aria-label="当前快捷键">
+        <span className="shortcut-caption">当前组合</span>
+        <div className="shortcut-chord" aria-live="polite">
+          {value.length === 0 && <span className="muted">还没有设置，点下方“录制快捷键”</span>}
+          {value.map((k, i) => (
+            <Fragment key={i}>
+              {i > 0 && (
+                <span className="shortcut-plus" aria-hidden="true">
+                  +
+                </span>
+              )}
+              <button
+                type="button"
+                className="shortcut-chip"
+                aria-label={`移除 ${keyLabel(keyValue(k))}`}
+                onClick={() => onChange(value.filter((_, j) => i !== j))}
+              >
+                {keyLabel(keyValue(k))} <span aria-hidden="true">×</span>
+              </button>
+            </Fragment>
+          ))}
         </div>
-      ))}
-      <button onClick={() => onChange([...value, key('Enter')])}>＋ 按键</button>
-      <button onClick={() => setCapturing(!capturing)}>
-        {capturing ? '取消录制' : '录制快捷键'}
-      </button>
-      {capturing && (
-        <input
-          autoFocus
-          aria-label="快捷键录制"
-          placeholder="按下组合键…"
-          readOnly
-          onKeyDown={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return;
-            if (e.key === 'Escape') {
-              setCapturing(false);
-              return;
-            }
-            const result: Data[] = [];
-            if (e.ctrlKey) result.push(key('Ctrl'));
-            if (e.shiftKey) result.push(key('Shift'));
-            if (e.altKey) result.push(key('Alt'));
-            if (e.metaKey) {
-              if (platform !== 'macos' && platform !== 'windows') {
+        <button type="button" disabled={value.length === 0} onClick={() => onChange([])}>
+          清空
+        </button>
+      </div>
+      <div className="shortcut-record">
+        <button
+          type="button"
+          className={capturing ? undefined : 'primary'}
+          aria-pressed={capturing}
+          onClick={() => setCapturing(!capturing)}
+        >
+          {capturing ? '取消录制' : '录制快捷键'}
+        </button>
+        {capturing && (
+          <input
+            autoFocus
+            aria-label="快捷键录制"
+            placeholder="现在按下组合键…"
+            readOnly
+            onKeyDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return;
+              if (e.key === 'Escape') {
                 setCapturing(false);
                 return;
               }
-              result.push(key(platform === 'macos' ? 'Cmd' : 'Win'));
-            }
-            let name = e.key.length === 1 ? e.key.toUpperCase() : e.key;
-            name =
-              (
-                {
-                  ArrowLeft: 'Left',
-                  ArrowRight: 'Right',
-                  ArrowUp: 'Up',
-                  ArrowDown: 'Down',
-                  ' ': 'Space',
-                } as Data
-              )[name] || name;
-            if (/^\d$/.test(name)) name = 'D' + name;
-            result.push(key(name));
-            onChange(result);
-            setCapturing(false);
-          }}
-        />
-      )}
-      <small>
-        点“录制快捷键”后，按一次想要的组合键即可；Esc 可取消。手动选择 $primary 时，Windows 使用
-        Ctrl，Mac 使用 Cmd。
+              const result: Data[] = [];
+              if (e.ctrlKey) result.push(key('Ctrl'));
+              if (e.shiftKey) result.push(key('Shift'));
+              if (e.altKey) result.push(key('Alt'));
+              if (e.metaKey) {
+                if (platform !== 'macos' && platform !== 'windows') {
+                  setCapturing(false);
+                  return;
+                }
+                result.push(key(platform === 'macos' ? 'Cmd' : 'Win'));
+              }
+              let name = e.key.length === 1 ? e.key.toUpperCase() : e.key;
+              name =
+                (
+                  {
+                    ArrowLeft: 'Left',
+                    ArrowRight: 'Right',
+                    ArrowUp: 'Up',
+                    ArrowDown: 'Down',
+                    ' ': 'Space',
+                  } as Data
+                )[name] || name;
+              if (/^\d$/.test(name)) name = 'D' + name;
+              result.push(key(name));
+              onChange(result);
+              setCapturing(false);
+            }}
+          />
+        )}
+      </div>
+      <small className="shortcut-hint">
+        点“录制快捷键”，再按一次想要的组合键（例如 Ctrl+C）即可；Esc 取消。
       </small>
+      <details className="shortcut-manual">
+        <summary>录不了？手动点选按键</summary>
+        <small className="shortcut-hint">点一下选中，再点一下取消；按点选的顺序组合。</small>
+        <div className="shortcut-keyboard" aria-label="点击选择快捷键">
+          {groups.map((group) => (
+            <div className="shortcut-group" role="group" aria-label={group.label} key={group.label}>
+              <span className="shortcut-caption">{group.label}</span>
+              {group.rows.map((row) => (
+                <div className="shortcut-key-row" key={row.join('-')}>
+                  {row.map((name) => {
+                    const selected = value.some((k) => keyValue(k) === name);
+                    return (
+                      <button
+                        type="button"
+                        className="shortcut-key"
+                        key={name}
+                        aria-label={name}
+                        aria-pressed={selected}
+                        title={name}
+                        onClick={() =>
+                          onChange(
+                            selected
+                              ? value.filter((k) => keyValue(k) !== name)
+                              : [...value, key(name)],
+                          )
+                        }
+                      >
+                        {keyLabel(name)}
+                      </button>
+                    );
+                  })}
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+        <details className="shortcut-advanced">
+          <summary>更多按键与 Windows 键码</summary>
+          <small>可填写 F13–F24、自定义按键名称或 # 键码；已有按键会保持原顺序。</small>
+          {value.map((k, i) => (
+            <div className="shortcut-custom-key" key={i}>
+              <KeySelect
+                value={k}
+                onChange={(n) => onChange(value.map((x, j) => (i === j ? n : x)))}
+              />
+              <button
+                type="button"
+                aria-label="删除按键"
+                onClick={() => onChange(value.filter((_, j) => i !== j))}
+              >
+                ×
+              </button>
+            </div>
+          ))}
+          <button type="button" onClick={() => onChange([...value, key('Enter')])}>
+            ＋ 按键
+          </button>
+        </details>
+      </details>
     </div>
   );
 }
@@ -641,20 +754,8 @@ export default function ActionEditor({
                   value={a.source.value}
                   onChange={(e) => edit({ source: { ...a.source, value: e.target.value } })}
                 />
-                <button
-                  onClick={() =>
-                    run(async () =>
-                      show({
-                        title: '按键内容检查结果',
-                        data: await parse('send_keys', a.source.value),
-                      }),
-                    )
-                  }
-                >
-                  检查并查看将按哪些键
-                </button>
-                <details className="sendkeys-cheatsheet">
-                  <summary>按键代码写法速查</summary>
+                <div className="sendkeys-cheatsheet">
+                  <strong>写法速查</strong>
                   <table>
                     <tbody>
                       {[
@@ -676,11 +777,8 @@ export default function ActionEditor({
                       ))}
                     </tbody>
                   </table>
-                </details>
-                <small>
-                  上面的录制框和这里是同一份内容，改哪边都可以。需要 Windows 键、播放等媒体键或
-                  F17–F24 时，请选择“按顺序执行多个操作”。
-                </small>
+                </div>
+                <small>这里和上面录下的内容是同一份，改哪边都行。</small>
               </details>
             </>
           ) : (

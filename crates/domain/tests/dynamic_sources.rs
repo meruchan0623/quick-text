@@ -104,3 +104,45 @@ fn syntax_reusable_parameter_requires_explicit_b_action_setting() {
     let plan = preflight_action(&action, &context).unwrap();
     assert!(matches!(plan.steps[0].operation, Operation::Hotkey { .. }));
 }
+
+#[test]
+fn only_actions_that_may_render_a_variable_need_it_read() {
+    let text = |value: &str| Action::Text {
+        method: Default::default(),
+        source: ContentSource::inline(value),
+    };
+    let none = Config::default();
+    assert!(action_uses_variable(
+        &text("a{cliptext}b"),
+        &none,
+        "cliptext"
+    ));
+    assert!(!action_uses_variable(
+        &text("a{cliptext}b"),
+        &none,
+        "selection"
+    ));
+    assert!(!action_uses_variable(&text("plain"), &none, "cliptext"));
+    let file = Action::Text {
+        method: Default::default(),
+        source: ContentSource::File {
+            path: "body.txt".into(),
+            encoding: Encoding::Utf8,
+        },
+    };
+    assert!(action_uses_variable(&file, &none, "cliptext"));
+
+    let reference = Action::Reusable {
+        action_id: "shared".into(),
+        parameters: Default::default(),
+    };
+    let mut config = Config::default();
+    config.rules.push(Rule {
+        id: "shared".into(),
+        action: text("{selection}"),
+        ..Rule::default()
+    });
+    assert!(action_uses_variable(&reference, &config, "selection"));
+    assert!(!action_uses_variable(&reference, &config, "cliptext"));
+    assert!(!action_uses_variable(&text("plain"), &config, "selection"));
+}

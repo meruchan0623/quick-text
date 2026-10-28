@@ -179,6 +179,21 @@ pub fn render_template(
     result.push_str(rest);
     Ok(result)
 }
+/// Whether running `action` may render the `{token}` placeholder (`cliptext`, `selection`),
+/// so a run reads the clipboard or the selection only for rules that can use it. Errs on
+/// the side of yes: content read from a file is unknown until the run, and an action that
+/// references another rule counts every rule in `config`.
+pub fn action_uses_variable(action: &Action, config: &Config, token: &str) -> bool {
+    let placeholder = format!("{{{token}}}");
+    let uses = |json: &str| json.contains(&placeholder) || json.contains(r#""type":"file""#);
+    let json = serde_json::to_string(action).unwrap_or_default();
+    uses(&json)
+        || json.contains(r#""action_id":"#)
+            && config
+                .rules
+                .iter()
+                .any(|rule| uses(&serde_json::to_string(&rule.action).unwrap_or_default()))
+}
 pub fn read_content_source(source: &ContentSource) -> Result<String, Vec<Diagnostic>> {
     match source {
         ContentSource::Inline { value } => Ok(value.clone()),

@@ -2856,21 +2856,18 @@ where
 /// Production runner: Windows ports behind the task's fence and claim.
 fn run_on_windows(candidate: &Candidate, scope: &TaskScope) -> RunReport {
     let shared = scope.shared();
+    let (clipboard_needed, selection_needed) = {
+        let config = shared.config.lock().unwrap_or_else(PoisonError::into_inner);
+        let action = &candidate.rule.action;
+        (
+            action_uses_variable(action, &config, "cliptext"),
+            action_uses_variable(action, &config, "selection"),
+        )
+    };
     let mut context = VariableContext {
-        clipboard: arboard::Clipboard::new()
-            .ok()
-            .and_then(|mut cb| cb.get_text().ok()),
+        clipboard: crate::clipboard_variable(clipboard_needed),
         ..Default::default()
     };
-    let selection_needed = serde_json::to_string(&candidate.rule.action)
-        .unwrap_or_default()
-        .contains("{selection}")
-        || matches!(candidate.rule.action, Action::Reusable { .. })
-            && serde_json::to_string(
-                &*shared.config.lock().unwrap_or_else(PoisonError::into_inner),
-            )
-            .unwrap_or_default()
-            .contains("{selection}");
     if selection_needed {
         context.selection = capture_selection().ok();
     }

@@ -152,7 +152,8 @@ pub fn preflight(plan: &ActionPlan) -> Result<(), String> {
             } => {
                 if !(target.starts_with("https://")
                     || target.starts_with("http://")
-                    || std::path::Path::new(target).exists())
+                    || std::path::Path::new(target).is_absolute()
+                        && std::path::Path::new(target).exists())
                 {
                     return Err(
                         "Open target must be an existing absolute path or HTTP(S) URL".into(),

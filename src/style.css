@@ -1,8 +1,9 @@
-/* Design tokens. Light by default, dark when the system asks for it.
+/* Design tokens. Light by default, dark under :root[data-theme='dark'] (theme.ts: the saved
+   choice of the header toggle, else the system's).
    Text and controls meet WCAG 2.1 AA (F-04): text >= 4.5:1, focus ring and switch track >= 3:1.
    The bright teal (--accent-bright) is decoration only; text and filled buttons use --accent. */
 :root {
-  color-scheme: light dark;
+  color-scheme: light;
   font-family:
     'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI', 'Microsoft YaHei', 'PingFang SC',
     system-ui, sans-serif;
@@ -58,42 +59,41 @@
   color: var(--text);
   background: var(--bg);
 }
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0d1315;
-    --surface: #151d20;
-    --surface-2: #1a2326;
-    --surface-3: #222d31;
-    --border: #283439;
-    --border-strong: #3a4950;
-    --text: #e4eef0;
-    --text-secondary: #9badb4;
-    --accent: #2dd4bf;
-    --accent-hover: #5eead4;
-    --on-accent: #042f2e;
-    --accent-soft: #12332f;
-    --accent-soft-text: #6ee7d6;
-    --accent-bright: #2dd4bf;
-    --focus: #5eead4;
-    --switch-off: #6c7e86;
-    --danger: #ff8a7a;
-    --danger-soft: #34191a;
-    --danger-border: #5c2a27;
-    --warning: #f5c35b;
-    --warning-soft: #2e2512;
-    --warning-border: #57461c;
-    --info: #9fd2ef;
-    --info-soft: #132a36;
-    --info-border: #24485b;
-    --success: #5fd4a8;
-    --violet: #b3b6ff;
-    --dot-idle: #7b8a91;
-    --overlay: rgb(0 0 0 / 0.55);
-    --scrollbar: #3a484e;
-    --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.3);
-    --shadow-md: 0 1px 2px rgb(0 0 0 / 0.3), 0 6px 20px rgb(0 0 0 / 0.25);
-    --shadow-lg: 0 24px 70px rgb(0 0 0 / 0.6);
-  }
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #0d1315;
+  --surface: #151d20;
+  --surface-2: #1a2326;
+  --surface-3: #222d31;
+  --border: #283439;
+  --border-strong: #3a4950;
+  --text: #e4eef0;
+  --text-secondary: #9badb4;
+  --accent: #2dd4bf;
+  --accent-hover: #5eead4;
+  --on-accent: #042f2e;
+  --accent-soft: #12332f;
+  --accent-soft-text: #6ee7d6;
+  --accent-bright: #2dd4bf;
+  --focus: #5eead4;
+  --switch-off: #6c7e86;
+  --danger: #ff8a7a;
+  --danger-soft: #34191a;
+  --danger-border: #5c2a27;
+  --warning: #f5c35b;
+  --warning-soft: #2e2512;
+  --warning-border: #57461c;
+  --info: #9fd2ef;
+  --info-soft: #132a36;
+  --info-border: #24485b;
+  --success: #5fd4a8;
+  --violet: #b3b6ff;
+  --dot-idle: #7b8a91;
+  --overlay: rgb(0 0 0 / 0.55);
+  --scrollbar: #3a484e;
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.3);
+  --shadow-md: 0 1px 2px rgb(0 0 0 / 0.3), 0 6px 20px rgb(0 0 0 / 0.25);
+  --shadow-lg: 0 24px 70px rgb(0 0 0 / 0.6);
 }
 * {
   box-sizing: border-box;
@@ -222,10 +222,8 @@ select:not([multiple]) {
   background-position: right 9px center;
   background-size: 14px;
 }
-@media (prefers-color-scheme: dark) {
-  select:not([multiple]) {
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239badb4' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
-  }
+:root[data-theme='dark'] select:not([multiple]) {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239badb4' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
 }
 input:focus,
 select:focus,
@@ -434,10 +432,8 @@ header {
 .switch input:checked + span:before {
   left: 18px;
 }
-@media (prefers-color-scheme: dark) {
-  .switch input:checked + span:before {
-    background: var(--on-accent);
-  }
+:root[data-theme='dark'] .switch input:checked + span:before {
+  background: var(--on-accent);
 }
 .switch input:disabled + span {
   opacity: 0.5;
@@ -447,6 +443,41 @@ header {
   border-radius: 999px;
   background: var(--surface-3);
   font-weight: 500;
+}
+/* Light/dark toggle: a pill like the startup toggle, with a warm sun or a soft moon. */
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 6px 14px 6px 10px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--surface-3);
+  box-shadow: none;
+  font-weight: 500;
+}
+.theme-toggle:hover {
+  background: var(--accent-soft);
+  color: var(--accent-soft-text);
+}
+.theme-icon {
+  width: 18px;
+  height: 18px;
+  transition: transform 0.35s cubic-bezier(0.3, 0.7, 0.4, 1);
+  -webkit-mask: var(--theme-icon) center / contain no-repeat;
+  mask: var(--theme-icon) center / contain no-repeat;
+}
+.theme-toggle.light .theme-icon {
+  --theme-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='12' cy='12' r='4' fill='black'/%3E%3Cpath d='M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4'/%3E%3C/svg%3E");
+  background: #f59e0b;
+}
+.theme-toggle.dark .theme-icon {
+  --theme-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a8.5 8.5 0 1 0 11 11Z' fill='black'/%3E%3C/svg%3E");
+  background: #c4b5fd;
+}
+.theme-toggle:hover .theme-icon {
+  transform: rotate(-20deg) scale(1.1);
 }
 
 /* Main tabs: a segmented control. */
@@ -520,10 +551,8 @@ header {
   padding-left: 36px !important;
   background: var(--surface-2) var(--icon-search) no-repeat 13px center / 15px !important;
 }
-@media (prefers-color-scheme: dark) {
-  .search {
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239badb4' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='m20 20-3.5-3.5'/%3E%3C/svg%3E") !important;
-  }
+:root[data-theme='dark'] .search {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239badb4' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='m20 20-3.5-3.5'/%3E%3C/svg%3E") !important;
 }
 .toolbar > .primary {
   margin-left: auto;
@@ -1104,16 +1133,114 @@ dialog.overlay::backdrop {
     transform: translateY(8px) scale(0.985);
   }
 }
-.editor {
+/* ---- In-app windows (WindowFrame) ---- */
+dialog.overlay.windowed {
+  display: block;
+  padding: 0;
+}
+.window-frame {
+  position: absolute;
   background: var(--surface);
-  width: min(1080px, 100%);
-  height: min(870px, 94vh);
   display: flex;
   flex-direction: column;
   border-radius: var(--radius-lg);
   border: 1px solid var(--border);
   box-shadow: var(--shadow-lg);
   overflow: hidden;
+  /* Its content lays out by the window's width, not the screen's (see @container below). */
+  container-type: inline-size;
+}
+.window-frame[data-filled] {
+  inset: 0;
+  border-radius: 0;
+  border: 0;
+}
+.window-titlebar {
+  gap: 4px;
+  cursor: move;
+  user-select: none;
+  touch-action: none;
+}
+.window-frame[data-filled] .window-titlebar {
+  cursor: default;
+}
+.window-titlebar h2 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.window-titlebar button {
+  cursor: pointer;
+}
+.window-resize {
+  position: absolute;
+  z-index: 2;
+  touch-action: none;
+}
+.window-resize.n,
+.window-resize.s {
+  left: 10px;
+  right: 10px;
+  height: 6px;
+  cursor: ns-resize;
+}
+.window-resize.e,
+.window-resize.w {
+  top: 10px;
+  bottom: 10px;
+  width: 6px;
+  cursor: ew-resize;
+}
+.window-resize.n {
+  top: 0;
+}
+.window-resize.s {
+  bottom: 0;
+}
+.window-resize.e {
+  right: 0;
+}
+.window-resize.w {
+  left: 0;
+}
+.window-resize.ne,
+.window-resize.nw,
+.window-resize.se,
+.window-resize.sw {
+  width: 14px;
+  height: 14px;
+}
+.window-resize.ne {
+  top: 0;
+  right: 0;
+  cursor: nesw-resize;
+}
+.window-resize.sw {
+  bottom: 0;
+  left: 0;
+  cursor: nesw-resize;
+}
+.window-resize.nw {
+  top: 0;
+  left: 0;
+  cursor: nwse-resize;
+}
+.window-resize.se {
+  bottom: 0;
+  right: 0;
+  cursor: nwse-resize;
+}
+/* A visible grip in the bottom-right corner. */
+.window-resize.se::after {
+  content: '';
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid var(--border-strong);
+  border-bottom: 2px solid var(--border-strong);
+  border-bottom-right-radius: 2px;
 }
 .modal-title {
   padding: 14px 16px 14px 22px;
@@ -1267,17 +1394,115 @@ dialog.overlay::backdrop {
 .number {
   width: 76px;
 }
-.shortcut > div {
+.shortcut {
+  min-width: 0;
+}
+.shortcut-preview,
+.shortcut-chord,
+.shortcut-record,
+.shortcut-custom-key {
   display: flex;
-  gap: 4px;
-  margin: 5px 0;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.shortcut-preview {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+.shortcut-chord {
+  flex: 1;
+  min-width: 0;
+}
+.shortcut-caption {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.shortcut-plus {
+  color: var(--text-secondary);
+}
+.shortcut .shortcut-chip {
+  padding: 4px 9px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  font-family: var(--mono);
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent-soft-text);
+}
+.shortcut-chip span {
+  margin-left: 4px;
+}
+.shortcut-keyboard {
+  display: grid;
+  gap: 12px;
+  margin: 12px 0;
+  padding: 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.shortcut-group {
+  display: grid;
+  gap: 5px;
+}
+.shortcut-key-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.shortcut .shortcut-key {
+  flex: 0 0 auto;
+  min-width: 32px;
+  min-height: 34px;
+  margin: 0;
+  padding: 5px 9px;
+  border-radius: 6px;
+  font-family: var(--mono);
+  box-shadow: 0 2px 0 var(--border-strong);
+}
+.shortcut .shortcut-key[aria-pressed='true'] {
+  background: var(--accent);
+  color: var(--on-accent);
+  border-color: var(--accent);
+  box-shadow: 0 2px 0 var(--accent-hover);
+}
+.shortcut-record {
+  margin-top: 10px;
+}
+.shortcut-manual {
+  margin-top: 10px;
+}
+.shortcut-advanced {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  margin-bottom: 12px;
+}
+.shortcut-manual > summary,
+.shortcut-advanced summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+.shortcut-custom-key {
+  margin: 6px 0;
 }
 .shortcut input {
   flex: 1;
+  min-width: 0;
 }
 .shortcut small {
   display: block;
   margin-top: 9px;
+}
+@media (max-width: 600px) {
+  .shortcut-keyboard {
+    padding: 9px;
+  }
+  .shortcut-preview > .shortcut-caption {
+    flex-basis: 100%;
+  }
 }
 .step-toolbar {
   display: flex;
@@ -1591,9 +1816,6 @@ input[aria-invalid='true'] {
     border-right: 0;
     border-bottom: 1px solid var(--border);
   }
-  .editor {
-    height: 94vh;
-  }
   .main-tabs {
     padding: 0 12px 10px;
   }
@@ -1693,11 +1915,12 @@ input[aria-invalid='true'] {
   margin: 8px 0;
   font-size: 12px;
 }
-.sendkeys-cheatsheet summary {
-  cursor: pointer;
+.sendkeys-cheatsheet strong {
   color: var(--accent-soft-text);
 }
 .sendkeys-cheatsheet table {
+  min-width: 0;
+  font-size: 12px;
   border-collapse: collapse;
   margin-top: 6px;
 }
@@ -1737,4 +1960,27 @@ input[aria-invalid='true'] {
 .export-options button {
   text-align: left;
   white-space: nowrap;
+}
+
+/* The editor's layout follows its window's width (WindowFrame sets container-type). */
+@container (max-width: 760px) {
+  .edit-grid {
+    grid-template-columns: 1fr;
+  }
+  .trigger-panel {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .step-layout {
+    grid-template-columns: 36% 64%;
+  }
+}
+@container (max-width: 520px) {
+  .trigger-panel,
+  .action-panel {
+    padding: 14px 14px;
+  }
+  .modal-footer {
+    padding: 10px 12px;
+  }
 }

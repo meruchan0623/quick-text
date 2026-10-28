@@ -279,3 +279,51 @@ pub mod supervisor_wiring;
 
 /// The app's clipboard lease options, set at startup from prefs (B-08).
 pub mod clipboard_options;
+
+/// Why the clipboard gave no text for `{cliptext}`. Logged as a reason only,
+/// never with the text (B-09).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipboardTextError {
+    /// Another program kept the clipboard open for every attempt (Windows).
+    Busy,
+    /// The clipboard holds no text (empty, or only images or files).
+    NoText,
+    /// The text is larger than a clipboard read takes.
+    TooLarge,
+    /// Text is there but could not be read or decoded.
+    Unreadable,
+}
+
+/// The clipboard's text, read the way each platform needs: on Windows with
+/// the lease's bounded `OpenClipboard` retry, since clipboard managers open
+/// the clipboard right after every copy; on macOS from NSPasteboard.
+pub fn read_clipboard_text() -> Result<String, ClipboardTextError> {
+    #[cfg(windows)]
+    let read = windows::read_clipboard_text();
+    #[cfg(target_os = "macos")]
+    let read = macos::read_clipboard_text();
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let read = arboard::Clipboard::new()
+        .and_then(|mut board| board.get_text())
+        .map_err(|error| match error {
+            arboard::Error::ContentNotAvailable => ClipboardTextError::NoText,
+            arboard::Error::ClipboardOccupied => ClipboardTextError::Busy,
+            _ => ClipboardTextError::Unreadable,
+        });
+    read
+}
+
+/// The `{cliptext}` value for a run: read only when `needed` (the rule may
+/// use it, see [`quicker_domain::action_uses_variable`]), so other rules
+/// never open the clipboard. A failed read is logged with its reason and
+/// leaves the value unset; the rule then fails with `clipboard_unavailable`.
+pub fn clipboard_variable(needed: bool) -> Option<String> {
+    if !needed {
+        return None;
+    }
+    read_clipboard_text()
+        .inspect_err(|reason| {
+            tracing::warn!(event = "clipboard.text_unavailable", ?reason);
+        })
+        .ok()
+}
