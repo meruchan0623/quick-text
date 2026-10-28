@@ -1,4 +1,5 @@
 //! Versioned, platform-independent rules and action semantics. No input hooks or logging.
+mod cloud;
 mod content;
 mod erasure;
 mod input_session;
@@ -9,6 +10,7 @@ mod parser;
 mod stored;
 mod transaction;
 mod typing;
+pub use cloud::*;
 pub use content::*;
 pub use erasure::*;
 pub use input_session::*;

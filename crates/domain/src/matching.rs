@@ -33,6 +33,12 @@ impl CompiledRule {
     pub fn priority(&self) -> MatchPriority {
         MatchPriority::of(&self.rule, self.order)
     }
+    /// The same rule at another position: team phrases are compiled on their own and then
+    /// appended after the personal rules (`cloud::merge_cloud`).
+    pub(crate) fn at_order(mut self, order: usize) -> Self {
+        self.order = order;
+        self
+    }
 }
 /// S-17 priority between rules that match the same input; the smallest value wins.
 ///
