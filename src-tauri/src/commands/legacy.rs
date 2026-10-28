@@ -660,8 +660,10 @@ mod excel_preview_tests {
 
     #[test]
     fn replace_keeps_globals_clears_old_rules_and_validates_disabled_rows() {
-        let mut candidate = Config::default();
-        candidate.enabled = false;
+        let mut candidate = Config {
+            enabled: false,
+            ..Config::default()
+        };
         candidate.globals.word_separators = ",".into();
         candidate
             .rules

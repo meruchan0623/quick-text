@@ -73,9 +73,8 @@ impl KeyBits {
     /// repeated key-down still invalidates an older sample.
     pub(super) fn set(&self, vk: u16, down: bool) {
         if let Some(word) = self.slot(vk) {
-            // The closure never returns None, so the update cannot fail.
-            let _ = word.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                Some(advance(current, down))
+            word.update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                advance(current, down)
             });
         }
     }

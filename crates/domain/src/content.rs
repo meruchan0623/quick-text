@@ -231,12 +231,14 @@ pub fn read_content_source(source: &ContentSource) -> Result<String, Vec<Diagnos
                         ));
                     }
                     let units: Vec<_> = bytes
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|b| {
                             if *encoding == Encoding::Utf16Le {
-                                u16::from_le_bytes([b[0], b[1]])
+                                u16::from_le_bytes(*b)
                             } else {
-                                u16::from_be_bytes([b[0], b[1]])
+                                u16::from_be_bytes(*b)
                             }
                         })
                         .collect();

@@ -172,7 +172,7 @@ impl JobSlots {
     /// A slot, or `None` while `limit` jobs hold theirs.
     fn take(&'static self) -> Option<JobPermit> {
         self.live
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
                 (live < self.limit).then_some(live + 1)
             })
             .ok()
