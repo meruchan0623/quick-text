@@ -222,6 +222,15 @@ export function summarizeAction(action: unknown): string {
   }
 }
 
+/** What the list's search box looks in: 缩写、说明、分组、摘要 (lowercased by the caller). */
+export const ruleSearchText = (rule: {
+  match: { value: string };
+  description: string;
+  group: unknown;
+  action: unknown;
+}): string =>
+  `${rule.match.value} ${rule.description} ${groupKey(rule.group)} ${summarizeAction(rule.action)}`;
+
 export interface PathDiagnostic {
   path?: unknown;
 }

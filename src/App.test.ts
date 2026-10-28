@@ -4382,3 +4382,331 @@ describe('文字与按键组合 is recorded: typing and every key, until 停止�
     });
   });
 });
+
+describe('团队话术 (docs/cloud-phrases.md §6)', () => {
+  async function mountCloud(
+    options: MockOptions = {},
+    setup?: (backend: MockBackend) => void,
+  ): Promise<Mounted> {
+    const mounted = await mount({ cloud: 'sample', ...options }, setup);
+    await waitFor(mounted, () => {
+      expect(statusText(mounted.container)).toContain('已连接');
+      expect(callsOf(mounted.backend, 'get_cloud_state')).toHaveLength(1);
+    });
+    await settle(mounted);
+    return mounted;
+  }
+
+  const switchTo = (mounted: Mounted, view: '我的指令' | '团队话术') => {
+    const target = [...mounted.container.querySelectorAll('.view-switch button')].find((b) =>
+      b.textContent.startsWith(view),
+    );
+    if (!(target instanceof HTMLButtonElement)) throw new Error(`no view ${view}`);
+    return mounted.act(() => {
+      target.click();
+    });
+  };
+
+  const cloudRow = (container: HTMLElement, abbreviation: string) =>
+    [...container.querySelectorAll('.cloud-table tbody tr')].find(
+      (tr) => tr.querySelector('strong')?.textContent === abbreviation,
+    );
+
+  it('switches between 我的指令 and 团队话术 and marks the rule that shadows a phrase', async () => {
+    const mounted = await mountCloud();
+    const { container } = mounted;
+    expect(
+      [...container.querySelectorAll('.view-switch button')].map((b) => b.textContent),
+    ).toEqual(['我的指令3', '团队话术8']);
+    const mine = [...container.querySelectorAll('tbody tr')];
+    expect(mine).toHaveLength(3);
+    const marked = mine.filter((tr) => tr.querySelector('.markers .shadows'));
+    expect(marked.map((tr) => tr.querySelector('strong')?.textContent)).toEqual([';s2']);
+    expect(marked[0]?.querySelector('.shadows')?.getAttribute('title')).toContain('「;s2」');
+
+    await switchTo(mounted, '团队话术');
+    expect(container.querySelectorAll('.cloud-table tbody tr')).toHaveLength(8);
+    expect(cloudRow(container, ';s2')?.textContent).toContain('被我的指令覆盖');
+    expect(container.querySelector('input[aria-label="搜索指令"]')).toBeNull();
+    await switchTo(mounted, '我的指令');
+    expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
+  });
+
+  it('copies a phrase into 我的指令 with one save under a new id', async () => {
+    const mounted = await mountCloud();
+    const { backend, container } = mounted;
+    await switchTo(mounted, '团队话术');
+    await clickIn(mounted, cloudRow(container, 'tnh') ?? null, '复制到我的指令');
+    await waitFor(mounted, () => expect(backend.active.revision).toBe(2));
+    const saves = callsOf(backend, 'save_config');
+    expect(saves).toHaveLength(1);
+    expect((saves[0]?.args.config as { revision: number }).revision).toBe(1);
+    const copies = backend.active.rules.filter(isRule).filter((r) => r.match.value === 'tnh');
+    expect(copies).toHaveLength(1);
+    const [copy] = copies;
+    const phrase = backend.cloudCache?.rules[0];
+    expect(copy?.id).not.toBe(phrase?.id);
+    expect(copy?.id).toMatch(/^[0-9a-f-]{36}$/);
+    expect({ ...copy, id: '' }).toEqual({ ...phrase, id: '' });
+    // Now the copy takes the phrase's place (§4), and both lists say so.
+    await waitFor(mounted, () =>
+      expect(cloudRow(container, 'tnh')?.textContent).toContain('被我的指令覆盖'),
+    );
+    expect(statusText(container)).toContain('已复制「tnh」到我的指令');
+    await switchTo(mounted, '我的指令');
+    const row = [...container.querySelectorAll('tbody tr')].find(
+      (tr) => tr.querySelector('strong')?.textContent === 'tnh',
+    );
+    expect(row?.querySelector('.shadows')).not.toBeNull();
+  });
+
+  /** Add `phrase` to the synced table, after the sample's own (as the server would send it). */
+  const withPhrase =
+    (...phrases: Record<string, unknown>[]) =>
+    (backend: MockBackend) => {
+      const base = backend.cloudCache?.rules[0];
+      if (!base) throw new Error('no sample table');
+      for (const phrase of phrases)
+        backend.cloudCache?.rules.push({ ...structuredClone(base), ...phrase });
+    };
+
+  const copyButton = (container: HTMLElement, abbreviation: string) =>
+    [...(cloudRow(container, abbreviation)?.querySelectorAll('button') ?? [])].find(
+      (b) => b.textContent === '复制到我的指令',
+    );
+
+  it('copies only the safe fields of a phrase, into a new enabled rule', async () => {
+    const mounted = await mountCloud(
+      {},
+      withPhrase({
+        id: 'mock-cloud-hostile',
+        enabled: false,
+        match: { kind: 'literal', value: 'thost' },
+        terminator: { keys: ['enter', 'semicolon'], consume: false },
+        ime_erasure: 'backspace',
+        action: { type: 'text', method: 'keys', source: { type: 'inline', value: '固定文字' } },
+        parameter: { type: 'fixed', value: 'p' },
+        notification: { enabled: true, message: '提示' },
+        future_field: { run: 'calc.exe' },
+      }),
+    );
+    const { backend, container } = mounted;
+    await switchTo(mounted, '团队话术');
+    expect(cloudRow(container, 'thost')?.textContent).toContain('云端已停用');
+    await mounted.act(() => copyButton(container, 'thost')?.click());
+    await waitFor(mounted, () => expect(backend.active.revision).toBe(2));
+    const saved = backend.active.rules.filter(isRule).find((r) => r.match.value === 'thost');
+    expect(saved).toEqual({
+      id: expect.stringMatching(/^[0-9a-f-]{36}$/) as unknown,
+      enabled: true,
+      group: '问候',
+      description: '开场问候（示例）',
+      ignore_case: false,
+      match: { kind: 'literal', value: 'thost' },
+      trigger_mode: 'terminator',
+      terminator: { keys: ['semicolon'], consume: false },
+      ime_erasure: null,
+      action: { type: 'text', method: 'keys', source: { type: 'inline', value: '固定文字' } },
+      parameter: { type: 'default_match' },
+      notification: { enabled: false, message: '' },
+    });
+  });
+
+  it('never copies a refused action or text that reads this computer, whatever is clicked', async () => {
+    const mounted = await mountCloud(
+      {},
+      withPhrase(
+        {
+          // Enabled on the server; the merge refuses it (invalid), but the rule still reaches the UI.
+          id: 'mock-cloud-open',
+          enabled: true,
+          match: { kind: 'regex', value: '(bad' },
+          action: {
+            type: 'open',
+            target: 'cmd.exe',
+            args: ['/c', 'calc'],
+            working_directory: null,
+          },
+        },
+        {
+          id: 'mock-cloud-clip',
+          match: { kind: 'literal', value: 'tclip' },
+          action: {
+            type: 'text',
+            method: 'paste',
+            source: { type: 'inline', value: '{cliptext}' },
+          },
+        },
+      ),
+    );
+    const { backend, container } = mounted;
+    await switchTo(mounted, '团队话术');
+    expect(cloudRow(container, '(bad')?.querySelector('.cloud-status')?.textContent).toBe(
+      '无法使用',
+    );
+    for (const [abbreviation, why] of [
+      ['(bad', '无法使用'],
+      ['tclip', '剪贴板'],
+    ] as const) {
+      const copy = copyButton(container, abbreviation);
+      expect(copy?.disabled, abbreviation).toBe(true);
+      expect(copy?.title).toContain(why);
+      // The handler refuses on its own, as App checks again where it writes.
+      await callHandler(mounted, copy, 'onClick');
+      await settle(mounted);
+      expect(container.querySelector('.alert.error')?.textContent).toContain(why);
+    }
+    expect(callsOf(backend, 'save_config')).toEqual([]);
+    expect(backend.active.rules.filter(isRule)).toHaveLength(3);
+  });
+
+  it('refuses a copy based on a stale revision without overwriting the newer one', async () => {
+    const mounted = await mountCloud();
+    const { backend, container } = mounted;
+    await switchTo(mounted, '团队话术');
+    // Published elsewhere, not yet read by this window.
+    backend.publishExternally((c) => {
+      c.enabled = false;
+    });
+    await clickIn(mounted, cloudRow(container, 'tnh') ?? null, '复制到我的指令');
+    await waitFor(mounted, () =>
+      expect(container.querySelector('.alert.error')?.textContent).toMatch(/设置已在别处更新/),
+    );
+    expect(backend.active.enabled).toBe(false);
+    expect(backend.active.rules.filter(isRule).some((r) => r.match.value === 'tnh')).toBe(false);
+  });
+
+  it('offers no copy before the config is read, nor in safe mode', async () => {
+    const failed = await mount({ cloud: 'sample' }, (backend) => {
+      backend.failures.set('load_state', '桌面引擎没有响应');
+    });
+    await waitFor(failed, () => expect(button(failed.container, '团队话术8')).toBeDefined());
+    await switchTo(failed, '团队话术');
+    const copies = () =>
+      [...failed.container.querySelectorAll('button')].filter(
+        (b) => b.textContent === '复制到我的指令',
+      );
+    expect(copies().length).toBeGreaterThan(0);
+    expect(copies().every((b) => b.disabled)).toBe(true);
+    // Not writes of the config: a sync and local switches stay usable.
+    expect(button(failed.container, '立即同步')?.disabled).toBe(false);
+    await callHandler(failed, copies()[0], 'onClick');
+    await settle(failed);
+    expect(callsOf(failed.backend, 'save_config')).toEqual([]);
+    const alerts = [...failed.container.querySelectorAll('.alert.error')].map((a) => a.textContent);
+    expect(alerts.join('\n')).toContain('还没有读取到当前配置');
+
+    const safe = await mount({ cloud: 'sample', safeMode: 'crash_loop' });
+    await waitFor(safe, () => expect(statusText(safe.container)).toContain('已连接'));
+    await switchTo(safe, '团队话术');
+    const safeCopies = () =>
+      [...safe.container.querySelectorAll('button')].filter(
+        (b) => b.textContent === '复制到我的指令',
+      );
+    await waitFor(safe, () => expect(safeCopies().length).toBeGreaterThan(0));
+    expect(safeCopies().every((b) => b.disabled)).toBe(true);
+  });
+
+  it('syncs now and switches a phrase off on this computer, without holding the engine buttons', async () => {
+    const mounted = await mountCloud({ cloudDelayMs: 50 });
+    const { backend, container } = mounted;
+    await switchTo(mounted, '团队话术');
+    backend.publishCloud();
+    await click(mounted, '立即同步');
+    expect(button(container, '正在同步…')?.disabled).toBe(true);
+    // A sync may take its timeout: pausing the engine stays possible meanwhile.
+    expect(button(container, '暂停监听')?.disabled).toBe(false);
+    await waitFor(mounted, () => expect(container.textContent).toContain('v13'));
+    expect(statusText(container)).toBe('团队话术已同步 · v13');
+
+    await mounted.act(() =>
+      container.querySelector<HTMLInputElement>('input[aria-label="本机停用 tnh"]')?.click(),
+    );
+    await waitFor(mounted, () =>
+      expect(cloudRow(container, 'tnh')?.querySelector('.cloud-status')?.textContent).toBe(
+        '本机停用',
+      ),
+    );
+    expect(callsOf(backend, 'set_cloud_rules_disabled').map((c) => c.args)).toEqual([
+      { ids: ['mock-cloud-1'], disabled: true },
+    ]);
+    expect(callsOf(backend, 'save_config')).toEqual([]);
+  });
+
+  it('shows a failed sync with its reason and leads to the settings', async () => {
+    const mounted = await mountCloud({ cloud: 'error' });
+    const { container } = mounted;
+    await switchTo(mounted, '团队话术');
+    expect(container.querySelector('.panel [role="alert"]')?.textContent).toContain('同步密钥无效');
+    await clickIn(mounted, container.querySelector('.panel [role="alert"]'), '去参数设置');
+    expect(container.querySelector('h2')?.textContent).toBe('文本指令参数设置');
+    expect(document.activeElement).toBe(
+      checkbox(container, '订阅团队话术') ?? 'missing the switch',
+    );
+  });
+
+  it('subscribes from 参数设置 with 保存并同步', async () => {
+    const mounted = await mountCloud({ cloud: 'off' });
+    const { backend, container } = mounted;
+    expect(button(container, '团队话术')).toBeDefined();
+    await switchTo(mounted, '团队话术');
+    expect(container.textContent).toContain('还没有订阅团队话术');
+    await click(mounted, '去参数设置开启');
+    await mounted.act(() => checkbox(container, '订阅团队话术')?.click());
+    await type(mounted, field(container, '服务器地址'), 'https://cs.example.com');
+    const key = container.querySelector<HTMLInputElement>('input[aria-label="同步密钥"]');
+    if (!key) throw new Error('missing the key input');
+    expect(key.type).toBe('password');
+    await type(mounted, key, 'secret-key');
+    await click(mounted, '保存并同步');
+    await waitFor(mounted, () =>
+      expect(container.querySelector('.cloud-outcome')?.textContent).toBe(
+        '已保存并同步，团队话术 v12。',
+      ),
+    );
+    expect(callsOf(backend, 'set_cloud_settings').map((c) => c.args)).toEqual([
+      {
+        settings: {
+          enabled: true,
+          base_url: 'https://cs.example.com',
+          key: 'secret-key',
+          auto_sync_minutes: 30,
+        },
+      },
+    ]);
+    expect(callsOf(backend, 'sync_cloud_now')).toHaveLength(1);
+    // Write-only: the key is not shown again, nor sent back.
+    expect(container.querySelector('input[aria-label="同步密钥"]')).toBeNull();
+    expect(container.querySelector('.key-state')?.textContent).toContain('已设置');
+    expect(JSON.stringify(callsOf(backend, 'get_cloud_state'))).not.toContain('secret-key');
+    // The config's own settings were not saved by it.
+    expect(callsOf(backend, 'save_config')).toEqual([]);
+    await click(mounted, '文本指令管理');
+    expect(button(container, '团队话术8')).toBeDefined();
+  });
+
+  it('names cloud: rules of the history from the phrase table', async () => {
+    const mounted = await mountCloud();
+    const { backend, container } = mounted;
+    await click(mounted, '运行状态与恢复');
+    await mounted.act(() => {
+      backend.recordExecution({ rule_id: 'cloud:mock-cloud-1' });
+      backend.recordExecution({ rule_id: 'cloud:gone' });
+      backend.recordExecution({ rule_id: 'mock-rule-1' });
+    });
+    const names = [...container.querySelectorAll('.history-table tbody tr')].map(
+      (tr) => tr.querySelectorAll('td')[1]?.textContent,
+    );
+    expect(names).toEqual([';s1', 'cloud:gone', 'tnh（团队话术：开场问候（示例））']);
+  });
+
+  it('is not offered by a backend without team phrases', async () => {
+    const mounted = await mount({ legacy: true, cloud: 'sample' });
+    const { container } = mounted;
+    await waitFor(mounted, () => expect(headerStatus(container)).toBe('引擎运行中'));
+    await settle(mounted);
+    expect(container.querySelector('.view-switch')).toBeNull();
+    await click(mounted, '文本指令参数设置');
+    expect(container.textContent).not.toContain('团队话术同步');
+  });
+});

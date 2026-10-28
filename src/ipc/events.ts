@@ -10,9 +10,11 @@
 // flight; whatever else asks for one meanwhile shares it or, when it does not settle things (stale,
 // failed, or followed by a gap), one retry scheduled with a capped backoff.
 import { useEffect, useSyncExternalStore } from 'react';
-import { isMissingCommand } from './errors';
+import { errorText, isMissingCommand } from './errors';
 import { invoke, isBackendUnavailable, listen, type Transport, type Unlisten } from './transport';
 import type {
+  CloudSettingsInput,
+  CloudState,
   EngineState,
   EventName,
   EventPayloads,
@@ -22,7 +24,7 @@ import type {
   SafeModeReason,
   StartupProblem,
 } from './types';
-import { EVENT_NAMES } from './types';
+import { CLOUD_STATE_EVENT, EVENT_NAMES } from './types';
 
 export type SeqVerdict = 'apply' | 'drop' | 'gap';
 
@@ -471,6 +473,176 @@ export function runtimeSync(): RuntimeSync {
 
 /** Live runtime state for React. Starts the shared subscription on first use (app lifetime). */
 export function useRuntime(sync: RuntimeSync = runtimeSync()): RuntimeView {
+  useEffect(() => {
+    void sync.start();
+  }, [sync]);
+  return useSyncExternalStore(sync.subscribe, sync.getView);
+}
+
+// ---- team phrases (docs/cloud-phrases.md §5) ----
+//
+// `cloud-state` pushes the whole CloudState, without a seq, so nothing orders an answer against an
+// event exactly. The backend sends it after every change it makes (sync start and end, settings,
+// local disables, a save of 我的指令), so the latest event is never older than the state it
+// describes. An answer is installed only when no event arrived, and no later request's answer was
+// installed, since its request was sent; one dropped that way is covered by the event that came.
+
+/** What a team phrase command of this window is doing; one at a time. */
+export type CloudCommand = 'settings' | 'sync' | 'disabled';
+
+export interface CloudView {
+  /**
+   * `connecting` until get_cloud_state first answers (or while it fails, see `loadError`);
+   * `unsupported` when the backend has no team phrases (no get_cloud_state).
+   */
+  status: 'connecting' | 'ready' | 'unsupported';
+  state: CloudState | null;
+  /** This window's command in flight: its entries stay disabled meanwhile. */
+  pending: CloudCommand | null;
+  /** Why the last get_cloud_state failed while there is no state yet. */
+  loadError: string | null;
+}
+
+export const initialCloudView: CloudView = {
+  status: 'connecting',
+  state: null,
+  pending: null,
+  loadError: null,
+};
+
+export const CLOUD_PENDING = '上一个团队话术操作尚未完成，请稍候。';
+
+/** Keeps a CloudView in sync with the backend; one per app (`cloudSync`), tests make their own. */
+export class CloudSync {
+  readonly #io: RuntimeIo;
+  readonly #listeners = new Set<() => void>();
+  #view: CloudView = initialCloudView;
+  #started: Promise<void> | null = null;
+  #disposed = false;
+  #unlisten: Unlisten | null = null;
+  /** cloud-state events received; an answer to a request sent before the last one is dropped. */
+  #events = 0;
+  #requests = 0;
+  /** The newest request whose answer was installed. */
+  #installed = 0;
+
+  constructor(io: RuntimeIo) {
+    this.#io = io;
+  }
+
+  getView = (): CloudView => this.#view;
+
+  subscribe = (listener: () => void): (() => void) => {
+    this.#listeners.add(listener);
+    return () => this.#listeners.delete(listener);
+  };
+
+  /** Idempotent: subscribe to cloud-state, then read the state once. */
+  start(): Promise<void> {
+    this.#started ??= this.#start();
+    return this.#started;
+  }
+
+  async #start(): Promise<void> {
+    try {
+      this.#unlisten = await this.#io.listen<CloudState>(CLOUD_STATE_EVENT, this.#receive);
+    } catch {
+      // No events (no backend at all, say): the answers below are all there is.
+    }
+    if (this.#disposed) {
+      this.dispose();
+      return;
+    }
+    await this.refresh();
+  }
+
+  dispose(): void {
+    this.#disposed = true;
+    this.#unlisten?.();
+    this.#unlisten = null;
+    this.#listeners.clear();
+  }
+
+  #receive = (state: CloudState) => {
+    if (this.#disposed || this.#view.status === 'unsupported') return;
+    this.#events += 1;
+    this.#set({ ...this.#view, status: 'ready', state, loadError: null });
+  };
+
+  /**
+   * Read the state again (start, window focus, 「重新读取」). Never rejects: a failure before any
+   * state is shown as `loadError`; after one, the state shown stays and the next push corrects it.
+   */
+  async refresh(): Promise<void> {
+    if (this.#view.status === 'unsupported') return;
+    try {
+      await this.#request('get_cloud_state');
+    } catch (e) {
+      if (this.#disposed) return;
+      if (isMissingCommand(e))
+        this.#set({ ...this.#view, status: 'unsupported', state: null, loadError: null });
+      else if (this.#view.state === null)
+        this.#set({ ...this.#view, loadError: errorText(e) ?? '读取被中断' });
+    }
+  }
+
+  /** set_cloud_settings; a `validation` error rejects (contract §5). */
+  saveSettings(settings: CloudSettingsInput): Promise<CloudState> {
+    return this.#command('settings', 'set_cloud_settings', { settings });
+  }
+
+  /** sync_cloud_now: resolves when the sync is over; a failed sync is `status.last_error`. */
+  syncNow(): Promise<CloudState> {
+    return this.#command('sync', 'sync_cloud_now');
+  }
+
+  /** set_cloud_rules_disabled, by the table's own ids (no `cloud:` prefix). */
+  setDisabled(ids: string[], disabled: boolean): Promise<CloudState> {
+    return this.#command('disabled', 'set_cloud_rules_disabled', { ids, disabled });
+  }
+
+  async #command(
+    kind: CloudCommand,
+    command: string,
+    args?: Record<string, unknown>,
+  ): Promise<CloudState> {
+    // Read from the instance, which is never behind the render that offered the entry.
+    if (this.#view.pending !== null) throw new Error(CLOUD_PENDING);
+    this.#set({ ...this.#view, pending: kind });
+    try {
+      return await this.#request(command, args);
+    } finally {
+      this.#set({ ...this.#view, pending: null });
+    }
+  }
+
+  async #request(command: string, args?: Record<string, unknown>): Promise<CloudState> {
+    const request = ++this.#requests;
+    const events = this.#events;
+    const state = await this.#io.invoke<CloudState>(command, args);
+    if (!this.#disposed && this.#events === events && request > this.#installed) {
+      this.#installed = request;
+      this.#set({ ...this.#view, status: 'ready', state, loadError: null });
+    }
+    return state;
+  }
+
+  #set(view: CloudView): void {
+    this.#view = view;
+    for (const listener of this.#listeners) listener();
+  }
+}
+
+let sharedCloud: CloudSync | null = null;
+
+/** The app-wide instance, bound to the real transport. */
+export function cloudSync(): CloudSync {
+  sharedCloud ??= new CloudSync({ invoke, listen });
+  return sharedCloud;
+}
+
+/** Live team phrase state for React. Starts the shared subscription on first use (app lifetime). */
+export function useCloud(sync: CloudSync = cloudSync()): CloudView {
   useEffect(() => {
     void sync.start();
   }, [sync]);

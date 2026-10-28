@@ -25,10 +25,12 @@ import ActionEditor from './ActionEditor';
 import ExportMenu from './ExportMenu';
 import CaptureTemplate from './CaptureTemplate';
 import RuntimeStatus from './RuntimeStatus';
+import CloudPhrases, { CloudSettingsSection } from './CloudPhrases';
+import { TerminatorList } from './TerminatorList';
 import { useAsk } from './Ask';
 import { Modal } from './Modal';
 import { WindowFrame } from './WindowFrame';
-import { runtimeSync, useRuntime } from './ipc/events';
+import { cloudSync, runtimeSync, useCloud, useRuntime } from './ipc/events';
 import type { SafeModeReason } from './ipc/types';
 import { liveStatus } from './status';
 import { BannerStack, HealthCard, HistoryList } from './StatusArea';
@@ -40,11 +42,13 @@ import {
   pruneSelection,
   replaceReadable,
   ruleDiagnostics,
+  ruleSearchText,
   summarizeAction,
   unknownRuleKeys,
   unreadableEntries,
 } from './lib/rules';
-import { effectiveTerminators, unsupportedTerminators } from './lib/terminators';
+import { cloudRuleName, phraseCopy, shadowedPhrases, type CloudRow } from './lib/cloud';
+import { unsupportedTerminators } from './lib/terminators';
 import { fixedImeErasure } from './lib/capabilities';
 import { ruleEditDiagnostics } from './lib/numberFields';
 import { describeMatch } from './lib/describe';
@@ -147,28 +151,6 @@ function EndKeys({
     </div>
   );
 }
-/** 触发字符 column: supported keys, then the unsupported ones marked as such. */
-function TerminatorList({
-  keys: list,
-  platform,
-}: {
-  keys: string[];
-  platform?: string | undefined;
-}) {
-  const usable = effectiveTerminators(list, platform);
-  const unusable = list.filter((k) => !usable.includes(k));
-  return (
-    <>
-      {usable.map((k) => keyNames[k] || k).join(' / ') || '—'}
-      {unusable.length > 0 && (
-        <small className="muted">
-          {' '}
-          {unusable.map((k) => keyNames[k] || k).join('、')} 暂不支持
-        </small>
-      )}
-    </>
-  );
-}
 
 export default function App() {
   const [state, setState] = useState<State | null>(null),
@@ -205,6 +187,16 @@ export default function App() {
   const sync = runtimeSync();
   const runtime = useRuntime(sync);
   const live = liveStatus(runtime);
+  // Team phrases (docs/cloud-phrases.md): a table of their own, pushed with cloud-state. They are
+  // not part of the config: nothing of theirs goes through `write`, only a copy into 我的指令 does.
+  const cloudSyncer = cloudSync();
+  const cloud = useCloud(cloudSyncer);
+  const [manageView, setManageView] = useState<'mine' | 'team'>('mine');
+  // 「去参数设置」 from the 团队话术 page focuses 「团队话术同步」 there, until another page is shown.
+  const [cloudFocus, setCloudFocus] = useState(false);
+  if (cloudFocus && tab !== 'settings') setCloudFocus(false);
+  // Without a subscription the engine runs no team phrase, so none is counted or shadowed.
+  const subscribed = cloud.state?.settings.enabled ? cloud.state : null;
   const editingCurrent = useRef<Rule | null>(null);
   const setEditing = (value: Rule | null) => {
     editingCurrent.current = value;
@@ -523,6 +515,12 @@ export default function App() {
     window.addEventListener('focus', onFocus);
     return () => window.removeEventListener('focus', onFocus);
   }, []);
+  // cloud-state has no seq to tell a missed push by: read the team phrases again on focus too.
+  useEffect(() => {
+    const onFocus = () => void cloudSyncer.refresh();
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+  }, [cloudSyncer]);
   // store-state moved the revision (runtime.revision, the target): a change this window did not
   // make (another window, a background Locked retry) is read with load_state until `reconciled`
   // reaches it (review C5). Read once the first load has applied and while no write of this window
@@ -742,7 +740,10 @@ export default function App() {
   const readable = config.rules.filter(isRule);
   const unreadable = unreadableEntries(config.rules);
   const ruleNames = new Map<string, string>(readable.map((r) => [r.id, r.match.value || r.id]));
-  const ruleName = (id: string) => ruleNames.get(id) ?? id;
+  // A team phrase runs as `cloud:<id>` (§4); its name comes from the phrase table.
+  const ruleName = (id: string) => ruleNames.get(id) ?? cloudRuleName(id, cloud.state) ?? id;
+  // 我的指令 rules that take the place of a team phrase (「覆盖团队话术」).
+  const shadows = shadowedPhrases(subscribed);
   // An empty group is listed, counted and filtered as 「默认」 (F-04).
   const groupCounts = countByGroup(config.rules);
   const groups = ['全部', ...groupCounts.keys()];
@@ -751,9 +752,7 @@ export default function App() {
     .filter(
       (r) =>
         (group === '全部' || groupKey(r.group) === group) &&
-        `${r.match.value} ${r.description} ${groupKey(r.group)} ${summarizeAction(r.action)}`
-          .toLowerCase()
-          .includes(needle),
+        ruleSearchText(r).toLowerCase().includes(needle),
     )
     .sort((a, b) => a.match.value.localeCompare(b.match.value));
   const unreadableRows =
@@ -784,6 +783,73 @@ export default function App() {
         })),
       '指令已保存并立即生效',
     );
+  /**
+   * 「复制到我的指令」: a new rule (its defaults, a new id, enabled) with only what `phraseCopy`
+   * lets through of a team phrase: fixed text, never the phrase as it came from the server. Checked
+   * here, where it is written, whatever the button offered. Saved into 我的指令 like any rule change
+   * (`save`: the same readiness, one write at a time, the revision checked); saved, the copy takes
+   * the phrase's place (§4 shadowed).
+   */
+  const copyPhrase = (row: CloudRow) => {
+    const { copy, reason } = phraseCopy(row);
+    // Taken now: the change may be made again later (see `save`), with the same copy.
+    const rule: Rule | null = copy && { ...newRule(platform), ...clone(copy) };
+    return run(
+      async () => {
+        if (rule === null) throw new Error(reason ?? '这条团队话术不能复制。');
+        await save((c) => ({ ...c, rules: [...c.rules, rule] }));
+      },
+      `已复制「${copy?.match.value ?? ''}」到我的指令并立即生效`,
+    );
+  };
+  // Team phrase commands write prefs, not the config: none of `write` applies. Nor do they hold
+  // `busy`: a sync may run to its 15-second timeout, and pausing must stay possible meanwhile.
+  const cloudRun = async (fn: () => Promise<void>) => {
+    setError('');
+    try {
+      await fn();
+    } catch (e) {
+      setError(errorText(e));
+    }
+  };
+  const syncPhrases = () =>
+    cloudRun(async () => {
+      const s = await cloudSyncer.syncNow();
+      setMessage(
+        s.status.last_error
+          ? '团队话术同步失败，仍使用上次同步的内容'
+          : `团队话术已同步${s.status.revision === null ? '' : ` · v${s.status.revision}`}`,
+      );
+    });
+  const disablePhrases = (ids: string[], disabled: boolean) =>
+    cloudRun(async () => {
+      await cloudSyncer.setDisabled(ids, disabled);
+      setMessage(`已在本机${disabled ? '停用' : '启用'} ${ids.length} 条团队话术`);
+    });
+  const openCloudSettings = () => {
+    setCloudFocus(true);
+    setTab('settings');
+  };
+  // 「我的指令 | 团队话术」 above both lists; not offered by a backend without team phrases.
+  const teamView = manageView === 'team' && cloud.status !== 'unsupported';
+  const viewSwitch = cloud.status !== 'unsupported' && (
+    <div className="view-switch" role="group" aria-label="指令来源">
+      <button
+        className={teamView ? '' : 'active'}
+        aria-pressed={!teamView}
+        onClick={() => setManageView('mine')}
+      >
+        我的指令<small>{config.rules.length}</small>
+      </button>
+      <button
+        className={teamView ? 'active' : ''}
+        aria-pressed={teamView}
+        onClick={() => setManageView('team')}
+      >
+        团队话术{subscribed && <small>{subscribed.rules.length}</small>}
+      </button>
+    </div>
+  );
   const choose = async (kind = 'file') => call<string[] | null>('choose_file', { kind });
   const exportData = (format: 'json' | 'xlsx' = 'json') =>
     run(async () => {
@@ -990,8 +1056,26 @@ export default function App() {
           </button>
         </div>
       )}
-      {tab === 'manage' && (
+      {tab === 'manage' && teamView && (
         <div className="workspace">
+          {viewSwitch}
+          <CloudPhrases
+            view={cloud}
+            platform={platform}
+            terminators={config.globals.terminators}
+            ruleName={(id) => ruleNames.get(id) ?? id}
+            canCopy={writable}
+            onCopy={(row) => void copyPhrase(row)}
+            onSync={() => void syncPhrases()}
+            onSetDisabled={(ids, disabled) => void disablePhrases(ids, disabled)}
+            onRetry={() => void cloudSyncer.refresh()}
+            onOpenSettings={openCloudSettings}
+          />
+        </div>
+      )}
+      {tab === 'manage' && !teamView && (
+        <div className="workspace">
+          {viewSwitch}
           <div className="panel">
             <div className="toolbar">
               <label className="switch">
@@ -1152,6 +1236,14 @@ export default function App() {
                           {r.ignore_case && <i>Aa</i>}
                           {r.trigger_mode === 'immediate' && <i>即时</i>}
                           {r.match.kind === 'regex' && <i>正则</i>}
+                          {shadows.has(r.id) && (
+                            <i
+                              className="shadows"
+                              title={`同一缩写的团队话术「${(shadows.get(r.id) ?? []).join('」「')}」不生效，以这条为准`}
+                            >
+                              覆盖团队话术
+                            </i>
+                          )}
                         </span>
                       </td>
                       <td>
@@ -1368,6 +1460,14 @@ export default function App() {
           >
             取消修改
           </button>
+          {cloud.status !== 'unsupported' && (
+            <CloudSettingsSection
+              view={cloud}
+              focusOnMount={cloudFocus}
+              onSave={(input) => cloudSyncer.saveSettings(input)}
+              onSync={() => cloudSyncer.syncNow()}
+            />
+          )}
           <h3>许可证与第三方声明</h3>
           <p className="muted license">
             Quicktext 是自由软件，按 GNU 通用公共许可证第 3 版或（由你选择）任何更新的版本授权

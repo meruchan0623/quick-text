@@ -1962,6 +1962,217 @@ input[aria-invalid='true'] {
   white-space: nowrap;
 }
 
+/* ---- Team phrases (docs/cloud-phrases.md §6) ---- */
+/* 「我的指令 | 团队话术」 above the list: a segmented pill like the group tabs' counts. */
+.view-switch {
+  display: inline-flex;
+  align-self: flex-start;
+  gap: 2px;
+  padding: 3px;
+  margin-bottom: 12px;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+.view-switch button {
+  display: inline-flex;
+  align-items: center;
+  border: 0;
+  border-radius: 999px;
+  background: none;
+  box-shadow: none;
+  padding: 4px 8px 4px 16px;
+  min-height: 30px;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+.view-switch button:hover {
+  background: none;
+  color: var(--text);
+}
+.view-switch button.active {
+  background: var(--surface);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: var(--shadow-sm);
+}
+.view-switch small {
+  margin-left: 7px;
+  min-width: 22px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-secondary) 14%, transparent);
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 18px;
+  text-align: center;
+}
+.view-switch button.active small {
+  background: var(--accent-soft);
+  color: var(--accent-soft-text);
+}
+/* 「来自 TSim 客服系统 · v12 · 上次同步 …」 and 「立即同步」. */
+.cloud-source {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+.cloud-source > span {
+  flex: 1;
+  min-width: 0;
+}
+.cloud-source button {
+  border-radius: 999px;
+  min-height: 30px;
+}
+.panel > .alert {
+  margin: 12px 16px 0;
+  flex-shrink: 0;
+}
+.cloud-table {
+  min-width: 1080px;
+}
+/* With two more columns than 我的指令, keep the short ones (触发字符, 分组) on one line. */
+.cloud-table td:nth-child(3),
+.cloud-table td:nth-child(5) {
+  white-space: nowrap;
+}
+/* Status tags: text always accompanies colour, as with the health tags. */
+.cloud-status {
+  display: inline-block;
+  padding: 1px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  border: 1px solid color-mix(in srgb, currentColor 35%, transparent);
+  background: color-mix(in srgb, currentColor 10%, transparent);
+  color: var(--text-secondary);
+}
+.cloud-status.active {
+  color: var(--success);
+}
+.cloud-status.shadowed {
+  color: var(--info);
+}
+.cloud-status.invalid {
+  color: var(--danger);
+}
+.cloud-status.other {
+  color: var(--warning);
+}
+.cloud-problem {
+  display: block;
+  margin-top: 2px;
+  color: var(--danger);
+  overflow-wrap: anywhere;
+}
+/* The whole reason is in the tooltip and in 「查看」. */
+td .cloud-problem {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+}
+/* Both batch actions belong together; 我的指令 keeps 删除 apart at the end. */
+.cloud-batch button:last-child {
+  margin-left: 0;
+}
+.unreadable-row .cloud-status {
+  margin-left: 8px;
+}
+/* 「覆盖团队话术」 on a rule of 我的指令. */
+.markers i.shadows {
+  color: var(--info);
+  background: var(--info-soft);
+  border-color: var(--info-border);
+}
+.cloud-guide p {
+  max-width: 460px;
+  margin: 0 auto 18px;
+  line-height: 1.7;
+}
+/* 「查看」: read-only details. */
+.cloud-detail-body {
+  flex: 1;
+  overflow: auto;
+  padding: 18px 22px;
+  overscroll-behavior: contain;
+}
+.cloud-detail-body dl {
+  max-width: none;
+  grid-template-columns: 84px 1fr;
+  gap: 10px 16px;
+  margin: 0;
+}
+.cloud-detail-body dd {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.cloud-detail-body dd small {
+  display: block;
+  margin-top: 2px;
+}
+.cloud-detail-body dd .cloud-status + small {
+  display: inline;
+  margin-left: 8px;
+}
+.cloud-detail-body strong.abbr {
+  font-family: var(--mono);
+  font-weight: 600;
+  color: var(--accent-soft-text);
+  background: var(--accent-soft);
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+.cloud-detail-body h3 {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 20px 0 8px;
+}
+.cloud-detail-body pre {
+  margin: 0;
+  max-height: 40vh;
+  overflow: auto;
+  color: var(--text);
+}
+.cloud-detail-body details pre {
+  margin-top: 8px;
+  color: var(--text-secondary);
+}
+/* 「团队话术同步」 settings. */
+.key-state {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.key-state input {
+  flex: 1;
+  min-width: 200px;
+  max-width: 380px;
+}
+.key-state button {
+  min-height: 28px;
+  padding: 2px 12px;
+  border-radius: 999px;
+  box-shadow: none;
+}
+.cloud-outcome {
+  font-size: 12.5px;
+  color: var(--success);
+}
+.cloud-outcome.error {
+  color: var(--danger);
+}
+
 /* The editor's layout follows its window's width (WindowFrame sets container-type). */
 @container (max-width: 760px) {
   .edit-grid {

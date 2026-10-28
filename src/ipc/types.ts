@@ -211,3 +211,68 @@ export interface LastMiss {
   outcome: Outcome;
   reason: ReasonCode;
 }
+
+// ---- team phrases (docs/cloud-phrases.md §5) ----
+
+/** Pushed with the whole CloudState; carries no `seq` and is not one of the runtime events. */
+export const CLOUD_STATE_EVENT = 'cloud-state';
+
+/** Open in practice like every union here: a newer backend may add statuses. */
+export type CloudRuleStatus =
+  'active' | 'disabled_remote' | 'disabled_local' | 'shadowed' | 'invalid';
+
+/** The sync settings as the backend shows them: the key is write-only, only `has_key` is read. */
+export interface CloudSettings {
+  enabled: boolean;
+  base_url: string;
+  has_key: boolean;
+  /** 0 (manual only), 15, 30, 60, 120 or 240. */
+  auto_sync_minutes: number;
+}
+
+/** `set_cloud_settings` input: `key` absent or null keeps the key, `''` clears it. */
+export interface CloudSettingsInput {
+  enabled: boolean;
+  base_url: string;
+  key?: string | null;
+  auto_sync_minutes: number;
+}
+
+/** `code` is open: not_configured, invalid_url, unauthorized, network, timeout, … (§3). */
+export interface CloudError {
+  code: string;
+  message: string;
+}
+
+export interface CloudStatus {
+  syncing: boolean;
+  /** RFC 3339. */
+  last_attempt_at: string | null;
+  last_success_at: string | null;
+  last_error: CloudError | null;
+  /** Of the cached table; null before the first successful sync. */
+  revision: number | null;
+  updated_at: string | null;
+  /** Entries of the downloaded table that were skipped as unreadable. */
+  unreadable_count: number;
+}
+
+export interface CloudRuleEntry {
+  /** The table's own id, without the engine's `cloud:` prefix. */
+  id: string;
+  /** The rule as the table has it, serialized like a Rule; narrowed with `isReadableRule`. */
+  rule: unknown;
+  status: CloudRuleStatus;
+  /** Whether this computer switched it off (`disabled_ids`), whatever `status` says. */
+  disabled_local: boolean;
+  /** With `shadowed`: the id of the 我的指令 rule that takes its place. */
+  shadowed_by?: string;
+  /** With `invalid`: why it cannot be used, in Chinese for the user. */
+  problem?: string;
+}
+
+export interface CloudState {
+  settings: CloudSettings;
+  status: CloudStatus;
+  rules: CloudRuleEntry[];
+}

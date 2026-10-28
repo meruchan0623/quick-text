@@ -14,7 +14,14 @@ import {
   type MockConfig,
 } from './mock';
 import { call, createTauriTransport, invoke, setTransport } from './transport';
-import { EVENT_NAMES, type HealthSnapshot, type HistoryEntry, type RuntimeSnapshot } from './types';
+import {
+  CLOUD_STATE_EVENT,
+  EVENT_NAMES,
+  type CloudState,
+  type HealthSnapshot,
+  type HistoryEntry,
+  type RuntimeSnapshot,
+} from './types';
 
 afterEach(() => {
   clearMocks();
@@ -503,4 +510,190 @@ describe('atomic active configuration contract', () => {
       expect(backend.active.revision).toBe(1);
     },
   );
+});
+
+describe('team phrases (docs/cloud-phrases.md §5)', () => {
+  const use = (backend: MockBackend) => setTransport(createMockTransport(backend));
+  const statuses = (state: CloudState) => state.rules.map((r) => [r.id, r.status]);
+
+  it('serves the sample table with one phrase per status, merged against 我的指令', async () => {
+    use(new MockBackend({ rules: 3, cloud: 'sample' }));
+    const state = await invoke<CloudState>('get_cloud_state');
+    expect(state.settings).toEqual({
+      enabled: true,
+      base_url: 'https://cs.example.com',
+      has_key: true,
+      auto_sync_minutes: 30,
+    });
+    expect(state.settings).not.toHaveProperty('key');
+    expect(state.status).toMatchObject({ revision: 12, unreadable_count: 1, last_error: null });
+    expect(statuses(state)).toEqual([
+      ['mock-cloud-1', 'active'],
+      ['mock-cloud-2', 'active'],
+      ['mock-cloud-3', 'active'],
+      ['mock-cloud-4', 'disabled_remote'],
+      ['mock-cloud-5', 'disabled_local'],
+      ['mock-cloud-6', 'shadowed'],
+      ['mock-cloud-7', 'invalid'],
+      ['mock-cloud-8', 'active'],
+    ]);
+    expect(state.rules[5]?.shadowed_by).toBe('mock-rule-2');
+    expect(state.rules[6]?.problem).toMatch(/正则表达式/);
+    expect(state.rules.map((r) => r.disabled_local)).toEqual([
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+    ]);
+    for (const entry of state.rules) expect(isMockRule(entry.rule)).toBe(true);
+  });
+
+  it('starts unsubscribed with nothing cached by default', async () => {
+    use(new MockBackend({ rules: 0 }));
+    const state = await invoke<CloudState>('get_cloud_state');
+    expect(state.settings).toMatchObject({ enabled: false, has_key: false });
+    expect(state.status).toMatchObject({ revision: null, last_success_at: null });
+    expect(state.rules).toEqual([]);
+    expect((await invoke<CloudState>('sync_cloud_now')).status.last_error?.code).toBe(
+      'not_configured',
+    );
+  });
+
+  it('keeps, replaces and clears the key as §5 says, and refuses invalid settings', async () => {
+    const backend = new MockBackend({ rules: 0, cloud: 'sample' });
+    use(backend);
+    const settings = { enabled: false, base_url: ' https://a.example ', auto_sync_minutes: 60 };
+    expect((await invoke<CloudState>('set_cloud_settings', { settings })).settings).toEqual({
+      enabled: false,
+      base_url: 'https://a.example',
+      has_key: true,
+      auto_sync_minutes: 60,
+    });
+    await invoke('set_cloud_settings', { settings: { ...settings, key: null } });
+    expect(backend.cloudPrefs.key).toBe('mock-sync-key');
+    await invoke('set_cloud_settings', { settings: { ...settings, key: 'new' } });
+    expect(backend.cloudPrefs.key).toBe('new');
+    const cleared = await invoke<CloudState>('set_cloud_settings', {
+      settings: { ...settings, key: '' },
+    });
+    expect(cleared.settings.has_key).toBe(false);
+
+    for (const bad of [
+      { ...settings, base_url: 'http://cs.example.com' },
+      { ...settings, auto_sync_minutes: 5 },
+    ]) {
+      const error = parseCommandError(
+        await invoke('set_cloud_settings', { settings: bad }).catch((e: unknown) => e),
+      );
+      expect(error.code).toBe('validation');
+    }
+    await invoke('set_cloud_settings', {
+      settings: { ...settings, base_url: 'http://127.0.0.1:8000' },
+    });
+    expect(backend.cloudPrefs.base_url).toBe('http://127.0.0.1:8000');
+  });
+
+  it('downloads a new revision, drops stale local disables and keeps the cache on failure', async () => {
+    const backend = new MockBackend({ rules: 0, cloud: 'sample' });
+    use(backend);
+    await invoke('set_cloud_rules_disabled', { ids: ['mock-cloud-1', 'gone'], disabled: true });
+    expect(backend.cloudPrefs.disabled_ids).toEqual(['mock-cloud-5', 'mock-cloud-1', 'gone']);
+    backend.publishCloud((rules) => rules.splice(0, 1));
+    const synced = await invoke<CloudState>('sync_cloud_now');
+    expect(synced.status).toMatchObject({ revision: 13, syncing: false, last_error: null });
+    expect(synced.rules.map((r) => r.id)).not.toContain('mock-cloud-1');
+    expect(backend.cloudPrefs.disabled_ids).toEqual(['mock-cloud-5']);
+
+    backend.setCloudFailure({ code: 'timeout', message: 'timed out' });
+    backend.publishCloud();
+    const failed = await invoke<CloudState>('sync_cloud_now');
+    expect(failed.status).toMatchObject({ revision: 13, last_error: { code: 'timeout' } });
+    expect(failed.status.last_success_at).toBe(synced.status.last_success_at);
+    expect(failed.rules).toHaveLength(synced.rules.length);
+  });
+
+  it('switches phrases off on this computer only and back', async () => {
+    use(new MockBackend({ rules: 0, cloud: 'sample' }));
+    const off = await invoke<CloudState>('set_cloud_rules_disabled', {
+      ids: ['mock-cloud-1', 'mock-cloud-4'],
+      disabled: true,
+    });
+    expect(statuses(off).slice(0, 5)).toEqual([
+      ['mock-cloud-1', 'disabled_local'],
+      ['mock-cloud-2', 'active'],
+      ['mock-cloud-3', 'active'],
+      // The table's own switch comes first (§4); disabled_local still says this computer's choice.
+      ['mock-cloud-4', 'disabled_remote'],
+      ['mock-cloud-5', 'disabled_local'],
+    ]);
+    expect(off.rules.slice(0, 5).map((r) => r.disabled_local)).toEqual([
+      true,
+      false,
+      false,
+      true,
+      true,
+    ]);
+    const on = await invoke<CloudState>('set_cloud_rules_disabled', {
+      ids: ['mock-cloud-1', 'mock-cloud-5'],
+      disabled: false,
+    });
+    expect(on.rules[0]).toMatchObject({ status: 'active', disabled_local: false });
+    expect(on.rules[4]).toMatchObject({ status: 'active', disabled_local: false });
+  });
+
+  it('pushes cloud-state on sync, settings, local disables and saves, without a seq', async () => {
+    const backend = new MockBackend({ rules: 3, cloud: 'sample' });
+    use(backend);
+    const pushed: CloudState[] = [];
+    backend.on(CLOUD_STATE_EVENT, (payload) => pushed.push(payload as CloudState));
+    const seq = backend.seq;
+    await invoke('sync_cloud_now');
+    expect(pushed.map((p) => p.status.syncing)).toEqual([true, false]);
+    await invoke('set_cloud_rules_disabled', { ids: ['mock-cloud-1'], disabled: true });
+    expect(pushed).toHaveLength(3);
+    // 我的指令 saved without ;s2: the phrase it shadowed is in effect again.
+    const { active } = await invoke<{ active: MockConfig }>('load_state');
+    await invoke('save_config', {
+      config: {
+        ...active,
+        rules: active.rules.filter((r) => isMockRule(r) && r.id !== 'mock-rule-2'),
+      },
+    });
+    expect(pushed.at(-1)?.rules[5]?.status).toBe('active');
+    expect(pushed.every((p) => !('seq' in p))).toBe(true);
+    // The runtime events' seq moved for store-state only.
+    expect(backend.seq).toBe(seq + 1);
+  });
+
+  it('runs one sync at a time: a settings change syncs, sync_cloud_now joins it', async () => {
+    const backend = new MockBackend({ rules: 0, cloud: 'off', cloudDelayMs: 20 });
+    use(backend);
+    const saved = await invoke<CloudState>('set_cloud_settings', {
+      settings: { enabled: true, base_url: 'https://x.example', key: 'k', auto_sync_minutes: 0 },
+    });
+    expect(saved.status.syncing).toBe(true);
+    const synced = await invoke<CloudState>('sync_cloud_now');
+    expect(synced.status).toMatchObject({ syncing: false, revision: 12, last_error: null });
+    expect(backend.cloudStatus.last_attempt_at).toBe(synced.status.last_success_at);
+  });
+
+  it('has no team phrase commands in legacy mode', async () => {
+    use(new MockBackend({ rules: 0, legacy: true, cloud: 'sample' }));
+    for (const command of [
+      'get_cloud_state',
+      'set_cloud_settings',
+      'sync_cloud_now',
+      'set_cloud_rules_disabled',
+    ])
+      expect(isMissingCommand(await invoke(command).catch((e: unknown) => e))).toBe(true);
+  });
+
+  it('reads the preview switch', () => {
+    expect(mockOptionsFromQuery('?mock-cloud=error')).toEqual({ cloud: 'error' });
+    expect(mockOptionsFromQuery('?mock-cloud=bogus')).toEqual({});
+  });
 });

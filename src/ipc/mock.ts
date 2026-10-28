@@ -1,21 +1,28 @@
 // In-memory mock backend (FE-18): answers every command the frontend uses, 0.3 and 0.4, and can
-// push the four runtime events. Used by the development browser preview (`npm run dev` outside
-// Tauri, or VITE_MOCK=1) and by Vitest, never by a production build (see ./transport). All sample
-// data is synthetic; no real user phrases.
+// push the runtime events and cloud-state. Used by the development browser preview (`npm run dev`
+// outside Tauri, or VITE_MOCK=1) and by Vitest, never by a production build (see ./transport). All
+// sample data is synthetic; no real user phrases.
 //
 // Preview switches (query string): ?mock=empty|200|10000 (rule count, default 200),
 // &mock-legacy=1 (behave like a 0.3 backend), &mock-health=<HealthState>,
 // &mock-safe-mode=<SafeModeReason>, &mock-platform=windows|macos|linux, &mock-dialog=cancel,
-// &mock-unreadable=1 (B-43 sample: rules entries the backend could not read, unknown fields).
+// &mock-unreadable=1 (B-43 sample: rules entries the backend could not read, unknown fields),
+// &mock-cloud=off|sample|error (team phrases, docs/cloud-phrases.md; the preview default is sample).
 // In the preview the backend is also reachable as `globalThis.quickerMock` for manual pokes
 // (e.g. `quickerMock.recordExecution({ outcome: 'dropped_busy' })`).
+import { AUTO_SYNC_MINUTES } from '../lib/cloud';
 import { isReadableRule } from '../lib/rules';
 import { DEFAULT_TERMINATORS } from '../lib/terminators';
 import type { CommandError } from './errors';
 import type { CommandArgs, Transport, Unlisten } from './transport';
+import { CLOUD_STATE_EVENT } from './types';
 import type {
   Capability,
   CapabilityStatus,
+  CloudError,
+  CloudRuleEntry,
+  CloudState,
+  CloudStatus,
   Component,
   ComponentHealth,
   Diagnostic,
@@ -104,6 +111,13 @@ export interface MockOptions {
   importFormat?: 'json' | 'xlsx';
   /** Mix in the B-43 sample (unreadable entries, unknown fields). Default false. */
   unreadable?: boolean;
+  /**
+   * Team phrases: `off` (not subscribed, nothing cached), `sample` (subscribed, the sample table
+   * synced) or `error` (as `sample`, but the key is refused). Default `off`.
+   */
+  cloud?: 'off' | 'sample' | 'error';
+  /** How long a team phrase sync takes, in ms. Default 0 (settles with the command). */
+  cloudDelayMs?: number;
 }
 
 const COMPONENTS: ComponentHealth['component'][] = [
@@ -156,6 +170,131 @@ export function syntheticRules(count: number): MockRule[] {
       notification: { enabled: false, message: '' },
     };
   });
+}
+
+// ---- team phrases (docs/cloud-phrases.md) ----
+
+/** The mock phrase server's table (§1), as the download serves it. */
+export interface MockCloudTable {
+  revision: number;
+  updated_at: string;
+  rules: MockRule[];
+  /** Entries the download skipped as unreadable (`unreadable_count`). */
+  unreadable: number;
+}
+
+/** `prefs.json` `app.cloud` (§2): the key itself never leaves the backend. */
+export interface MockCloudPrefs {
+  enabled: boolean;
+  base_url: string;
+  key: string;
+  auto_sync_minutes: number;
+  disabled_ids: string[];
+}
+
+const cloudText = (value: string) => ({
+  type: 'text',
+  method: 'paste',
+  source: { type: 'inline', value },
+});
+
+/**
+ * Synthetic team phrases, one per status with the default prefs of `sample`: `mock-cloud-4` is
+ * switched off in the table, `mock-cloud-5` on this computer, `mock-cloud-6` has the abbreviation of
+ * synthetic rule 2 (shadowed while that one is enabled), `mock-cloud-7` a regex that does not compile.
+ */
+export function sampleCloudRules(): MockRule[] {
+  const phrase = (n: number, partial: Partial<MockRule>): MockRule => ({
+    id: `mock-cloud-${n}`,
+    enabled: true,
+    group: '',
+    description: '',
+    ignore_case: false,
+    match: { kind: 'literal', value: `tm${n}` },
+    trigger_mode: 'terminator',
+    terminator: null,
+    ime_erasure: null,
+    action: cloudText(`团队示例 ${n}`),
+    parameter: { type: 'default_match' },
+    notification: { enabled: false, message: '' },
+    ...partial,
+  });
+  return [
+    phrase(1, {
+      group: '问候',
+      description: '开场问候（示例）',
+      match: { kind: 'literal', value: 'tnh' },
+      action: cloudText('您好，这里是示例客服，请问有什么可以帮您？'),
+    }),
+    phrase(2, {
+      group: '问候',
+      description: '结束语（示例）',
+      match: { kind: 'literal', value: 'tjs' },
+      trigger_mode: 'immediate',
+      action: cloudText('感谢您的耐心等待，祝您生活愉快！\n如有其他问题，欢迎随时联系。'),
+    }),
+    phrase(3, {
+      group: '售后',
+      description: '退款时效（示例）',
+      ignore_case: true,
+      match: { kind: 'literal', value: 'ttk' },
+      terminator: { keys: ['semicolon'] },
+      action: cloudText('示例：退款一般在 3 至 5 个工作日内原路退回。'),
+    }),
+    phrase(4, {
+      enabled: false,
+      group: '售后',
+      description: '已下线的旧话术（示例）',
+      match: { kind: 'literal', value: 'tjh' },
+    }),
+    phrase(5, {
+      group: '物流',
+      description: '发货时间（示例）',
+      match: { kind: 'literal', value: 'tfh' },
+      action: cloudText('示例：下单后 48 小时内发货。'),
+    }),
+    phrase(6, {
+      group: '物流',
+      description: '与「我的指令」同名的缩写（示例）',
+      match: { kind: 'literal', value: ';s2' },
+    }),
+    phrase(7, {
+      group: '物流',
+      description: '订单号（正则写错的示例）',
+      match: { kind: 'regex', value: '(DD[0-9' },
+    }),
+    phrase(8, {
+      description: '帮助中心（示例）',
+      match: { kind: 'literal', value: 'tbz' },
+      action: {
+        type: 'open',
+        target: 'https://example.com/help',
+        args: [],
+        working_directory: null,
+      },
+    }),
+  ];
+}
+
+const sampleCloudTable = (): MockCloudTable => ({
+  revision: 12,
+  updated_at: '2026-10-28T08:30:00+00:00',
+  rules: sampleCloudRules(),
+  unreadable: 1,
+});
+
+/**
+ * Why a phrase cannot be used, in Chinese for the user as the backend words it (§5); null when it
+ * can. JavaScript's RegExp stands in for the backend's lenient compile.
+ */
+function cloudProblem(rule: MockRule): string | null {
+  if (rule.match.kind !== 'regex') return null;
+  try {
+    new RegExp(rule.match.value);
+    return null;
+  } catch {
+    return '缩写的正则表达式写法有误，无法使用。';
+  }
 }
 
 // get_capabilities as crates/platform/src/capabilities.rs builds it: per row, whether an adapter
@@ -286,6 +425,16 @@ export class MockBackend {
   /** S-09 `auto_listen_on_start`; a 0.3 backend has no such setting. */
   autoListen = false;
   recording = false;
+  /** Team phrase sync settings (`app.cloud`). */
+  cloudPrefs: MockCloudPrefs;
+  /** `cloud-phrases.json`: the table last downloaded, or null. */
+  cloudCache: MockCloudTable | null;
+  /** CloudState.status without the cached table's revision, updated_at and unreadable_count. */
+  cloudStatus: Pick<CloudStatus, 'syncing' | 'last_attempt_at' | 'last_success_at' | 'last_error'>;
+  /** What the phrase server answers a download with: the table, unless `error` is set. */
+  cloudServer: { table: MockCloudTable; error: CloudError | null };
+  /** The sync running; another sync request joins it (§3: one at a time). */
+  #cloudSync: Promise<CloudState> | null = null;
   #seq = 0;
   #historySeq = 0;
   readonly #handlers = new Map<string, Set<(payload: unknown) => void>>();
@@ -304,6 +453,32 @@ export class MockBackend {
       dialog: options.dialog ?? 'accept',
       importFormat: options.importFormat ?? 'json',
       unreadable: options.unreadable ?? false,
+      cloud: options.cloud ?? 'off',
+      cloudDelayMs: options.cloudDelayMs ?? 0,
+    };
+    const subscribed = this.options.cloud !== 'off';
+    const synced = new Date(Date.now() - 5 * 60_000).toISOString();
+    this.cloudPrefs = {
+      enabled: subscribed,
+      base_url: subscribed ? 'https://cs.example.com' : '',
+      key: subscribed ? 'mock-sync-key' : '',
+      auto_sync_minutes: 30,
+      disabled_ids: subscribed ? ['mock-cloud-5'] : [],
+    };
+    this.cloudCache = subscribed ? sampleCloudTable() : null;
+    const refused: CloudError = {
+      code: 'unauthorized',
+      message: '服务器拒绝了同步密钥（HTTP 401）',
+    };
+    this.cloudStatus = {
+      syncing: false,
+      last_attempt_at: subscribed ? new Date().toISOString() : null,
+      last_success_at: subscribed ? synced : null,
+      last_error: this.options.cloud === 'error' ? refused : null,
+    };
+    this.cloudServer = {
+      table: sampleCloudTable(),
+      error: this.options.cloud === 'error' ? refused : null,
     };
     const config: MockConfig = {
       version: 1,
@@ -410,6 +585,20 @@ export class MockBackend {
     this.previous.push(this.active);
     this.active = next;
     this.#emitStore();
+  }
+
+  /** The phrase server publishes a new revision of its table; the next sync downloads it. */
+  publishCloud(edit?: (rules: MockRule[]) => void): void {
+    const table = clone(this.cloudServer.table);
+    edit?.(table.rules);
+    table.revision += 1;
+    table.updated_at = new Date().toISOString();
+    this.cloudServer = { ...this.cloudServer, table };
+  }
+
+  /** Make every following download fail with `error` (null: succeed again). */
+  setCloudFailure(error: CloudError | null): void {
+    this.cloudServer = { ...this.cloudServer, error };
   }
 
   /**
@@ -731,6 +920,73 @@ export class MockBackend {
       this.autoListen = args.enabled === true;
       return this.autoListen;
     },
+    // Team phrases (docs/cloud-phrases.md §5); prefs too, so not refused in safe mode here.
+    get_cloud_state: () => this.#cloudState(),
+    set_cloud_settings: (args) => {
+      const input = (args.settings ?? {}) as Partial<Omit<MockCloudPrefs, 'key'>> & {
+        key?: string | null;
+      };
+      const baseUrl = typeof input.base_url === 'string' ? input.base_url.trim() : '';
+      const minutes = input.auto_sync_minutes;
+      const errors: Diagnostic[] = [];
+      // §3: https only; http for the local development hosts.
+      if (
+        baseUrl &&
+        !/^(https:\/\/|http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(\/|$))/.test(baseUrl)
+      )
+        errors.push(
+          diagnostic(
+            'invalid_url',
+            '服务器地址必须以 https:// 开头（本机调试可用 http://localhost）',
+            'settings.base_url',
+          ),
+        );
+      // The backend's codes and messages (src-tauri/src/cloud/sync.rs `validate`).
+      if (typeof input.key === 'string' && !/^[\x21-\x7e]*$/.test(input.key))
+        errors.push(
+          diagnostic(
+            'invalid_key',
+            '同步密钥只能包含英文字母、数字和符号，不能有空格或中文',
+            'settings.key',
+          ),
+        );
+      if (typeof minutes !== 'number' || !AUTO_SYNC_MINUTES.includes(minutes))
+        errors.push(
+          diagnostic(
+            'invalid_interval',
+            '自动同步间隔只能是 0（仅手动）、15、30、60、120 或 240 分钟',
+            'settings.auto_sync_minutes',
+          ),
+        );
+      if (errors.length > 0 || typeof minutes !== 'number')
+        this.#fail({ code: 'validation', detail: { diagnostics: errors } }, '');
+      this.cloudPrefs = {
+        ...this.cloudPrefs,
+        enabled: input.enabled === true,
+        base_url: baseUrl,
+        auto_sync_minutes: minutes,
+        // Absent or null keeps the key; '' clears it.
+        key: typeof input.key === 'string' ? input.key : this.cloudPrefs.key,
+      };
+      this.#pushCloud();
+      // §3: a change of the settings syncs once right away; sync_cloud_now meanwhile joins it.
+      if (this.cloudPrefs.enabled) void this.#syncCloud();
+      return this.#cloudState();
+    },
+    sync_cloud_now: () => this.#syncCloud(),
+    set_cloud_rules_disabled: (args) => {
+      const ids = Array.isArray(args.ids)
+        ? args.ids.filter((id): id is string => typeof id === 'string')
+        : [];
+      const disabled = new Set(this.cloudPrefs.disabled_ids);
+      for (const id of ids) {
+        if (args.disabled === true) disabled.add(id);
+        else disabled.delete(id);
+      }
+      this.cloudPrefs = { ...this.cloudPrefs, disabled_ids: [...disabled] };
+      this.#pushCloud();
+      return this.#cloudState();
+    },
   };
 
   // ---- internals ----
@@ -762,6 +1018,95 @@ export class MockBackend {
       startup_problems: clone(this.problems),
       safe_mode: this.safeMode,
     };
+  }
+
+  /** CloudState now, the statuses merged against the active config as §4 orders them. */
+  #cloudState(): CloudState {
+    const prefs = this.cloudPrefs;
+    const table = this.cloudCache;
+    const disabled = new Set(prefs.disabled_ids);
+    const personal = this.active.rules.filter(isMockRule).filter((r) => r.enabled);
+    const same = (a: MockRule, b: MockRule) =>
+      a.match.kind === b.match.kind &&
+      (a.ignore_case || b.ignore_case
+        ? a.match.value.toLowerCase() === b.match.value.toLowerCase()
+        : a.match.value === b.match.value);
+    const rules = (table?.rules ?? []).map((rule): CloudRuleEntry => {
+      const local = disabled.has(rule.id);
+      const entry = { id: rule.id, rule: clone(rule), disabled_local: local };
+      if (!rule.enabled) return { ...entry, status: 'disabled_remote' };
+      if (local) return { ...entry, status: 'disabled_local' };
+      const by = personal.find((p) => same(p, rule));
+      if (by) return { ...entry, status: 'shadowed', shadowed_by: by.id };
+      const problem = cloudProblem(rule);
+      if (problem !== null) return { ...entry, status: 'invalid', problem };
+      return { ...entry, status: 'active' };
+    });
+    return {
+      settings: {
+        enabled: prefs.enabled,
+        base_url: prefs.base_url,
+        has_key: prefs.key !== '',
+        auto_sync_minutes: prefs.auto_sync_minutes,
+      },
+      status: {
+        ...clone(this.cloudStatus),
+        revision: table?.revision ?? null,
+        updated_at: table?.updated_at ?? null,
+        unreadable_count: table?.unreadable ?? 0,
+      },
+      rules,
+    };
+  }
+
+  /** Push cloud-state. It carries no seq: the runtime events' counter is not touched. */
+  #pushCloud(): void {
+    if (this.options.legacy) return;
+    const handlers = this.#handlers.get(CLOUD_STATE_EVENT);
+    if (!handlers?.size) return;
+    const state = this.#cloudState();
+    for (const handler of handlers) handler(clone(state));
+  }
+
+  #syncCloud(): Promise<CloudState> {
+    this.#cloudSync ??= this.#runCloudSync().finally(() => {
+      this.#cloudSync = null;
+    });
+    return this.#cloudSync;
+  }
+
+  /** One download (§3): on success the cache is replaced; on failure it stays, with the error. */
+  async #runCloudSync(): Promise<CloudState> {
+    const at = new Date().toISOString();
+    this.cloudStatus = { ...this.cloudStatus, syncing: true, last_attempt_at: at };
+    this.#pushCloud();
+    const delay = this.options.cloudDelayMs;
+    await (delay > 0 ? new Promise((resolve) => setTimeout(resolve, delay)) : Promise.resolve());
+    const prefs = this.cloudPrefs;
+    const error: CloudError | null =
+      !prefs.enabled || !prefs.base_url || !prefs.key
+        ? { code: 'not_configured', message: '未开启订阅，或缺少服务器地址、同步密钥' }
+        : this.cloudServer.error;
+    if (error) {
+      this.cloudStatus = { ...this.cloudStatus, syncing: false, last_error: clone(error) };
+    } else {
+      const table = clone(this.cloudServer.table);
+      this.cloudCache = table;
+      // §4: ids no phrase has any more are dropped after a successful sync.
+      const ids = new Set(table.rules.map((r) => r.id));
+      this.cloudPrefs = {
+        ...prefs,
+        disabled_ids: prefs.disabled_ids.filter((id) => ids.has(id)),
+      };
+      this.cloudStatus = {
+        syncing: false,
+        last_attempt_at: at,
+        last_success_at: at,
+        last_error: null,
+      };
+    }
+    this.#pushCloud();
+    return this.#cloudState();
   }
 
   #capabilities(): Capability[] {
@@ -825,6 +1170,8 @@ export class MockBackend {
     if (store.revision === this.#store.revision && store.safeMode === this.#store.safeMode) return;
     this.#store = store;
     this.emit('store-state', { revision: store.revision, safe_mode: store.safeMode });
+    // §5: 我的指令 changed, so did which team phrases it shadows.
+    this.#pushCloud();
   }
 
   #appendHistory(partial: Partial<HistoryEntry>): HistoryEntry {
@@ -921,12 +1268,19 @@ export function mockOptionsFromQuery(search: string): MockOptions {
     options.platform = platform;
   if (q.get('mock-dialog') === 'cancel') options.dialog = 'cancel';
   if (q.get('mock-unreadable') === '1') options.unreadable = true;
+  const cloud = q.get('mock-cloud');
+  if (cloud === 'off' || cloud === 'sample' || cloud === 'error') options.cloud = cloud;
   return options;
 }
 
 /** Transport for the browser preview, configured from the URL. */
 export function createPreviewTransport(): Transport {
-  const backend = new MockBackend(mockOptionsFromQuery(window.location.search));
+  // The preview shows the team phrases, synced, with a sync slow enough to be seen.
+  const backend = new MockBackend({
+    cloud: 'sample',
+    cloudDelayMs: 800,
+    ...mockOptionsFromQuery(window.location.search),
+  });
   (globalThis as { quickerMock?: MockBackend }).quickerMock = backend;
   return createMockTransport(backend);
 }

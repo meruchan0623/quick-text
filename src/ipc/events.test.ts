@@ -2,18 +2,21 @@ import { act, createElement, StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  CLOUD_PENDING,
+  CloudSync,
   HISTORY_LIMIT,
   RETRY_CAP_MS,
   retryDelay,
   RuntimeSync,
   SeqLedger,
+  useCloud,
   useRuntime,
   type RuntimeIo,
   type Schedule,
 } from './events';
 import { createMockTransport, MockBackend, type MockOptions } from './mock';
 import { BackendUnavailableError } from './transport';
-import { EVENT_NAMES, type RuntimeSnapshot } from './types';
+import { CLOUD_STATE_EVENT, EVENT_NAMES, type CloudState, type RuntimeSnapshot } from './types';
 
 describe('SeqLedger', () => {
   it('applies consecutive events', () => {
@@ -679,6 +682,161 @@ describe('useRuntime', () => {
     });
     expect(host.textContent).toBe('ready:1');
     expect(snapshots()).toBe(1);
+    act(() => root.unmount());
+  });
+});
+
+describe('CloudSync (team phrases)', () => {
+  const clouds: CloudSync[] = [];
+  afterEach(() => {
+    for (const cloud of clouds.splice(0)) cloud.dispose();
+  });
+
+  /**
+   * A CloudSync on a mock backend; `hold` keeps get_cloud_state answers back (read when asked for,
+   * delivered on `release`). Without `events` no push reaches it.
+   */
+  function cloudSetup(options: MockOptions = { cloud: 'sample' }, events = true) {
+    const backend = new MockBackend({ rules: 3, ...options });
+    const mock = createMockTransport(backend);
+    const gates: (() => void)[] = [];
+    let holding = false;
+    const io: RuntimeIo = {
+      listen: (event, handler) =>
+        events ? mock.listen(event, handler) : Promise.resolve(() => undefined),
+      invoke: async (command, args) => {
+        const result = await mock.invoke<unknown>(command, args);
+        if (holding && command === 'get_cloud_state')
+          await new Promise<void>((resolve) => gates.push(resolve));
+        return result as never;
+      },
+    };
+    const cloud = new CloudSync(io);
+    clouds.push(cloud);
+    return {
+      backend,
+      cloud,
+      hold: () => {
+        holding = true;
+      },
+      release: () => {
+        holding = false;
+        for (const open of gates.splice(0)) open();
+      },
+    };
+  }
+
+  it('reads the state once and follows cloud-state pushes', async () => {
+    const { backend, cloud } = cloudSetup();
+    await Promise.all([cloud.start(), cloud.start()]);
+    expect(backend.calls.filter((c) => c.command === 'get_cloud_state')).toHaveLength(1);
+    expect(cloud.getView()).toMatchObject({ status: 'ready', pending: null, loadError: null });
+    expect(cloud.getView().state?.status.revision).toBe(12);
+    backend.publishCloud();
+    await backend.handle('sync_cloud_now');
+    expect(cloud.getView().state?.status.revision).toBe(13);
+  });
+
+  it('drops an answer overtaken by a push, which is never older', async () => {
+    const { backend, cloud, hold, release } = cloudSetup();
+    await cloud.start();
+    hold();
+    const refresh = cloud.refresh();
+    await settle();
+    // Read before this push was made, answered after it.
+    await backend.handle('set_cloud_rules_disabled', { ids: ['mock-cloud-1'], disabled: true });
+    expect(cloud.getView().state?.rules[0]?.status).toBe('disabled_local');
+    release();
+    await refresh;
+    expect(cloud.getView().state?.rules[0]?.status).toBe('disabled_local');
+  });
+
+  it('keeps a later request over an earlier one answering last', async () => {
+    const { cloud, hold, release } = cloudSetup({ cloud: 'sample' }, false);
+    await cloud.start();
+    hold();
+    const first = cloud.refresh();
+    await settle();
+    await cloud.setDisabled(['mock-cloud-2'], true);
+    expect(cloud.getView().state?.rules[1]?.status).toBe('disabled_local');
+    release();
+    await first;
+    expect(cloud.getView().state?.rules[1]?.status).toBe('disabled_local');
+  });
+
+  it('runs one command at a time and says so', async () => {
+    const { cloud } = cloudSetup({ cloud: 'sample', cloudDelayMs: 20 });
+    await cloud.start();
+    const sync = cloud.syncNow();
+    expect(cloud.getView().pending).toBe('sync');
+    await expect(cloud.setDisabled(['mock-cloud-1'], true)).rejects.toThrow(CLOUD_PENDING);
+    await sync;
+    expect(cloud.getView().pending).toBeNull();
+    expect(cloud.getView().state?.status.syncing).toBe(false);
+  });
+
+  it('rejects a refused setting to the caller and keeps the state', async () => {
+    const { cloud } = cloudSetup();
+    await cloud.start();
+    const before = cloud.getView().state;
+    await expect(
+      cloud.saveSettings({ enabled: true, base_url: 'ftp://x', auto_sync_minutes: 30 }),
+    ).rejects.toMatchObject({ code: 'validation' });
+    expect(cloud.getView().state).toBe(before);
+    expect(cloud.getView().pending).toBeNull();
+  });
+
+  it('turns unsupported on a backend without team phrases', async () => {
+    const { cloud } = cloudSetup({ legacy: true });
+    await cloud.start();
+    expect(cloud.getView()).toMatchObject({ status: 'unsupported', state: null });
+    await cloud.refresh();
+    expect(cloud.getView().status).toBe('unsupported');
+  });
+
+  it('keeps why the first read failed until one succeeds', async () => {
+    const { backend, cloud } = cloudSetup();
+    backend.failures.set('get_cloud_state', { code: 'busy' });
+    await cloud.start();
+    expect(cloud.getView()).toMatchObject({ status: 'connecting', state: null });
+    expect(cloud.getView().loadError).toMatch(/上一个动作/);
+    await cloud.refresh();
+    expect(cloud.getView()).toMatchObject({ status: 'ready', loadError: null });
+  });
+
+  it('reports no backend without retrying (production build outside the app)', async () => {
+    const cloud = new CloudSync({
+      invoke: () => Promise.reject(new BackendUnavailableError()),
+      listen: () => Promise.reject(new BackendUnavailableError()),
+    });
+    clouds.push(cloud);
+    await cloud.start();
+    expect(cloud.getView().loadError).toBe('未连接到桌面后端');
+  });
+
+  it('re-renders useCloud on pushes', async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const { backend, cloud } = cloudSetup();
+    const listened: string[] = [];
+    backend.on(CLOUD_STATE_EVENT, () => listened.push('pushed'));
+    function Probe() {
+      const view = useCloud(cloud);
+      const state: CloudState | null = view.state;
+      return createElement('output', null, `${view.status}:${String(state?.status.revision)}`);
+    }
+    const host = document.createElement('div');
+    const root = createRoot(host);
+    await act(async () => {
+      root.render(createElement(StrictMode, null, createElement(Probe)));
+      await settle();
+    });
+    expect(host.textContent).toBe('ready:12');
+    await act(async () => {
+      backend.publishCloud();
+      await backend.handle('sync_cloud_now');
+    });
+    expect(host.textContent).toBe('ready:13');
+    expect(listened).toHaveLength(2);
     act(() => root.unmount());
   });
 });
