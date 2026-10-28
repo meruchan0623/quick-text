@@ -49,7 +49,7 @@ Rust 侧的共享类型在 `crates/platform/src/health.rs`，JSON 形状由其 s
 
 ## 3. 事件（B-44）
 
-广播事件的载荷顶层都有 `seq: number`，取自同一个全局单调递增计数器（`src-tauri/src/events.rs` 的 EventBus）。前端：
+广播事件的载荷顶层都有 `seq: number`，取自同一个全局单调递增计数器（`src-tauri/src/events.rs` 的 EventBus）。例外：旧别名 `engine-status` 与团队话术的 `cloud-state`（见 §5「团队话术」）不带 `seq`、不占序号，不参与下面的记账。前端：
 
 - 丢弃 `seq` 不大于已处理最大值的事件；
 - 发现跳号（新 `seq` ≠ 上一个 + 1）或窗口重新获得焦点时，调用一次 `get_runtime_snapshot` 重新对齐；
@@ -63,6 +63,7 @@ Rust 侧的共享类型在 `crates/platform/src/health.rs`，JSON 形状由其 s
 | `startup-problem` | `{ seq, kind: string, severity: "info" \| "warning" \| "error", args: object }` | 每个问题一次；同时可通过 `startup_problems` 命令取全集。只推送加载之后才出现的问题（SafeMode(Locked) 重试成功后新出现的问题、`autostart_repaired`、`self_test_failed`、`log_level_elevated`、`backup_failed`、加载之后才改名的 `config_quarantined`）；加载时已有的问题不推送，由 `load_state.startup_problems` 提供。问题消失（例如 Locked 重试成功后移除 `safe_mode`）不发事件，前端在 `store-state` 的 `safe_mode` 变为 `null` 时（或 `engine-state` 的 `paused_reasons` 不再含 `safe_mode` 时）可以重新调用 `startup_problems` |
 | `store-state` | `{ seq, revision: number, safe_mode: SafeModeReason \| null }` | 不限速、不合并。当前生效修订号或安全模式变化时发送一次，不论原因（保存并应用、回滚、导入发布、SafeMode(Locked) 重试成功、其他后端路径）；两者同时变化（如 Locked 重试成功：新修订号与 `safe_mode: null`）是同一条事件；值与上一条 `store-state`（或下方发送规则所说的基线）相同时不重发。初值不推送，从 `get_runtime_snapshot` / `load_state` 取 |
 | `engine-status` | 旧字符串 `"running"` \| `"paused"` \| `"listening"` | 0.4–0.5 保留为别名，不带 `seq`，新代码不要订阅。某条 `engine-state` 使这个字符串变化时紧随其后发送 |
+| `cloud-state` | `CloudState`（见 §5「团队话术」），**不带 `seq`** | 不限速、不合并、不去重。同步开始与结束、同步设置变化、本机停用变化、个人配置保存（发布、回滚、导入发布、SafeMode(Locked) 重试成功）后各发一条。由存储在持锁时排队、EventBus 线程发出，所以按变化顺序到达；不进 `get_runtime_snapshot`，初值用 `get_cloud_state` 取 |
 
 发送规则（`src-tauri/src/events.rs`）：
 
@@ -112,7 +113,7 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 
 后端可以新增 kind；前端对未知 kind 显示 `kind` 原文加通用文案。
 
-`recovered` 的 `from: "last_good"` 指 `store-meta.json` 中的 `last_good_revision`。后端在 EventBus 线程上记录它（B-04，`src-tauri/src/lkg.rs`），需要同时满足两个条件：当前版本生效后，至少有一次触发路径展开成功（`trigger` 为 `immediate` 或 `terminator`，`outcome` 为 `succeeded`；手动「执行」不算；只算 `seq` 大于版本生效时历史最大 `seq` 的条目，发布前就已记录、晚到的旧版本成功不算）；Health 持续「正常」满 60 秒，并且真正写入前再读一次运行时当前的 Health，不是「正常」就放弃这次写入、重新计时。换版本（发布、回滚、导入）后重新计时、重新计数，Health 离开「正常」也重新计时。安全模式下不记录。每个版本只记录一次。存储拒绝这次记录时（例如 pre-0.4 备份还没做成，或者同号快照 `revisions/<n>.json` 读不出来、与当前版本不一致；后者不覆盖、不记录）不记，从拒绝时起重新计时后再试：第一次拒绝后等 60 秒，之后每次加倍，最长 32 分钟；同一版本、同一原因只记一条日志。记录不发事件，也不新增命令，前端无需处理。
+`recovered` 的 `from: "last_good"` 指 `store-meta.json` 中的 `last_good_revision`。后端在 EventBus 线程上记录它（B-04，`src-tauri/src/lkg.rs`），需要同时满足两个条件：当前版本生效后，至少有一次触发路径展开成功（`trigger` 为 `immediate` 或 `terminator`，`outcome` 为 `succeeded`，`rule_id` 属于当前个人配置的规则；手动「执行」和团队话术不算；只算 `seq` 大于版本生效时历史最大 `seq` 的条目，发布前就已记录、晚到的旧版本成功不算）；Health 持续「正常」满 60 秒，并且真正写入前再读一次运行时当前的 Health，不是「正常」就放弃这次写入、重新计时。换版本（发布、回滚、导入）后重新计时、重新计数，Health 离开「正常」也重新计时。安全模式下不记录。每个版本只记录一次。存储拒绝这次记录时（例如 pre-0.4 备份还没做成，或者同号快照 `revisions/<n>.json` 读不出来、与当前版本不一致；后者不覆盖、不记录）不记，从拒绝时起重新计时后再试：第一次拒绝后等 60 秒，之后每次加倍，最长 32 分钟；同一版本、同一原因只记一条日志。记录不发事件，也不新增命令，前端无需处理。
 
 ## 4. 现有命令在 0.4 的变化
 
@@ -150,6 +151,47 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 | `clear_history` | — | `null`；清空内存中的执行历史，不发事件。历史 `seq` 不归零，之后的条目接着编号。安全模式下也可调用（不写数据或设置） |
 | `explain_last_miss` | — | `{ seq, at_ms, rule_id: string, outcome: Outcome, reason: ReasonCode } \| null`：0.4 只基于执行历史，取最近一条不是 `succeeded` 的记录（F-52 的完整版在 0.5） |
 | `debug_inject_fault` | `{ point: FaultPoint, param: number }` | `null`；只在 `fault-injection` feature 下注册，release 构建不存在（命令和符号都没有）。`param` 对 `executor_hang`、`clipboard_busy` 是毫秒数，其他点忽略；每次调用写一条 `fault.injected` 日志 |
+
+### 团队话术（`docs/cloud-phrases.md`）
+
+团队话术是从 TSim 客服系统只读下载的话术表，与个人配置分开存放（下载内容、本机存放、下载规则、合并与状态判定见 `docs/cloud-phrases.md` §1–§4）。四个命令都返回调用后的 `CloudState`，参数名为 snake_case；安全模式下都允许（它们只写 `prefs.json` 和 `cloud-phrases.json`，不写 `active.json` / `revisions/`；安全模式下团队话术不进引擎）。
+
+| 命令 | 参数 | 返回 |
+|---|---|---|
+| `get_cloud_state` | — | `CloudState` |
+| `set_cloud_settings` | `{ settings: { enabled: boolean, base_url: string, key?: string \| null, auto_sync_minutes: number } }` | `CloudState`。`key` 省略或为 `null` 不改，`""` 清除；`base_url`、`key` 先去首尾空白。设置非法时返回 `validation`，`diagnostics[].path` 为 `settings.base_url`（`code` `invalid_url`：非空且不是 `https://`，或 `http://` 指向 `localhost`、`127.0.0.1`、`[::1]` 以外的主机，或带用户名密码、`?`、`#`）、`settings.key`（`invalid_key`：含空格、中文等非可见 ASCII 字符）、`settings.auto_sync_minutes`（`invalid_interval`：不是 0、15、30、60、120、240），`message` 为中文。写入后立即生效；订阅开启时随即在后台同步一次，**不等待**同步结束（开始与结束各有一条 `cloud-state`）。服务器地址变化时清除旧地址的缓存与同步记录 |
+| `sync_cloud_now` | — | `CloudState`：等这次同步结束后返回；同步失败不报错，看 `status.last_error`。已有同步在进行时不再排队第二次，等它结束并返回它的结果（single-flight）；但若该次同步开始后设置又变了（其结果作废），则另跑一次 |
+| `set_cloud_rules_disabled` | `{ ids: string[], disabled: boolean }` | `CloudState`。`ids` 为原始 id（不带 `cloud:`），写入 `prefs.json` 的 `app.cloud.disabled_ids` 并重新装载引擎 |
+
+```ts
+interface CloudState {
+  settings: { enabled: boolean; base_url: string; has_key: boolean; auto_sync_minutes: number };
+  status: {
+    syncing: boolean;
+    last_attempt_at: string | null;   // RFC 3339 UTC，如 "2026-10-28T08:30:00Z"
+    last_success_at: string | null;   // 启动时取缓存的 synced_at；304 也更新
+    last_error: { code: string; message: string } | null;
+    revision: number | null;          // 当前缓存表的 revision；未订阅时为 null
+    updated_at: string | null;
+    unreadable_count: number;
+  };
+  rules: Array<{                      // 未订阅时为 []
+    id: string;                       // 原始 id
+    rule: Rule;                       // 云端原样规则
+    status: 'active' | 'disabled_remote' | 'disabled_local' | 'shadowed' | 'invalid';
+    disabled_local: boolean;          // id 是否在 disabled_ids 里，与 status 无关
+    shadowed_by?: string;             // 仅 shadowed：个人规则 id
+    problem?: string;                 // 仅 invalid：中文原因，可直接显示
+  }>;
+}
+```
+
+- `last_error.code`：`not_configured`、`invalid_url`、`unauthorized`、`network`、`timeout`、`http_status`、`too_large`、`too_many_rules`（话术表超过 2000 条，整表拒绝，保留旧缓存）、`invalid_format`、`schema_newer`、`io`。`last_error.message` 与 `rules[].problem` 是给用户看的中文，可原样显示；技术细节（HTTP 状态、系统或 TLS 错误、解析位置、诊断码）只写日志（`cloud.sync_failed`、`cloud.sync` 的 `invalid_codes`），不进载荷。两者都不含同步密钥和话术正文。
+- 同步密钥只写不读：任何返回值和事件里只有 `has_key`。
+- 引擎中的团队话术 id 为 `cloud:<原始 id>`，执行历史（`HistoryEntry.rule_id`）、`execution-result`、`ExecutionResult.id`、`explain_last_miss` 中出现的这类 id 用 `CloudState.rules` 查名称。`load_state.active`、`save_config`、导出、Excel 只含个人配置。
+- 团队话术只接受「纯文本 + 内联正文」动作（`action.type` 为 `text`、`source.type` 为 `inline`），其他动作即使下载到也判为 `invalid`（`problem`：「团队话术只能粘贴或键入纯文本」），不会打开程序或读本机文件。正则缩写（「团队话术只支持普通缩写，不支持正则」）、超过 64 个字符的缩写、超过 20000 个字符的正文，以及正文含 `{cliptext}`、`{selection}` 或 `{param:` 的也判为 `invalid`（`problem`：「正文含 {cliptext}、{selection} 或 {param:…}，团队话术只输出固定文字」），日期占位符 `{0:…}` 照常可用。
+- 服务器地址变化后，旧地址的缓存不再使用：缓存文件记录来源地址，启动和修改设置时只装载与当前地址一致的缓存。旧缓存删除失败时 `last_error` 为 `io`（message 说明旧缓存无法删除、其中的话术不会被使用）。
+- 团队话术变化（下载到新表、本机停用或启用、设置变化）时，引擎的规则一次性原子替换，不打断正在执行的指令；变化之前已匹配的触发按匹配时的规则执行。团队话术的执行不计入个人配置的 last-known-good（§3 `recovered` 的 `last_good` 只由个人规则的成功执行累积）。前端无需处理。
 
 `FaultPoint` 的取值见 `crates/platform/src/fault.rs`：`executor_panic`、`executor_hang`、`hook_panic`、`hook_unhook`、`rawinput_close`、`rawinput_unregister`、`clipboard_busy`、`store_write_fail`、`config_corrupt`、`store_locked`、`autostart_stale`、`session_end`。
 

@@ -57,6 +57,11 @@ pub struct AppPrefs {
     pub log_level: Option<LogLevelOverride>,
     /// How a paste restores the clipboard (B-08).
     pub clipboard: ClipboardPrefs,
+    /// Team phrase sync (docs/cloud-phrases.md §2); absent until first set,
+    /// and then left out of the file again only by hand. Holds the sync key:
+    /// prefs are never exported or kept in the revision history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<CloudPrefs>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -67,6 +72,7 @@ impl Default for AppPrefs {
             auto_listen_on_start: true,
             log_level: None,
             clipboard: ClipboardPrefs::default(),
+            cloud: None,
             extra: Map::new(),
         }
     }
@@ -195,6 +201,161 @@ impl ClipboardPrefs {
         LeaseOptions {
             policy: self.restore_policy,
             restore_delay: Duration::from_millis(ms),
+        }
+    }
+}
+
+/// `app.cloud.auto_sync_minutes` values (docs/cloud-phrases.md §2); 0 is
+/// "no timer" (manual sync only).
+pub const AUTO_SYNC_MINUTES: [u32; 6] = [0, 15, 30, 60, 120, 240];
+const DEFAULT_AUTO_SYNC_MINUTES: u32 = 30;
+
+/// `app.cloud`: the team phrase subscription (docs/cloud-phrases.md §2).
+///
+/// Read field by field like [`ClipboardPrefs`]: a missing, mistyped or
+/// out-of-range value takes its default and is logged
+/// (`store.prefs_invalid`, never the value), so a bad entry never makes the
+/// whole file count as damaged. `key` is the sync key in plain text (the
+/// file stays on this computer); `Debug` never prints it.
+#[derive(Clone, PartialEq, Serialize)]
+pub struct CloudPrefs {
+    pub enabled: bool,
+    /// As entered, trimmed; the download path is appended to it.
+    pub base_url: String,
+    /// The sync key; empty when none is set.
+    pub key: String,
+    /// One of [`AUTO_SYNC_MINUTES`]; 30 by default.
+    pub auto_sync_minutes: u32,
+    /// Team phrase ids switched off on this computer, without the `cloud:`
+    /// prefix, sorted and unique.
+    pub disabled_ids: Vec<String>,
+    /// Fields this version does not know, kept and written back unchanged.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl Default for CloudPrefs {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: String::new(),
+            key: String::new(),
+            auto_sync_minutes: DEFAULT_AUTO_SYNC_MINUTES,
+            disabled_ids: vec![],
+            extra: Map::new(),
+        }
+    }
+}
+
+/// The key is shown as whether one is set; base URL and ids are not secret.
+impl std::fmt::Debug for CloudPrefs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudPrefs")
+            .field("enabled", &self.enabled)
+            .field("base_url", &self.base_url)
+            .field("has_key", &!self.key.is_empty())
+            .field("auto_sync_minutes", &self.auto_sync_minutes)
+            .field("disabled_ids", &self.disabled_ids)
+            .field("extra", &self.extra.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl<'de> Deserialize<'de> for CloudPrefs {
+    /// Fails only where the JSON itself is invalid, like [`ClipboardPrefs`].
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Value::deserialize(deserializer).map(Self::from_value)
+    }
+}
+
+impl CloudPrefs {
+    /// Runs inside serde, so inside every load of prefs.json; it only checks
+    /// the value and logs (see [`ClipboardPrefs::from_value`]).
+    fn from_value(value: Value) -> Self {
+        let mut fields = match value {
+            Value::Object(fields) => fields,
+            other => {
+                invalid("app.cloud", &other, "not_an_object");
+                return Self::default();
+            }
+        };
+        let defaults = Self::default();
+        let enabled = match fields.remove("enabled") {
+            None => defaults.enabled,
+            Some(Value::Bool(enabled)) => enabled,
+            Some(other) => {
+                invalid("app.cloud.enabled", &other, "wrong_type");
+                defaults.enabled
+            }
+        };
+        let mut text = |name: &'static str, field: &'static str| match fields.remove(name) {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(text)) => text,
+            Some(other) => {
+                invalid(field, &other, "wrong_type");
+                String::new()
+            }
+        };
+        let base_url = text("base_url", "app.cloud.base_url");
+        let key = text("key", "app.cloud.key");
+        let auto_sync_minutes = match fields.remove("auto_sync_minutes") {
+            None => defaults.auto_sync_minutes,
+            Some(Value::Number(minutes)) => match minutes.as_u64() {
+                Some(minutes) if AUTO_SYNC_MINUTES.iter().any(|&m| u64::from(m) == minutes) => {
+                    minutes as u32
+                }
+                _ => {
+                    tracing::warn!(
+                        event = "store.prefs_invalid",
+                        file = FILE,
+                        field = "app.cloud.auto_sync_minutes",
+                        problem = "out_of_range",
+                        value = %minutes,
+                        "invalid preference replaced by its default"
+                    );
+                    defaults.auto_sync_minutes
+                }
+            },
+            Some(other) => {
+                invalid("app.cloud.auto_sync_minutes", &other, "wrong_type");
+                defaults.auto_sync_minutes
+            }
+        };
+        let disabled_ids = match fields.remove("disabled_ids") {
+            None => vec![],
+            Some(Value::Array(ids)) => {
+                let total = ids.len();
+                let ids: std::collections::BTreeSet<String> = ids
+                    .into_iter()
+                    .filter_map(|id| match id {
+                        Value::String(id) => Some(id),
+                        _ => None,
+                    })
+                    .collect();
+                if ids.len() < total {
+                    tracing::warn!(
+                        event = "store.prefs_invalid",
+                        file = FILE,
+                        field = "app.cloud.disabled_ids",
+                        problem = "entries_dropped",
+                        dropped = total - ids.len(),
+                        "non-string or repeated entries dropped"
+                    );
+                }
+                ids.into_iter().collect()
+            }
+            Some(other) => {
+                invalid("app.cloud.disabled_ids", &other, "wrong_type");
+                vec![]
+            }
+        };
+        Self {
+            enabled,
+            base_url,
+            key,
+            auto_sync_minutes,
+            disabled_ids,
+            extra: fields,
         }
     }
 }
@@ -541,6 +702,72 @@ mod tests {
         assert_eq!(written["app"]["auto_listen_on_start"], true);
         assert_eq!(written["app"]["log_level"], original["app"]["log_level"]);
         assert!(quarantined(&dir).is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// docs/cloud-phrases.md §2: `app.cloud` is read field by field (a bad
+    /// value never damages the file), round-trips with unknown fields, and
+    /// `Debug` never shows the key.
+    #[test]
+    fn cloud_prefs_are_read_leniently_and_hide_the_key() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let written = json!({
+            "app": {
+                "cloud": {
+                    "enabled": true,
+                    "base_url": "https://csapi.tsim.tech",
+                    "key": "qtk_0123.secret-value",
+                    "auto_sync_minutes": 60,
+                    "disabled_ids": ["b", "a", "b"],
+                    "added_later": {"x": 1}
+                }
+            },
+            "ui": {}
+        });
+        fs::write(dir.join(FILE), serde_json::to_vec(&written).unwrap()).unwrap();
+        let prefs = load_prefs(&dir).unwrap();
+        let cloud = prefs.app.cloud.clone().unwrap();
+        assert!(cloud.enabled);
+        assert_eq!(cloud.base_url, "https://csapi.tsim.tech");
+        assert_eq!(cloud.key, "qtk_0123.secret-value");
+        assert_eq!(cloud.auto_sync_minutes, 60);
+        assert_eq!(cloud.disabled_ids, ["a", "b"]);
+        assert_eq!(cloud.extra["added_later"], json!({"x": 1}));
+        let shown = format!("{prefs:?}");
+        assert!(!shown.contains("secret-value"), "{shown}");
+        assert!(shown.contains("has_key: true"), "{shown}");
+        save_prefs(&dir, &prefs).unwrap();
+        assert_eq!(load_prefs(&dir).unwrap(), prefs);
+
+        let bad = json!({
+            "app": {
+                "auto_listen_on_start": false,
+                "cloud": {
+                    "enabled": "yes",
+                    "base_url": 5,
+                    "key": ["secret-value"],
+                    "auto_sync_minutes": 7,
+                    "disabled_ids": ["a", 3, null]
+                }
+            }
+        });
+        fs::write(dir.join(FILE), serde_json::to_vec(&bad).unwrap()).unwrap();
+        let prefs = load_prefs(&dir).unwrap();
+        let cloud = prefs.app.cloud.unwrap();
+        assert!(!cloud.enabled);
+        assert_eq!((cloud.base_url.as_str(), cloud.key.as_str()), ("", ""));
+        assert_eq!(cloud.auto_sync_minutes, 30);
+        assert_eq!(cloud.disabled_ids, ["a"]);
+        // The rest of the file still reads; nothing was quarantined.
+        assert!(!prefs.app.auto_listen_on_start);
+        assert!(quarantined(&dir).is_empty());
+        let not_an_object = json!({"app": {"cloud": "on"}});
+        fs::write(dir.join(FILE), serde_json::to_vec(&not_an_object).unwrap()).unwrap();
+        assert_eq!(
+            load_prefs(&dir).unwrap().app.cloud,
+            Some(CloudPrefs::default())
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

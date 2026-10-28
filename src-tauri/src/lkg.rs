@@ -22,6 +22,15 @@
 //! with no rule id, so they say nothing about whether the active revision
 //! works. Degraded is not Healthy and does not count either.
 //!
+//! Only runs of the active revision's own rules count
+//! ([`LkgTracker::only_personal`]: the entry's `rule_id` is one of
+//! `active`'s rule ids). Team phrases (docs/cloud-phrases.md) run in the
+//! engine next to them under `cloud:<id>` but are not part of the revision,
+//! so their successes prove nothing about it. The check is by membership,
+//! not by the `cloud:` prefix: `merge_cloud` refuses a team phrase whose
+//! engine id a personal rule already uses, so a personal rule named
+//! `cloud:…` still counts and a team phrase never does.
+//!
 //! # Which revision a run belongs to
 //!
 //! History entries carry no revision, and the bus gets them from the
@@ -141,7 +150,7 @@ use crate::{
     app_state::Managed,
     error::CommandError,
     events::{Observer, StoreState},
-    store::SNAPSHOT_MISMATCH,
+    store::{PersonalRuleIds, SNAPSHOT_MISMATCH},
 };
 use quicker_platform::{
     health::{EngineState, HealthSnapshot, HealthState, HistoryEntry, Outcome, TriggerKind},
@@ -191,6 +200,8 @@ pub struct LkgTracker {
     skipped: Vec<&'static str>,
     /// The revision this tracker last marked.
     marked: Option<u64>,
+    /// When set, only runs of these rules count ([`LkgTracker::only_personal`]).
+    personal: Option<PersonalRuleIds>,
 }
 
 impl LkgTracker {
@@ -210,7 +221,15 @@ impl LkgTracker {
             refusals: 0,
             skipped: vec![],
             marked: None,
+            personal: None,
         }
+    }
+
+    /// Counts only runs of the active personal rules (`ids`, kept current by
+    /// the store), never team phrases. The app's tracker always has it.
+    pub fn only_personal(mut self, ids: PersonalRuleIds) -> Self {
+        self.personal = Some(ids);
+        self
     }
 
     /// The runtime's last history `seq`; once the runtime is gone, the
@@ -301,7 +320,11 @@ impl Observer for LkgTracker {
         // delivery of the previous revision's) does not count.
         let counts = entry.seq > self.counted_after
             && entry.trigger != TriggerKind::Manual
-            && entry.outcome == Outcome::Succeeded;
+            && entry.outcome == Outcome::Succeeded
+            && self
+                .personal
+                .as_ref()
+                .is_none_or(|ids| ids.contains(&entry.rule_id));
         if counts && self.store.safe_mode.is_none() {
             self.successes = self.successes.saturating_add(1);
         }
@@ -579,6 +602,63 @@ mod tests {
         rig.store(store(1, None));
         rig.wait(secs(600));
         assert_eq!(rig.marks(), [1]);
+    }
+
+    /// Team phrases run in the engine under `cloud:<id>` but are not part of
+    /// the revision: their successes never mark it. The check is membership
+    /// in the active rule ids, not the prefix.
+    #[test]
+    fn only_successes_of_personal_rules_mark_the_revision() {
+        let dir = std::env::temp_dir().join(format!("quicker-lkg-{}", uuid::Uuid::new_v4()));
+        let mut loaded = Store::load(dir.clone());
+        let mut config = loaded.active.clone();
+        config.rules = ["mine", "cloud:legacy"]
+            .into_iter()
+            .map(|id| Rule {
+                id: id.into(),
+                match_spec: MatchSpec {
+                    kind: MatchKind::Literal,
+                    value: format!("t-{id}"),
+                },
+                ..Rule::default()
+            })
+            .collect();
+        loaded.save_config(config, None).unwrap();
+        let ids = loaded.personal_rule_ids();
+        assert!(ids.contains("mine") && ids.contains("cloud:legacy"));
+        assert!(!ids.contains("cloud:team"));
+        let revision = loaded.active.revision;
+        let run = |rig: &mut Rig, rule: &str| {
+            let entry = rig.runtime.record(Record::new(
+                rule,
+                TriggerKind::Terminator,
+                Outcome::Succeeded,
+                ReasonCode::Ok,
+            ));
+            rig.tracker.executed(&entry);
+        };
+        // Only team phrases succeed: never marked.
+        let mut rig = Rig::new(store(revision, None));
+        rig.tracker.personal = Some(ids.clone());
+        rig.healthy();
+        run(&mut rig, "cloud:team");
+        run(&mut rig, "cloud:team");
+        assert_eq!(rig.due_in(), None, "nothing counted");
+        rig.wait(secs(600));
+        assert!(rig.marks().is_empty());
+        // A personal rule succeeds: marked as before.
+        run(&mut rig, "mine");
+        rig.wait(QUALIFY_AFTER);
+        assert_eq!(rig.marks(), [revision]);
+        // A personal rule whose id happens to start with `cloud:` counts too.
+        let mut rig = Rig::new(store(revision, None));
+        rig.tracker.personal = Some(ids);
+        rig.healthy();
+        run(&mut rig, "cloud:legacy");
+        rig.wait(QUALIFY_AFTER);
+        assert_eq!(rig.marks(), [revision]);
+        drop(loaded);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -59,6 +59,12 @@ impl Store {
             problem_sink: None,
             store_sink: None,
             manual_changes: Default::default(),
+            personal_compiled: CompiledConfig {
+                config: Config::default(),
+                rules: vec![],
+            },
+            cloud: Default::default(),
+            personal_ids: Default::default(),
         };
         store.install(report);
         store
@@ -76,8 +82,10 @@ impl Store {
     }
     fn install(&mut self, report: LoadReport) {
         let safe_mode = report.safe_mode();
-        *self.engine.config.lock().unwrap() = report.active.clone();
-        *self.engine.compiled.lock().unwrap() = report.compiled;
+        // With the team phrases already loaded (a Locked retry), merged once
+        // safe mode is left below.
+        self.set_personal(report.compiled);
+        self.apply_engine();
         self.engine.generation.fetch_add(1, Ordering::SeqCst);
         self.meta.replace(report.meta, report.meta_writable);
         self.disk_hash = report.disk_hash;
@@ -130,6 +138,8 @@ impl Store {
         // The new revision and the safe mode it left (or entered) together,
         // in one report, under the lock the caller holds.
         self.report_store_state();
+        // Shadowing depends on the personal rules.
+        self.report_cloud();
     }
     /// Move obsolete unconfirmed files aside once after the legacy backup gate.
     /// Never replace an earlier archive, even when an older app recreated a file.

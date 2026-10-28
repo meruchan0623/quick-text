@@ -140,8 +140,10 @@ impl Store {
             restore(self);
             return Err(e);
         }
-        *self.engine.compiled.lock().unwrap() = compiled;
-        *self.engine.config.lock().unwrap() = config.clone();
+        // The engine runs the personal configuration plus the team phrases
+        // (docs/cloud-phrases.md §4); only `config` is written above.
+        self.set_personal(compiled);
+        self.apply_engine();
         self.active = config.clone();
         self.active_on_disk = true;
         // A stand-in was not backed up: there is no revision to roll back to.
@@ -162,6 +164,8 @@ impl Store {
             self.set_safe_mode(None);
         }
         self.report_store_state();
+        // Which team phrases a personal rule shadows may have changed.
+        self.report_cloud();
         tracing::info!(
             event = "store.published",
             revision = self.active.revision,

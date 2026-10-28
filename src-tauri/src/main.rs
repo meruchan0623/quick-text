@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod app_state;
 mod autostart;
+mod cloud;
 mod commands;
 mod config_package;
 mod diagnostics;
@@ -62,7 +63,10 @@ fn main() {
                 Arc::new(diagnostics::logging::apply_level),
             ));
             store::prefs::apply_clipboard_prefs(&dir);
-            let store = store::Store::load(dir);
+            let mut store = store::Store::load(dir);
+            // Team phrases from the cache, before the engine starts
+            // (docs/cloud-phrases.md §3): they work offline too.
+            cloud::init(&mut store);
             let engine = store.engine.clone();
             let runtime = store.runtime.clone();
             app.manage(Managed::new(store));
@@ -80,7 +84,9 @@ fn main() {
                     &runtime,
                     store.store_state(),
                     lkg::mark_in(app.handle().clone()),
-                );
+                )
+                // Team phrase runs never prove a personal revision.
+                .only_personal(store.personal_rule_ids());
                 let bus = events::EventBus::start(
                     &runtime,
                     store.store_state(),
@@ -94,11 +100,15 @@ fn main() {
                 // is a `store-state` above it. Commands reach the bus only
                 // after `manage` below.
                 store.set_store_sink(bus.store_sink());
+                store.set_cloud_sink(bus.cloud_sink());
                 bus
             };
             app.manage(bus);
+            app.manage(cloud::CloudSync::new());
             startup::after_load(app.handle());
             startup::start_engine(engine, runtime);
+            // The first team phrase download, then the timer, in the background.
+            cloud::start(app.handle());
             // B-10: waits for Healthy, runs the self-test, then listens or
             // stays paused and says why.
             startup::spawn_self_test(app.handle().clone());
@@ -164,6 +174,10 @@ fn main() {
             commands::engine::clear_history,
             commands::engine::explain_last_miss,
             commands::engine::self_test,
+            commands::cloud::get_cloud_state,
+            commands::cloud::set_cloud_settings,
+            commands::cloud::sync_cloud_now,
+            commands::cloud::set_cloud_rules_disabled,
             #[cfg(feature = "fault-injection")]
             commands::engine::debug_inject_fault
         ])

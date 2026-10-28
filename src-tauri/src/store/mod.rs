@@ -13,12 +13,14 @@ mod revisions;
 #[cfg(test)]
 mod startup_tests;
 
+pub(crate) use atomic::atomic_json;
 pub use atomic::replace_file;
 pub use fallback::{retry_locked, RecoverySource, StoreEnv};
 pub use meta::clear_run_marker_on_session_end;
 pub use metadata::merge_import_metadata;
 
 use crate::{
+    cloud::CloudData,
     error::{CommandError, EntityKind, IoOp, SafeModeReason},
     events::{ProblemSink, StoreSink, StoreState},
     startup::{ProblemKind, StartupProblem},
@@ -27,6 +29,7 @@ use meta::MetaHandle;
 use quicker_domain::*;
 use quicker_platform::{health::PauseReasons, runtime::Runtime, Shared};
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -85,6 +88,34 @@ pub struct Store {
     /// Successful [`Store::set_manual_pause`] calls so far, so startup can
     /// tell whether the user paused or resumed while it waited.
     manual_changes: AtomicU64,
+    /// `active` compiled (strictly at publish, rule by rule at load): the
+    /// base of what the engine runs ([`Store::apply_engine`]).
+    personal_compiled: CompiledConfig,
+    /// Team phrases (docs/cloud-phrases.md): settings, the cached table,
+    /// sync status and the statuses of the last merge. Never part of
+    /// `active`, its files or its exports.
+    pub(crate) cloud: CloudData,
+    /// The ids of `active`'s rules, for the last-known-good tracker.
+    personal_ids: PersonalRuleIds,
+}
+
+/// The rule ids of the active personal configuration, readable without the
+/// store lock (the last-known-good tracker on the bus thread,
+/// [`crate::lkg::LkgTracker::only_personal`]): only runs of these rules
+/// prove that a personal revision works, not team phrases, whose engine ids
+/// are never among them (`merge_cloud` refuses a team phrase whose
+/// `cloud:<id>` a personal rule uses). Updated, under the store lock, before
+/// each new store state is reported. Its lock is a leaf.
+#[derive(Clone, Default)]
+pub struct PersonalRuleIds(Arc<parking_lot::RwLock<BTreeSet<String>>>);
+
+impl PersonalRuleIds {
+    pub fn contains(&self, rule_id: &str) -> bool {
+        self.0.read().contains(rule_id)
+    }
+    fn set(&self, config: &Config) {
+        *self.0.write() = config.rules.iter().map(|rule| rule.id.clone()).collect();
+    }
 }
 
 /// Deferred work run with the store once it is writable.
@@ -239,6 +270,76 @@ impl Store {
             self.writable_hooks.push((key, hook));
         }
     }
+    /// The handle on the active personal rule ids (setup gives it to the
+    /// last-known-good tracker).
+    pub fn personal_rule_ids(&self) -> PersonalRuleIds {
+        self.personal_ids.clone()
+    }
+    /// Takes `compiled` (of the new `active`) as the personal base of the
+    /// engine and its rule ids; the caller then loads the engine.
+    fn set_personal(&mut self, compiled: CompiledConfig) {
+        self.personal_ids.set(&compiled.config);
+        self.personal_compiled = compiled;
+    }
+    /// Loads the engine with the effective configuration
+    /// (docs/cloud-phrases.md §4): the compiled personal configuration plus
+    /// the active team phrases (`quicker_domain::merge_cloud`), and refreshes
+    /// the team phrase statuses. Without a subscription or a cached table,
+    /// and always in safe mode, the engine gets the personal configuration
+    /// alone, exactly (a sync in safe mode only updates the cache and the
+    /// statuses, which come from the checks before compiling:
+    /// `quicker_domain::cloud_rule_states`; no team phrase is compiled in
+    /// safe mode). Called wherever the personal configuration, the safe mode
+    /// or the team phrase inputs change. It does not pause: a publish does
+    /// that around it, and a sync or a local disable swaps the rules between
+    /// two keystrokes.
+    ///
+    /// The swap is atomic for every reader: `config` and `compiled` are
+    /// replaced while both locks are held, taken in the order of the one
+    /// reader that holds both (the macOS event tap: `config`, then
+    /// `compiled`; every other reader takes one at a time, so this cannot
+    /// deadlock). A tap therefore never matches a new trigger against the old
+    /// rule bodies or the reverse.
+    ///
+    /// The generation is not touched here. A candidate is matched against
+    /// one consistent snapshot and carries a clone of its rule: the macOS tap
+    /// matches and looks the rule up while holding both locks, the Windows
+    /// matcher takes the rule from the same `compiled` it matched against;
+    /// both executors then run `candidate.rule.action` and use the current
+    /// `config` only for `action_uses_variable` and reusable references. A
+    /// candidate matched before a team phrase reload therefore runs exactly
+    /// the rule it matched, as if typed just before the sync. Bumping the
+    /// generation would instead stop any run in progress (the executors check
+    /// it before every erased or typed character), personal ones included,
+    /// leaving half-typed text. A publish or a load replaces the personal
+    /// configuration and bumps the generation itself, as before.
+    pub(crate) fn apply_engine(&mut self) {
+        let table = self.cloud.table();
+        let disabled = self.cloud.disabled_ids();
+        let compiled = if self.safe_mode.is_some() {
+            // Team phrases do not run in safe mode: their statuses are shown, but
+            // nothing of theirs is compiled until safe mode ends (this is called
+            // again then, `set_safe_mode`).
+            self.cloud.rules = cloud_rule_states(&self.personal_compiled.config, table, &disabled);
+            self.personal_compiled.clone()
+        } else {
+            let merge = merge_cloud(&self.personal_compiled, table, &disabled);
+            self.cloud.rules = merge.rules;
+            merge.compiled
+        };
+        let config = compiled.config.clone();
+        let replaced = {
+            let mut config_slot = self.engine.config.lock().unwrap();
+            let mut compiled_slot = self.engine.compiled.lock().unwrap();
+            (
+                std::mem::replace(&mut *config_slot, config),
+                std::mem::replace(&mut *compiled_slot, compiled),
+            )
+        };
+        // The replaced values are dropped after the locks are released (macOS
+        // input only `try_lock`s them).
+        drop(replaced);
+    }
     /// The only place safe mode changes, and with it
     /// `PauseReasons::SAFE_MODE`. The engine is never resumed here: entering
     /// also sets MANUAL (as the 0.3 flag did), and leaving clears only
@@ -262,6 +363,8 @@ impl Store {
             }
         }
         self.safe_mode = reason;
+        // Team phrases run only outside safe mode.
+        self.apply_engine();
         if reason.is_none() {
             for (key, hook) in std::mem::take(&mut self.writable_hooks) {
                 self.writable_done.push(key);

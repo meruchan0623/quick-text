@@ -25,11 +25,17 @@
 //! `store-state`, unthrottled, with the next `seq`, only when it differs
 //! from the value in the view (the baseline or the last one sent).
 //!
+//! Team phrase sync state (`cloud-state`, docs/cloud-phrases.md §5) also
+//! leaves through the bus thread, in the order the store queued it (under
+//! the store lock, [`CloudSink`]), but outside the `seq` stream: it takes no
+//! `seq` and is not part of [`BusView`] (the frontend reads it with
+//! `get_cloud_state`), so a frontend that counts `seq` sees no gap.
+//!
 //! Idle cost: the bus thread sleeps in `recv` and only sets a timeout while
 //! something is held back (a trailing Health/State, held executions, a busy
 //! re-check) or the observer asked for a tick ([`Observer::due_in`]), so it
 //! adds no periodic wake-ups.
-use crate::{error::SafeModeReason, startup::StartupProblem};
+use crate::{cloud::CloudState, error::SafeModeReason, startup::StartupProblem};
 use parking_lot::Mutex;
 use quicker_platform::{
     health::{EngineEvent, EngineState, HealthSnapshot, HistoryEntry},
@@ -52,6 +58,9 @@ pub const ENGINE_STATE: &str = "engine-state";
 pub const EXECUTION_RESULT: &str = "execution-result";
 pub const STARTUP_PROBLEM: &str = "startup-problem";
 pub const STORE_STATE: &str = "store-state";
+/// Team phrase sync state; payload `CloudState`, no `seq` (see the module
+/// documentation).
+pub const CLOUD_STATE: &str = "cloud-state";
 /// Legacy alias (0.4–0.5): the `"running" | "paused" | "listening"` string,
 /// without `seq`.
 pub const ENGINE_STATUS: &str = "engine-status";
@@ -180,6 +189,38 @@ impl StoreSink {
     }
 }
 
+/// Where the store gives the team phrase sync state ([`EventBus::cloud_sink`],
+/// [`crate::store::Store::set_cloud_sink`]). Called with the store lock held,
+/// so states leave in the order of the changes; only queues, never blocks.
+#[derive(Clone)]
+pub struct CloudSink {
+    tx: mpsc::Sender<Input>,
+}
+
+impl CloudSink {
+    /// Queued and sent as `cloud-state` (no `seq`), unthrottled.
+    pub fn report(&self, state: CloudState) {
+        let _ = self.tx.send(Input::Cloud(Box::new(state)));
+    }
+
+    /// A sink whose states go nowhere (tests).
+    #[cfg(test)]
+    pub(crate) fn detached() -> (Self, mpsc::Receiver<CloudState>) {
+        let (tx, rx) = mpsc::channel();
+        let (out, states) = mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(input) = rx.recv() {
+                if let Input::Cloud(state) = input {
+                    if out.send(*state).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        (Self { tx }, states)
+    }
+}
+
 /// The emitted stream at one point: the last `seq` and the Health, State
 /// and store state sent up to it. Before the first event: `seq` 0 and the
 /// Health and State the bus started with; `store` is the value the bus
@@ -208,6 +249,7 @@ enum Input {
     Engine(EngineEvent),
     Problem(StartupProblem),
     Store(StoreState),
+    Cloud(Box<CloudState>),
 }
 
 /// What the throttle lets through, in order.
@@ -221,6 +263,8 @@ enum Out {
     },
     Problem(StartupProblem),
     Store(StoreState),
+    /// Outside the `seq` stream.
+    Cloud(Box<CloudState>),
 }
 
 pub struct EventBus {
@@ -335,6 +379,14 @@ impl EventBus {
             tx: self.tx.clone(),
         }
     }
+
+    /// Where the store gives the team phrase sync state: each report becomes
+    /// one `cloud-state` event (no `seq`).
+    pub fn cloud_sink(&self) -> CloudSink {
+        CloudSink {
+            tx: self.tx.clone(),
+        }
+    }
 }
 
 /// The bus thread's state.
@@ -434,6 +486,7 @@ impl Worker {
                 guarded("store", || observer.store(store));
                 out.push(Out::Store(store));
             }
+            Input::Cloud(state) => out.push(Out::Cloud(state)),
         }
     }
 
@@ -497,6 +550,15 @@ fn guarded(what: &'static str, f: impl FnOnce()) {
 /// equal to the view's (the baseline the store sink wrote, or the last one
 /// sent) is dropped there, before it takes a `seq`.
 fn deliver(view: &Mutex<BusView>, sink: &dyn Sink, item: Out) {
+    // Outside the `seq` stream: no number, nothing recorded in the view.
+    let item = match item {
+        Out::Cloud(state) => {
+            let payload = serde_json::to_value(&*state).unwrap_or_else(|_| json!({}));
+            guarded("emit", || sink.emit(CLOUD_STATE, payload));
+            return;
+        }
+        item => item,
+    };
     let (seq, legacy) = {
         let mut view = view.lock();
         if matches!(&item, Out::Store(store) if *store == view.store) {
@@ -518,7 +580,7 @@ fn deliver(view: &Mutex<BusView>, sink: &dyn Sink, item: Out) {
                 view.store = *store;
                 None
             }
-            Out::Execution { .. } | Out::Problem(_) => None,
+            Out::Execution { .. } | Out::Problem(_) | Out::Cloud(_) => None,
         };
         (view.seq, legacy)
     };
@@ -531,6 +593,8 @@ fn deliver(view: &Mutex<BusView>, sink: &dyn Sink, item: Out) {
         ),
         Out::Problem(problem) => (STARTUP_PROBLEM, with_seq(seq, &problem)),
         Out::Store(store) => (STORE_STATE, with_seq(seq, &store)),
+        // Sent above, before any `seq` was taken.
+        Out::Cloud(_) => return,
     };
     guarded("emit", || sink.emit(name, payload));
     if let Some(status) = legacy {
@@ -1111,6 +1175,46 @@ mod tests {
         let view = bus.view();
         assert_eq!(view.seq, 3);
         assert_eq!(view.store, store(3, None));
+    }
+
+    /// docs/cloud-phrases.md §5: `cloud-state` goes out in order, unthrottled,
+    /// with the `CloudState` as its whole payload: no `seq`, no number taken
+    /// from the stream, nothing recorded in the view.
+    #[test]
+    fn cloud_state_goes_out_outside_the_seq_stream() {
+        let runtime = Arc::new(Runtime::new(Arc::new(SystemClock)));
+        let (tx, rx) = mpsc::channel();
+        let bus = EventBus::start(
+            &runtime,
+            store(1, None),
+            Channel(tx),
+            Box::new(Recorder(Arc::default())),
+        );
+        let dir = std::env::temp_dir().join(format!("quicker-bus-{}", uuid::Uuid::new_v4()));
+        let mut first = crate::store::Store::load(dir.clone()).cloud_state();
+        first.status.syncing = true;
+        let mut second = first.clone();
+        second.status.syncing = false;
+        let sink = bus.cloud_sink();
+        sink.report(first.clone());
+        bus.store_sink().report(store(2, None));
+        sink.report(second.clone());
+        (bus.problem_sink())(ProblemKind::AutostartRepaired {}.into());
+        assert_eq!(
+            until_marker(&rx),
+            [
+                (CLOUD_STATE, serde_json::to_value(&first).unwrap()),
+                (
+                    STORE_STATE,
+                    json!({"seq": 1, "revision": 2, "safe_mode": null})
+                ),
+                (CLOUD_STATE, serde_json::to_value(&second).unwrap()),
+            ]
+        );
+        assert!(serde_json::to_value(&first).unwrap().get("seq").is_none());
+        // The marker took seq 2: cloud-state took none.
+        assert_eq!(bus.view().seq, 2);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Review A9: the baseline is in the view as soon as `baseline` returns

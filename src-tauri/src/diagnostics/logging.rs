@@ -53,6 +53,18 @@
 //! | `clipboard.slow` | warn | the clipboard was held open past its budget; `held_ms`, `budget_ms` |
 //! | `clipboard.unreadable` | warn | an enumerated clipboard format gave no data or unreadable memory; the backup is refused; format id |
 //! | `clipboard.worker_failed` | warn | the clipboard backup worker thread did not start; error |
+//! | `cloud.cache_discarded` | info | a team phrase cache of another server address than the one set (or recording none) was removed, at startup or after the address changed; it was never loaded |
+//! | `cloud.cache_remove_failed` | warn | that cache could not be removed; it stays unused (its recorded source differs) and `last_error` says so; error |
+//! | `cloud.cache_unreadable` | warn | the team phrase cache (`cloud-phrases.json`) could not be read at startup; code (`io`, `schema_newer`, `too_many_rules`) and a detail without file content |
+//! | `cloud.disabled_cleaned` | info | locally disabled team phrase ids that match no phrase of the table were dropped after a successful sync; `count` |
+//! | `cloud.disabled_cleanup_failed` | warn | those stale ids could not be dropped (prefs not written); error |
+//! | `cloud.loaded` | info | team phrases loaded from the cache at startup; `enabled`, cached `revision`, `rules`, `active` |
+//! | `cloud.prefs_unavailable` | warn | prefs.json could not be read at startup; team phrase sync stays off for this run; error |
+//! | `cloud.rules_disabled` | info | `set_cloud_rules_disabled`; `count` of ids, `disabled`, `total_disabled`; never phrase content |
+//! | `cloud.scheduler_start_failed` | error | the team phrase sync thread did not start; only manual syncs run |
+//! | `cloud.settings` | info | `set_cloud_settings`; `enabled`, `has_key`, `auto_sync_minutes`, whether the server address changed (`source_changed`); never the key |
+//! | `cloud.sync` | info | a team phrase sync ended: `trigger`, `outcome` (`updated`, `not_modified`, `discarded` when the settings changed during the download), `revision`, `rules`, `active`, `unreadable`, the diagnostic codes of invalid phrases (`invalid_codes`), `elapsed_ms`; never the key, triggers or phrase bodies |
+//! | `cloud.sync_failed` | warn | a team phrase sync failed and the cache and engine stay as they were: `trigger`, `code` (`not_configured`, `invalid_url`, `unauthorized`, `network`, `timeout`, `http_status`, `too_large`, `too_many_rules`, `invalid_format`, `schema_newer`, `io`), the technical detail (HTTP status, OS/TLS error without the URL, parser position), `elapsed_ms` |
 //! | `command.execute_failed` | warn / error | a manual run (`execute_action`) failed: fenced or refused by the send exclusion (`category` `stalled`, warn, with the `health` returned), or otherwise (`run_failed`, error, with its `trace_id`); the run's reason code, never the run's text; or a thread of the run did not start (`spawn_failed`, error: the `thread` name, the OS error's `kind` and `os_code`, the `trace_id`) |
 //! | `command.execute_refused` | warn | a manual run (`execute_action`) refused before it started because earlier runs' jobs have not ended (`reason` `jobs_exhausted`, the `limit`, the `health` read); no content |
 //! | `command.internal` | error | `CommandError::Internal`; `trace_id` and the original error, or for a blocking task that handed back no result (`CommandError::task_failed`) `task` (`panicked` / `cancelled` / `failed`) and the panic payload's class, length and fingerprint, never the join error's text (it quotes the payload) |
