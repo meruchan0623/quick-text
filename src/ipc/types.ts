@@ -56,7 +56,14 @@ export interface HealthSnapshot {
 }
 
 export type PauseReason =
-  'manual' | 'timed' | 'fullscreen' | 'recording' | 'safe_mode' | 'engine_down' | 'self_test';
+  | 'manual'
+  | 'timed'
+  | 'fullscreen'
+  | 'recording'
+  | 'safe_mode'
+  | 'engine_down'
+  | 'self_test'
+  | 'platform';
 
 export interface EngineState {
   listening: boolean;

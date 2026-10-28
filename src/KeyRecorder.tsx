@@ -103,8 +103,11 @@ export function KeyRecorder({
               e.preventDefault();
               e.stopPropagation();
               if (pressed === 'unsupported') {
+                // SendKeys has no Cmd/Win modifier; a sequence's 快捷键 step has Ctrl / Cmd.
                 setNotice(
-                  'Windows 键、媒体键和 F17 以上的功能键录不了；需要时请改用“按顺序执行多个操作”。',
+                  e.metaKey || e.key === 'Meta' || e.key === 'OS'
+                    ? 'Cmd / Win 组合键录不了；需要 Cmd+C 这类组合时，请改用“按顺序执行多个操作”，在其中加一步快捷键，选“Ctrl / Cmd”（Mac 上按 Cmd，Windows 上按 Ctrl）。'
+                    : 'Windows 键、媒体键和 F17 以上的功能键录不了；需要时请改用“按顺序执行多个操作”。',
                 );
                 return;
               }
@@ -171,10 +174,7 @@ export function KeyRecorder({
           </button>
         ))}
       </div>
-      <small>
-        这些按钮会加入一块标记，执行指令时再换成当时的文字、日期或时间。录制时按下的每个键都会照录，执行时也会照按；录错了点块上的
-        × 删除，或点“撤销上一步”。
-      </small>
+      <small>录错了点块上的 × 删除；插入的内容会在执行时换成当时的文字、日期或时间。</small>
     </div>
   );
 }

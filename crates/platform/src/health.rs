@@ -130,7 +130,12 @@ impl PauseReasons {
     pub const SAFE_MODE: Self = Self(1 << 4);
     pub const ENGINE_DOWN: Self = Self(1 << 5);
     pub const SELF_TEST: Self = Self(1 << 6);
-    const NAMES: [(Self, &'static str); 7] = [
+    /// The operating system blocks input for now (macOS Secure Input, an
+    /// input method that cannot be observed, an event tap being reinstalled).
+    /// The platform backend sets and clears it as the condition comes and
+    /// goes, so it never turns into, or clears, a manual pause.
+    pub const PLATFORM: Self = Self(1 << 7);
+    const NAMES: [(Self, &'static str); 8] = [
         (Self::MANUAL, "manual"),
         (Self::TIMED, "timed"),
         (Self::FULLSCREEN, "fullscreen"),
@@ -138,6 +143,7 @@ impl PauseReasons {
         (Self::SAFE_MODE, "safe_mode"),
         (Self::ENGINE_DOWN, "engine_down"),
         (Self::SELF_TEST, "self_test"),
+        (Self::PLATFORM, "platform"),
     ];
 
     pub const fn empty() -> Self {
@@ -147,7 +153,7 @@ impl PauseReasons {
         self.0
     }
     pub const fn from_bits_truncate(bits: u32) -> Self {
-        Self(bits & 0x7f)
+        Self(bits & 0xff)
     }
     pub const fn is_empty(self) -> bool {
         self.0 == 0
@@ -169,7 +175,12 @@ impl PauseReasons {
     /// Reasons a user can see on the "paused" row of the Health mapping table
     /// (everything except ENGINE_DOWN and SELF_TEST).
     pub const USER_VISIBLE: Self = Self(
-        Self::MANUAL.0 | Self::TIMED.0 | Self::FULLSCREEN.0 | Self::RECORDING.0 | Self::SAFE_MODE.0,
+        Self::MANUAL.0
+            | Self::TIMED.0
+            | Self::FULLSCREEN.0
+            | Self::RECORDING.0
+            | Self::SAFE_MODE.0
+            | Self::PLATFORM.0,
     );
     pub fn names(self) -> Vec<&'static str> {
         Self::NAMES
@@ -296,7 +307,7 @@ impl StatusText {
     /// 1. Health Starting / Failed / Recovering (rows 1-3), whatever the
     ///    pause bits say.
     /// 2. Healthy/Degraded with any user-visible reason (MANUAL, TIMED,
-    ///    FULLSCREEN, RECORDING, SAFE_MODE) → Paused (row 4). This row is
+    ///    FULLSCREEN, RECORDING, SAFE_MODE, PLATFORM) → Paused (row 4). This row is
     ///    above every row an internal bit can map to, so a user-visible pause
     ///    is never hidden behind "starting" or "recovering".
     /// 3. Fallback for the case the table does not cover: Health already
@@ -404,10 +415,11 @@ mod tests {
             PauseReasons::FULLSCREEN,
             PauseReasons::RECORDING,
             PauseReasons::SAFE_MODE,
+            PauseReasons::PLATFORM,
             PauseReasons::ENGINE_DOWN,
             PauseReasons::SELF_TEST,
         ];
-        let user_visible = &all_bits[..5];
+        let user_visible = &all_bits[..6];
         let mut every_set = vec![none];
         every_set.extend(all_bits);
         every_set.push(PauseReasons::from_bits_truncate(u32::MAX));
@@ -509,6 +521,7 @@ mod tests {
             PauseReasons::FULLSCREEN,
             PauseReasons::RECORDING,
             PauseReasons::SAFE_MODE,
+            PauseReasons::PLATFORM,
         ]
         .iter()
         .any(|&bit| paused.contains(bit));
@@ -550,13 +563,13 @@ mod tests {
         *status
     }
 
-    /// All 5 Health states × all 2^7 pause-bit combinations × busy.
+    /// All 5 Health states × all 2^8 pause-bit combinations × busy.
     #[test]
     fn mapping_table_exhaustive() {
         use HealthState::*;
         let mut checked = 0;
         for health in [Starting, Healthy, Degraded, Recovering, Failed] {
-            for bits in 0..(1u32 << 7) {
+            for bits in 0..(1u32 << 8) {
                 let paused = PauseReasons::from_bits_truncate(bits);
                 assert_eq!(paused.bits(), bits);
                 for busy in [false, true] {
@@ -570,7 +583,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(checked, 5 * 128 * 2);
+        assert_eq!(checked, 5 * 256 * 2);
     }
 
     #[test]

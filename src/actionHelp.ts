@@ -61,14 +61,11 @@ export const actionGuides: Record<string, ActionGuide> & { none: ActionGuide } =
     purpose: '在当前窗口执行一个快捷键，例如复制或粘贴。',
     steps: [
       '点“录制快捷键”，再按一次需要的组合键。',
-      '检查录下的按键；也可以用“＋ 按键”和删除按钮手动调整。',
+      '录不了的组合可以展开“录不了？手动点选按键”，点键盘上的键来选；在“当前组合”里点 × 移除。',
       '保存并应用指令，在需要操作的窗口触发。',
     ],
     example: '录制 Ctrl+C：先在目标窗口选中文字，触发后复制选中内容。',
-    special: [
-      '录制时按 Esc 可取消，不会把 Esc 设成快捷键。',
-      '手动填写 $primary，Windows 会使用 Ctrl，Mac 会使用 Cmd。快捷键的效果由目标软件决定。',
-    ],
+    special: ['录制时按 Esc 可取消，不会把 Esc 设成快捷键。', '快捷键的效果由目标软件决定。'],
   },
   send_keys: {
     summary: '录下一段打字和按键，触发时照着做一遍',

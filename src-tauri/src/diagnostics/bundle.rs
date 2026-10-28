@@ -1342,7 +1342,8 @@ mod tests {
                 "legacy draft is never loaded"
             );
             assert_eq!(summarize(&dir).quarantined_files, 0, "BOM: {with_bom}");
-            for (name, loaded) in [("active", &store.active)] {
+            {
+                let (name, loaded) = ("active", &store.active);
                 let entry = &summary[name];
                 assert_eq!(entry["file"]["status"], "ok", "{name}, BOM: {with_bom}");
                 assert_eq!(
@@ -1391,7 +1392,8 @@ mod tests {
             fs::write(dir.join("draft.json"), &bytes).unwrap();
             let loader = read_stored_config(&bytes).unwrap_err().diagnostic();
             let summary = serde_json::to_value(summarize(&dir)).unwrap();
-            for name in ["active"] {
+            {
+                let name = "active";
                 let file = &summary[name]["file"];
                 assert_eq!(file["status"], "unparsable", "{name}, BOM: {with_bom}");
                 assert_eq!(file["category"], loader.code, "{name}, BOM: {with_bom}");
@@ -1460,7 +1462,8 @@ mod tests {
                 });
                 drop(built.guard);
                 let log = read_logs(&log_dir(&dir));
-                for name in ["active"] {
+                {
+                    let name = "active";
                     let at = format!("{name}, {category} {kind:?}, BOM: {with_bom}");
                     let file = &summary[name]["file"];
                     assert_eq!(file["status"], "unparsable", "{at}");

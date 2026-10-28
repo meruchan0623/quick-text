@@ -144,8 +144,10 @@ mod tests {
     use super::*;
     #[test]
     fn json_exports_import_with_unknown_fields_and_unreadable_rules() {
-        let mut config = Config::default();
-        config.enabled = false;
+        let mut config = Config {
+            enabled: false,
+            ..Config::default()
+        };
         config.globals.word_separators = "中文,\n".into();
         config
             .extra

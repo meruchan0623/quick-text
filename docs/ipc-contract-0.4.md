@@ -78,7 +78,7 @@ Rust 侧的共享类型在 `crates/platform/src/health.rs`，JSON 形状由其 s
 type Component = 'executor' | 'keyboard_hook' | 'mouse_hook' | 'raw_input' | 'supervisor'
                | 'focus_events' | 'clipboard' | 'protection';
 interface ComponentHealth { component: Component; state: HealthState; reason: ReasonCode | null; since_ms: number }
-type PauseReason = 'manual' | 'timed' | 'fullscreen' | 'recording' | 'safe_mode' | 'engine_down' | 'self_test';
+type PauseReason = 'manual' | 'timed' | 'fullscreen' | 'recording' | 'safe_mode' | 'engine_down' | 'self_test' | 'platform';
 type TriggerKind = 'immediate' | 'terminator' | 'manual';
 type Outcome = 'succeeded' | 'unknown' | 'failed' | 'skipped' | 'cancelled' | 'dropped_busy';
 interface StageTimings { queue_us: number | null; resolve_us: number | null; erase_us: number | null;
@@ -93,7 +93,7 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 
 `HistoryEntry.seq` 是执行历史自己的序号（`list_history(since_seq)` 用它），与事件的全局 `seq` 不是同一个计数器。
 
-`paused_reasons` 中只有 `manual`、`timed`、`fullscreen`、`recording`、`safe_mode` 是用户可见的暂停（Health 映射表的「已暂停」行）；`engine_down`、`self_test` 由 Health 行（故障、恢复中、正在启动）表达。显示文案按计划 §7.2 Health 映射表，Rust 侧的同一逻辑在 `StatusText::resolve`。
+`paused_reasons` 中只有 `manual`、`timed`、`fullscreen`、`recording`、`safe_mode`、`platform` 是用户可见的暂停（Health 映射表的「已暂停」行）；`engine_down`、`self_test` 由 Health 行（故障、恢复中、正在启动）表达。`platform`（macOS）：系统暂时阻止监听（安全输入开启、非 ABC/美式键盘布局或输入法、事件 tap 被系统停用后正在重装），由平台代码随条件出现与消失自动置位、清除，不是手动暂停，手动恢复不会清除它。显示文案按计划 §7.2 Health 映射表，Rust 侧的同一逻辑在 `StatusText::resolve`。
 
 ### `startup-problem` 的 kind（0.4）
 

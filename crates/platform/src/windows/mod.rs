@@ -41,6 +41,7 @@ mod session;
 mod trace_capture;
 pub use actions::{execute, preflight};
 pub use clipboard::clipboard_health;
+pub(crate) use clipboard::read_clipboard_text;
 pub use foreground::{cursor, foreground};
 pub use input::{engine_ready, input_status, native_ready};
 pub use input::{input_health, reattach};

@@ -485,17 +485,19 @@ pub fn platform_adapters(
 }
 
 /// macOS (experimental): no executor supervision ([`NullExecutor`]) and the
-/// keyboard hook healthy while `native_ready()` is Ok, `hook_missing`
-/// otherwise, so Health can reach Healthy and listening can resume.
-/// 待实测: `native_ready()` also fails for missing permissions, Secure Input
-/// and IME layouts; while it fails Health stays Starting or goes
+/// keyboard hook healthy while `hook_ready()` is Ok (permissions granted,
+/// event tap installed or being reinstalled), `hook_missing` otherwise, so
+/// Health can reach Healthy and listening can resume. Secure Input and IME
+/// layouts are not health failures: they hold detection through
+/// `PauseReasons::PLATFORM` and clear it themselves.
+/// 待实测: with permissions missing Health stays Starting or goes
 /// Recovering, and after the recovery attempts Failed (repair needed).
 #[cfg(target_os = "macos")]
 pub fn platform_adapters(
     started: &Result<(), String>,
 ) -> (Arc<dyn ExecutorControl>, Arc<dyn InputSources>) {
     let executor = executor_for(started, Some(Arc::new(NullExecutor)));
-    let inputs = ReadinessInputs::new(Box::new(crate::native_ready), ReasonCode::HookMissing);
+    let inputs = ReadinessInputs::new(Box::new(crate::hook_ready), ReasonCode::HookMissing);
     (executor, Arc::new(inputs))
 }
 
@@ -1378,7 +1380,7 @@ mod tests {
         assert_eq!(*reattached.lock(), [Component::RawInput]);
     }
 
-    /// macOS: the keyboard hook follows `native_ready`, so Health can
+    /// macOS: the keyboard hook follows `hook_ready`, so Health can
     /// reach Healthy; while it fails the hook is down with `hook_missing`.
     #[test]
     fn readiness_inputs_follow_the_probe() {

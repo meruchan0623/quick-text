@@ -581,7 +581,8 @@ impl Runtime {
     ///
     /// The src-tauri shell no longer writes the flag. The remaining writers
     /// are platform code paths that stop detection on their own (Windows
-    /// hook installation failure, the macOS event tap) and tests: a value
+    /// hook installation failure; macOS uses `PauseReasons::PLATFORM`
+    /// instead) and tests: a value
     /// that differs from what this runtime last wrote is adopted as MANUAL
     /// on/off, then the flag is re-derived. The compare-exchange retries if
     /// such a writer races the update. A write of the value the flag
@@ -1150,6 +1151,7 @@ mod tests {
             PauseReasons::RECORDING,
             PauseReasons::SAFE_MODE,
             PauseReasons::SELF_TEST,
+            PauseReasons::PLATFORM,
         ] {
             runtime.set_pause(reason, true);
             assert!(flag(), "{reason:?}");

@@ -27,6 +27,7 @@ import CaptureTemplate from './CaptureTemplate';
 import RuntimeStatus from './RuntimeStatus';
 import { useAsk } from './Ask';
 import { Modal } from './Modal';
+import { WindowFrame } from './WindowFrame';
 import { runtimeSync, useRuntime } from './ipc/events';
 import type { SafeModeReason } from './ipc/types';
 import { liveStatus } from './status';
@@ -47,6 +48,7 @@ import { effectiveTerminators, unsupportedTerminators } from './lib/terminators'
 import { fixedImeErasure } from './lib/capabilities';
 import { ruleEditDiagnostics } from './lib/numberFields';
 import { describeMatch } from './lib/describe';
+import { useTheme } from './theme';
 
 // `null` from describe() means the user cancelled: show nothing.
 const errorText = (e: unknown) => describe(e) ?? '';
@@ -172,6 +174,7 @@ export default function App() {
   const [state, setState] = useState<State | null>(null),
     [config, setConfig] = useState<Config>(emptyConfig),
     [tab, setTab] = useState('manage'),
+    [theme, setTheme] = useTheme(),
     [search, setSearch] = useState(''),
     [group, setGroup] = useState('全部'),
     [selected, setSelected] = useState<string[]>([]),
@@ -911,6 +914,16 @@ export default function App() {
           <span />
           开机时启动
         </label>
+        <button
+          type="button"
+          className={`theme-toggle ${theme}`}
+          onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+          title={theme === 'dark' ? '切换到白天模式' : '切换到暗黑模式'}
+          aria-label={theme === 'dark' ? '切换到白天模式' : '切换到暗黑模式'}
+        >
+          <span aria-hidden="true" className="theme-icon" />
+          {theme === 'dark' ? '暗黑' : '白天'}
+        </button>
       </header>
       <nav className="main-tabs">
         <button className={tab === 'manage' ? 'active' : ''} onClick={() => setTab('manage')}>
@@ -1437,14 +1450,14 @@ export default function App() {
         </span>
       </footer>
       {editing && (
-        <Modal title="编辑文本指令" className="overlay" onClose={() => void closeEditor()}>
-          <div className="editor">
-            <div className="modal-title">
-              <h2>{editingFound >= 0 ? '编辑文本指令' : '添加文本指令'}</h2>
-              <button aria-label="关闭编辑" onClick={() => void closeEditor()}>
-                ×
-              </button>
-            </div>
+        <Modal title="编辑文本指令" className="overlay windowed" onClose={() => void closeEditor()}>
+          <WindowFrame
+            className="editor"
+            storageKey="quicker-text.editor-window"
+            title={editingFound >= 0 ? '编辑文本指令' : '添加文本指令'}
+            closeLabel="关闭编辑"
+            onClose={() => void closeEditor()}
+          >
             <div className="edit-grid">
               <div className="trigger-panel">
                 {editingFieldErrors.length > 0 && (
@@ -1752,7 +1765,7 @@ export default function App() {
                 保存
               </button>
             </div>
-          </div>
+          </WindowFrame>
         </Modal>
       )}
       {dialog && (

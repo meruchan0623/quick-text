@@ -105,20 +105,15 @@ pub async fn execute_action(
             let target = quicker_platform::foreground();
             let generation = engine.generation.load(Ordering::SeqCst);
             let mut context = VariableContext {
-                clipboard: arboard::Clipboard::new()
-                    .ok()
-                    .and_then(|mut cb| cb.get_text().ok()),
+                clipboard: quicker_platform::clipboard_variable(action_uses_variable(
+                    &action,
+                    &compiled.config,
+                    "cliptext",
+                )),
                 ..Default::default()
             };
             checkpoint()?;
-            let needs_selection = serde_json::to_string(&action)
-                .unwrap_or_default()
-                .contains("{selection}")
-                || matches!(action, Action::Reusable { .. })
-                    && serde_json::to_string(&compiled.config)
-                        .unwrap_or_default()
-                        .contains("{selection}");
-            if needs_selection {
+            if action_uses_variable(&action, &compiled.config, "selection") {
                 context.selection = quicker_platform::capture_selection().ok();
             }
             checkpoint()?;
@@ -177,7 +172,7 @@ impl JobSlots {
     /// A slot, or `None` while `limit` jobs hold theirs.
     fn take(&'static self) -> Option<JobPermit> {
         self.live
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
                 (live < self.limit).then_some(live + 1)
             })
             .ok()
@@ -537,10 +532,11 @@ pub fn stop_recording(store: State<Managed>) -> Result<ActionPlan, CommandError>
         (s.engine.clone(), s.runtime.clone())
     };
     // Windows stops and takes the recording in one critical section, so no
-    // hook event lands between the two (M2).
-    #[cfg(windows)]
+    // hook event lands between the two (M2); macOS releases what is still
+    // held and reports a recording error before the take.
+    #[cfg(any(windows, target_os = "macos"))]
     let plan = quicker_platform::finish_and_take(&engine);
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     let plan = quicker_platform::stop_recording(&engine);
     sync_recording_reason(&runtime, &engine);
     plan.map_err(CommandError::internal)

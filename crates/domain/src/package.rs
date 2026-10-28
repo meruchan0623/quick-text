@@ -546,10 +546,10 @@ fn quicker_schema_diagnostic(original: &serde_json::Value) -> Diagnostic {
             invalid.push(name);
         }
     }
-    if !object
+    if object
         .get("ActionType")
         .and_then(serde_json::Value::as_i64)
-        .is_some_and(|n| i32::try_from(n).is_ok())
+        .is_none_or(|n| i32::try_from(n).is_err())
     {
         invalid.push("ActionType");
     }
@@ -568,7 +568,7 @@ fn quicker_schema_diagnostic(original: &serde_json::Value) -> Diagnostic {
     ] {
         if object
             .get(name)
-            .is_some_and(|v| !v.is_boolean() && !(name == "IsDirectInputTrigger" && v.is_null()))
+            .is_some_and(|v| !(v.is_boolean() || (name == "IsDirectInputTrigger" && v.is_null())))
         {
             invalid.push(name);
         }
@@ -583,7 +583,7 @@ fn quicker_schema_diagnostic(original: &serde_json::Value) -> Diagnostic {
     }
     if object
         .get("TriggerKey")
-        .is_some_and(|v| !v.is_null() && !v.as_i64().is_some_and(|n| i32::try_from(n).is_ok()))
+        .is_some_and(|v| !v.is_null() && v.as_i64().is_none_or(|n| i32::try_from(n).is_err()))
     {
         invalid.push("TriggerKey");
     }

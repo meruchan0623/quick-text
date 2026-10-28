@@ -293,6 +293,21 @@ const CODE_KEYS: Record<string, string> = {
 };
 
 /**
+ * The key name (parse_key in crates/domain/src/parser.rs) of the physical key `code`
+ * (`KeyboardEvent.code`), whatever the layout, Shift or Option make it type; null for a code
+ * without one. The shortcut recorder of 「快捷键」 names keys this way.
+ */
+export function keyNameFromCode(code: string): string | null {
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3);
+  if (/^Digit\d$/.test(code)) return `D${code.slice(5)}`;
+  if (/^Numpad\d$/.test(code)) return `NumPad${code.slice(6)}`;
+  const f = /^F(\d{1,2})$/.exec(code);
+  if (f) return Number(f[1]) >= 1 && Number(f[1]) <= 24 ? code : null;
+  if (code === 'NumpadEnter') return 'Enter';
+  return NAMED_EVENT_KEYS[code] ?? CODE_KEYS[code] ?? null;
+}
+
+/**
  * What a key press while recording stands for: a key block; `'text'` for a character the input
  * box types itself (the recorder takes the text it gets, so Shift and input methods work as
  * usual); `'unsupported'` for what SendKeys cannot press (the Windows key, media keys, F17 and

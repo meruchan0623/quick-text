@@ -143,6 +143,71 @@ const USAGE_MOUSE: u16 = 0x02;
 const USAGE_KEYBOARD: u16 = 0x06;
 static LAST_SOURCE: Mutex<&str> = Mutex::new("waiting_for_input");
 static LAST_PROCESS: Mutex<String> = Mutex::new(String::new());
+/// Diagnostics only: no keys, abbreviations or text are retained. Counters
+/// describe matcher decisions, not input-source health or delivered output.
+macro_rules! match_decisions {
+    ($($variant:ident => $code:literal),+ $(,)?) => {
+        #[derive(Clone, Copy)]
+        pub(super) enum MatchDecision { $($variant),+ }
+        const MATCH_DECISIONS: &[&str] = &[$($code),+];
+    };
+}
+// Keep the counter index and its public code in one declaration.
+match_decisions! {
+    Waiting => "waiting",
+    NoMatch => "no_match",
+    Candidate => "candidate",
+    Paused => "paused",
+    Busy => "busy",
+    CaptureBlocked => "capture_blocked",
+    Modifier => "modifier",
+    Reset => "reset",
+    Neutral => "neutral",
+    StaleInput => "stale_input",
+    ContextUnavailable => "context_unavailable",
+    TargetChanged => "target_changed",
+    TargetUnavailable => "target_unavailable",
+    OwnWindow => "own_window",
+    Protected => "protected",
+    CompilerUnavailable => "compiler_unavailable",
+    RevisionChanged => "revision_changed",
+    Disabled => "disabled",
+    Blacklisted => "blacklisted",
+}
+struct MatchDiagnostics {
+    last: AtomicUsize,
+    counts: [AtomicU64; MATCH_DECISIONS.len()],
+}
+impl MatchDiagnostics {
+    const fn new() -> Self {
+        Self {
+            last: AtomicUsize::new(MatchDecision::Waiting as usize),
+            counts: [const { AtomicU64::new(0) }; MATCH_DECISIONS.len()],
+        }
+    }
+    fn note(&self, decision: MatchDecision) {
+        let index = decision as usize;
+        if let Some(count) = self.counts.get(index) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        self.last.store(index, Ordering::Relaxed);
+    }
+    /// An approximate snapshot while input continues; no locks on the
+    /// capture or consumer thread, and no per-key log traffic.
+    fn status(&self) -> serde_json::Value {
+        let last = MATCH_DECISIONS
+            .get(self.last.load(Ordering::Relaxed))
+            .copied()
+            .unwrap_or("waiting");
+        let counts: serde_json::Map<String, serde_json::Value> = MATCH_DECISIONS
+            .iter()
+            .zip(&self.counts)
+            .map(|(reason, count)| ((*reason).into(), count.load(Ordering::Relaxed).into()))
+            .collect();
+        serde_json::json!({"last_decision":last, "counts":counts})
+    }
+}
+static MATCH_DIAGNOSTICS: MatchDiagnostics = MatchDiagnostics::new();
 thread_local! { static PROOF: std::cell::RefCell<Option<Proof>> = const {std::cell::RefCell::new(None)}; }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,33 +234,16 @@ impl Proof {
         }
     }
 }
-#[derive(Clone)]
-pub(super) enum Kind {
-    Text(String),
-    Backspace,
-    Neutral,
-    Reset,
-}
-/// The typed text is redacted (B-09).
-impl std::fmt::Debug for Kind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Text(text) => f
-                .debug_tuple("Text")
-                .field(&quicker_domain::Redacted(text))
-                .finish(),
-            Self::Backspace => f.write_str("Backspace"),
-            Self::Neutral => f.write_str("Neutral"),
-            Self::Reset => f.write_str("Reset"),
-        }
-    }
-}
+/// One key-down's edit to the typed-key buffer, shared with macOS
+/// (`quicker_domain::KeyEdit`).
+pub(super) use quicker_domain::KeyEdit as Kind;
 pub(super) struct Event {
     pub(super) kind: Kind,
     pub(super) stamp: Stamp,
     pub(super) generation: u64,
     pub(super) source: &'static str,
-    pub(super) captured_allowed: bool,
+    pub(super) captured_block: Option<MatchDecision>,
+    pub(super) modified: bool,
 }
 #[derive(Default)]
 pub(super) struct Buffer {
@@ -231,36 +279,21 @@ impl Buffer {
     }
 }
 /// Applies one key to a typed-key buffer. The matcher's buffer and the busy
-/// shadow (S-19) edit by the same rules.
+/// shadow (S-19) edit by the same rules, which macOS shares
+/// (`quicker_domain::apply_key_edit`).
 fn edit(text: &mut String, kind: &Kind) {
-    match kind {
-        Kind::Text(typed) => text.push_str(typed),
-        Kind::Backspace => {
-            text.pop();
-        }
-        Kind::Neutral => {}
-        Kind::Reset => text.clear(),
-    }
-    while text.chars().count() > 1024 {
-        let Some(first) = text.chars().next() else {
-            break;
-        };
-        text.drain(..first.len_utf8());
-    }
+    quicker_domain::apply_key_edit(text, kind);
 }
 fn kind(vkey: u16, text: Option<String>, modified: bool) -> Kind {
-    match vkey {
+    let class = match vkey {
         VK_SHIFT | VK_LSHIFT | VK_RSHIFT | VK_CAPITAL | VK_CONTROL | VK_LCONTROL | VK_RCONTROL
-        | VK_MENU | VK_LMENU | VK_RMENU => Kind::Neutral,
-        VK_BACK if !modified => Kind::Backspace,
+        | VK_MENU | VK_LMENU | VK_RMENU => KeyClass::Modifier,
+        VK_BACK => KeyClass::Backspace,
         VK_TAB | VK_RETURN | VK_ESCAPE | VK_DELETE | VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN
-        | VK_HOME | VK_END | VK_PRIOR | VK_NEXT => Kind::Reset,
-        _ if modified => Kind::Reset,
-        _ => text
-            .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
-            .map(Kind::Text)
-            .unwrap_or(Kind::Reset),
-    }
+        | VK_HOME | VK_END | VK_PRIOR | VK_NEXT => KeyClass::Navigation,
+        _ => KeyClass::Other,
+    };
+    quicker_domain::key_edit(class, text, modified)
 }
 /// Current transaction stamp: the probe's input context plus the compiled
 /// configuration revision. `None` when either cannot be read.
@@ -454,11 +487,26 @@ pub(super) fn lane() -> &'static Lane<RawRecord> {
 /// compiler or a missing input context fails closed (the key is dropped and
 /// its generation gap clears the buffer).
 pub(super) fn event_from(shared: &Shared, record: &RawRecord) -> Option<Event> {
+    event_from_with_diagnostics(shared, record, &MATCH_DIAGNOSTICS)
+}
+fn event_from_with_diagnostics(
+    shared: &Shared,
+    record: &RawRecord,
+    diagnostics: &MatchDiagnostics,
+) -> Option<Event> {
     if !record.down {
         return None;
     }
-    let context = record.context?;
-    let revision = shared.compiled.lock().ok()?.config.revision;
+    let Some(context) = record.context else {
+        diagnostics.note(MatchDecision::ContextUnavailable);
+        return None;
+    };
+    let Ok(compiler) = shared.compiled.lock() else {
+        diagnostics.note(MatchDecision::CompilerUnavailable);
+        return None;
+    };
+    let revision = compiler.config.revision;
+    drop(compiler);
     let text = record
         .text
         .get(..record.len)
@@ -468,7 +516,14 @@ pub(super) fn event_from(shared: &Shared, record: &RawRecord) -> Option<Event> {
         stamp: stamp_of(context, revision),
         generation: record.generation,
         source: "rawinput_hardware",
-        captured_allowed: !record.paused && !record.busy,
+        captured_block: if record.paused {
+            Some(MatchDecision::Paused)
+        } else if record.busy {
+            Some(MatchDecision::Busy)
+        } else {
+            None
+        },
+        modified: record.modified,
     })
 }
 /// Consumer side, acceptance mode only: the matcher event for an injected
@@ -490,7 +545,8 @@ pub(super) fn acceptance_event(shared: &Shared, key: &KeyRecord) -> Option<Event
         stamp: stamp_of(acceptance.context, revision),
         generation: key.generation,
         source: "acceptance_sendinput_hook",
-        captured_allowed: acceptance.allowed,
+        captured_block: (!acceptance.allowed).then_some(MatchDecision::CaptureBlocked),
+        modified: acceptance.modified,
     })
 }
 /// Records which source fed the matcher last (diagnostics only).
@@ -516,17 +572,7 @@ fn match_buffer(
     previous_terminator: Option<(&str, &'static str)>,
     foreground_context: &ForegroundContext,
 ) -> Option<(MatchResult, Option<&'static str>)> {
-    previous_terminator
-        .and_then(|(input, key)| {
-            compiler
-                .match_input(input, Some(key), foreground_context)
-                .map(|matched| (matched, Some(key)))
-        })
-        .or_else(|| {
-            compiler
-                .match_input(text, None, foreground_context)
-                .map(|matched| (matched, None))
-        })
+    quicker_domain::match_typed(compiler, text, previous_terminator, foreground_context)
 }
 fn validate_stamp(original: &Stamp, current: Option<&Stamp>) -> Result<(), String> {
     if current != Some(original) {
@@ -557,11 +603,7 @@ extern "C" fn callback(context: *mut c_void, event: InputEvent) {
 /// reach the target: erase shortcut plus terminator. RawInput never claims
 /// to swallow Enter or Tab.
 fn terminator_of(kind: &Kind) -> Option<&'static str> {
-    match kind {
-        Kind::Text(value) if value == " " => Some("space"),
-        Kind::Text(value) if value == ";" => Some("semicolon"),
-        _ => None,
-    }
+    quicker_domain::typed_terminator(kind)
 }
 /// Whether a match typed under `stamp` may count in `target`: the focus is
 /// still the one the key was typed into, the process is known and not ours,
@@ -787,9 +829,25 @@ pub(super) fn detect_candidate(
     event: Event,
     probe: &impl ForegroundProbe,
 ) -> Option<Candidate> {
-    let allowed = event.captured_allowed
-        && !shared.paused.load(Ordering::SeqCst)
-        && !shared.busy.load(Ordering::SeqCst);
+    detect_candidate_with_diagnostics(shared, buffer, event, probe, &MATCH_DIAGNOSTICS)
+}
+fn detect_candidate_with_diagnostics(
+    shared: &Shared,
+    buffer: &mut Buffer,
+    event: Event,
+    probe: &impl ForegroundProbe,
+    diagnostics: &MatchDiagnostics,
+) -> Option<Candidate> {
+    let blocked = event.captured_block.or_else(|| {
+        if shared.paused.load(Ordering::SeqCst) {
+            Some(MatchDecision::Paused)
+        } else if shared.busy.load(Ordering::SeqCst) {
+            Some(MatchDecision::Busy)
+        } else {
+            None
+        }
+    });
+    let allowed = blocked.is_none();
     let terminator = terminator_of(&event.kind);
     // no-regression #3: a terminator match needs the contiguous, same-stamp prefix.
     let previous = if terminator.is_some()
@@ -801,22 +859,60 @@ pub(super) fn detect_candidate(
         None
     };
     buffer.push(&event, allowed);
-    if !allowed
-        || !matches!(event.kind, Kind::Text(_))
-        || event.generation != shared.generation.load(Ordering::SeqCst)
-    {
+    if let Some(reason) = blocked {
+        diagnostics.note(reason);
+        return None;
+    }
+    if !matches!(event.kind, Kind::Text(_)) {
+        diagnostics.note(match event.kind {
+            Kind::Reset if event.modified => MatchDecision::Modifier,
+            Kind::Reset | Kind::Backspace => MatchDecision::Reset,
+            _ => MatchDecision::Neutral,
+        });
+        return None;
+    }
+    if event.generation != shared.generation.load(Ordering::SeqCst) {
+        diagnostics.note(MatchDecision::StaleInput);
         return None;
     }
     let target = probe.foreground();
     *LAST_PROCESS.lock().unwrap_or_else(PoisonError::into_inner) = target.process.clone();
-    if !eligible(&target, &event.stamp, probe) {
+    let target_block = if target.id != event.stamp.focus {
+        Some(MatchDecision::TargetChanged)
+    } else if target.process.is_empty() {
+        Some(MatchDecision::TargetUnavailable)
+    } else if target.process.eq_ignore_ascii_case("quicktext.exe") {
+        Some(MatchDecision::OwnWindow)
+    } else if probe.protection().is_some() {
+        Some(MatchDecision::Protected)
+    } else {
+        None
+    };
+    if let Some(reason) = target_block {
+        diagnostics.note(reason);
         return None;
     }
     let Ok(compiler) = shared.compiled.lock() else {
+        diagnostics.note(MatchDecision::CompilerUnavailable);
         return None;
     };
     if compiler.config.revision != event.stamp.revision {
         buffer.text.clear();
+        diagnostics.note(MatchDecision::RevisionChanged);
+        return None;
+    }
+    if !compiler.config.enabled {
+        diagnostics.note(MatchDecision::Disabled);
+        return None;
+    }
+    if compiler
+        .config
+        .globals
+        .blacklist
+        .iter()
+        .any(|process| process.eq_ignore_ascii_case(&target.process))
+    {
+        diagnostics.note(MatchDecision::Blacklisted);
         return None;
     }
     let foreground_context = ForegroundContext {
@@ -824,12 +920,15 @@ pub(super) fn detect_candidate(
         process: target.process.clone(),
         bundle_id: String::new(),
     };
-    let (matched, terminator) = match_buffer(
+    let Some((matched, terminator)) = match_buffer(
         &compiler,
         &buffer.text,
         previous.as_deref().zip(terminator),
         &foreground_context,
-    )?;
+    ) else {
+        diagnostics.note(MatchDecision::NoMatch);
+        return None;
+    };
     let risky = ime_active() || (event.stamp.layout & 0x3ff) == 4;
     let rule = compiler
         .config
@@ -843,6 +942,7 @@ pub(super) fn detect_candidate(
         at: Instant::now(),
         ime_unverified: risky,
     };
+    diagnostics.note(MatchDecision::Candidate);
     Some(Candidate {
         rule,
         matched,
@@ -1108,6 +1208,7 @@ pub(super) fn status() -> serde_json::Value {
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
     serde_json::json!({"backend":"espanso_win32_v2.4.1", "source":source,
+        "matcher":MATCH_DIAGNOSTICS.status(),
         "ready":READY.load(Ordering::SeqCst), "available":READY.load(Ordering::SeqCst),
         "process":process, "reason":protection_block().unwrap_or_else(||"RawInput capture; delivery and IME composition are unverified".into()),
         "terminators":{"space":"post-input erasure; final IME consumption unknown","semicolon":"post-input erasure", "enter":"disabled","tab":"disabled"},
@@ -1123,6 +1224,7 @@ pub(super) fn status() -> serde_json::Value {
 )]
 mod tests {
     use super::*;
+    use crate::mock::MockForeground;
     fn original() -> Stamp {
         Stamp {
             focus: 1,
@@ -1138,8 +1240,149 @@ mod tests {
             stamp: original(),
             generation,
             source: "fixture",
-            captured_allowed: true,
+            captured_block: None,
+            modified: false,
         }
+    }
+    fn diagnostic_engine() -> (Arc<Shared>, MockForeground) {
+        let shared = Shared::new();
+        shared.paused.store(false, Ordering::SeqCst);
+        let config = Config {
+            revision: original().revision,
+            rules: vec![Rule {
+                id: "diagnostic-fixture".into(),
+                match_spec: MatchSpec {
+                    kind: MatchKind::Literal,
+                    value: "ok".into(),
+                },
+                trigger_mode: TriggerMode::Immediate,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        *shared.compiled.lock().unwrap() = compile_config(&config).unwrap();
+        let probe = MockForeground::new(MockForeground::window(original().focus, "notepad.exe"));
+        (shared, probe)
+    }
+    #[test]
+    fn matcher_diagnostics_count_normal_misses_and_candidates_without_input_text() {
+        let (shared, probe) = diagnostic_engine();
+        let diagnostics = MatchDiagnostics::new();
+        assert_eq!(diagnostics.status()["last_decision"], "waiting");
+        let mut buffer = Buffer::default();
+        for (text, generation) in [("o", 1), ("k", 2)] {
+            shared.generation.store(generation, Ordering::SeqCst);
+            let candidate = detect_candidate_with_diagnostics(
+                &shared,
+                &mut buffer,
+                event(text, generation),
+                &probe,
+                &diagnostics,
+            );
+            assert_eq!(candidate.is_some(), generation == 2);
+        }
+        let status = diagnostics.status();
+        assert_eq!(status["last_decision"], "candidate");
+        assert_eq!(status["counts"]["no_match"], 1);
+        assert_eq!(status["counts"]["candidate"], 1);
+        assert_eq!(status["counts"]["paused"], 0);
+        let serialized = status.to_string();
+        assert!(!serialized.contains("diagnostic-fixture"));
+        assert!(!serialized.contains("notepad.exe"));
+        assert!(!serialized.contains("\"ok\""));
+    }
+    #[test]
+    fn matcher_diagnostics_preserve_the_specific_block_and_count_it_once() {
+        for reason in [
+            "paused",
+            "busy",
+            "modifier",
+            "reset",
+            "neutral",
+            "stale_input",
+            "target_changed",
+            "target_unavailable",
+            "own_window",
+            "protected",
+            "revision_changed",
+            "disabled",
+            "blacklisted",
+        ] {
+            let (shared, probe) = diagnostic_engine();
+            let diagnostics = MatchDiagnostics::new();
+            let mut input = event("private body", 1);
+            shared.generation.store(1, Ordering::SeqCst);
+            match reason {
+                "paused" => input.captured_block = Some(MatchDecision::Paused),
+                "busy" => input.captured_block = Some(MatchDecision::Busy),
+                "modifier" => {
+                    input.kind = Kind::Reset;
+                    input.modified = true;
+                }
+                "reset" => input.kind = Kind::Reset,
+                "neutral" => input.kind = Kind::Neutral,
+                "stale_input" => {
+                    shared.generation.store(2, Ordering::SeqCst);
+                }
+                "target_changed" => probe.set_foreground(MockForeground::window(99, "notepad.exe")),
+                "target_unavailable" => probe.set_foreground(MockForeground::window(1, "")),
+                "own_window" => probe.set_foreground(MockForeground::window(1, "Quicktext.exe")),
+                "protected" => probe.set_protection(Some("secret control")),
+                "revision_changed" => input.stamp.revision += 1,
+                "disabled" => shared.compiled.lock().unwrap().config.enabled = false,
+                "blacklisted" => shared
+                    .compiled
+                    .lock()
+                    .unwrap()
+                    .config
+                    .globals
+                    .blacklist
+                    .push("NotePad.Exe".into()),
+                _ => unreachable!(),
+            }
+            assert!(detect_candidate_with_diagnostics(
+                &shared,
+                &mut Buffer::default(),
+                input,
+                &probe,
+                &diagnostics,
+            )
+            .is_none());
+            let status = diagnostics.status();
+            assert_eq!(status["last_decision"], reason);
+            assert_eq!(status["counts"][reason], 1);
+            assert_eq!(
+                status["counts"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .map(|v| v.as_u64().unwrap())
+                    .sum::<u64>(),
+                1
+            );
+            assert!(!status.to_string().contains("private body"));
+            assert!(!status.to_string().contains("secret control"));
+        }
+    }
+    #[test]
+    fn missing_context_is_counted_but_key_releases_are_not_match_decisions() {
+        let (shared, probe) = diagnostic_engine();
+        let diagnostics = MatchDiagnostics::new();
+        let keys = KeyBits::new();
+        probe.set_input_context(None);
+        let record = raw_record(
+            &shared,
+            &keys,
+            &InputEvent::key_down(0x41, "private", true),
+            &probe,
+        )
+        .unwrap();
+        assert!(event_from_with_diagnostics(&shared, &record, &diagnostics).is_none());
+        assert_eq!(diagnostics.status()["last_decision"], "context_unavailable");
+        assert_eq!(diagnostics.status()["counts"]["context_unavailable"], 1);
+        let release = raw_record(&shared, &keys, &InputEvent::key_up(0x41, true), &probe).unwrap();
+        assert!(event_from_with_diagnostics(&shared, &release, &diagnostics).is_none());
+        assert_eq!(diagnostics.status()["counts"]["context_unavailable"], 1);
     }
     #[test]
     fn production_buffer_preserves_case_digits_punctuation_and_shift() {

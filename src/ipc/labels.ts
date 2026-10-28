@@ -129,6 +129,7 @@ export const pauseNames: Readonly<Record<string, string>> = {
   safe_mode: '安全模式',
   engine_down: '输入组件失效',
   self_test: '正在自检',
+  platform: '系统限制（安全输入/输入法）',
 };
 
 export const outcomeNames: Readonly<Record<string, string>> = {

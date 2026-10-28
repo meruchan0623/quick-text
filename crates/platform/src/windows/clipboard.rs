@@ -708,6 +708,40 @@ fn with_clipboard_open<R>(window: HWND, f: impl FnOnce() -> R) -> Option<R> {
     let _close = Close;
     Some(f())
 }
+/// The clipboard's text for `{cliptext}`: CF_UNICODETEXT (the system
+/// synthesizes it from CF_TEXT/CF_OEMTEXT), with the lease's bounded
+/// `OpenClipboard` retry (B-08) instead of arboard's ~25 ms, which a
+/// clipboard manager reading a fresh copy easily outlasts.
+pub fn read_clipboard_text() -> Result<String, crate::ClipboardTextError> {
+    use crate::ClipboardTextError as E;
+    for attempt in 0..OPEN_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(OPEN_RETRY_INTERVAL);
+        }
+        let Some(read) =
+            WinReader.locked(|| WinReader.read_format(CF_UNICODETEXT, MAX_FORMAT_BYTES))
+        else {
+            continue;
+        };
+        return match read {
+            FormatRead::Data(bytes) => {
+                let units: Vec<u16> = bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| u16::from_le_bytes(*pair))
+                    .take_while(|unit| *unit != 0)
+                    .collect();
+                String::from_utf16(&units).map_err(|_| E::Unreadable)
+            }
+            FormatRead::Missing => Err(E::NoText),
+            FormatRead::TooLarge => Err(E::TooLarge),
+            FormatRead::Unreadable => Err(E::Unreadable),
+        };
+    }
+    Err(E::Busy)
+}
+
 /// Read-only clipboard access for the backup worker thread: it opens the
 /// clipboard with no owner window (`OpenClipboard(NULL)`) and has no write
 /// methods.

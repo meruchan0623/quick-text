@@ -162,6 +162,14 @@ impl Store {
             self.set_safe_mode(None);
         }
         self.report_store_state();
+        tracing::info!(
+            event = "store.published",
+            revision = self.active.revision,
+            enabled = self.active.enabled,
+            rule_count = self.active.rules.len(),
+            enabled_rule_count = self.active.rules.iter().filter(|rule| rule.enabled).count(),
+            "configuration published to disk and engine"
+        );
         Ok(())
     }
     /// One above the active revision and every number a file of this program
@@ -239,6 +247,201 @@ fn occupied_number(name: &str) -> Option<u64> {
 mod tests {
     use super::super::{atomic::atomic_json, test_support::*};
     use super::*;
+    fn assert_runtime_match(
+        store: &Store,
+        id: &str,
+        trigger: &str,
+        terminator: Option<&str>,
+        mode: TriggerMode,
+        body: &str,
+    ) {
+        let compiler = store.engine.compiled.lock().unwrap();
+        assert_eq!(compiler.config, store.active);
+        assert!(compiler.config.enabled);
+        let context = ForegroundContext {
+            process: "notepad.exe".into(),
+            ..Default::default()
+        };
+        let matched = compiler.match_input(trigger, terminator, &context).unwrap();
+        assert_eq!(matched.rule_id, id);
+        assert_eq!(matched.revision, store.active.revision);
+        let rule = compiler.rule(id).unwrap();
+        assert!(rule.enabled);
+        assert_eq!(rule.trigger_mode, mode);
+        let plan = compiler
+            .expand_reusable(&rule.action, &VariableContext::default())
+            .unwrap();
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(
+            plan.steps[0].operation,
+            Operation::Text {
+                text: body.into(),
+                method: OutputMethod::Keys
+            }
+        );
+    }
+
+    #[test]
+    fn imported_and_manual_rules_keep_matching_after_edits_failed_save_and_reload() {
+        let dir = std::env::temp_dir().join(format!("quicktext-matching-{}", uuid::Uuid::new_v4()));
+        let mut store = Store::load(dir.clone());
+        let text_rule = |id: &str, trigger: &str, body: &str, mode| Rule {
+            id: id.into(),
+            match_spec: MatchSpec {
+                kind: MatchKind::Literal,
+                value: trigger.into(),
+            },
+            trigger_mode: mode,
+            action: Action::Text {
+                method: OutputMethod::Keys,
+                source: ContentSource::inline(body),
+            },
+            ..Default::default()
+        };
+        // Take the same deserialize + preview/confirm path as a JSON import.
+        let imported = Config {
+            rules: vec![text_rule(
+                "imported",
+                "thx",
+                "Thanks",
+                TriggerMode::Immediate,
+            )],
+            ..Default::default()
+        };
+        let imported: Config =
+            serde_json::from_slice(&serde_json::to_vec(&imported).unwrap()).unwrap();
+        let token = store.preview_import(imported.clone(), vec![]);
+        store.save_config(imported, Some(token)).unwrap();
+        listening(&store);
+        assert_runtime_match(
+            &store,
+            "imported",
+            "thx",
+            None,
+            TriggerMode::Immediate,
+            "Thanks",
+        );
+
+        let mut manual = store.active.clone();
+        manual.rules.push(text_rule(
+            "manual",
+            "time",
+            "Time body",
+            TriggerMode::Terminator,
+        ));
+        manual.rules.push(Rule {
+            enabled: false,
+            ..text_rule("disabled", "off", "Disabled body", TriggerMode::Immediate)
+        });
+        store.save_config(manual, None).unwrap();
+        assert_runtime_match(
+            &store,
+            "imported",
+            "thx",
+            None,
+            TriggerMode::Immediate,
+            "Thanks",
+        );
+        assert_runtime_match(
+            &store,
+            "manual",
+            "time",
+            Some("space"),
+            TriggerMode::Terminator,
+            "Time body",
+        );
+        let context = ForegroundContext::default();
+        assert!(store
+            .engine
+            .compiled
+            .lock()
+            .unwrap()
+            .match_input("time", None, &context)
+            .is_none());
+        assert!(store
+            .engine
+            .compiled
+            .lock()
+            .unwrap()
+            .match_input("off", None, &context)
+            .is_none());
+
+        let mut edit = store.active.clone();
+        edit.rules[1].match_spec.value = "whoami".into();
+        edit.rules[1].trigger_mode = TriggerMode::Immediate;
+        edit.rules[1].action = Action::Text {
+            method: OutputMethod::Keys,
+            source: ContentSource::inline("Edited body"),
+        };
+        store.save_config(edit, None).unwrap();
+        assert!(store
+            .engine
+            .compiled
+            .lock()
+            .unwrap()
+            .match_input("time", Some("space"), &context)
+            .is_none());
+        assert_runtime_match(
+            &store,
+            "manual",
+            "whoami",
+            None,
+            TriggerMode::Immediate,
+            "Edited body",
+        );
+        assert!(store.runtime.engine_state().listening);
+
+        let committed = store.active.clone();
+        let disk = fs::read(dir.join("active.json")).unwrap();
+        fs::create_dir(dir.join("active.json.tmp")).unwrap();
+        let mut rejected = committed.clone();
+        rejected.rules[1].enabled = false;
+        assert!(store.save_config(rejected, None).is_err());
+        assert_eq!(store.active, committed);
+        assert_eq!(fs::read(dir.join("active.json")).unwrap(), disk);
+        assert!(store.runtime.engine_state().listening);
+        assert_runtime_match(
+            &store,
+            "manual",
+            "whoami",
+            None,
+            TriggerMode::Immediate,
+            "Edited body",
+        );
+        fs::remove_dir(dir.join("active.json.tmp")).unwrap();
+        store.meta.clear_run_marker();
+        drop(store);
+
+        let reloaded = Store::load(dir.clone());
+        assert_eq!(reloaded.active, committed);
+        assert_runtime_match(
+            &reloaded,
+            "imported",
+            "thx",
+            None,
+            TriggerMode::Immediate,
+            "Thanks",
+        );
+        assert_runtime_match(
+            &reloaded,
+            "manual",
+            "whoami",
+            None,
+            TriggerMode::Immediate,
+            "Edited body",
+        );
+        assert!(reloaded
+            .engine
+            .compiled
+            .lock()
+            .unwrap()
+            .rule("disabled")
+            .is_none());
+        reloaded.meta.clear_run_marker();
+        drop(reloaded);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn save_config_updates_engine_immediately_and_rejects_stale_revision() {
         let dir = std::env::temp_dir().join(format!("quicktext-direct-{}", uuid::Uuid::new_v4()));
