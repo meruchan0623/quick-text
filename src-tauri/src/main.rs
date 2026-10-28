@@ -170,6 +170,12 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("Quicktext startup failed")
         .run(|app, event| {
+            // macOS: clicking the Dock icon (or opening the app again) while the
+            // window is hidden in the menu bar brings it back.
+            #[cfg(target_os = "macos")]
+            if matches!(event, tauri::RunEvent::Reopen { .. }) {
+                tray::show_main(app);
+            }
             let exiting = matches!(event, tauri::RunEvent::Exit);
             // Clears the run marker (safe mode, B-04) before the exit is logged,
             // so the final flush also covers anything it logs.

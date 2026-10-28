@@ -108,6 +108,7 @@ describe('labels', () => {
       'safe_mode',
       'engine_down',
       'self_test',
+      'platform',
     ]);
     expectNamed(outcomeNames, [
       'succeeded',

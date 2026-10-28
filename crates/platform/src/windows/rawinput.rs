@@ -234,27 +234,9 @@ impl Proof {
         }
     }
 }
-#[derive(Clone)]
-pub(super) enum Kind {
-    Text(String),
-    Backspace,
-    Neutral,
-    Reset,
-}
-/// The typed text is redacted (B-09).
-impl std::fmt::Debug for Kind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Text(text) => f
-                .debug_tuple("Text")
-                .field(&quicker_domain::Redacted(text))
-                .finish(),
-            Self::Backspace => f.write_str("Backspace"),
-            Self::Neutral => f.write_str("Neutral"),
-            Self::Reset => f.write_str("Reset"),
-        }
-    }
-}
+/// One key-down's edit to the typed-key buffer, shared with macOS
+/// (`quicker_domain::KeyEdit`).
+pub(super) use quicker_domain::KeyEdit as Kind;
 pub(super) struct Event {
     pub(super) kind: Kind,
     pub(super) stamp: Stamp,
@@ -297,36 +279,21 @@ impl Buffer {
     }
 }
 /// Applies one key to a typed-key buffer. The matcher's buffer and the busy
-/// shadow (S-19) edit by the same rules.
+/// shadow (S-19) edit by the same rules, which macOS shares
+/// (`quicker_domain::apply_key_edit`).
 fn edit(text: &mut String, kind: &Kind) {
-    match kind {
-        Kind::Text(typed) => text.push_str(typed),
-        Kind::Backspace => {
-            text.pop();
-        }
-        Kind::Neutral => {}
-        Kind::Reset => text.clear(),
-    }
-    while text.chars().count() > 1024 {
-        let Some(first) = text.chars().next() else {
-            break;
-        };
-        text.drain(..first.len_utf8());
-    }
+    quicker_domain::apply_key_edit(text, kind);
 }
 fn kind(vkey: u16, text: Option<String>, modified: bool) -> Kind {
-    match vkey {
+    let class = match vkey {
         VK_SHIFT | VK_LSHIFT | VK_RSHIFT | VK_CAPITAL | VK_CONTROL | VK_LCONTROL | VK_RCONTROL
-        | VK_MENU | VK_LMENU | VK_RMENU => Kind::Neutral,
-        VK_BACK if !modified => Kind::Backspace,
+        | VK_MENU | VK_LMENU | VK_RMENU => KeyClass::Modifier,
+        VK_BACK => KeyClass::Backspace,
         VK_TAB | VK_RETURN | VK_ESCAPE | VK_DELETE | VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN
-        | VK_HOME | VK_END | VK_PRIOR | VK_NEXT => Kind::Reset,
-        _ if modified => Kind::Reset,
-        _ => text
-            .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
-            .map(Kind::Text)
-            .unwrap_or(Kind::Reset),
-    }
+        | VK_HOME | VK_END | VK_PRIOR | VK_NEXT => KeyClass::Navigation,
+        _ => KeyClass::Other,
+    };
+    quicker_domain::key_edit(class, text, modified)
 }
 /// Current transaction stamp: the probe's input context plus the compiled
 /// configuration revision. `None` when either cannot be read.
@@ -605,17 +572,7 @@ fn match_buffer(
     previous_terminator: Option<(&str, &'static str)>,
     foreground_context: &ForegroundContext,
 ) -> Option<(MatchResult, Option<&'static str>)> {
-    previous_terminator
-        .and_then(|(input, key)| {
-            compiler
-                .match_input(input, Some(key), foreground_context)
-                .map(|matched| (matched, Some(key)))
-        })
-        .or_else(|| {
-            compiler
-                .match_input(text, None, foreground_context)
-                .map(|matched| (matched, None))
-        })
+    quicker_domain::match_typed(compiler, text, previous_terminator, foreground_context)
 }
 fn validate_stamp(original: &Stamp, current: Option<&Stamp>) -> Result<(), String> {
     if current != Some(original) {
@@ -646,11 +603,7 @@ extern "C" fn callback(context: *mut c_void, event: InputEvent) {
 /// reach the target: erase shortcut plus terminator. RawInput never claims
 /// to swallow Enter or Tab.
 fn terminator_of(kind: &Kind) -> Option<&'static str> {
-    match kind {
-        Kind::Text(value) if value == " " => Some("space"),
-        Kind::Text(value) if value == ";" => Some("semicolon"),
-        _ => None,
-    }
+    quicker_domain::typed_terminator(kind)
 }
 /// Whether a match typed under `stamp` may count in `target`: the focus is
 /// still the one the key was typed into, the process is known and not ours,

@@ -113,6 +113,8 @@ mod windows;
 pub use windows::*;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(test, target_os = "macos"))]
+mod macos_rules;
 #[cfg(target_os = "macos")]
 pub use macos::*;
 #[cfg(not(any(windows, target_os = "macos")))]

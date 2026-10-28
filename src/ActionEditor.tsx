@@ -25,7 +25,7 @@ import { ActionTypePicker } from './ActionTypePicker';
 import { LinesInput } from './LinesInput';
 import { NumberField } from './NumberField';
 import { describeExecution } from './lib/describe';
-import { parseRecording } from './lib/sendKeys';
+import { keyNameFromCode, parseRecording } from './lib/sendKeys';
 import { KeyRecorder } from './KeyRecorder';
 type Props = {
   platform?: string | undefined;
@@ -355,8 +355,10 @@ function Shortcut({
                 }
                 result.push(key(platform === 'macos' ? 'Cmd' : 'Win'));
               }
-              let name = e.key.length === 1 ? e.key.toUpperCase() : e.key;
-              name =
+              // The physical key (e.code): with Shift or Option held, e.key is the character
+              // typed (`!`, `å`), not the key. An event without a known code uses e.key.
+              const typed = e.key.length === 1 ? e.key.toUpperCase() : e.key;
+              const fallback =
                 (
                   {
                     ArrowLeft: 'Left',
@@ -364,10 +366,11 @@ function Shortcut({
                     ArrowUp: 'Up',
                     ArrowDown: 'Down',
                     ' ': 'Space',
-                  } as Data
-                )[name] || name;
-              if (/^\d$/.test(name)) name = 'D' + name;
-              result.push(key(name));
+                  } as Record<string, string>
+                )[typed] ?? typed;
+              result.push(
+                key(keyNameFromCode(e.code) ?? (/^\d$/.test(fallback) ? `D${fallback}` : fallback)),
+              );
               onChange(result);
               setCapturing(false);
             }}

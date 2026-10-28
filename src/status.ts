@@ -38,6 +38,7 @@ export const USER_VISIBLE_PAUSES: readonly string[] = [
   'fullscreen',
   'recording',
   'safe_mode',
+  'platform',
 ];
 
 /** First matching row of the mapping table, top to bottom. */

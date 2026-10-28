@@ -79,6 +79,29 @@ describe('shortcut keyboard', () => {
         ?.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', metaKey: true, bubbles: true }));
     });
     expect(change).toHaveBeenLastCalledWith([named('Cmd'), named('A')]);
+    // Option and Shift change the character typed, not the key recorded (e.code).
+    click('录制快捷键');
+    act(() => {
+      host
+        .querySelector('input[aria-label="快捷键录制"]')
+        ?.dispatchEvent(
+          new KeyboardEvent('keydown', { key: 'å', code: 'KeyA', altKey: true, bubbles: true }),
+        );
+    });
+    expect(change).toHaveBeenLastCalledWith([named('Alt'), named('A')]);
+    click('录制快捷键');
+    act(() => {
+      host.querySelector('input[aria-label="快捷键录制"]')?.dispatchEvent(
+        new KeyboardEvent('keydown', {
+          key: '!',
+          code: 'Digit1',
+          shiftKey: true,
+          metaKey: true,
+          bubbles: true,
+        }),
+      );
+    });
+    expect(change).toHaveBeenLastCalledWith([named('Shift'), named('Cmd'), named('D1')]);
     expect(host.querySelector('[aria-label="Cmd"]')?.getAttribute('aria-pressed')).toBe('true');
     click('录制快捷键');
     act(() => {
@@ -86,7 +109,7 @@ describe('shortcut keyboard', () => {
         .querySelector('input[aria-label="快捷键录制"]')
         ?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     });
-    expect(change).toHaveBeenCalledTimes(2);
+    expect(change).toHaveBeenCalledTimes(4);
     expect(host.querySelector('input[aria-label="快捷键录制"]')).toBeNull();
   });
 });

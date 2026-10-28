@@ -188,7 +188,7 @@ use super::keystate::{modifier_name, own_input, physical, OwnInput};
 use super::*;
 use crate::fault::{self, FaultPoint};
 use crate::health::{Component, ComponentHealth, Outcome, ReasonCode, StageTimings, TriggerKind};
-use crate::history::Record;
+use crate::history::{outcome_for, Record};
 use crate::runtime::Runtime;
 use crate::supervisor::{ExecutorControl, Status};
 use crate::traits::{ClipboardBackend, ClipboardRead, Clock, Injector, SystemClock};
@@ -385,29 +385,6 @@ fn reason_for(message: &str, stage: Stage) -> ReasonCode {
             .iter()
             .find(|(fragment, _)| message.contains(fragment))
             .map_or(ReasonCode::Internal, |(_, reason)| *reason),
-    }
-}
-
-/// The outcome of a run that stopped for `reason`; the one place that
-/// decides it, whichever way the run reported the stop (an error, a failed
-/// result or a cancelled result). A cancel is `Cancelled` wherever it
-/// landed: before the first backspace, between two of them or during the
-/// output. Engine-side failures stay `Failed` even when nothing reached the
-/// screen; refusals (guards, held keys, preflight, clipboard safety) are
-/// `Skipped` then and `Failed` once something was sent.
-fn outcome_for(reason: ReasonCode, side_effects: bool) -> Outcome {
-    let engine_failure = matches!(
-        reason,
-        ReasonCode::InjectPartial
-            | ReasonCode::ClipboardBusy
-            | ReasonCode::ExecutorPanic
-            | ReasonCode::ExecutorTimeout
-            | ReasonCode::Internal
-    );
-    match reason {
-        ReasonCode::Cancelled => Outcome::Cancelled,
-        _ if side_effects || engine_failure => Outcome::Failed,
-        _ => Outcome::Skipped,
     }
 }
 

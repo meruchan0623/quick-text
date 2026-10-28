@@ -53,6 +53,29 @@ impl Record {
     }
 }
 
+/// The outcome of a run that stopped for `reason`; the one place that
+/// decides it on every platform, whichever way the run reported the stop (an error, a failed
+/// result or a cancelled result). A cancel is `Cancelled` wherever it
+/// landed: before the first backspace, between two of them or during the
+/// output. Engine-side failures stay `Failed` even when nothing reached the
+/// screen; refusals (guards, held keys, preflight, clipboard safety) are
+/// `Skipped` then and `Failed` once something was sent.
+pub fn outcome_for(reason: ReasonCode, side_effects: bool) -> Outcome {
+    let engine_failure = matches!(
+        reason,
+        ReasonCode::InjectPartial
+            | ReasonCode::ClipboardBusy
+            | ReasonCode::ExecutorPanic
+            | ReasonCode::ExecutorTimeout
+            | ReasonCode::Internal
+    );
+    match reason {
+        ReasonCode::Cancelled => Outcome::Cancelled,
+        _ if side_effects || engine_failure => Outcome::Failed,
+        _ => Outcome::Skipped,
+    }
+}
+
 /// Payload of `explain_last_miss` (IPC contract §5): the latest entry whose
 /// outcome is not `succeeded`. 0.4 explains from the history only.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

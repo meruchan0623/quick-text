@@ -4,6 +4,7 @@ import {
   appendText,
   itemLabel,
   keyFromEvent,
+  keyNameFromCode,
   parseRecording,
   recordingSource,
   undoLast,
@@ -174,5 +175,24 @@ describe('keyFromEvent', () => {
       press({ key: '1', code: 'Numpad1', ctrlKey: true }),
     ].map((p) => keyFromEvent(p) as Recorded);
     expect(parseRecording(recordingSource(keys))).toEqual(keys);
+  });
+});
+
+describe('keyNameFromCode', () => {
+  it('names the physical key whatever it types', () => {
+    expect(keyNameFromCode('KeyA')).toBe('A');
+    expect(keyNameFromCode('Digit1')).toBe('D1');
+    expect(keyNameFromCode('Numpad7')).toBe('NumPad7');
+    expect(keyNameFromCode('F24')).toBe('F24');
+    expect(keyNameFromCode('Slash')).toBe('OEMQUESTION');
+    expect(keyNameFromCode('Space')).toBe('Space');
+    expect(keyNameFromCode('ArrowLeft')).toBe('Left');
+    expect(keyNameFromCode('PageUp')).toBe('PgUp');
+    expect(keyNameFromCode('NumpadEnter')).toBe('Enter');
+  });
+  it('has no name for codes without one', () => {
+    expect(keyNameFromCode('')).toBeNull();
+    expect(keyNameFromCode('F25')).toBeNull();
+    expect(keyNameFromCode('IntlYen')).toBeNull();
   });
 });

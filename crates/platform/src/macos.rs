@@ -4,6 +4,9 @@
 // lint ramp until the backend is reworked.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
+use crate::health::{PauseReasons, TriggerKind};
+use crate::history::Record;
+use crate::macos_rules::{Backup, Stop};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{c_char, c_void, CString},
@@ -184,12 +187,15 @@ static ENVIRONMENT: OnceLock<Mutex<(Foreground, bool)>> = OnceLock::new();
 static PHYSICAL: OnceLock<Mutex<BTreeSet<u16>>> = OnceLock::new();
 static BUTTONS: OnceLock<Mutex<BTreeSet<u32>>> = OnceLock::new();
 static READY: AtomicBool = AtomicBool::new(false);
+/// Set from the moment macOS disables the tap (timeout or user input) until
+/// it is reinstalled: the input health stays up meanwhile, and
+/// `PauseReasons::PLATFORM` holds detection.
+static RESTARTING: AtomicBool = AtomicBool::new(false);
 static RECORD_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static CLIPBOARD_TOKEN: AtomicU64 = AtomicU64::new(0);
 struct Buffer {
     value: String,
     focus: u64,
-    at: Instant,
     record_at: Instant,
 }
 struct Candidate {
@@ -202,10 +208,27 @@ struct Candidate {
     terminator: Option<String>,
     consume: bool,
 }
+/// Whether the input backend can run (resume, recording, the Health probe):
+/// see [`hook_ready`].
 pub fn engine_ready() -> bool {
-    native_ready().is_ok()
+    hook_ready().is_ok()
 }
-pub fn native_ready() -> Result<(), String> {
+/// The input health (supervisor probe): the permissions are granted and the
+/// event tap is installed, or being reinstalled after macOS disabled it.
+/// Secure Input and an unsafe input source are not part of it: they come
+/// and go on their own and set `PauseReasons::PLATFORM` instead (the monitor
+/// thread in [`start_engine`]), so they neither fail the health nor become a
+/// manual pause.
+pub fn hook_ready() -> Result<(), String> {
+    permissions()?;
+    if !READY.load(Ordering::SeqCst) && !RESTARTING.load(Ordering::SeqCst) {
+        return Err(
+            "macOS event tap is not installed or was disabled; engine remains paused".into(),
+        );
+    }
+    Ok(())
+}
+fn permissions() -> Result<(), String> {
     unsafe {
         if !AXIsProcessTrusted() {
             return Err("Grant Accessibility to Quicktext in System Settings, then resume".into());
@@ -219,12 +242,19 @@ pub fn native_ready() -> Result<(), String> {
         if !CGPreflightPostEventAccess() {
             return Err("macOS denied synthetic input permission (Accessibility)".into());
         }
-        if IsSecureEventInputEnabled() {
-            return Err("Secure Input is active; native input is paused until it ends".into());
-        }
     }
-    if !layout_safe() {
-        return Err("Automatic capture requires ABC or U.S. keyboard layout; IME/dead-key layouts are paused".into());
+    Ok(())
+}
+/// Whether synthetic input may be sent right now: [`hook_ready`], the tap
+/// installed, and no platform block (Secure Input, unsafe input source).
+pub fn native_ready() -> Result<(), String> {
+    permissions()?;
+    if let Some(block) = crate::macos_rules::platform_block(
+        unsafe { IsSecureEventInputEnabled() },
+        layout_safe(),
+        RESTARTING.load(Ordering::SeqCst),
+    ) {
+        return Err(block.into());
     }
     if !READY.load(Ordering::SeqCst) {
         return Err(
@@ -400,8 +430,10 @@ pub fn cursor() -> serde_json::Value {
         serde_json::json!({"available":true,"x":p.x,"y":p.y,"width":r.size.width,"height":r.size.height,"left":r.origin.x,"top":r.origin.y,"coordinate_unit":"Quartz display points","displays":items})
     }
 }
+/// Stops pending work and reports why as the last result. It never writes
+/// `Shared::paused` (the runtime would read that as a manual pause): the
+/// Health probe ([`hook_ready`]) and `PauseReasons::PLATFORM` hold detection.
 fn error_status(shared: &Shared, message: String) {
-    shared.paused.store(true, Ordering::SeqCst);
     shared.generation.fetch_add(1, Ordering::SeqCst);
     *shared.last.lock().unwrap() = Some(ExecutionResult {
         id: "engine".into(),
@@ -440,9 +472,14 @@ unsafe extern "C" fn tap(_: Id, kind: u32, event: Event, _: Id) -> Event {
         return event;
     };
     if kind == 0xffff_fffe || kind == 0xffff_ffff {
+        // macOS disabled the tap (timeout or user input). The tap thread
+        // reinstalls it; meanwhile PLATFORM holds detection.
+        RESTARTING.store(true, Ordering::SeqCst);
         READY.store(false, Ordering::SeqCst);
-        shared.paused.store(true, Ordering::SeqCst);
         shared.generation.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut buffer) = BUFFER.get().unwrap().try_lock() {
+            buffer.value.clear();
+        }
         return event;
     }
     if CGEventGetIntegerValueField(event, 42) == MARK {
@@ -500,9 +537,10 @@ unsafe extern "C" fn tap(_: Id, kind: u32, event: Event, _: Id) -> Event {
             return ptr::null_mut();
         }
     }
+    // Until the monitor thread sets PLATFORM, the tap itself stays out of a
+    // Secure Input session.
     if IsSecureEventInputEnabled() {
         buffer.value.clear();
-        shared.paused.store(true, Ordering::SeqCst);
         shared.generation.fetch_add(1, Ordering::SeqCst);
         return event;
     }
@@ -540,8 +578,12 @@ unsafe extern "C" fn tap(_: Id, kind: u32, event: Event, _: Id) -> Event {
         return event;
     }
     if !matches!(kind, 10..=12) {
-        shared.generation.fetch_add(1, Ordering::SeqCst);
-        buffer.value.clear();
+        // A click or a scroll may move the caret; a pointer move or drag
+        // does not, so it keeps the buffer and pending work (as on Windows).
+        if !matches!(kind, 5 | 6 | 7 | 27) {
+            shared.generation.fetch_add(1, Ordering::SeqCst);
+            buffer.value.clear();
+        }
         let p = CGEventGetLocation(event);
         let b = CGEventGetIntegerValueField(event, 3) as u32;
         if let Ok(mut buttons) = BUTTONS.get().unwrap().try_lock() {
@@ -637,12 +679,17 @@ unsafe extern "C" fn tap(_: Id, kind: u32, event: Event, _: Id) -> Event {
         shared.cancel.store(true, Ordering::SeqCst);
     }
     // Shift (56, 60) and Caps Lock (57) only change the case of the next
-    // character (Windows' `Kind::Neutral`): they keep the buffer and the
-    // generation, so `Hi` or `x:` can match and run.
+    // character: they keep the buffer and the generation, so `Hi` or `x:`
+    // can match and run.
     if kind == 11 || kind == 12 && matches!(code, 56 | 57 | 60) {
         return event;
     }
     let generation = shared.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    // Control, Option and Cmd alone keep the buffer too (`KeyEdit::Neutral`);
+    // the next key typed with one of them held resets it.
+    if kind == 12 {
+        return event;
+    }
     let Ok(env) = ENVIRONMENT.get().unwrap().try_lock() else {
         buffer.value.clear();
         return event;
@@ -651,34 +698,33 @@ unsafe extern "C" fn tap(_: Id, kind: u32, event: Event, _: Id) -> Event {
         || shared.busy.load(Ordering::SeqCst)
         || !env.1
         || env.0.id == 0
-        || flags & (CTRL | ALT | CMD) != 0
-        || kind == 12
     {
         buffer.value.clear();
         return event;
     }
     let focus = env.0.clone();
     drop(env);
-    if buffer.focus != focus.id || buffer.at.elapsed() > Duration::from_secs(10) {
+    if buffer.focus != focus.id {
         buffer.value.clear()
     }
     buffer.focus = focus.id;
-    buffer.at = Instant::now();
-    if code == 51 {
-        buffer.value.pop();
-        return event;
-    }
+    // The buffer rules are shared with Windows (`quicker_domain::key_edit`):
+    // any character the layout types counts, Backspace edits, caret keys
+    // and shortcuts reset, and only space and `;` are terminators.
     let mut chars = [0u16; 8];
     let mut len = 0;
     CGEventKeyboardGetUnicodeString(event, 8, &mut len, chars.as_mut_ptr());
     let text = String::from_utf16_lossy(&chars[..len.min(8)]);
-    let mut terminator = match code {
-        49 => Some("space"),
-        48 => Some("tab"),
-        36 | 76 => Some("enter"),
-        41 if text == ";" => Some("semicolon"),
-        _ => None,
-    };
+    let edit = key_edit(
+        crate::macos_rules::key_class(code),
+        Some(text),
+        flags & (CTRL | ALT | CMD) != 0,
+    );
+    let previous = typed_terminator(&edit).map(|key| (buffer.value.clone(), key));
+    apply_key_edit(&mut buffer.value, &edit);
+    if !matches!(edit, KeyEdit::Text(_)) {
+        return event;
+    }
     let Ok(config) = shared.config.try_lock() else {
         buffer.value.clear();
         return event;
@@ -687,63 +733,47 @@ unsafe extern "C" fn tap(_: Id, kind: u32, event: Event, _: Id) -> Event {
         buffer.value.clear();
         return event;
     };
-    if terminator == Some("semicolon") && buffer.value.is_empty() {
-        terminator = None
-    }
-    if terminator.is_none() {
-        if text.len() == 1 && text.is_ascii() && !text.as_bytes()[0].is_ascii_control() {
-            buffer.value.push_str(&text);
-        } else {
-            buffer.value.clear();
-            return event;
-        }
-    }
-    if buffer.value.len() > 1024 {
-        buffer.value.clear();
-        return event;
-    }
     let foreground_context = ForegroundContext {
         platform: Platform::Macos,
         process: focus.process.clone(),
         bundle_id: focus.process.clone(),
     };
-    let mut found = compiled.match_input(&buffer.value, terminator, &foreground_context);
-    if found.is_none() && terminator == Some("semicolon") {
-        buffer.value.push(';');
-        terminator = None;
-        found = compiled.match_input(&buffer.value, None, &foreground_context);
-    }
-    if let Some(matched) = found {
-        if let Some(rule) = config.rules.iter().find(|r| r.id == matched.rule_id) {
-            let candidate = Candidate {
-                rule: rule.clone(),
-                parameter: matched.parameter,
-                focus,
-                generation,
-                revision: config.revision,
-                erase: matched.erase_chars,
-                terminator: terminator.map(str::to_string),
-                consume: rule.terminator.as_ref().map(|t| t.consume).unwrap_or(true),
-            };
-            buffer.value.clear();
-            if shared
-                .busy
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                shared.cancel.store(false, Ordering::SeqCst);
-                if SENDER.get().unwrap().try_send(candidate).is_ok() {
-                    if terminator.is_some() {
-                        return ptr::null_mut();
-                    }
-                } else {
-                    shared.busy.store(false, Ordering::SeqCst);
+    let Some((matched, terminator)) = match_typed(
+        &compiled,
+        &buffer.value,
+        previous.as_ref().map(|(text, key)| (text.as_str(), *key)),
+        &foreground_context,
+    ) else {
+        return event;
+    };
+    if let Some(rule) = config.rules.iter().find(|r| r.id == matched.rule_id) {
+        let candidate = Candidate {
+            rule: rule.clone(),
+            parameter: matched.parameter,
+            focus,
+            generation,
+            revision: config.revision,
+            erase: matched.erase_chars,
+            terminator: terminator.map(str::to_string),
+            consume: rule.terminator.as_ref().map(|t| t.consume).unwrap_or(true),
+        };
+        buffer.value.clear();
+        if shared
+            .busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            shared.cancel.store(false, Ordering::SeqCst);
+            if SENDER.get().unwrap().try_send(candidate).is_ok() {
+                // The terminator is held back; the worker sends it again
+                // after the output when the rule keeps it.
+                if terminator.is_some() {
+                    return ptr::null_mut();
                 }
+            } else {
+                shared.busy.store(false, Ordering::SeqCst);
             }
         }
-    }
-    if terminator.is_some() {
-        buffer.value.clear()
     }
     event
 }
@@ -755,7 +785,6 @@ pub fn start_engine(shared: Arc<Shared>) -> Result<(), String> {
         .set(Mutex::new(Buffer {
             value: String::new(),
             focus: 0,
-            at: Instant::now(),
             record_at: Instant::now(),
         }))
         .ok();
@@ -819,14 +848,24 @@ pub fn start_engine(shared: Arc<Shared>) -> Result<(), String> {
                 .unwrap_or(serde_json::Value::Null),
         );
         let result = if config.revision != candidate.revision {
-            Err("Revision changed before native action".into())
+            Err((
+                Stop::Execute,
+                "Revision changed before native action".into(),
+            ))
         } else {
             expand_reusable(&candidate.rule.action, &config, &context)
                 .map_err(|e| {
-                    e.iter()
+                    let message = e
+                        .iter()
                         .map(|d| d.message.clone())
                         .collect::<Vec<_>>()
-                        .join("; ")
+                        .join("; ");
+                    (Stop::Resolve, message)
+                })
+                .and_then(|plan| {
+                    preflight(&plan)
+                        .map(|()| plan)
+                        .map_err(|message| (Stop::Preflight, message))
                 })
                 .and_then(|plan| {
                     execute(
@@ -845,14 +884,31 @@ pub fn start_engine(shared: Arc<Shared>) -> Result<(), String> {
                             _ => 1.0,
                         },
                     )
+                    .map_err(|message| (Stop::Execute, message))
                 })
         };
+        // The run's history entry (B-35), with the Windows verdict rules.
+        let (outcome, reason, completed_steps, side_effects) = crate::macos_rules::verdict(&result);
+        crate::runtime::current().record(Record {
+            process: Some(candidate.focus.process.clone()).filter(|name| !name.is_empty()),
+            completed_steps,
+            side_effects,
+            ..Record::new(
+                candidate.rule.id.clone(),
+                match candidate.rule.trigger_mode {
+                    TriggerMode::Immediate => TriggerKind::Immediate,
+                    TriggerMode::Terminator => TriggerKind::Terminator,
+                },
+                outcome,
+                reason,
+            )
+        });
         match result {
             Ok(mut result) => {
                 result.id = format!("{}:run-{}", candidate.rule.id, candidate.generation);
                 *worker.last.lock().unwrap() = Some(result);
             }
-            Err(message) => {
+            Err((_, message)) => {
                 if guarded(
                     &worker,
                     &candidate.focus,
@@ -879,6 +935,9 @@ pub fn start_engine(shared: Arc<Shared>) -> Result<(), String> {
     let monitor = shared.clone();
     std::thread::spawn(move || {
         let mut old = 0;
+        // `None` until the first pass, so a PLATFORM pause left by an earlier
+        // engine run is written over at once.
+        let mut blocked: Option<Option<&str>> = None;
         while !monitor.shutdown.load(Ordering::SeqCst) {
             let focus = foreground();
             let safe = layout_safe();
@@ -892,13 +951,26 @@ pub fn start_engine(shared: Arc<Shared>) -> Result<(), String> {
             }
             old = focus.id;
             *ENVIRONMENT.get().unwrap().lock().unwrap() = (focus, safe);
-            if READY.load(Ordering::SeqCst) && !monitor.paused.load(Ordering::SeqCst) {
-                if let Err(error) = native_ready() {
-                    error_status(&monitor, error);
+            // Transient conditions hold detection through their own pause
+            // reason, set and cleared as they come and go.
+            let block = crate::macos_rules::platform_block(
+                unsafe { IsSecureEventInputEnabled() },
+                safe,
+                RESTARTING.load(Ordering::SeqCst),
+            );
+            if blocked != Some(block) {
+                if let Some(message) = block {
+                    error_status(&monitor, message.into());
+                    if let Ok(mut buffer) = BUFFER.get().unwrap().try_lock() {
+                        buffer.value.clear();
+                    }
                 }
+                crate::runtime::current().set_pause(PauseReasons::PLATFORM, block.is_some());
+                blocked = Some(block);
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        crate::runtime::current().set_pause(PauseReasons::PLATFORM, false);
     });
     std::thread::spawn(move || unsafe {
         let mut last_error = String::new();
@@ -908,6 +980,7 @@ pub fn start_engine(shared: Arc<Shared>) -> Result<(), String> {
                 || !CGPreflightPostEventAccess()
             {
                 let message = "macOS permissions required: System Settings → Privacy & Security → Accessibility and Input Monitoring; grant Quicktext and resume".to_string();
+                RESTARTING.store(false, Ordering::SeqCst);
                 if last_error != message {
                     error_status(&shared, message.clone());
                     last_error = message;
@@ -920,6 +993,7 @@ pub fn start_engine(shared: Arc<Shared>) -> Result<(), String> {
                 .fold(0u64, |mask, n| mask | (1 << n));
             let port = CGEventTapCreate(1, 0, 0, mask, tap, ptr::null_mut());
             if port.is_null() {
+                RESTARTING.store(false, Ordering::SeqCst);
                 if last_error != "tap" {
                     error_status(
                         &shared,
@@ -935,6 +1009,7 @@ pub fn start_engine(shared: Arc<Shared>) -> Result<(), String> {
             if source.is_null() {
                 CFMachPortInvalidate(port);
                 CFRelease(port);
+                RESTARTING.store(false, Ordering::SeqCst);
                 error_status(&shared, "Could not create event-tap runloop source".into());
                 break;
             }
@@ -942,15 +1017,15 @@ pub fn start_engine(shared: Arc<Shared>) -> Result<(), String> {
             CFRunLoopAddSource(runloop, source, kCFRunLoopDefaultMode);
             CGEventTapEnable(port, true);
             READY.store(true, Ordering::SeqCst);
+            RESTARTING.store(false, Ordering::SeqCst);
             last_error.clear();
             while !shared.shutdown.load(Ordering::SeqCst) && READY.load(Ordering::SeqCst) {
                 CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, false);
             }
+            // Disabled by macOS (the callback set RESTARTING already):
+            // reinstall at once while PLATFORM holds detection.
             if !shared.shutdown.load(Ordering::SeqCst) {
-                error_status(
-                    &shared,
-                    "macOS event tap was disabled; input paused and tap will be reinstalled".into(),
-                );
+                RESTARTING.store(true, Ordering::SeqCst);
             }
             READY.store(false, Ordering::SeqCst);
             CGEventTapEnable(port, false);
@@ -1455,6 +1530,8 @@ fn snapshot() -> Result<(isize, Payload), String> {
             msg!(items,"count"=>usize)
         };
         let mut total = 0;
+        let policy = crate::clipboard_options::lease_options().policy;
+        let (mut had_types, mut skipped) = (false, Vec::new());
         if count > 256 {
             return Err("Clipboard contains too many objects to safely preserve".into());
         }
@@ -1464,9 +1541,19 @@ fn snapshot() -> Result<(isize, Payload), String> {
             let mut formats = vec![];
             for index in 0..msg!(types,"count"=>usize) {
                 let kind = msg!(types,"objectAtIndex:"=>Id,index=>usize);
+                let name = string(kind);
                 let data = msg!(item,"dataForType:"=>Id,kind=>Id);
-                if data.is_null() {
-                    return Err("A promised/private clipboard format could not be preserved; paste refused before erasure".into());
+                had_types = true;
+                // A promised or private type gives no data: the restore
+                // policy decides (B-08), as on Windows.
+                match crate::macos_rules::backup(policy, &name, !data.is_null()) {
+                    Backup::Copy => {}
+                    Backup::Skip => {
+                        skipped.push(name);
+                        continue;
+                    }
+                    Backup::Ignore => continue,
+                    Backup::Refuse => return Err("A promised/private clipboard format could not be preserved; paste refused before erasure".into()),
                 }
                 let length = msg!(data,"length"=>usize);
                 total += length;
@@ -1480,7 +1567,7 @@ fn snapshot() -> Result<(isize, Payload), String> {
                     return Err("Clipboard data is unreadable".into());
                 }
                 formats.push((
-                    string(kind),
+                    name,
                     if length == 0 {
                         vec![]
                     } else {
@@ -1488,7 +1575,17 @@ fn snapshot() -> Result<(isize, Payload), String> {
                     },
                 ));
             }
-            snapshot.push(formats);
+            if !formats.is_empty() {
+                snapshot.push(formats);
+            }
+        }
+        if crate::macos_rules::backup_refused(policy, had_types, !snapshot.is_empty()) {
+            return Err(
+                "No clipboard format could be preserved; paste refused before erasure".into(),
+            );
+        }
+        if !skipped.is_empty() {
+            tracing::info!(event = "clipboard.skipped", formats = ?skipped, ?policy);
         }
         if before != msg!(board,"changeCount"=>isize) {
             return Err("Clipboard changed during backup; nothing was overwritten".into());
@@ -1736,15 +1833,6 @@ pub fn preflight(plan: &ActionPlan) -> Result<(), String> {
             Operation::Common { function } => {
                 common_keys(function)?;
             }
-            Operation::Wheel {
-                unit: WheelUnit::Delta,
-                ..
-            } => {
-                return Err(
-                    "Windows 1/120-click wheel delta has no verified macOS equivalent; use clicks"
-                        .into(),
-                )
-            }
             Operation::Open {
                 target,
                 args,
@@ -1871,8 +1959,15 @@ pub fn execute(
     } else {
         Some(ClipboardLease::new()?)
     };
-    if let Some((_, payload)) = payloads.first_key_value() {
-        clipboard.as_mut().unwrap().write(payload)?;
+    // The first paste is written before the trigger is erased only when
+    // every earlier step just types text (Windows `written_before_erase`):
+    // a key, chord or click before it may make the target copy or cut.
+    let early = payloads
+        .first_key_value()
+        .map(|(index, _)| *index)
+        .filter(|index| crate::macos_rules::written_before_erase(&plan, *index));
+    if let Some(index) = early {
+        clipboard.as_mut().unwrap().write(&payloads[&index])?;
     }
     guarded(&s, &target, generation, revision)?;
     let mut completed = 0;
@@ -1880,6 +1975,7 @@ pub fn execute(
     let mut failure = None;
     let mut held = BTreeSet::new();
     let mut buttons = BTreeSet::new();
+    let mut wheel = crate::macos_rules::WheelSteps::default();
     let started = Instant::now();
     for _ in 0..erase {
         if started.elapsed() > Duration::from_secs(120) {
@@ -1973,7 +2069,7 @@ pub fn execute(
                     | Operation::PasteFiles { .. }
                     | Operation::PasteImage { .. } => {
                         let lease = clipboard.as_mut().unwrap();
-                        if index != *payloads.first_key_value().unwrap().0 {
+                        if Some(index) != early {
                             lease.write(&payloads[&index])?;
                         }
                         if clipboard_count() != lease.generation {
@@ -2047,9 +2143,12 @@ pub fn execute(
                         if !p.x.is_finite() || !p.y.is_finite() {
                             return Err("Mouse coordinate is not finite".into());
                         }
+                        // A drag while the task holds a button (Quartz needs
+                        // the drag type for selections and moves).
+                        let (kind, button) = crate::macos_rules::move_event(&buttons);
                         step_effects = true;
                         unsafe {
-                            post(CGEventCreateMouseEvent(ptr::null(), 5, p, 0))?;
+                            post(CGEventCreateMouseEvent(ptr::null(), kind, p, button))?;
                         }
                     }
                     Operation::MouseButton { button, state } => {
@@ -2092,11 +2191,12 @@ pub fn execute(
                         }
                     }
                     Operation::Wheel { axis, amount, unit } => {
-                        let value = if *unit == WheelUnit::Delta {
-                            return Err("Windows 1/120-click wheel delta has no verified macOS equivalent; use clicks".into());
-                        } else {
-                            *amount
-                        };
+                        // Windows deltas (1/120 notch) become line steps; a
+                        // remainder carries over to the next wheel step.
+                        let value = wheel.lines(*axis, *amount, *unit);
+                        if value == 0 {
+                            return Ok(());
+                        }
                         step_effects = true;
                         unsafe {
                             post(CGEventCreateScrollWheelEvent(
