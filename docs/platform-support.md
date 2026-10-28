@@ -69,3 +69,17 @@ Windows 0.2.0 keys（包括手动动作测试）需要可靠UIAutomation provide
    - 「快捷键」录制改用 `KeyboardEvent.code` 识别物理键，Shift/Option 不再把键变成别的字符（`!`、`å`）；拿不到 code 时退回 `key`。
    - 「文字与按键组合」录制器**没有**把 Cmd 录成 `$primary`：SendKeys 语法（`parse_sendkeys`）只有 `^ + %` 三种修饰符，没有 Cmd/Win，要支持需要扩展领域层的方言（会影响 Quicker 导入/导出兼容）。2026-10-28 决定暂不扩展。目前按 Cmd 组合时提示改用「按顺序执行多个操作」中的快捷键步骤（`Ctrl / Cmd`）。
 7. **应用外壳。** 处理 `RunEvent::Reopen`：点 Dock 图标时显示并聚焦主窗口。`bundle.macOS.minimumSystemVersion` 设为 `10.15`。src-tauri 无法在 Windows 上交叉编译 macOS，这部分代码未经编译器检查。
+
+## 2026-10-28 macOS 运行稳定性
+
+同样只做了类型检查和纯逻辑单元测试（`released_within`、`FocusTracker`），没有 Mac 实机验证。
+
+1. **漏掉的松键不再让键永远处于按住状态。** Secure Input 期间 tap 收不到按键事件，tap 重装时也可能错过松键；以前这样会让键一直留在 `PHYSICAL` 里，之后每次执行都以「A physical modifier is held」失败，直到再按一次那个键。现在 `physical()` / `physical_button()` 还会查硬件状态（`CGEventSourceKeyState` / `CGEventSourceButtonState`），已松开就从集合中移除。媒体键（代码 ≥ 256）没有硬件状态可查，保持原样。
+2. **重发结束键前等它松开。** 动作很短时，被拦下的空格等结束键往往还按着，以前会以「Physical key conflicts」失败并丢掉结束键。现在最多等 500 ms（与等待修饰键相同）。
+3. **应用忙时不误判焦点变化。** 辅助功能读取的超时只有 20 ms，应用正在处理刚输入的按键时常常超时。以前监控线程把超时当成「没有可编辑控件」，清空缓冲并让待执行任务失效；发送前的检查也会以「Focused application/window/control changed」中断输出。现在：
+   - 监控线程在同一应用仍在前台时，最多连续 10 次超时沿用上次的焦点（`macos_rules::FocusTracker`）。
+   - 发送前的检查（`verified_foreground`）遇到超时最多重读 5 次，每次间隔 10 ms，不沿用旧值。
+   - 待实测：卡死的应用约半秒后是否正常判为焦点未知。
+4. **Electron 应用。** Slack、VS Code、Notion 等只有收到 `AXManualAccessibility` 才建立辅助功能树，以前在这些应用里找不到焦点输入框，什么都不会展开。现在每个进程第一次被读取时设置一次该属性，其他应用会忽略它。
+   - 待实测：这些应用里的输入框是否被识别为 `AXTextArea` / `AXTextField`。
+5. **其他。** tap 回调处理系统键事件时套上 autorelease pool，不再泄漏 `NSEvent`。按键输入文字时，松键事件也带上任务按住的修饰键标志，与按下事件一致。
