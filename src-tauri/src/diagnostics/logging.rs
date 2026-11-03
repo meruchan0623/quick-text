@@ -121,6 +121,9 @@
 //! | `log.level_restore_failed` | warn | prefs unreadable at startup; default level |
 //! | `log.reload_failed` | error | the filter could not be swapped |
 //! | `log.expiry_thread_failed` | error | the expiry thread did not start |
+//! | `permissions.marker_failed` | warn | the marker that the privacy pane was opened once could not be written; error |
+//! | `permissions.requested` | info | macOS launch with a permission missing, or 「去授权」 (`source` = `ui`): the system prompts for the missing ones were shown; whether all are now `granted` |
+//! | `permissions.settings_failed` | warn | System Settings could not be opened at the privacy pane at launch; error |
 //! | `prefs.auto_listen` | info | `set_auto_listen`; `enabled` and whether it `changed` |
 //! | `rawinput.rebuild_skipped` | info | a RawInput detector rebuild was skipped: the engine is shutting down |
 //! | `rawinput.closed` | info | the RawInput window closed; whether the close was `expected` |
@@ -196,6 +199,7 @@
 //! | `supervisor.attempt_failed` | warn | a recovery attempt failed; error, `failures` so far, and `retry_in_ms` when another attempt is scheduled |
 //! | `supervisor.attempt_hung` | error | a recovery attempt is still running after `ATTEMPT_TIMEOUT`; `attempt`, error, `failures` |
 //! | `supervisor.attempt_superseded` | info | a repair waits for the running attempt to return; `attempt` |
+//! | `supervisor.awaiting_user` | warn | a required component went down on a missing system permission: Recovering without an incident or an attempt until it is granted; the components down |
 //! | `supervisor.circuit_open` | error | the engine failed and waits for repair; `cause` |
 //! | `supervisor.driver_hung` | error | the supervisor driver and its replacement are both stuck; the engine is failed |
 //! | `supervisor.panic` | error | a supervisor tick panicked; the next tick continues |

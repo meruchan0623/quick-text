@@ -40,6 +40,7 @@ const REASON_CODES = [
   'hook_missing',
   'raw_input_missing',
   'hook_install_failed',
+  'permission_missing',
   'unsupported',
   'internal',
 ];
@@ -78,7 +79,7 @@ function expectNamed(names: Readonly<Record<string, string>>, codes: readonly st
 
 describe('labels', () => {
   it('names every ReasonCode', () => {
-    expect(REASON_CODES).toHaveLength(23);
+    expect(REASON_CODES).toHaveLength(24);
     expectNamed(reasonNames, REASON_CODES);
   });
 

@@ -18,7 +18,7 @@ use quicker_platform::{
 };
 use serde::Serialize;
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, PoisonError},
     time::Duration,
 };
@@ -201,6 +201,50 @@ pub fn start_engine(engine: Arc<Shared>, runtime: Arc<Runtime>) {
     let (executor, inputs) = supervisor_wiring::platform_adapters(&started);
     let clock = Arc::clone(runtime.clock());
     supervisor_wiring::install_supervisor(clock, runtime, executor, inputs);
+}
+
+/// Marks that the privacy pane was opened for the user once.
+const PERMISSIONS_PANE_OPENED: &str = "macos-permissions-pane-opened";
+
+/// macOS, every launch: when Accessibility, Input Monitoring or synthetic
+/// input is not granted, asks for the missing ones before the engine starts,
+/// so the system prompts appear at once instead of the user hunting through
+/// System Settings. Nothing is asked once all are granted. Meanwhile Health
+/// waits on `permission_missing`; the engine thread polls the permissions
+/// and installs its tap once they are granted.
+///
+/// TCC shows each prompt once per app at most, and not at all once the app
+/// is listed as denied, so the first launch that stays ungranted also opens
+/// the privacy pane itself; after that the 「去授权」 button
+/// (`request_permissions`) does.
+#[cfg(target_os = "macos")]
+pub fn request_missing_permissions(dir: &Path) {
+    if quicker_platform::permissions_granted() {
+        return;
+    }
+    let granted = quicker_platform::request_permissions();
+    tracing::info!(event = "permissions.requested", granted);
+    if !granted {
+        once_per_install(dir, PERMISSIONS_PANE_OPENED, || {
+            if let Err(error) = quicker_platform::open_permission_settings() {
+                tracing::warn!(event = "permissions.settings_failed", error = %error);
+            }
+        });
+    }
+}
+
+/// Runs `act` unless the marker `name` in `dir` says it already ran. The
+/// marker is written first: an action that hangs or crashes is not repeated.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn once_per_install(dir: &Path, name: &str, act: impl FnOnce()) {
+    let marker = dir.join(name);
+    if marker.exists() {
+        return;
+    }
+    if let Err(error) = std::fs::write(&marker, b"") {
+        tracing::warn!(event = "permissions.marker_failed", error = %error);
+    }
+    act();
 }
 
 /// The session-end callback (R5): runs on the session window thread while
@@ -823,6 +867,17 @@ mod tests {
                 ProblemSeverity::Info
             )]
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_privacy_pane_is_opened_once_per_install() {
+        let dir = temp_dir();
+        let mut opened = 0;
+        once_per_install(&dir, PERMISSIONS_PANE_OPENED, || opened += 1);
+        once_per_install(&dir, PERMISSIONS_PANE_OPENED, || opened += 1);
+        assert_eq!(opened, 1);
+        assert!(dir.join(PERMISSIONS_PANE_OPENED).exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -29,6 +29,24 @@ pub async fn capture_selection(app: tauri::AppHandle) -> Result<serde_json::Valu
         serde_json::json!({"text":text,"status":"success","message":"Selection read through accessibility; clipboard unchanged"}),
     )
 }
+/// 「去授权」 (docs/ipc-contract-0.4.md §5): asks macOS again for the missing
+/// permissions and, when something stays ungranted, opens the privacy pane
+/// for it. The engine thread polls the permissions and installs its tap on
+/// its own once they are granted. Other platforms have nothing to grant.
+#[tauri::command]
+pub fn request_permissions() -> Result<serde_json::Value, CommandError> {
+    #[cfg(target_os = "macos")]
+    {
+        let granted = quicker_platform::request_permissions();
+        tracing::info!(event = "permissions.requested", granted, source = "ui");
+        if !granted {
+            quicker_platform::open_permission_settings().map_err(CommandError::internal)?;
+        }
+        Ok(serde_json::json!({"granted": granted, "supported": true}))
+    }
+    #[cfg(not(target_os = "macos"))]
+    Ok(serde_json::json!({"granted": true, "supported": false}))
+}
 #[tauri::command]
 pub fn exit_app(app: tauri::AppHandle) {
     let state = app.state::<Managed>();

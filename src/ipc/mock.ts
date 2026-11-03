@@ -832,6 +832,7 @@ export class MockBackend {
       message: '浏览器预览：模拟读取',
     }),
     exit_app: () => null,
+    request_permissions: () => ({ granted: false, supported: true }),
     start_recording: () => {
       this.recording = true;
       this.setPaused('recording', true);

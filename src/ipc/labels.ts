@@ -85,7 +85,8 @@ export const capabilityStatusNames: Readonly<Record<string, string>> = {
  */
 export const platformReasonNames: Readonly<Record<string, string>> = {
   experimental_platform: '本平台的实现尚未经过实机验收，可能不稳定',
-  permission_missing: '缺少系统权限（辅助功能、输入监控或模拟输入），授权后重启本程序',
+  permission_missing:
+    '缺少系统权限（辅助功能、输入监控或模拟输入），授权后自动恢复，必要时重启本程序',
   not_implemented: '本平台不提供此功能',
 };
 
@@ -163,6 +164,8 @@ export const reasonNames: Readonly<Record<string, string>> = {
   hook_missing: '键盘监听失效',
   raw_input_missing: '原始键盘输入失效',
   hook_install_failed: '键盘监听安装失败',
+  permission_missing:
+    '缺少系统权限（辅助功能、输入监控或模拟输入），授权后自动恢复，必要时重启本程序',
   unsupported: '当前平台不支持',
   internal: '内部错误',
 };

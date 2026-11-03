@@ -14,6 +14,13 @@
 //! Failed     -> Recovering        only `repair()` (the user's "repair engine")
 //! ```
 //!
+//! A required component down only for a reason the user must fix (a macOS
+//! permission not granted, [`ReasonCode::awaits_user`]) is waited for: no
+//! recovery attempt runs and nothing counts towards the circuit, so Starting
+//! stays Starting past STARTUP_GRACE and Healthy/Degraded goes to Recovering
+//! without an incident. Once the user grants it the component comes back on
+//! its own and the machine settles.
+//!
 //! The module is platform-neutral: the executor and the input sources are
 //! reached through [`ExecutorControl`] and [`InputSources`], and all time
 //! decisions use the injected [`Clock`], so the machine is tested with a
@@ -209,6 +216,12 @@ impl Observed {
                 _ => None,
             })
             .collect()
+    }
+    /// Every required component that is down waits on the user
+    /// ([`ReasonCode::awaits_user`]): a rebuild cannot help.
+    fn awaiting_user(&self) -> bool {
+        let down = self.required_down();
+        !down.is_empty() && down.iter().all(|(_, reason)| reason.awaits_user())
     }
     fn settled_state(&self) -> HealthState {
         if self
@@ -496,6 +509,8 @@ impl Supervisor {
             HealthState::Starting => {
                 if observed.required_down().is_empty() {
                     self.settle(machine, observed);
+                } else if observed.awaiting_user() {
+                    // Waiting for the grant: no attempt, the grace not used up.
                 } else if now.saturating_duration_since(machine.started) >= STARTUP_GRACE {
                     if machine.next_attempt.is_none() && machine.verify_until.is_none() {
                         machine.next_attempt = Some(now);
@@ -507,6 +522,8 @@ impl Supervisor {
                 let down = observed.required_down();
                 if down.is_empty() {
                     machine.state = observed.settled_state();
+                } else if observed.awaiting_user() {
+                    Self::await_user(machine, &down, now);
                 } else {
                     Self::incident(machine, &down, now);
                 }
@@ -548,7 +565,28 @@ impl Supervisor {
         machine.next_attempt = Some(now + BACKOFF[0]);
     }
 
+    /// A required component went down on a missing permission: Recovering,
+    /// but no incident and no attempt while it lasts (see [`Self::recover`]).
+    fn await_user(machine: &mut Machine, down: &[(Component, ReasonCode)], now: Instant) {
+        tracing::warn!(
+            event = "supervisor.awaiting_user",
+            components = ?down,
+            "required component waits for a system permission"
+        );
+        machine.state = HealthState::Recovering;
+        machine.streak = 0;
+        machine.verify_until = None;
+        machine.next_attempt = Some(now + BACKOFF[0]);
+    }
+
     fn recover(&self, machine: &mut Machine, observed: &Observed, now: Instant) -> Option<Ticket> {
+        if observed.awaiting_user() {
+            // Nothing to rebuild until the user grants the permission; an
+            // attempt follows shortly after if something else is still down.
+            machine.verify_until = None;
+            machine.next_attempt = Some(now + BACKOFF[0]);
+            return None;
+        }
         let healthy = observed.required_down().is_empty();
         if machine.verify_until.is_some() {
             // Its deadline is applied first in the tick (expire_verification).
@@ -1404,6 +1442,87 @@ mod tests {
             .runtime
             .pause_reasons()
             .contains(PauseReasons::ENGINE_DOWN));
+    }
+
+    /// A missing permission is waited for at startup: no attempt, never
+    /// Failed, and Healthy as soon as the user grants it.
+    #[test]
+    fn starting_waits_for_a_missing_permission_without_attempts() {
+        let rig = Rig::new();
+        rig.inputs.set(
+            Component::KeyboardHook,
+            HealthState::Recovering,
+            ReasonCode::PermissionMissing,
+        );
+        *rig.inputs.heal_on_reattach.lock() = false;
+        rig.supervisor.tick();
+        for _ in 0..120 {
+            rig.step(Duration::from_secs(5));
+        }
+        assert_eq!(rig.state(), HealthState::Starting);
+        assert!(
+            rig.inputs.reattached.lock().is_empty(),
+            "nothing to rebuild"
+        );
+        assert_eq!(rig.failures(), 0);
+        assert!(rig.runtime.health().awaiting_permission());
+        rig.inputs.set(
+            Component::KeyboardHook,
+            HealthState::Healthy,
+            ReasonCode::Ok,
+        );
+        rig.step(MS);
+        assert_eq!(rig.state(), HealthState::Healthy);
+        assert!(!rig.runtime.health().awaiting_permission());
+    }
+
+    /// A permission revoked while running: Recovering without an incident
+    /// or an attempt, then Healthy once granted again.
+    #[test]
+    fn a_revoked_permission_is_waited_for_not_counted() {
+        let rig = Rig::healthy();
+        *rig.inputs.heal_on_reattach.lock() = false;
+        rig.inputs.set(
+            Component::KeyboardHook,
+            HealthState::Recovering,
+            ReasonCode::PermissionMissing,
+        );
+        for _ in 0..120 {
+            rig.step(Duration::from_secs(5));
+        }
+        assert_eq!(rig.state(), HealthState::Recovering);
+        assert!(rig.inputs.reattached.lock().is_empty());
+        assert_eq!(rig.failures(), 0);
+        assert!(rig.supervisor.machine.lock().incidents.is_empty());
+        rig.inputs.set(
+            Component::KeyboardHook,
+            HealthState::Healthy,
+            ReasonCode::Ok,
+        );
+        rig.step(MS);
+        assert_eq!(rig.state(), HealthState::Healthy);
+    }
+
+    /// Granted, but the hook is still down for another reason: the normal
+    /// recovery resumes right away.
+    #[test]
+    fn recovery_resumes_once_the_permission_is_granted() {
+        let rig = Rig::healthy();
+        *rig.inputs.heal_on_reattach.lock() = false;
+        rig.inputs.set(
+            Component::KeyboardHook,
+            HealthState::Recovering,
+            ReasonCode::PermissionMissing,
+        );
+        rig.step(Duration::from_secs(30));
+        rig.inputs.set(
+            Component::KeyboardHook,
+            HealthState::Recovering,
+            ReasonCode::HookMissing,
+        );
+        rig.step(BACKOFF[0]);
+        rig.step(MS);
+        assert_eq!(rig.inputs.reattached.lock().len(), 1);
     }
 
     #[test]

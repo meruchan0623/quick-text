@@ -106,6 +106,8 @@ fn main() {
             app.manage(bus);
             app.manage(cloud::CloudSync::new());
             startup::after_load(app.handle());
+            #[cfg(target_os = "macos")]
+            startup::request_missing_permissions(&app.state::<DataDir>().0);
             startup::start_engine(engine, runtime);
             // The first team phrase download, then the timer, in the background.
             cloud::start(app.handle());
@@ -159,6 +161,7 @@ fn main() {
             commands::system::get_cursor,
             commands::system::capture_selection,
             commands::system::exit_app,
+            commands::system::request_permissions,
             commands::diagnostics::set_log_level,
             commands::diagnostics::export_diagnostics,
             commands::diagnostics::open_log_dir,

@@ -19,6 +19,9 @@ use tauri_plugin_notification::NotificationExt;
 
 const TRAY_ID: &str = "quicktext-tray";
 const PAUSE_ID: &str = "pause";
+/// The tooltip while Health waits for a macOS permission
+/// ([`HealthSnapshot::awaiting_permission`]); the window shows the same.
+const AWAITING_PERMISSION: &str = "Quicktext · 等待系统授权…";
 
 fn tray_icon(app: &tauri::App) -> tauri::image::Image<'_> {
     #[cfg(windows)]
@@ -202,8 +205,12 @@ impl Observer for TrayStatus {
     /// Both setters wait for the main thread; this runs on the bus thread
     /// with nothing locked, and only on a change.
     fn status(&mut self, health: &HealthSnapshot, state: &EngineState) {
-        let tooltip = StatusText::resolve(health.state, state.paused_reasons, state.busy)
-            .tooltip(state.paused_reasons);
+        let tooltip = if health.awaiting_permission() {
+            AWAITING_PERMISSION
+        } else {
+            StatusText::resolve(health.state, state.paused_reasons, state.busy)
+                .tooltip(state.paused_reasons)
+        };
         if self.tooltip != Some(tooltip) {
             if let Some(tray) = self.handle.tray_by_id(TRAY_ID) {
                 let _ = tray.set_tooltip(Some(tooltip));

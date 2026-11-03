@@ -55,6 +55,9 @@ pub type HealthProbe = Box<dyn Fn() -> Option<Vec<ComponentHealth>> + Send + Syn
 pub type Reattach = Box<dyn Fn(Component) -> Result<(), String> + Send + Sync>;
 /// Whether a self-managed input backend is ready (`native_ready`).
 pub type ReadyProbe = Box<dyn Fn() -> Result<(), String> + Send + Sync>;
+/// Why a self-managed input backend is not ready, read when `ReadyProbe`
+/// fails.
+pub type ReasonProbe = Box<dyn Fn() -> ReasonCode + Send + Sync>;
 
 /// Builds the supervisor on `executor` and `inputs`, makes it the
 /// process-wide instance ([`supervisor::install`], used by `repair_engine`
@@ -438,11 +441,15 @@ impl InputSources for CachedInputs {
 /// `reason` otherwise. A reattach only checks again.
 pub struct ReadinessInputs {
     ready: ReadyProbe,
-    reason: ReasonCode,
+    reason: ReasonProbe,
 }
 
 impl ReadinessInputs {
     pub fn new(ready: ReadyProbe, reason: ReasonCode) -> Self {
+        Self::explained(ready, Box::new(move || reason))
+    }
+    /// Down with whatever `reason` reports at the time.
+    pub fn explained(ready: ReadyProbe, reason: ReasonProbe) -> Self {
         Self { ready, reason }
     }
 }
@@ -451,7 +458,7 @@ impl InputSources for ReadinessInputs {
     fn input_health(&self) -> Vec<ComponentHealth> {
         let (state, reason) = match (self.ready)() {
             Ok(()) => (HealthState::Healthy, None),
-            Err(_) => (HealthState::Recovering, Some(self.reason)),
+            Err(_) => (HealthState::Recovering, Some((self.reason)())),
         };
         vec![ComponentHealth {
             component: Component::KeyboardHook,
@@ -486,18 +493,20 @@ pub fn platform_adapters(
 
 /// macOS (experimental): no executor supervision ([`NullExecutor`]) and the
 /// keyboard hook healthy while `hook_ready()` is Ok (permissions granted,
-/// event tap installed or being reinstalled), `hook_missing` otherwise, so
-/// Health can reach Healthy and listening can resume. Secure Input and IME
+/// event tap installed or being reinstalled), so Health can reach Healthy
+/// and listening can resume. Otherwise it is down with `permission_missing`
+/// while a permission is not granted, which the supervisor waits for
+/// (Starting/Recovering, never Failed; the engine thread installs the tap
+/// once granted), and `hook_missing` otherwise. Secure Input and IME
 /// layouts are not health failures: they hold detection through
 /// `PauseReasons::PLATFORM` and clear it themselves.
-/// 待实测: with permissions missing Health stays Starting or goes
-/// Recovering, and after the recovery attempts Failed (repair needed).
 #[cfg(target_os = "macos")]
 pub fn platform_adapters(
     started: &Result<(), String>,
 ) -> (Arc<dyn ExecutorControl>, Arc<dyn InputSources>) {
     let executor = executor_for(started, Some(Arc::new(NullExecutor)));
-    let inputs = ReadinessInputs::new(Box::new(crate::hook_ready), ReasonCode::HookMissing);
+    let inputs =
+        ReadinessInputs::explained(Box::new(crate::hook_ready), Box::new(crate::hook_reason));
     (executor, Arc::new(inputs))
 }
 

@@ -4,7 +4,7 @@
 // lint ramp until the backend is reworked.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
-use crate::health::{PauseReasons, TriggerKind};
+use crate::health::{PauseReasons, ReasonCode, TriggerKind};
 use crate::history::Record;
 use crate::macos_rules::{Backup, Stop};
 use std::{
@@ -40,12 +40,16 @@ type Callback = unsafe extern "C" fn(Id, u32, Event, Id) -> Event;
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrustedWithOptions(options: CF) -> bool;
+    static kAXTrustedCheckOptionPrompt: CF;
     fn AXUIElementCreateApplication(pid: i32) -> CF;
     fn AXUIElementCopyAttributeValue(element: CF, attribute: CF, value: *mut CF) -> i32;
     fn AXUIElementSetAttributeValue(element: CF, attribute: CF, value: CF) -> i32;
     fn AXUIElementSetMessagingTimeout(element: CF, seconds: f32) -> i32;
     fn CGPreflightListenEventAccess() -> bool;
     fn CGPreflightPostEventAccess() -> bool;
+    fn CGRequestListenEventAccess() -> bool;
+    fn CGRequestPostEventAccess() -> bool;
     fn CGEventTapCreate(
         location: u32,
         placement: u32,
@@ -93,8 +97,18 @@ extern "C" {
     fn CFRunLoopAddSource(runloop: CF, source: CF, mode: CF);
     fn CFRunLoopRemoveSource(runloop: CF, source: CF, mode: CF);
     fn CFRunLoopRunInMode(mode: CF, seconds: f64, return_after_source: bool) -> i32;
+    fn CFDictionaryCreate(
+        allocator: CF,
+        keys: *const CF,
+        values: *const CF,
+        count: isize,
+        key_callbacks: *const c_void,
+        value_callbacks: *const c_void,
+    ) -> CF;
     static kCFRunLoopDefaultMode: CF;
     static kCFBooleanTrue: CF;
+    static kCFTypeDictionaryKeyCallBacks: [u8; 0];
+    static kCFTypeDictionaryValueCallBacks: [u8; 0];
 }
 #[link(name = "Carbon", kind = "framework")]
 extern "C" {
@@ -245,6 +259,75 @@ pub fn hook_ready() -> Result<(), String> {
             "macOS event tap is not installed or was disabled; engine remains paused".into(),
         );
     }
+    Ok(())
+}
+/// Why [`hook_ready`] fails: a permission not granted (which the
+/// supervisor waits for) or the event tap not installed.
+pub fn hook_reason() -> ReasonCode {
+    if !permissions_granted() {
+        ReasonCode::PermissionMissing
+    } else {
+        ReasonCode::HookMissing
+    }
+}
+/// Whether Accessibility, Input Monitoring and synthetic input are all
+/// granted.
+pub fn permissions_granted() -> bool {
+    permissions().is_ok()
+}
+/// Asks macOS for every permission still missing: the Accessibility prompt
+/// (with its "Open System Settings" button) and the Input Monitoring and
+/// synthetic-input requests. macOS shows each system prompt at most once per
+/// app; later calls only re-check. Returns whether all of them are granted.
+pub fn request_permissions() -> bool {
+    unsafe {
+        let mut granted = AXIsProcessTrusted();
+        if !granted {
+            let keys = [kAXTrustedCheckOptionPrompt];
+            let values = [kCFBooleanTrue];
+            let options = CFDictionaryCreate(
+                ptr::null(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                1,
+                ptr::addr_of!(kCFTypeDictionaryKeyCallBacks).cast(),
+                ptr::addr_of!(kCFTypeDictionaryValueCallBacks).cast(),
+            );
+            granted = AXIsProcessTrustedWithOptions(options);
+            if !options.is_null() {
+                CFRelease(options);
+            }
+        }
+        if !CGPreflightListenEventAccess() {
+            granted &= CGRequestListenEventAccess();
+        }
+        if !CGPreflightPostEventAccess() {
+            granted &= CGRequestPostEventAccess();
+        }
+        granted
+    }
+}
+/// Opens System Settings at the privacy pane of the first permission still
+/// missing (Accessibility before Input Monitoring; synthetic input is granted
+/// under Accessibility). The system prompt is shown at most once per app and
+/// not at all once TCC lists the app as denied, so this is the way back in.
+pub fn open_permission_settings() -> Result<(), String> {
+    let pane = unsafe {
+        if !AXIsProcessTrusted() || CGPreflightListenEventAccess() {
+            "Privacy_Accessibility"
+        } else {
+            "Privacy_ListenEvent"
+        }
+    };
+    let url = format!("x-apple.systempreferences:com.apple.preference.security?{pane}");
+    let mut child = std::process::Command::new("open")
+        .arg(url)
+        .spawn()
+        .map_err(|e| format!("Could not open System Settings: {e}"))?;
+    // Reap the child so it does not linger as a zombie.
+    let _ = std::thread::Builder::new()
+        .name("quicker-open-settings".into())
+        .spawn(move || child.wait());
     Ok(())
 }
 fn permissions() -> Result<(), String> {

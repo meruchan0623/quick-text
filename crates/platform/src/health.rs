@@ -96,8 +96,20 @@ pub enum ReasonCode {
     HookMissing,
     RawInputMissing,
     HookInstallFailed,
+    /// macOS: Accessibility, Input Monitoring or synthetic input is not
+    /// granted. Only the user can fix it, so the supervisor waits for the
+    /// grant instead of counting recovery failures ([`Self::awaits_user`]).
+    PermissionMissing,
     Unsupported,
     Internal,
+}
+
+impl ReasonCode {
+    /// A component down for this reason comes back only once the user acts
+    /// (grants a system permission): no rebuild helps, so none counts.
+    pub fn awaits_user(self) -> bool {
+        matches!(self, Self::PermissionMissing)
+    }
 }
 
 /// One component's health as seen by the supervisor.
@@ -115,6 +127,18 @@ pub struct ComponentHealth {
 pub struct HealthSnapshot {
     pub state: HealthState,
     pub components: Vec<ComponentHealth>,
+}
+
+impl HealthSnapshot {
+    /// Starting or Recovering only because a system permission is missing:
+    /// the status reads 「等待系统授权」 rather than 「正在启动」/「正在恢复」.
+    pub fn awaiting_permission(&self) -> bool {
+        matches!(self.state, HealthState::Starting | HealthState::Recovering)
+            && self
+                .components
+                .iter()
+                .any(|c| c.reason == Some(ReasonCode::PermissionMissing))
+    }
 }
 
 /// Why automatic expansion is paused (B-03, B-37). A bitmap so that engine

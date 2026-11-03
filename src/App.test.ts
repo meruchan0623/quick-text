@@ -163,6 +163,32 @@ describe('runtime status area (S-19)', () => {
     expect(callsOf(backend, 'get_runtime_snapshot')).toHaveLength(1);
   });
 
+  it('offers 去授权 while the engine waits on a macOS permission', async () => {
+    const mounted = await mount();
+    const { backend, container } = mounted;
+    await waitFor(mounted, () => {
+      expect(headerStatus(container)).toBe('监听中');
+    });
+    expect(button(container, '去授权')).toBeUndefined();
+    await mounted.act(() => {
+      backend.setHealth('starting', [
+        {
+          component: 'keyboard_hook',
+          state: 'starting',
+          reason: 'permission_missing',
+          since_ms: 0,
+        },
+      ]);
+    });
+    expect(headerStatus(container)).toBe('等待系统授权…');
+    await click(mounted, '去授权');
+    expect(callsOf(backend, 'request_permissions')).toHaveLength(1);
+    await mounted.act(() => {
+      backend.setHealth('healthy');
+    });
+    expect(button(container, '去授权')).toBeUndefined();
+  });
+
   it('offers 修复引擎 when the engine failed and shows the recovery', async () => {
     const mounted = await mount();
     const { backend, container } = mounted;

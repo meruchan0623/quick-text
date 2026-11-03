@@ -40,6 +40,7 @@ export type ReasonCode =
   | 'hook_missing'
   | 'raw_input_missing'
   | 'hook_install_failed'
+  | 'permission_missing'
   | 'unsupported'
   | 'internal';
 

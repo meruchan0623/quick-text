@@ -64,6 +64,17 @@ export function affectedComponents(health: HealthSnapshot | null): string[] {
     .map((c) => label(componentNames, c.component));
 }
 
+/**
+ * Starting/Recovering only on a missing macOS permission (Rust `HealthSnapshot::awaiting_permission`):
+ * the supervisor waits for the grant and the engine comes back on its own.
+ */
+export function awaitingPermission(health: HealthSnapshot | null): boolean {
+  return (
+    (health?.state === 'starting' || health?.state === 'recovering') &&
+    health.components.some((c) => c.reason === 'permission_missing')
+  );
+}
+
 /** The 「状态栏 / 旧界面运行状态区」 column of the mapping table. */
 export function statusText(
   kind: StatusKind,
@@ -72,11 +83,11 @@ export function statusText(
 ): string {
   switch (kind) {
     case 'starting':
-      return '正在启动…';
+      return awaitingPermission(health) ? '等待系统授权…' : '正在启动…';
     case 'failed':
       return '输入监听已停止';
     case 'recovering':
-      return '正在恢复…';
+      return awaitingPermission(health) ? '等待系统授权…' : '正在恢复…';
     case 'paused':
       // The contract carries no resume time, so a timed pause cannot show 「14:30 自动恢复」 yet.
       if (paused.includes('safe_mode')) return '已暂停（安全模式）';
@@ -100,6 +111,8 @@ export interface LiveStatus {
   text: string;
   /** Whether the user's own pause is set: the header button toggles only this reason. */
   manualPause: boolean;
+  /** 「等待系统授权…」: the 「去授权」 button (`request_permissions`) is offered. */
+  awaitingPermission: boolean;
 }
 
 /** Status from pushed events; `null` until the first snapshot or with a pre-0.4 backend. */
@@ -111,6 +124,7 @@ export function liveStatus(view: RuntimeView): LiveStatus | null {
     kind,
     text: statusText(kind, paused, view.health),
     manualPause: paused.includes('manual'),
+    awaitingPermission: awaitingPermission(view.health),
   };
 }
 

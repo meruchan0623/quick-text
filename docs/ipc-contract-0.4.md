@@ -90,7 +90,7 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
                          timings: StageTimings }
 ```
 
-`ReasonCode` 的完整列表以 `crates/platform/src/health.rs` 为准（`ok`、`dropped_busy`、`cancelled`、`paused`、`engine_down`、`focus_changed`、`stale_input`、`protected_control`、`modifier_held`、`inject_partial`、`clipboard_busy`、`clipboard_changed`、`clipboard_format_skipped`、`clipboard_too_large`、`resolve_failed`、`preflight_failed`、`executor_panic`、`executor_timeout`、`hook_missing`、`raw_input_missing`、`hook_install_failed`、`unsupported`、`internal`）。
+`ReasonCode` 的完整列表以 `crates/platform/src/health.rs` 为准（`ok`、`dropped_busy`、`cancelled`、`paused`、`engine_down`、`focus_changed`、`stale_input`、`protected_control`、`modifier_held`、`inject_partial`、`clipboard_busy`、`clipboard_changed`、`clipboard_format_skipped`、`clipboard_too_large`、`resolve_failed`、`preflight_failed`、`executor_panic`、`executor_timeout`、`hook_missing`、`raw_input_missing`、`hook_install_failed`、`permission_missing`、`unsupported`、`internal`）。
 
 `HistoryEntry.seq` 是执行历史自己的序号（`list_history(since_seq)` 用它），与事件的全局 `seq` 不是同一个计数器。
 
@@ -143,6 +143,7 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 | `export_diagnostics` | `{ redaction: "summary" \| "full" }` | `string \| null`：弹出保存对话框，返回写入的 zip 路径；取消返回 `null` |
 | `set_log_level` | `{ level: "error" \| "warn" \| "info" \| "debug" \| "trace", ttl_hours: number \| null }` | `{ level, until_ms: number \| null }`；`ttl_hours` 为空表示恢复默认级别 |
 | `open_log_dir`、`open_data_dir` | — | `null` |
+| `request_permissions` | — | `{ granted: boolean, supported: boolean }`：macOS 再次请求辅助功能、输入监控与合成输入权限（系统提示每个应用最多弹一次，被拒绝过就不再弹），仍未授予时打开「系统设置 → 隐私与安全性」对应面板；授予后引擎自行安装钩子，不必重启。其他平台返回 `{ granted: true, supported: false }`，不做任何事 |
 | `self_test` | — | `{ passed: boolean, checks: { name: "raw_input" \| "hook_heartbeat" \| "foreground" \| "clipboard", passed: boolean, reason: ReasonCode \| null, elapsed_ms: number }[] }`；`checks` 恒为这四项、按此顺序；`reason` 在 `passed` 为真时为 `null`。细则见下方「自检」 |
 | `set_auto_listen` | `{ enabled: boolean }` | `boolean`：写入 `prefs.json` 的 `app.auto_listen_on_start`，返回写入后的值。与 `set_autostart` 对称，但安全模式下也允许（prefs 与安全模式保护的配置、修订、导出分开存放；无法读取的 prefs 文件不会被覆盖，此时返回错误，通常是 `io`）。只影响下次启动，不改变当前的监听状态 |
 | `log_frontend_error` | `{ message: string, stack: string \| null, source: string \| null }` | `null`；后端截断到 8 KiB 后写日志 |

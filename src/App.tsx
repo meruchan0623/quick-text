@@ -616,6 +616,9 @@ export default function App() {
       await call('repair_engine');
       await sync.resync();
     }, '已开始修复引擎，结果会自动更新');
+  // macOS: the system prompt shows once at most; the button asks again and opens the privacy pane.
+  const requestPermissions = () =>
+    run(() => call('request_permissions'), '已打开系统设置，授权后会自动开始监听');
   const togglePause = () =>
     run(async () => {
       const manual = live ? live.manualPause : !!state?.paused;
@@ -958,6 +961,11 @@ export default function App() {
           {live?.kind === 'failed' && (
             <button className="primary" onClick={repair} disabled={busy}>
               修复引擎
+            </button>
+          )}
+          {live?.awaitingPermission && (
+            <button className="primary" onClick={requestPermissions} disabled={busy}>
+              去授权
             </button>
           )}
           {/* Not a write of the config: usable before it is read, as soon as the current pause is
@@ -1482,7 +1490,12 @@ export default function App() {
       {tab === 'status' && (
         <section className="settings">
           <h2>运行状态与恢复</h2>
-          <HealthCard view={runtime} busy={busy} onRepair={repair} />
+          <HealthCard
+            view={runtime}
+            busy={busy}
+            onRepair={repair}
+            onRequestPermissions={requestPermissions}
+          />
           <dl>
             <dt>引擎状态</dt>
             <dd>

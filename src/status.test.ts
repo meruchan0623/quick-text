@@ -65,6 +65,19 @@ describe('resolveStatus (§7.2 Health mapping table, same order as StatusText::r
 });
 
 describe('statusText', () => {
+  it('says 等待系统授权 while Starting/Recovering waits on a missing permission', () => {
+    const hook: ComponentHealth = {
+      component: 'keyboard_hook',
+      state: 'recovering',
+      reason: 'permission_missing',
+      since_ms: 0,
+    };
+    expect(statusText('starting', [], health('starting', [hook]))).toBe('等待系统授权…');
+    expect(statusText('recovering', [], health('recovering', [hook]))).toBe('等待系统授权…');
+    expect(statusText('failed', [], health('failed', [hook]))).toBe('输入监听已停止');
+    expect(statusText('starting', [], health('starting'))).toBe('正在启动…');
+  });
+
   it('uses the status-area column of the table', () => {
     expect(statusText('starting', [], null)).toBe('正在启动…');
     expect(statusText('failed', ['engine_down'], null)).toBe('输入监听已停止');
@@ -114,6 +127,7 @@ describe('liveStatus', () => {
       kind: 'listening',
       text: '监听中',
       manualPause: false,
+      awaitingPermission: false,
     });
     const paused = ready({
       engine: {
@@ -127,8 +141,25 @@ describe('liveStatus', () => {
       kind: 'paused',
       text: '已暂停（安全模式）',
       manualPause: true,
+      awaitingPermission: false,
     });
     expect(liveStatus(ready({ health: health('failed') }))?.text).toBe('输入监听已停止');
+  });
+
+  it('offers 去授权 only while waiting on a missing permission', () => {
+    const hook: ComponentHealth = {
+      component: 'keyboard_hook',
+      state: 'starting',
+      reason: 'permission_missing',
+      since_ms: 0,
+    };
+    expect(liveStatus(ready({ health: health('starting', [hook]) }))).toEqual({
+      kind: 'starting',
+      text: '等待系统授权…',
+      manualPause: false,
+      awaitingPermission: true,
+    });
+    expect(liveStatus(ready({ health: health('starting') }))?.awaitingPermission).toBe(false);
   });
 });
 

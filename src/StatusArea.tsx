@@ -47,10 +47,12 @@ export function HealthCard({
   view,
   busy,
   onRepair,
+  onRequestPermissions,
 }: {
   view: RuntimeView;
   busy: boolean;
   onRepair: () => void;
+  onRequestPermissions?: (() => void) | undefined;
 }) {
   const live = liveStatus(view);
   if (!live || !view.health || !view.engine)
@@ -70,6 +72,11 @@ export function HealthCard({
         {live.kind === 'failed' && (
           <button className="primary" disabled={busy} onClick={onRepair}>
             修复引擎
+          </button>
+        )}
+        {live.awaitingPermission && onRequestPermissions && (
+          <button className="primary" disabled={busy} onClick={onRequestPermissions}>
+            去授权
           </button>
         )}
       </div>
