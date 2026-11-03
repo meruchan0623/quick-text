@@ -157,9 +157,17 @@ pub async fn fetch(
         ));
     }
     if !status.is_success() {
+        let message = if status == StatusCode::NOT_FOUND {
+            "服务器上没有团队话术接口（HTTP 404），请检查服务器地址是否填对".to_string()
+        } else {
+            format!(
+                "服务器返回错误（HTTP {}），请稍后再试；一直失败时请联系管理员",
+                status.as_u16()
+            )
+        };
         return Err(SyncError::new(
             code::HTTP_STATUS,
-            format!("服务器返回错误（HTTP {}），请稍后重试", status.as_u16()),
+            message,
             format!("HTTP {}", status.as_u16()),
         ));
     }
@@ -355,6 +363,7 @@ mod tests {
                 b"{\"detail\":{\"code\":\"unauthorized\"}}",
             )),
             Reply::now(http("403 Forbidden", &[], b"")),
+            Reply::now(http("404 Not Found", &[], b"")),
             Reply::now(http("500 Internal Server Error", &[], b"oops")),
             Reply::now(http(
                 "302 Found",
@@ -368,11 +377,20 @@ mod tests {
         let error = run(&server, None).unwrap_err();
         assert_eq!(
             (error.code, error.detail.as_str()),
+            (code::HTTP_STATUS, "HTTP 404")
+        );
+        assert!(error.message.contains("检查服务器地址"), "{error}");
+        let error = run(&server, None).unwrap_err();
+        assert_eq!(
+            (error.code, error.detail.as_str()),
             (code::HTTP_STATUS, "HTTP 500")
         );
-        assert_eq!(error.message, "服务器返回错误（HTTP 500），请稍后重试");
+        assert_eq!(
+            error.message,
+            "服务器返回错误（HTTP 500），请稍后再试；一直失败时请联系管理员"
+        );
         assert_eq!(run(&server, None).unwrap_err().code, code::HTTP_STATUS);
-        assert_eq!(server.requests().len(), 5, "the redirect was not followed");
+        assert_eq!(server.requests().len(), 6, "the redirect was not followed");
     }
 
     /// §3: a body over the limit is `too_large`, whether announced or streamed.

@@ -97,8 +97,15 @@ describe('cloudErrorText', () => {
     expect(cloudErrorText({ code: 'unauthorized', message: 'HTTP 401' })).not.toMatch(/HTTP/);
   });
 
-  it('adds the backend message where it tells more, and names an unknown code', () => {
-    expect(cloudErrorText({ code: 'http_status', message: 'HTTP 502' })).toMatch(/（HTTP 502）$/);
+  it('uses the backend message where it tells more, and names an unknown code', () => {
+    expect(
+      cloudErrorText({
+        code: 'http_status',
+        message: '服务器上没有团队话术接口（HTTP 404），请检查服务器地址是否填对',
+      }),
+    ).toBe('服务器上没有团队话术接口（HTTP 404），请检查服务器地址是否填对。');
+    expect(cloudErrorText({ code: 'io', message: '缓存无法写入。' })).toBe('缓存无法写入。');
+    expect(cloudErrorText({ code: 'http_status', message: '' })).toBe(cloudErrorNames.http_status);
     expect(cloudErrorText({ code: 'rate_limited', message: 'slow down' })).toBe(
       '同步失败（错误代码 rate_limited）：slow down',
     );

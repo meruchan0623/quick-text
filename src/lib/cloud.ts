@@ -51,7 +51,10 @@ export const cloudErrorNames: Readonly<Record<string, string>> = {
 /** Codes fixed in 「团队话术同步」 settings: the error offers a way there. */
 export const SETTINGS_ERRORS: readonly string[] = ['not_configured', 'invalid_url', 'unauthorized'];
 
-/** Codes whose backend message adds something (an HTTP status, an OS error). */
+/**
+ * Codes whose backend message is a more precise sentence than ours (the HTTP status and
+ * what to check, which cache file failed): it is shown instead of ours.
+ */
 const DETAILED_ERRORS = new Set(['http_status', 'network', 'io']);
 
 /** The Chinese sentence of a sync error; an unknown code is named, with the backend's message. */
@@ -61,7 +64,8 @@ export function cloudErrorText(error: CloudError): string {
     : undefined;
   if (known === undefined)
     return `同步失败（错误代码 ${error.code}）${error.message ? `：${error.message}` : '。'}`;
-  return DETAILED_ERRORS.has(error.code) && error.message ? `${known}（${error.message}）` : known;
+  if (!DETAILED_ERRORS.has(error.code) || !error.message) return known;
+  return /[。！？]$/.test(error.message) ? error.message : `${error.message}。`;
 }
 
 const pad = (n: number) => String(n).padStart(2, '0');

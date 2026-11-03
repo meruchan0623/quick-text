@@ -61,7 +61,7 @@ Quicktext 可以订阅 TSim 客服系统维护的一张「团队话术」表。�
 - 不跟随重定向（按 `http_status` 处理）；代理只认环境变量 `HTTP(S)_PROXY` / `NO_PROXY`，不读系统代理设置。
 - `base_url` 变化（按上面的规范化比较）时清除内存与磁盘上的缓存和同步记录，直到下次同步成功前团队话术为空（删除失败的处理见 §2）。
 - 成功（200）：校验格式 → 写缓存 → 重新装载引擎 → 发 `cloud-state` 事件。304：只更新 `last_success_at`。失败：保留缓存和引擎现状，记录错误。
-- 错误码：`not_configured`（未开启或缺地址/密钥）、`invalid_url`、`unauthorized`（401/403）、`network`、`timeout`、`http_status`（其他非 2xx/304）、`too_large`、`too_many_rules`（超过 2000 条，见 §1）、`invalid_format`、`schema_newer`、`io`（缓存读写失败）。
+- 错误码：`not_configured`（未开启或缺地址/密钥）、`invalid_url`、`unauthorized`（401/403）、`network`、`timeout`、`http_status`（其他非 2xx/304；404 的 message 提示检查服务器地址，其余提示稍后再试）、`too_large`、`too_many_rules`（超过 2000 条，见 §1）、`invalid_format`、`schema_newer`、`io`（缓存读写失败）。
 - 成功（200）的处理顺序里，「校验格式」包含 §1 的整表准入；逐条准入在合并时、编译之前进行。
 
 ## 4. 与「我的指令」合并
