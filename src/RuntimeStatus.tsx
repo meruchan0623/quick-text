@@ -16,6 +16,16 @@ const compositionNames: Record<string, string> = {
   active: '正在选字，仅完整候选与已输入缩写一致时可替换',
   unknown: '候选无法读取，使用按键兼容模式',
 };
+function blockedReason(reason: unknown): unknown {
+  if (
+    reason ===
+    'Automatic capture requires ABC or U.S. keyboard layout; IME/dead-key layouts are paused'
+  )
+    return '请将输入法切换为 ABC 或美国英文；中文输入法或其他键盘布局下会暂停监听，切换后自动恢复。';
+  if (reason === 'Secure Input is active; native input is paused until it ends')
+    return '安全输入正在使用中，请退出密码等安全输入框；结束后自动恢复。';
+  return reason;
+}
 function targetSummary(state: State | null) {
   const detail: Data = state?.engine_detail ?? {};
   const espanso: Data | null = detail.espanso_input ?? null;
@@ -71,8 +81,7 @@ function targetSummary(state: State | null) {
     ['输入法选字状态', composition],
     [
       '阻止原因',
-      target?.blocked_reason ||
-        (physical ? null : detail.reason) ||
+      blockedReason(target?.blocked_reason || (physical ? null : detail.reason)) ||
         (state?.paused
           ? '请先应用规则，再恢复监听。'
           : '未报告阻止原因；仍需符合触发边界与目标保护检查。'),

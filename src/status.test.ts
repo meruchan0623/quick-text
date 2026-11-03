@@ -70,6 +70,8 @@ describe('statusText', () => {
     expect(statusText('failed', ['engine_down'], null)).toBe('输入监听已停止');
     expect(statusText('recovering', [], null)).toBe('正在恢复…');
     expect(statusText('paused', ['manual'], null)).toBe('已暂停');
+    expect(statusText('paused', ['platform'], null)).toBe('系统限制，监听已暂停');
+    expect(statusText('paused', ['manual', 'platform'], null)).toBe('已暂停');
     expect(statusText('paused', ['timed', 'safe_mode'], null)).toBe('已暂停（安全模式）');
     expect(statusText('executing', [], null)).toBe('执行中');
     expect(statusText('listening', [], null)).toBe('监听中');

@@ -79,7 +79,9 @@ export function statusText(
       return '正在恢复…';
     case 'paused':
       // The contract carries no resume time, so a timed pause cannot show 「14:30 自动恢复」 yet.
-      return paused.includes('safe_mode') ? '已暂停（安全模式）' : '已暂停';
+      if (paused.includes('safe_mode')) return '已暂停（安全模式）';
+      if (paused.includes('platform') && !paused.includes('manual')) return '系统限制，监听已暂停';
+      return '已暂停';
     case 'executing':
       return '执行中';
     case 'degraded': {
