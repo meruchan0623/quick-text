@@ -78,7 +78,6 @@ extern "C" {
     fn CFRelease(value: CF);
     fn CFRetain(value: CF) -> CF;
     fn CFHash(value: CF) -> usize;
-    fn CFEqual(a: CF, b: CF) -> bool;
     fn CFStringCreateWithBytes(
         allocator: CF,
         bytes: *const u8,
@@ -100,11 +99,6 @@ extern "C" {
 #[link(name = "Carbon", kind = "framework")]
 extern "C" {
     fn IsSecureEventInputEnabled() -> bool;
-    fn TISCopyCurrentKeyboardInputSource() -> CF;
-    fn TISGetInputSourceProperty(source: CF, property: CF) -> CF;
-    static kTISPropertyInputSourceType: CF;
-    static kTISPropertyInputSourceID: CF;
-    static kTISTypeKeyboardLayout: CF;
 }
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {}
@@ -208,7 +202,7 @@ const MODIFIER_RELEASE_WAIT: Duration = Duration::from_millis(500);
 static ENGINE: OnceLock<Arc<Shared>> = OnceLock::new();
 static SENDER: OnceLock<mpsc::SyncSender<Candidate>> = OnceLock::new();
 static BUFFER: OnceLock<Mutex<Buffer>> = OnceLock::new();
-static ENVIRONMENT: OnceLock<Mutex<(Foreground, bool)>> = OnceLock::new();
+static ENVIRONMENT: OnceLock<Mutex<Foreground>> = OnceLock::new();
 static PHYSICAL: OnceLock<Mutex<BTreeSet<u16>>> = OnceLock::new();
 static BUTTONS: OnceLock<Mutex<BTreeSet<u32>>> = OnceLock::new();
 static READY: AtomicBool = AtomicBool::new(false);
@@ -240,7 +234,7 @@ pub fn engine_ready() -> bool {
 }
 /// The input health (supervisor probe): the permissions are granted and the
 /// event tap is installed, or being reinstalled after macOS disabled it.
-/// Secure Input and an unsafe input source are not part of it: they come
+/// Secure Input is not part of it: it can come
 /// and go on their own and set `PauseReasons::PLATFORM` instead (the monitor
 /// thread in [`start_engine`]), so they neither fail the health nor become a
 /// manual pause.
@@ -271,12 +265,11 @@ fn permissions() -> Result<(), String> {
     Ok(())
 }
 /// Whether synthetic input may be sent right now: [`hook_ready`], the tap
-/// installed, and no platform block (Secure Input, unsafe input source).
+/// installed, and no platform block (Secure Input or event-tap restart).
 pub fn native_ready() -> Result<(), String> {
     permissions()?;
     if let Some(block) = crate::macos_rules::platform_block(
         unsafe { IsSecureEventInputEnabled() },
-        layout_safe(),
         RESTARTING.load(Ordering::SeqCst),
     ) {
         return Err(block.into());
@@ -296,7 +289,7 @@ pub fn input_status() -> serde_json::Value {
             "platform":"macos", "hook_installed":READY.load(Ordering::SeqCst),
             "accessibility":AXIsProcessTrusted(), "input_monitoring":CGPreflightListenEventAccess(),
             "post_event_access":CGPreflightPostEventAccess(), "secure_input":IsSecureEventInputEnabled(),
-            "keyboard_layout_safe":layout_safe(), "focus_known":focus.id != 0,
+            "focus_known":focus.id != 0,
             "ready":ready.is_ok(), "reason":ready.err(), "ime_committed_text_supported":false
         })
     }
@@ -430,25 +423,6 @@ fn verified_foreground() -> Foreground {
             return focus;
         }
         std::thread::sleep(Duration::from_millis(10));
-    }
-}
-fn layout_safe() -> bool {
-    unsafe {
-        let input = TISCopyCurrentKeyboardInputSource();
-        if input.is_null() {
-            return false;
-        }
-        let kind = TISGetInputSourceProperty(input, kTISPropertyInputSourceType);
-        let id = TISGetInputSourceProperty(input, kTISPropertyInputSourceID);
-        let id = string(id);
-        let safe = !kind.is_null()
-            && CFEqual(kind, kTISTypeKeyboardLayout)
-            && matches!(
-                id.as_str(),
-                "com.apple.keylayout.ABC" | "com.apple.keylayout.US"
-            );
-        CFRelease(input);
-        safe
     }
 }
 fn location() -> Result<Point, String> {
@@ -746,15 +720,11 @@ unsafe extern "C" fn tap(_: Id, kind: u32, event: Event, _: Id) -> Event {
         buffer.value.clear();
         return event;
     };
-    if shared.paused.load(Ordering::SeqCst)
-        || shared.busy.load(Ordering::SeqCst)
-        || !env.1
-        || env.0.id == 0
-    {
+    if shared.paused.load(Ordering::SeqCst) || shared.busy.load(Ordering::SeqCst) || env.id == 0 {
         buffer.value.clear();
         return event;
     }
-    let focus = env.0.clone();
+    let focus = env.clone();
     drop(env);
     if buffer.focus != focus.id {
         buffer.value.clear()
@@ -841,16 +811,13 @@ pub fn start_engine(shared: Arc<Shared>) -> Result<(), String> {
         }))
         .ok();
     ENVIRONMENT
-        .set(Mutex::new((
-            Foreground {
-                platform: "macos".into(),
-                bundle_id: String::new(),
-                id: 0,
-                process: String::new(),
-                title: String::new(),
-            },
-            false,
-        )))
+        .set(Mutex::new(Foreground {
+            platform: "macos".into(),
+            bundle_id: String::new(),
+            id: 0,
+            process: String::new(),
+            title: String::new(),
+        }))
         .ok();
     PHYSICAL
         .set(Mutex::new(
@@ -994,7 +961,6 @@ pub fn start_engine(shared: Arc<Shared>) -> Result<(), String> {
         while !monitor.shutdown.load(Ordering::SeqCst) {
             let (probed, timed_out) = probe_foreground();
             let focus = tracker.observe(probed, timed_out);
-            let safe = layout_safe();
             if old != focus.id && !monitor.busy.load(Ordering::SeqCst) {
                 monitor.generation.fetch_add(1, Ordering::SeqCst);
             }
@@ -1004,12 +970,11 @@ pub fn start_engine(shared: Arc<Shared>) -> Result<(), String> {
                 }
             }
             old = focus.id;
-            *ENVIRONMENT.get().unwrap().lock().unwrap() = (focus, safe);
+            *ENVIRONMENT.get().unwrap().lock().unwrap() = focus;
             // Transient conditions hold detection through their own pause
             // reason, set and cleared as they come and go.
             let block = crate::macos_rules::platform_block(
                 unsafe { IsSecureEventInputEnabled() },
-                safe,
                 RESTARTING.load(Ordering::SeqCst),
             );
             if blocked != Some(block) {
@@ -1949,12 +1914,6 @@ fn guarded(s: &Shared, target: &Foreground, generation: u64, revision: u64) -> R
     let now = verified_foreground();
     if target.id == 0 || now.id != target.id {
         return Err("Focused application/window/control changed or cannot be verified".into());
-    }
-    if !layout_safe() {
-        return Err(
-            "IME/composition cannot be safely observed; choose a keyboard-layout input source"
-                .into(),
-        );
     }
     // The trigger's last character may be typed with Shift still held: give
     // the modifiers a moment to come up before refusing.

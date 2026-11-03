@@ -7,7 +7,7 @@
 | 能力 | Windows x64 | macOS Apple Silicon | 验证边界 |
 |---|---|---|---|
 | 单引擎监听/结束键消费 | 单一低级键鼠 hook → 共享 Rust matcher；0.2.0仅即时触发，结束键透传不执行 | 单一 session CGEventTap → 同一 matcher，可返回 null 消费结束键 | Windows GUI草稿/发布子用例已观察；真实键盘触发未完成。Mac无实机证据 |
-| 触发/规则范围 | 原生Edit/RichEdit对照路径；新增 UIAutomation TextPattern2 观察可靠文本/折叠光标与composition的控件路径；进程名。浏览器若未提供可靠provider则拒绝 | CGEvent Unicode字符（不再限ASCII）+ 仅ABC/U.S.输入源ID白名单；真实bundle id；dead-key/IME布局由 `platform` 暂停原因挡住；缓冲规则与Windows共用（`quicker_domain::key_edit`） | 本机只读枚举NotepadTextBox→RichEditD2DPT，不能视作hook消费通过。导航、鼠标、物理组合键、外部注入、超时、焦点或revision变化清/拒绝旧输入 |
+| 触发/规则范围 | 原生Edit/RichEdit对照路径；新增 UIAutomation TextPattern2 观察可靠文本/折叠光标与composition的控件路径；进程名。浏览器若未提供可靠provider则拒绝 | CGEvent Unicode字符（不再限ASCII），不按输入源名称暂停；真实bundle id；输入法候选能否正确匹配及删除需在目标应用实测；缓冲规则与Windows共用（`quicker_domain::key_edit`） | 本机只读枚举NotepadTextBox→RichEditD2DPT，不能视作hook消费通过。导航、鼠标、物理组合键、外部注入、超时、焦点或revision变化清/拒绝旧输入 |
 | IME | Active、Unknown或过期composition不执行；可靠TextPattern2 inactive已上屏即时匹配，IME提交还须匹配已观察候选且正文未变，不自动清候选 | TIS input-source type 非 keyboard-layout 时拒绝 | 规则 null/缺省继承全局，旧显式 escape/backspace 保留。Windows特定provider路径仍未实机验收；Mac中文commit未实现，不能宣称通用支持 |
 | 焦点/选中文本 | 原生前台和 UI Automation 只读选区 | NSWorkspace bundle id + AXFocusedWindow/AXFocusedUIElement，仅AXTextArea/AXTextField，AXSelectedText读取 | Mac AX拿不到焦点、非文本角色或安全控件时id=0并拒绝。AX选区不修改剪贴板；未暴露选区的应用明确失败 |
 | Unicode 键入 | SendInput Unicode | CGEventKeyboardSetUnicodeString | Unicode/emoji/换行及应用消费需实测；结果为 unknown，不冒充目标消费成功 |
@@ -22,7 +22,7 @@
 | 录制/回放/取消 | 用户显式启停；自注入过滤 | 显式启停；键鼠/媒体及间隔，左右Cmd均记录为可移植Cmd；Ctrl+Shift+Esc停止收集并排除停止组合；停止时补IR持键释放 | 未知硬件键不静默省略，会使录制失败；有长度/超时界限。补IR释放不向用户当前按键发送释放。自然滚动、全部11类opcode实际回放未验 |
 | 目标安全/清理 | generation/revision/focus、物理键冲突检查 | generation/revision + AX窗口/控件，物理键/鼠标冲突检查 | 本任务持键才清理，冲突不无条件释放用户按键。权限丢失不能绕过保护做cleanup，需提示用户释放；任何副作用仍记入报告 |
 | 跨窗宏 | declared目标策略已进入IR | declared bundle id校验；执行期间焦点变化清matcher、由live focus guard检查locked/declared，不再将其单独当物理输入 | unexpected物理输入仍失效旧generation。目标是否已完成切换不可假定，需要显式等待及声明；T19声明转换实机未验 |
-| 启动/托盘/退出/登录项 | 用户会话、托盘、Run登录启动实现 | GUI可运行；原生tap权限后台重试，Secure Input/输入法/tap重装期间以 `platform` 暂停原因自动暂停并自动恢复，点 Dock 图标重新打开窗口，最低系统版本 10.15，退出poll清理tap；用户级LaunchAgent显式开启下次登录运行background | Mac登录项/关窗/退出必须在本机验收；完整app链接与打包未验；Developer ID和公证凭据缺失 |
+| 启动/托盘/退出/登录项 | 用户会话、托盘、Run登录启动实现 | GUI可运行；原生tap权限后台重试，Secure Input/tap重装期间以 `platform` 暂停原因自动暂停并自动恢复，点 Dock 图标重新打开窗口，最低系统版本 10.15，退出poll清理tap；用户级LaunchAgent显式开启下次登录运行background | Mac登录项/关窗/退出必须在本机验收；完整app链接与打包未验；Developer ID和公证凭据缺失 |
 | 分发 | Windows NSIS开发包 | 源码 + adapter目标类型检查 | 没有Mac机器、签名/公证凭据；Intel Mac/WinARM未验。Linux没有native adapter |
 
 macOS FFI使用系统ApplicationServices、CoreFoundation、Carbon、AppKit及Objective-C runtime，无新增第三方native依赖。CGPoint/CGRect按`repr(C)`布局，NSInteger/NSUInteger按指针宽度，NSEvent借用CGEvent先CFRetain再由发送函数释放。类型检查不会验证真实framework符号链接、权限、NSPasteboard目标读取或CGEvent消费，需要Mac实机验证。
@@ -42,8 +42,8 @@ Windows 0.2.0 keys（包括手动动作测试）需要可靠UIAutomation provide
 
 只在 Windows 上做了类型检查（`cargo check -p quicker-platform --target aarch64-apple-darwin` 无错误、无新增警告），以及跨平台的纯逻辑单元测试（`crates/platform/src/macos_rules.rs`、`crates/domain/src/typing.rs`）。下面每一项都没有 Mac 实机验证。
 
-1. **平台条件不再记为手动暂停。** 新增暂停原因 `PauseReasons::PLATFORM`（IPC 名 `platform`，界面显示「系统限制（安全输入/输入法）」，属于用户可见的暂停）。Secure Input、非 ABC/美式布局或输入法、事件 tap 被系统停用后重装期间，监控线程（20 ms 一次）在条件出现时置位，消失时清除；tap 回调和 `error_status` 不再写 `Shared::paused`，所以不会被 runtime 当成 MANUAL，条件结束后无需手动恢复。Health 探针改为 `hook_ready()`（权限 + tap 已安装或正在重装），Secure Input 和输入法不再使 Health 进入 Recovering/Failed；`native_ready()` 仍包含这些条件，用来在发送合成输入前把关。
-   - 待实测：Secure Input 开关、切换输入法、tap 超时停用后，状态栏是否在约 20 ms 内进入或离开「已暂停」；条件出现到监控线程置位之间的约 20 ms 内，tap 回调本身仍会在 Secure Input 下清空缓冲，不做匹配。
+1. **平台条件不再记为手动暂停。** 新增暂停原因 `PauseReasons::PLATFORM`（IPC 名 `platform`，界面显示「系统限制（安全输入/输入法）」，属于用户可见的暂停）。Secure Input 或事件 tap 被系统停用后重装期间，监控线程（20 ms 一次）在条件出现时置位，消失时清除；tap 回调和 `error_status` 不再写 `Shared::paused`，所以不会被 runtime 当成 MANUAL，条件结束后无需手动恢复。Health 探针改为 `hook_ready()`（权限 + tap 已安装或正在重装），Secure Input 不再使 Health 进入 Recovering/Failed；`native_ready()` 仍包含这些条件，用来在发送合成输入前把关。
+   - 待实测：Secure Input 开关、tap 超时停用后，状态栏是否在约 20 ms 内进入或离开「已暂停」；条件出现到监控线程置位之间的约 20 ms 内，tap 回调本身仍会在 Secure Input 下清空缓冲，不做匹配。
 2. **执行结果写入历史。** worker 结束时按 Windows 的判定规则（`history::outcome_for`，现由两个平台共用）调用 `runtime::current().record`，区分解析、预检、执行三个阶段；原因码由错误文字片段映射（`macos_rules::REASONS`，有测试保证每个片段确实出现在 `macos.rs` 中）。
    - 待实测：完成步数与副作用标志是否与实际一致。手动（非规则）执行的 macOS 运行仍不写历史，列为后续工作。
 3. **输入缓冲与 Windows 共用规则。** 新增 `quicker_domain::typing`（`key_edit`、`apply_key_edit`、`typed_terminator`、`match_typed`、`TYPED_BUFFER_CHARS` = 1024）。Windows `rawinput.rs` 和 macOS tap 都改为调用它。对 macOS 的影响：
@@ -53,7 +53,7 @@ Windows 0.2.0 keys（包括手动动作测试）需要可靠UIAutomation provide
    - 只有空格和 `;` 是结束键，Tab/Enter 不再是（B-12）；结束键规则优先，其次把含结束键字符的整段缓冲当即时规则匹配。
    - Ctrl/Option/Cmd 单独按下不清缓冲，按住它们再按其他键会清。
    - 鼠标移动和拖动不再清缓冲，也不使待执行任务失效。
-   - 待实测：带 Option 的字符（如 `é`）在 ABC 布局下能否作为缩写字符；死键仍由布局白名单挡住。
+   - 待实测：带 Option 的字符（如 `é`）在 ABC 布局下能否作为缩写字符；死键和输入法组合的匹配与删除效果仍需实测。
 4. **回放。**
    - 任务按住鼠标键时，移动改发拖动事件（左键 6、右键 7、其他 27），按住多个键时取最小的那个键。
    - Windows 录制的 delta 滚轮单位按 120 = 1 格换算，不再拒绝整个计划。

@@ -47,7 +47,7 @@
 
 首次运行在“系统设置 → 隐私与安全性”中给实际安装的 Quicktext 应用授予“辅助功能”和“输入监控”。开发运行可能需要给当前可执行文件或宿主终端授权；以实际系统提示为准。授权后可能需重启，再手动恢复。权限不足时 GUI 保持可用、引擎保持暂停并显示原因；不会绕过 Secure Input。更换应用路径或签名后重新核对授权。
 
-选择 **ABC 或 U.S.** 输入源（支持 `com.apple.keylayout.ABC` / `com.apple.keylayout.US`），再在 TextEdit 的纯文本窗口测试 `qtzzx`。ABC Extended、U.S. International等dead-key布局和IME拒绝，避免把组合中的ASCII误当已经上屏。安全输入、不可识别的窗口/控件或本应用自身均拒绝触发。Ctrl 导入仍为 Ctrl；新动作可用平台常用修饰键，在 Mac 映射 Cmd。Windows `#键值` 只走显式映射，未知值在删除缩写前报错。
+在 TextEdit 的纯文本窗口测试 `qtzzx`；无需切换输入源。监听的是按键事件，不保证输入法候选中的字符已经上屏或能被正确删除，具体输入法和目标应用需要实测。安全输入、不可识别的窗口/控件或本应用自身均拒绝触发。Ctrl 导入仍为 Ctrl；新动作可用平台常用修饰键，在 Mac 映射 Cmd。Windows `#键值` 只走显式映射，未知值在删除缩写前报错。
 
 Mac adapter 已实现 CGEventTap、CGEvent、AX 焦点/选区、NSPasteboard 文本/HTML/file-URL/PNG、多屏 Quartz 坐标、键鼠及媒体/音量/亮度事件。不同应用和硬件可能不消费这些事件，成功发送返回“未知”。Windows 1/120-click 滚轮 delta 没有经过验证的 Mac 等价映射，预检拒绝并提示使用 clicks。
 

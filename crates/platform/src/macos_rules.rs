@@ -30,17 +30,11 @@ pub(crate) fn key_class(code: u16) -> KeyClass {
 /// (`PauseReasons::PLATFORM`). These conditions come and go on their own:
 /// the backend sets the reason while one holds and clears it after, so they
 /// neither become a manual pause nor count against the input health.
-pub(crate) fn platform_block(
-    secure_input: bool,
-    layout_safe: bool,
-    tap_restarting: bool,
-) -> Option<&'static str> {
+pub(crate) fn platform_block(secure_input: bool, tap_restarting: bool) -> Option<&'static str> {
     if tap_restarting {
         Some("macOS disabled the event tap; it is being reinstalled")
     } else if secure_input {
         Some("Secure Input is active; native input is paused until it ends")
-    } else if !layout_safe {
-        Some("Automatic capture requires ABC or U.S. keyboard layout; IME/dead-key layouts are paused")
     } else {
         None
     }
@@ -220,8 +214,6 @@ const REASONS: &[(&str, ReasonCode)] = &[
     ("Physical input or focus changed", ReasonCode::StaleInput),
     ("revision changed", ReasonCode::StaleInput),
     ("Revision changed", ReasonCode::StaleInput),
-    ("IME/composition", ReasonCode::StaleInput),
-    ("keyboard layout", ReasonCode::StaleInput),
     (
         "Focused application/window/control changed",
         ReasonCode::FocusChanged,
@@ -327,16 +319,11 @@ mod tests {
 
     #[test]
     fn transient_conditions_name_their_block() {
-        assert_eq!(platform_block(false, true, false), None);
-        assert!(platform_block(true, true, false)
+        assert_eq!(platform_block(false, false), None);
+        assert!(platform_block(true, false)
             .unwrap()
             .contains("Secure Input"));
-        assert!(platform_block(false, false, false)
-            .unwrap()
-            .contains("layout"));
-        assert!(platform_block(true, false, true)
-            .unwrap()
-            .contains("event tap"));
+        assert!(platform_block(true, true).unwrap().contains("event tap"));
     }
 
     #[test]
@@ -552,12 +539,8 @@ mod tests {
     #[test]
     fn reason_fragments_match_the_mac_messages() {
         let mut source = include_str!("macos.rs").to_string();
-        for (secure, safe, restarting) in [
-            (true, true, false),
-            (false, false, false),
-            (false, true, true),
-        ] {
-            source.push_str(platform_block(secure, safe, restarting).unwrap());
+        for (secure, restarting) in [(true, false), (false, true)] {
+            source.push_str(platform_block(secure, restarting).unwrap());
         }
         for (fragment, reason) in REASONS {
             assert!(
