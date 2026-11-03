@@ -687,11 +687,14 @@ export function CloudSettingsSection({
               <span>服务器地址</span>
               <input
                 value={draft.base_url}
-                placeholder="https://"
+                placeholder="https://csapi.tsim.tech"
                 spellCheck={false}
                 onChange={(e) => edit({ base_url: e.target.value })}
               />
-              <small>TSim 客服系统的地址，只支持 https://（本机调试可用 http://localhost）。</small>
+              <small>
+                TSim 客服系统的根地址，不用带接口路径；只支持 https://（本机调试可用
+                http://localhost）。
+              </small>
             </label>
             <div className="field">
               <span>同步密钥</span>

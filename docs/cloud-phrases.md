@@ -49,13 +49,13 @@ Quicktext 可以订阅 TSim 客服系统维护的一张「团队话术」表。�
   ```
   `auto_sync_minutes` 取 0（仅手动）、15、30、60、120、240；`disabled_ids` 是本机停用的团队话术 id（原始 id，不带前缀）。
 - 数据目录 `cloud-phrases.json`：最近一次成功下载的表，`{ "source": "...", "etag": "...", "synced_at": "RFC3339", "table": { …下载内容… } }`，原子写入。启动时先读它，断网也能用。
-  - `source` 是这份表的下载地址，按下载时同一规则规范化（`base_url` 去首尾空白和末尾 `/` 后拼接路径，协议和主机名小写），例如 `https://csapi.tsim.tech/integrations/quick-text/v1/phrase-table`。
+  - `source` 是这份表的下载地址，按下载时同一规则规范化（`base_url` 去首尾空白、末尾 `/` 和已带上的下载路径后拼接路径，协议和主机名小写），例如 `https://csapi.tsim.tech/integrations/quick-text/v1/phrase-table`。
   - 只有 `source` 与当前 `base_url` 规范化后的下载地址一致时才装载（启动时、修改设置时都核对）。不一致（含没有 `source` 的旧文件、地址为空或非法）的缓存一律不用并尽量删除；删除失败时 `status.last_error` 为 `io`，message 为「旧服务器地址的团队话术缓存（cloud-phrases.json）无法删除，其中的话术不会被使用；请检查数据目录的权限」。因为来源不符的缓存永远不会装载，删除失败也不会让旧服务器的话术在重启后重新生效。
   - `prefs.json` 读不出时本次不启用同步，缓存保持原样（不装载、不删除）。
 
 ## 3. 下载规则
 
-- 地址：`base_url` 去掉末尾 `/` 后拼接路径。只允许 `https://`；`http://` 仅允许 `localhost`、`127.0.0.1`、`[::1]`（本地开发）。
+- 地址：`base_url` 去掉末尾 `/` 后拼接路径；`base_url` 本身已以该路径结尾（把完整下载地址填进来）时先去掉它，不会拼两次。只允许 `https://`；`http://` 仅允许 `localhost`、`127.0.0.1`、`[::1]`（本地开发）。
 - 超时 15 秒；正文上限 2 MiB（超过报 `too_large`）；`User-Agent: Quicktext/<版本>`。
 - 时机：启动加载完成后先装载缓存，再在后台拉取一次；之后按 `auto_sync_minutes` 定时（0 只关闭定时器，启动时和修改设置后仍各同步一次）；「立即同步」手动触发；修改同步设置后立即同步一次。同一时间只跑一个同步。
 - 不跟随重定向（按 `http_status` 处理）；代理只认环境变量 `HTTP(S)_PROXY` / `NO_PROXY`，不读系统代理设置。

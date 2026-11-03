@@ -13,7 +13,8 @@ use reqwest::{
 };
 use std::time::Duration;
 
-/// Appended to the server address (`base_url` without trailing `/`).
+/// Appended to the server address (`base_url` without trailing `/`, and without this
+/// path when it was pasted in already).
 pub const DOWNLOAD_PATH: &str = "/integrations/quick-text/v1/phrase-table";
 const USER_AGENT: &str = concat!("Quicktext/", env!("CARGO_PKG_VERSION"));
 
@@ -44,11 +45,16 @@ pub enum Fetched {
     NotModified,
 }
 
-/// The download URL for `base_url`: trailing `/` removed, [`DOWNLOAD_PATH`] appended.
+/// The download URL for `base_url`: trailing `/` removed, [`DOWNLOAD_PATH`] appended. A
+/// full download URL pasted as the address is taken as its server address.
 /// Only `https`, or `http` to `localhost`, `127.0.0.1` or `[::1]` (local development);
 /// no user name or password, query or fragment. An empty address is `not_configured`.
 pub fn endpoint(base_url: &str) -> Result<Url, SyncError> {
     let base = base_url.trim().trim_end_matches('/');
+    let base = base
+        .strip_suffix(DOWNLOAD_PATH)
+        .unwrap_or(base)
+        .trim_end_matches('/');
     if base.is_empty() {
         return Err(SyncError::new(
             code::NOT_CONFIGURED,
@@ -278,6 +284,14 @@ mod tests {
                 "HTTPS://CSAPI.TSIM.TECH",
                 "https://csapi.tsim.tech/integrations/quick-text/v1/phrase-table",
             ),
+            (
+                "http://localhost:8000/integrations/quick-text/v1/phrase-table",
+                "http://localhost:8000/integrations/quick-text/v1/phrase-table",
+            ),
+            (
+                "https://csapi.tsim.tech/api/integrations/quick-text/v1/phrase-table/",
+                "https://csapi.tsim.tech/api/integrations/quick-text/v1/phrase-table",
+            ),
         ] {
             assert_eq!(endpoint(base).unwrap().as_str(), url, "{base}");
         }
@@ -292,6 +306,7 @@ mod tests {
             "https://csapi.tsim.tech/?a=1",
             "https://csapi.tsim.tech#x",
             "https://",
+            "https:///integrations/quick-text/v1/phrase-table",
             "not a url",
         ] {
             assert_eq!(
