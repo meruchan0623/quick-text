@@ -533,11 +533,13 @@ describe('team phrases (docs/cloud-phrases.md §5)', () => {
       ['mock-cloud-3', 'active'],
       ['mock-cloud-4', 'disabled_remote'],
       ['mock-cloud-5', 'disabled_local'],
-      ['mock-cloud-6', 'shadowed'],
+      ['mock-cloud-6', 'active'],
       ['mock-cloud-7', 'invalid'],
       ['mock-cloud-8', 'active'],
     ]);
-    expect(state.rules[5]?.shadowed_by).toBe('mock-rule-2');
+    // The phrase with a personal rule's abbreviation wins and lists the rule it replaces.
+    expect(state.rules[5]?.overrides).toEqual(['mock-rule-2']);
+    expect(state.rules.filter((r) => r.overrides !== undefined).length).toBe(1);
     expect(state.rules[6]?.problem).toMatch(/正则表达式/);
     expect(state.rules.map((r) => r.disabled_local)).toEqual([
       false,
@@ -655,7 +657,8 @@ describe('team phrases (docs/cloud-phrases.md §5)', () => {
     expect(pushed.map((p) => p.status.syncing)).toEqual([true, false]);
     await invoke('set_cloud_rules_disabled', { ids: ['mock-cloud-1'], disabled: true });
     expect(pushed).toHaveLength(3);
-    // 我的指令 saved without ;s2: the phrase it shadowed is in effect again.
+    // 我的指令 saved without ;s2: the phrase no longer replaces anything.
+    expect(pushed.at(-1)?.rules[5]?.overrides).toEqual(['mock-rule-2']);
     const { active } = await invoke<{ active: MockConfig }>('load_state');
     await invoke('save_config', {
       config: {
@@ -663,7 +666,8 @@ describe('team phrases (docs/cloud-phrases.md §5)', () => {
         rules: active.rules.filter((r) => isMockRule(r) && r.id !== 'mock-rule-2'),
       },
     });
-    expect(pushed.at(-1)?.rules[5]?.status).toBe('active');
+    expect(pushed.at(-1)?.rules[5]).toMatchObject({ status: 'active' });
+    expect(pushed.at(-1)?.rules[5]?.overrides).toBeUndefined();
     expect(pushed.every((p) => !('seq' in p))).toBe(true);
     // The runtime events' seq moved for store-state only.
     expect(backend.seq).toBe(seq + 1);

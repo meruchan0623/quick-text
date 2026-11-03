@@ -201,7 +201,8 @@ const cloudText = (value: string) => ({
 /**
  * Synthetic team phrases, one per status with the default prefs of `sample`: `mock-cloud-4` is
  * switched off in the table, `mock-cloud-5` on this computer, `mock-cloud-6` has the abbreviation of
- * synthetic rule 2 (shadowed while that one is enabled), `mock-cloud-7` a regex that does not compile.
+ * synthetic rule 2 (and replaces it while both are enabled), `mock-cloud-7` a regex that does not
+ * compile.
  */
 export function sampleCloudRules(): MockRule[] {
   const phrase = (n: number, partial: Partial<MockRule>): MockRule => ({
@@ -1036,11 +1037,13 @@ export class MockBackend {
       const entry = { id: rule.id, rule: clone(rule), disabled_local: local };
       if (!rule.enabled) return { ...entry, status: 'disabled_remote' };
       if (local) return { ...entry, status: 'disabled_local' };
-      const by = personal.find((p) => same(p, rule));
-      if (by) return { ...entry, status: 'shadowed', shadowed_by: by.id };
       const problem = cloudProblem(rule);
       if (problem !== null) return { ...entry, status: 'invalid', problem };
-      return { ...entry, status: 'active' };
+      // Only a phrase that runs takes the place of the personal rules with its abbreviation.
+      const overrides = personal.filter((p) => same(p, rule)).map((p) => p.id);
+      return overrides.length > 0
+        ? { ...entry, status: 'active', overrides }
+        : { ...entry, status: 'active' };
     });
     return {
       settings: {
@@ -1170,7 +1173,7 @@ export class MockBackend {
     if (store.revision === this.#store.revision && store.safeMode === this.#store.safeMode) return;
     this.#store = store;
     this.emit('store-state', { revision: store.revision, safe_mode: store.safeMode });
-    // §5: 我的指令 changed, so did which team phrases it shadows.
+    // §5: 我的指令 changed, so did which of its rules a team phrase replaces.
     this.#pushCloud();
   }
 

@@ -15,6 +15,7 @@ import {
   cloudRows,
   cloudStatusClass,
   cloudStatusNames,
+  overriddenIds,
   phraseCopy,
   SETTINGS_ERRORS,
   syncTime,
@@ -158,7 +159,10 @@ function PhraseDetail({
   );
 }
 
-/** Why a phrase is not in effect, under its status: who shadows it, or what is wrong with it. */
+/**
+ * A note under the status: the 我的指令 rules an active phrase takes the place of, or why a phrase
+ * is not in effect.
+ */
 function PhraseNote({
   entry,
   ruleName,
@@ -166,8 +170,13 @@ function PhraseNote({
   entry: CloudRow['entry'];
   ruleName: (id: string) => string;
 }) {
-  if (entry.status === 'shadowed' && entry.shadowed_by)
-    return <small className="muted">我的指令「{ruleName(entry.shadowed_by)}」生效</small>;
+  const overridden = overriddenIds(entry);
+  if (overridden.length > 0)
+    return (
+      <small className="muted" title="同一缩写的我的指令不会触发；在本机停用这条后才会恢复">
+        覆盖我的指令「{overridden.map(ruleName).join('」「')}」
+      </small>
+    );
   // The table's switch shows first (§4); what this computer chose holds once it is on again.
   if (entry.status === 'disabled_remote' && entry.disabled_local)
     return <small className="muted">本机也已停用</small>;
@@ -249,7 +258,7 @@ export default function CloudPhrases({
   platform: string | undefined;
   /** The default 触发字符 of 我的指令, which a phrase without its own keys inherits (§4). */
   terminators: string[];
-  /** Name of a 我的指令 rule by id (「被我的指令覆盖」). */
+  /** Name of a 我的指令 rule by id (「覆盖我的指令」). */
   ruleName: (id: string) => string;
   /** 我的指令 can be saved now (App's `writable`). */
   canCopy: boolean;

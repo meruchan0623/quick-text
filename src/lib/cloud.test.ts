@@ -10,8 +10,9 @@ import {
   cloudRuleName,
   cloudStatusClass,
   cloudStatusNames,
+  overriddenIds,
+  overridingPhrases,
   phraseCopy,
-  shadowedPhrases,
   syncTime,
   triggerText,
 } from './cloud';
@@ -55,10 +56,10 @@ describe('labels', () => {
       'active',
       'disabled_remote',
       'disabled_local',
-      'shadowed',
       'invalid',
     ]);
-    expect(cloudStatusNames.shadowed).toBe('被我的指令覆盖');
+    // A phrase that takes a personal rule's place is simply in effect: `shadowed` is gone.
+    expect(cloudStatusClass('shadowed')).toBe('other');
     expect(cloudStatusClass('invalid')).toBe('invalid');
     expect(cloudStatusClass('paused_by_admin')).toBe('other');
     expect(cloudStatusClass('constructor')).toBe('other');
@@ -151,7 +152,7 @@ describe('cloudRows', () => {
   });
 });
 
-describe('shadowedPhrases and cloudRuleName', () => {
+describe('overridingPhrases and cloudRuleName', () => {
   const s = state([
     {
       id: 'a',
@@ -162,23 +163,49 @@ describe('shadowedPhrases and cloudRuleName', () => {
     {
       id: 'b',
       rule: rule('b', 'tb'),
-      status: 'shadowed',
+      status: 'active',
       disabled_local: false,
-      shadowed_by: 'mine-1',
+      overrides: ['mine-1'],
     },
     {
       id: 'c',
       rule: rule('c', 'tc'),
-      status: 'shadowed',
+      status: 'active',
       disabled_local: false,
-      shadowed_by: 'mine-1',
+      overrides: ['mine-1', 'mine-2'],
     },
-    { id: 'd', rule: rule('d', 'td'), status: 'shadowed', disabled_local: false },
+    // Only a phrase that is in effect takes anything's place.
+    {
+      id: 'd',
+      rule: rule('d', 'td'),
+      status: 'disabled_local',
+      disabled_local: true,
+      overrides: ['mine-3'],
+    },
+    { id: 'e', rule: rule('e', 'te'), status: 'active', disabled_local: false, overrides: [] },
   ]);
 
-  it('lists the phrases each personal rule takes the place of', () => {
-    expect([...shadowedPhrases(s)]).toEqual([['mine-1', ['tb', 'tc']]]);
-    expect(shadowedPhrases(null).size).toBe(0);
+  it('lists the phrases that take the place of each personal rule', () => {
+    expect([...overridingPhrases(s)]).toEqual([
+      ['mine-1', ['tb', 'tc']],
+      ['mine-2', ['tc']],
+    ]);
+    expect(overridingPhrases(null).size).toBe(0);
+  });
+
+  it('reads the replaced ids of an active phrase, and nothing malformed', () => {
+    const entry = (extra: Partial<CloudRuleEntry>): CloudRuleEntry => ({
+      id: 'x',
+      rule: rule('x', 'tx'),
+      status: 'active',
+      disabled_local: false,
+      ...extra,
+    });
+    expect(overriddenIds(entry({ overrides: ['a', 'b'] }))).toEqual(['a', 'b']);
+    expect(overriddenIds(entry({}))).toEqual([]);
+    expect(overriddenIds(entry({ status: 'invalid', overrides: ['a'] }))).toEqual([]);
+    expect(overriddenIds(entry({ overrides: 'a' as unknown as string[] }))).toEqual([]);
+    expect(overriddenIds(entry({ overrides: ['a', 3] as unknown as string[] }))).toEqual(['a']);
   });
 
   it('names a cloud: id from the table, and nothing else', () => {
@@ -277,7 +304,7 @@ describe('phraseCopy (「复制到我的指令」 whitelist)', () => {
   });
 
   it('copies fixed text whatever the status says, except invalid', () => {
-    for (const status of ['active', 'disabled_remote', 'disabled_local', 'shadowed'] as const)
+    for (const status of ['active', 'disabled_remote', 'disabled_local'] as const)
       expect(phraseCopy(row(rule('x', 'a'), status)).reason, status).toBeNull();
     expect(phraseCopy(row(rule('x', 'a'), 'invalid')).reason).toMatch(/无法使用/);
   });
@@ -293,7 +320,7 @@ describe('phraseCopy (「复制到我的指令」 whitelist)', () => {
       ),
     ).toMatch(/无法使用/);
     // Statuses decided before the action is checked do not let it through either.
-    for (const status of ['active', 'disabled_remote', 'disabled_local', 'shadowed'] as const)
+    for (const status of ['active', 'disabled_remote', 'disabled_local'] as const)
       expect(
         refused(
           { ...rule('x', 'a'), action: { type: 'open', target: 'cmd.exe', args: [] } },

@@ -47,7 +47,7 @@ import {
   unknownRuleKeys,
   unreadableEntries,
 } from './lib/rules';
-import { cloudRuleName, phraseCopy, shadowedPhrases, type CloudRow } from './lib/cloud';
+import { cloudRuleName, overridingPhrases, phraseCopy, type CloudRow } from './lib/cloud';
 import { unsupportedTerminators } from './lib/terminators';
 import { fixedImeErasure } from './lib/capabilities';
 import { ruleEditDiagnostics } from './lib/numberFields';
@@ -195,7 +195,7 @@ export default function App() {
   // 「去参数设置」 from the 团队话术 page focuses 「团队话术同步」 there, until another page is shown.
   const [cloudFocus, setCloudFocus] = useState(false);
   if (cloudFocus && tab !== 'settings') setCloudFocus(false);
-  // Without a subscription the engine runs no team phrase, so none is counted or shadowed.
+  // Without a subscription the engine runs no team phrase, so none is counted or takes a rule's place.
   const subscribed = cloud.state?.settings.enabled ? cloud.state : null;
   const editingCurrent = useRef<Rule | null>(null);
   const setEditing = (value: Rule | null) => {
@@ -742,8 +742,8 @@ export default function App() {
   const ruleNames = new Map<string, string>(readable.map((r) => [r.id, r.match.value || r.id]));
   // A team phrase runs as `cloud:<id>` (§4); its name comes from the phrase table.
   const ruleName = (id: string) => ruleNames.get(id) ?? cloudRuleName(id, cloud.state) ?? id;
-  // 我的指令 rules that take the place of a team phrase (「覆盖团队话术」).
-  const shadows = shadowedPhrases(subscribed);
+  // 我的指令 rules that an active team phrase takes the place of (「被团队话术覆盖」).
+  const overridden = overridingPhrases(subscribed);
   // An empty group is listed, counted and filtered as 「默认」 (F-04).
   const groupCounts = countByGroup(config.rules);
   const groups = ['全部', ...groupCounts.keys()];
@@ -787,8 +787,9 @@ export default function App() {
    * 「复制到我的指令」: a new rule (its defaults, a new id, enabled) with only what `phraseCopy`
    * lets through of a team phrase: fixed text, never the phrase as it came from the server. Checked
    * here, where it is written, whatever the button offered. Saved into 我的指令 like any rule change
-   * (`save`: the same readiness, one write at a time, the revision checked); saved, the copy takes
-   * the phrase's place (§4 shadowed).
+   * (`save`: the same readiness, one write at a time, the revision checked). While the phrase is
+   * active the team phrase wins over its copy (§4 overrides): the copy runs once the phrase is
+   * switched off on this computer, and the message says so.
    */
   const copyPhrase = (row: CloudRow) => {
     const { copy, reason } = phraseCopy(row);
@@ -799,7 +800,9 @@ export default function App() {
         if (rule === null) throw new Error(reason ?? '这条团队话术不能复制。');
         await save((c) => ({ ...c, rules: [...c.rules, rule] }));
       },
-      `已复制「${copy?.match.value ?? ''}」到我的指令并立即生效`,
+      row.entry.status === 'active'
+        ? `已复制「${copy?.match.value ?? ''}」到我的指令。同一缩写以团队话术为准，在本机停用团队话术那条后，这份副本才会生效`
+        : `已复制「${copy?.match.value ?? ''}」到我的指令并立即生效`,
     );
   };
   // Team phrase commands write prefs, not the config: none of `write` applies. Nor do they hold
@@ -1236,12 +1239,12 @@ export default function App() {
                           {r.ignore_case && <i>Aa</i>}
                           {r.trigger_mode === 'immediate' && <i>即时</i>}
                           {r.match.kind === 'regex' && <i>正则</i>}
-                          {shadows.has(r.id) && (
+                          {overridden.has(r.id) && (
                             <i
-                              className="shadows"
-                              title={`同一缩写的团队话术「${(shadows.get(r.id) ?? []).join('」「')}」不生效，以这条为准`}
+                              className="overridden"
+                              title={`同一缩写的团队话术「${(overridden.get(r.id) ?? []).join('」「')}」优先，这条不会触发；在团队话术中本机停用那条后才会恢复`}
                             >
-                              覆盖团队话术
+                              被团队话术覆盖
                             </i>
                           )}
                         </span>

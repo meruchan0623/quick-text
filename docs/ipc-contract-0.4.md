@@ -178,9 +178,9 @@ interface CloudState {
   rules: Array<{                      // 未订阅时为 []
     id: string;                       // 原始 id
     rule: Rule;                       // 云端原样规则
-    status: 'active' | 'disabled_remote' | 'disabled_local' | 'shadowed' | 'invalid';
+    status: 'active' | 'disabled_remote' | 'disabled_local' | 'invalid';
     disabled_local: boolean;          // id 是否在 disabled_ids 里，与 status 无关
-    shadowed_by?: string;             // 仅 shadowed：个人规则 id
+    overrides?: string[];             // 仅 active：被它取代的（同一缩写、已启用的）个人规则 id；这些规则不进引擎
     problem?: string;                 // 仅 invalid：中文原因，可直接显示
   }>;
 }

@@ -218,8 +218,7 @@ export interface LastMiss {
 export const CLOUD_STATE_EVENT = 'cloud-state';
 
 /** Open in practice like every union here: a newer backend may add statuses. */
-export type CloudRuleStatus =
-  'active' | 'disabled_remote' | 'disabled_local' | 'shadowed' | 'invalid';
+export type CloudRuleStatus = 'active' | 'disabled_remote' | 'disabled_local' | 'invalid';
 
 /** The sync settings as the backend shows them: the key is write-only, only `has_key` is read. */
 export interface CloudSettings {
@@ -265,8 +264,11 @@ export interface CloudRuleEntry {
   status: CloudRuleStatus;
   /** Whether this computer switched it off (`disabled_ids`), whatever `status` says. */
   disabled_local: boolean;
-  /** With `shadowed`: the id of the 我的指令 rule that takes its place. */
-  shadowed_by?: string;
+  /**
+   * With `active`: the ids of the 我的指令 rules with the same abbreviation. The phrase takes their
+   * place: while it is active they do not trigger.
+   */
+  overrides?: string[];
   /** With `invalid`: why it cannot be used, in Chinese for the user. */
   problem?: string;
 }

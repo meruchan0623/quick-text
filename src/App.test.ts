@@ -4412,7 +4412,7 @@ describe('团队话术 (docs/cloud-phrases.md §6)', () => {
       (tr) => tr.querySelector('strong')?.textContent === abbreviation,
     );
 
-  it('switches between 我的指令 and 团队话术 and marks the rule that shadows a phrase', async () => {
+  it('switches between 我的指令 and 团队话术 and marks the rule a phrase takes the place of', async () => {
     const mounted = await mountCloud();
     const { container } = mounted;
     expect(
@@ -4420,13 +4420,14 @@ describe('团队话术 (docs/cloud-phrases.md §6)', () => {
     ).toEqual(['我的指令3', '团队话术8']);
     const mine = [...container.querySelectorAll('tbody tr')];
     expect(mine).toHaveLength(3);
-    const marked = mine.filter((tr) => tr.querySelector('.markers .shadows'));
+    const marked = mine.filter((tr) => tr.querySelector('.markers .overridden'));
     expect(marked.map((tr) => tr.querySelector('strong')?.textContent)).toEqual([';s2']);
-    expect(marked[0]?.querySelector('.shadows')?.getAttribute('title')).toContain('「;s2」');
+    expect(marked[0]?.querySelector('.overridden')?.textContent).toBe('被团队话术覆盖');
+    expect(marked[0]?.querySelector('.overridden')?.getAttribute('title')).toContain('「;s2」');
 
     await switchTo(mounted, '团队话术');
     expect(container.querySelectorAll('.cloud-table tbody tr')).toHaveLength(8);
-    expect(cloudRow(container, ';s2')?.textContent).toContain('被我的指令覆盖');
+    expect(cloudRow(container, ';s2')?.textContent).toContain('覆盖我的指令');
     expect(container.querySelector('input[aria-label="搜索指令"]')).toBeNull();
     await switchTo(mounted, '我的指令');
     expect(container.querySelectorAll('tbody tr')).toHaveLength(3);
@@ -4448,16 +4449,19 @@ describe('团队话术 (docs/cloud-phrases.md §6)', () => {
     expect(copy?.id).not.toBe(phrase?.id);
     expect(copy?.id).toMatch(/^[0-9a-f-]{36}$/);
     expect({ ...copy, id: '' }).toEqual({ ...phrase, id: '' });
-    // Now the copy takes the phrase's place (§4), and both lists say so.
+    // The phrase is still in effect and takes the copy's place (§4): both lists say so, and the
+    // message says how to get the copy to run.
     await waitFor(mounted, () =>
-      expect(cloudRow(container, 'tnh')?.textContent).toContain('被我的指令覆盖'),
+      expect(cloudRow(container, 'tnh')?.textContent).toContain('覆盖我的指令'),
     );
+    expect(cloudRow(container, 'tnh')?.querySelector('.cloud-status')?.textContent).toBe('生效');
     expect(statusText(container)).toContain('已复制「tnh」到我的指令');
+    expect(statusText(container)).toContain('在本机停用团队话术那条后，这份副本才会生效');
     await switchTo(mounted, '我的指令');
     const row = [...container.querySelectorAll('tbody tr')].find(
       (tr) => tr.querySelector('strong')?.textContent === 'tnh',
     );
-    expect(row?.querySelector('.shadows')).not.toBeNull();
+    expect(row?.querySelector('.overridden')).not.toBeNull();
   });
 
   /** Add `phrase` to the synced table, after the sample's own (as the server would send it). */

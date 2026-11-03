@@ -2058,9 +2058,6 @@ input[aria-invalid='true'] {
 .cloud-status.active {
   color: var(--success);
 }
-.cloud-status.shadowed {
-  color: var(--info);
-}
 .cloud-status.invalid {
   color: var(--danger);
 }
@@ -2088,8 +2085,8 @@ td .cloud-problem {
 .unreadable-row .cloud-status {
   margin-left: 8px;
 }
-/* 「覆盖团队话术」 on a rule of 我的指令. */
-.markers i.shadows {
+/* 「被团队话术覆盖」 on a rule of 我的指令. */
+.markers i.overridden {
   color: var(--info);
   background: var(--info-soft);
   border-color: var(--info-border);

@@ -171,14 +171,13 @@ pub fn cloud_table_from_value(value: Value) -> Result<CloudTable, CloudTableErro
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CloudRuleStatus {
-    /// In the engine as `cloud:<id>`.
+    /// In the engine as `cloud:<id>`. An enabled personal rule with the same trigger does not
+    /// run then: the team phrase wins (`CloudRuleState::overrides`).
     Active,
     /// `enabled` is false in the downloaded table.
     DisabledRemote,
     /// Switched off on this computer (`app.cloud.disabled_ids`).
     DisabledLocal,
-    /// An enabled personal rule has the same trigger; the personal rule wins.
-    Shadowed,
     /// Does not compile (or is not a plain text phrase); `problem` says why.
     Invalid,
 }
@@ -194,10 +193,10 @@ pub struct CloudRuleState {
     /// Whether the id is in `disabled_ids`, whatever the status (a phrase the server
     /// switched off can be switched off locally too).
     pub disabled_local: bool,
-    /// For [`CloudRuleStatus::Shadowed`]: the id of the first enabled personal rule with the
-    /// same trigger.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub shadowed_by: Option<String>,
+    /// For [`CloudRuleStatus::Active`]: the ids of the enabled personal rules with the same
+    /// trigger, which the phrase replaces: they are not in the engine while it is active.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub overrides: Vec<String>,
     /// For [`CloudRuleStatus::Invalid`]: why, as text shown to the user (Chinese, one
     /// sentence per reason, joined by `；`). Never quotes the trigger or the phrase.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -212,9 +211,10 @@ pub struct CloudRuleState {
 #[derive(Debug, Clone)]
 pub struct CloudMerge {
     /// The effective configuration (`compiled.config`) and its compiled rules: the personal
-    /// configuration's version, revision, `enabled` and globals, its rules in their order,
-    /// then the active team phrases as `cloud:<id>` in download order. Without a table or
-    /// with an empty one this is exactly the personal compilation.
+    /// configuration's version, revision, `enabled` and globals, its rules in their order
+    /// (except the ones an active team phrase replaces), then the active team phrases as
+    /// `cloud:<id>` in download order. Without a table or with an empty one this is exactly
+    /// the personal compilation.
     pub compiled: CompiledConfig,
     /// Every readable team phrase, in download order.
     pub rules: Vec<CloudRuleState>,
@@ -253,9 +253,8 @@ fn cloud_inline_text(action: &Action) -> Option<&str> {
 /// Merges `table` into the compiled personal configuration (§4).
 ///
 /// Each readable phrase gets the first status that applies: `disabled_remote` (`enabled`
-/// false), `disabled_local` (its id in `disabled_ids`), `shadowed` (an enabled personal rule
-/// with the same `match.kind` and the same `match.value`, compared in lower case when either
-/// side ignores case), `invalid`, else `active`. `invalid` covers an empty id, a `cloud:<id>`
+/// false), `disabled_local` (its id in `disabled_ids`), `invalid`, else `active`. `invalid`
+/// covers an empty id, a `cloud:<id>`
 /// a personal rule already uses, an action other than inline text
 /// ([`cloud_action_allowed`]), and the admission limits: a regex trigger
 /// ([`REGEX_NOT_ALLOWED`]), a trigger over [`CLOUD_MAX_TRIGGER_CHARS`] or a text over
@@ -265,11 +264,17 @@ fn cloud_inline_text(action: &Action) -> Option<&str> {
 /// their own, with the personal version and globals, so a duplicate id inside the table is
 /// refused for the later entry), and what it refuses is `invalid` too. With at most
 /// [`CLOUD_MAX_RULES`] literal triggers of at most [`CLOUD_MAX_TRIGGER_CHARS`] characters,
-/// that compile stays small. Personal rules are never touched: they keep their compiled
-/// form and positions, and the active phrases follow them, so between overlapping
-/// triggers the existing priority holds (literal before regex, so a team phrase beats a
-/// personal regex on the same input; longer before shorter; equal literal triggers are
-/// `shadowed`).
+/// that compile stays small.
+///
+/// A team phrase that ends up `active` wins over a personal rule with the same trigger: an
+/// enabled personal rule with the same `match.kind` and the same `match.value` (compared in
+/// lower case when either side ignores case) is left out of the effective configuration, and
+/// the phrase lists its id in `overrides`. Switching the phrase off (remotely, on this
+/// computer) or having it refused (`invalid`) brings the personal rule back, since only a
+/// phrase that really runs replaces anything. The other personal rules keep their compiled
+/// form and order, and the active phrases follow them, so between overlapping triggers the
+/// existing priority holds (literal before regex, so a team phrase beats a personal regex
+/// on the same input; longer before shorter).
 pub fn merge_cloud(
     personal: &CompiledConfig,
     table: Option<&CloudTable>,
@@ -291,6 +296,8 @@ pub fn merge_cloud(
         ..Config::default()
     };
     let mut compiled = personal.clone();
+    // The compiled candidates, which are the active phrases (below).
+    let mut active = vec![];
     match compile_config_lenient(&candidate_config) {
         Err(errors) => {
             // Only errors of the whole configuration (version, global terminators), which the
@@ -315,14 +322,19 @@ pub fn merge_cloud(
                     states[*index].mark_invalid(&codes);
                 }
             }
-            for rule in lenient.compiled.rules {
-                // Every compiled candidate is active: it passed every earlier check and has
-                // no diagnostic. Its order is its index in the effective `rules`.
-                let order = compiled.config.rules.len();
-                compiled.config.rules.push(rule.rule.clone());
-                compiled.rules.push(rule.at_order(order));
-            }
+            // Every compiled candidate is active: it passed every earlier check and has no
+            // diagnostic.
+            active = lenient.compiled.rules;
         }
+    }
+    // Only now is it known which phrases are active, so which personal rules they replace.
+    let replaced = mark_overrides(&personal.config.rules, &mut states);
+    remove_replaced(&mut compiled, &replaced);
+    for rule in active {
+        // Its order is its index in the effective `rules`.
+        let order = compiled.config.rules.len();
+        compiled.config.rules.push(rule.rule.clone());
+        compiled.rules.push(rule.at_order(order));
     }
     CloudMerge {
         compiled,
@@ -331,15 +343,20 @@ pub fn merge_cloud(
 }
 
 /// The statuses [`merge_cloud`] would give, without compiling anything: a phrase that passes
-/// every check before compiling is `active` here even if it would not compile. For safe mode
-/// (the store), where team phrases do not run: the list stays visible and nothing is compiled;
-/// leaving safe mode merges, and compiles, for real.
+/// every check before compiling is `active` here even if it would not compile (and then lists
+/// the personal rules it would replace). For safe mode (the store), where team phrases do not
+/// run: the list stays visible and nothing is compiled; leaving safe mode merges, and
+/// compiles, for real.
 pub fn cloud_rule_states(
     personal: &Config,
     table: Option<&CloudTable>,
     disabled_ids: &BTreeSet<String>,
 ) -> Vec<CloudRuleState> {
-    table.map_or_else(Vec::new, |table| classify(personal, table, disabled_ids).0)
+    table.map_or_else(Vec::new, |table| {
+        let (mut states, _) = classify(personal, table, disabled_ids);
+        mark_overrides(&personal.rules, &mut states);
+        states
+    })
 }
 
 /// Every check of [`merge_cloud`] before compiling: the states, and the candidates still to
@@ -349,7 +366,6 @@ fn classify(
     table: &CloudTable,
     disabled_ids: &BTreeSet<String>,
 ) -> (Vec<CloudRuleState>, Vec<(usize, Rule)>) {
-    let triggers = PersonalTriggers::new(&personal.rules);
     let personal_ids: BTreeSet<&str> = personal.rules.iter().map(|rule| rule.id.as_str()).collect();
     let mut states = Vec::with_capacity(table.rules.len());
     let mut candidates: Vec<(usize, Rule)> = vec![];
@@ -360,7 +376,7 @@ fn classify(
             rule: rule.clone(),
             status: CloudRuleStatus::Active,
             disabled_local,
-            shadowed_by: None,
+            overrides: vec![],
             problem: None,
             problem_codes: vec![],
         };
@@ -368,9 +384,6 @@ fn classify(
             state.status = CloudRuleStatus::DisabledRemote;
         } else if disabled_local {
             state.status = CloudRuleStatus::DisabledLocal;
-        } else if let Some(by) = triggers.shadowing(rule) {
-            state.status = CloudRuleStatus::Shadowed;
-            state.shadowed_by = Some(by.to_string());
         } else if let Some(code) = precheck(rule, &personal_ids) {
             state.mark_invalid(&[code]);
         } else {
@@ -483,56 +496,74 @@ fn rule_position(path: &str) -> Option<usize> {
     rest[..rest.find(']')?].parse().ok()
 }
 
-/// Enabled personal triggers, for the `shadowed` check: for each key the first personal
-/// rule (lowest position) that has it.
-struct PersonalTriggers<'a> {
-    /// `(regex, value)` of every enabled rule.
-    exact: HashMap<(bool, &'a str), (usize, &'a str)>,
-    /// `(regex, lower-case value)` of every enabled rule.
-    folded: HashMap<(bool, String), (usize, &'a str)>,
-    /// `(regex, lower-case value)` of the enabled rules that ignore case.
-    folded_ignoring_case: HashMap<(bool, String), (usize, &'a str)>,
-}
-impl<'a> PersonalTriggers<'a> {
-    fn new(rules: &'a [Rule]) -> Self {
-        let mut triggers = Self {
-            exact: HashMap::new(),
-            folded: HashMap::new(),
-            folded_ignoring_case: HashMap::new(),
-        };
-        for (order, rule) in rules.iter().enumerate().filter(|(_, rule)| rule.enabled) {
-            let regex = rule.match_spec.kind == MatchKind::Regex;
-            let value = rule.match_spec.value.as_str();
-            let lower = value.to_lowercase();
-            let entry = (order, rule.id.as_str());
-            triggers.exact.entry((regex, value)).or_insert(entry);
-            if rule.ignore_case {
-                triggers
-                    .folded_ignoring_case
-                    .entry((regex, lower.clone()))
-                    .or_insert(entry);
-            }
-            triggers.folded.entry((regex, lower)).or_insert(entry);
-        }
-        triggers
-    }
-    /// The id of the first enabled personal rule with `rule`'s trigger.
-    fn shadowing(&self, rule: &Rule) -> Option<&'a str> {
+/// Which enabled personal rules the active team phrases replace (§4): those with the same
+/// `match.kind` and the same `match.value`, compared in lower case when either side ignores
+/// case. Each active phrase gets the ids of the rules it replaces in `overrides` (in personal
+/// order); the result is their positions in `personal`, a rule counted once however many
+/// phrases cover it. Phrases in any other status replace nothing.
+fn mark_overrides(personal: &[Rule], states: &mut [CloudRuleState]) -> BTreeSet<usize> {
+    // Only rules whose lower-case values are equal can be the same trigger.
+    let mut by_trigger: HashMap<(bool, String), Vec<usize>> = HashMap::new();
+    for (position, rule) in personal.iter().enumerate().filter(|(_, rule)| rule.enabled) {
         let regex = rule.match_spec.kind == MatchKind::Regex;
-        let value = rule.match_spec.value.as_str();
-        let lower = value.to_lowercase();
-        let found = if rule.ignore_case {
-            self.folded.get(&(regex, lower)).copied()
-        } else {
-            let exact = self.exact.get(&(regex, value)).copied();
-            let folded = self.folded_ignoring_case.get(&(regex, lower)).copied();
-            exact
-                .into_iter()
-                .chain(folded)
-                .min_by_key(|(order, _)| *order)
-        };
-        found.map(|(_, id)| id)
+        by_trigger
+            .entry((regex, rule.match_spec.value.to_lowercase()))
+            .or_default()
+            .push(position);
     }
+    let mut replaced = BTreeSet::new();
+    if by_trigger.is_empty() {
+        return replaced;
+    }
+    for state in states
+        .iter_mut()
+        .filter(|state| state.status == CloudRuleStatus::Active)
+    {
+        let regex = state.rule.match_spec.kind == MatchKind::Regex;
+        let value = state.rule.match_spec.value.as_str();
+        let Some(positions) = by_trigger.get(&(regex, value.to_lowercase())) else {
+            continue;
+        };
+        for &position in positions {
+            let mine = &personal[position];
+            if state.rule.ignore_case || mine.ignore_case || mine.match_spec.value == value {
+                state.overrides.push(mine.id.clone());
+                replaced.insert(position);
+            }
+        }
+    }
+    replaced
+}
+
+/// Takes the personal rules at `replaced` (positions in the personal `config.rules`) out of
+/// the effective configuration. The rules after them move up, so each compiled rule's `order`
+/// is renumbered to stay its index in `config.rules`.
+fn remove_replaced(compiled: &mut CompiledConfig, replaced: &BTreeSet<usize>) {
+    if replaced.is_empty() {
+        return;
+    }
+    let mut moved_to = Vec::with_capacity(compiled.config.rules.len());
+    let mut next = 0;
+    for position in 0..compiled.config.rules.len() {
+        if replaced.contains(&position) {
+            moved_to.push(None);
+        } else {
+            moved_to.push(Some(next));
+            next += 1;
+        }
+    }
+    let mut position = 0;
+    compiled.config.rules.retain(|_| {
+        position += 1;
+        moved_to[position - 1].is_some()
+    });
+    compiled.rules = std::mem::take(&mut compiled.rules)
+        .into_iter()
+        .filter_map(|rule| {
+            let order = moved_to.get(rule.order()).copied().flatten()?;
+            Some(rule.at_order(order))
+        })
+        .collect();
 }
 
 #[cfg(test)]
@@ -810,7 +841,7 @@ mod tests {
         assert!(merge.compiled.rule("cloud:t1").is_some());
     }
 
-    /// §4: the order of the checks: disabled_remote, disabled_local, shadowed, invalid.
+    /// §4: the order of the checks: disabled_remote, disabled_local, invalid, else active.
     #[test]
     fn statuses_are_decided_in_order() {
         let personal = personal(vec![text_rule("mine", "same", "personal body")]);
@@ -819,9 +850,10 @@ mod tests {
         remote_off.match_spec.value.clear(); // would be invalid too
         let mut local_off = text_rule("local", "same", "x");
         local_off.match_spec.kind = MatchKind::Literal;
-        let mut shadowed_and_broken = text_rule("shadowed", "same", "x");
-        shadowed_and_broken.trigger_mode = TriggerMode::Immediate;
-        shadowed_and_broken.terminator = Some(Terminator {
+        // The same trigger as the personal rule, but compiling refuses the empty override: a
+        // phrase that does not run replaces nothing.
+        let mut broken_same_trigger = text_rule("refused", "same", "x");
+        broken_same_trigger.terminator = Some(Terminator {
             keys: vec![],
             consume: true,
         });
@@ -838,7 +870,7 @@ mod tests {
             Some(&table(vec![
                 remote_off,
                 local_off,
-                shadowed_and_broken,
+                broken_same_trigger,
                 broken,
                 fine,
             ])),
@@ -849,16 +881,15 @@ mod tests {
             [
                 ("remote".to_string(), CloudRuleStatus::DisabledRemote),
                 ("local".to_string(), CloudRuleStatus::DisabledLocal),
-                ("shadowed".to_string(), CloudRuleStatus::Shadowed),
+                ("refused".to_string(), CloudRuleStatus::Invalid),
                 ("broken".to_string(), CloudRuleStatus::Invalid),
                 ("fine".to_string(), CloudRuleStatus::Active),
             ]
         );
-        assert_eq!(merge.rules[2].shadowed_by.as_deref(), Some("mine"));
-        assert!(merge.rules[2].problem.is_none());
+        assert_eq!(merge.rules[2].problem.as_deref(), Some("结束键设置无效"));
         assert_eq!(merge.rules[3].problem.as_deref(), Some("结束键设置无效"));
         assert_eq!(merge.rules[3].problem_codes, ["terminator"]);
-        assert!(merge.rules[3].shadowed_by.is_none());
+        assert!(merge.rules.iter().all(|state| state.overrides.is_empty()));
         // `disabled_local` follows `disabled_ids` whatever the status.
         let local: Vec<_> = merge
             .rules
@@ -887,10 +918,11 @@ mod tests {
         assert_eq!(ids, ["mine", "cloud:fine"]);
     }
 
-    /// §4: only enabled personal rules shadow; kind and value must both match; case is
-    /// folded when either side ignores it; `shadowed_by` is the first such personal rule.
+    /// §4: an active phrase replaces the enabled personal rules with its trigger: kind and
+    /// value must both match, case is folded when either side ignores it, and `overrides`
+    /// lists every such personal rule (in their order), not just the first.
     #[test]
-    fn shadowing_follows_the_trigger_rules() {
+    fn overriding_follows_the_trigger_rules() {
         let mut disabled = text_rule("off", "dis", "x");
         disabled.enabled = false;
         let mut regex = text_rule("re", "rx", "x");
@@ -922,25 +954,166 @@ mod tests {
         let found: Vec<_> = merge
             .rules
             .iter()
-            .map(|state| {
-                (
-                    state.id.as_str(),
-                    state.status,
-                    state.shadowed_by.as_deref(),
-                )
-            })
+            .map(|state| (state.id.as_str(), state.status, state.overrides.clone()))
             .collect();
+        let active = CloudRuleStatus::Active;
         assert_eq!(
             found,
             [
-                ("t-dis", CloudRuleStatus::Active, None),
-                ("t-rx", CloudRuleStatus::Active, None),
-                ("t-exact", CloudRuleStatus::Shadowed, Some("exact")),
-                ("t-other-case", CloudRuleStatus::Active, None),
-                ("t-mixed", CloudRuleStatus::Shadowed, Some("fold")),
-                ("t-fold", CloudRuleStatus::Shadowed, Some("upper-first")),
+                ("t-dis", active, vec![]),
+                ("t-rx", active, vec![]),
+                (
+                    "t-exact",
+                    active,
+                    vec!["exact".to_string(), "second-same".to_string()]
+                ),
+                ("t-other-case", active, vec![]),
+                ("t-mixed", active, vec!["fold".to_string()]),
+                (
+                    "t-fold",
+                    active,
+                    vec![
+                        "upper-first".to_string(),
+                        "exact".to_string(),
+                        "second-same".to_string()
+                    ]
+                ),
             ]
         );
+        // The rules that are replaced are gone from the engine; `off` (disabled) and `re`
+        // (a regex) have no phrase with their trigger and stay.
+        let ids: Vec<_> = merge
+            .compiled
+            .config
+            .rules
+            .iter()
+            .map(|rule| rule.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "off",
+                "re",
+                "cloud:t-dis",
+                "cloud:t-rx",
+                "cloud:t-exact",
+                "cloud:t-other-case",
+                "cloud:t-mixed",
+                "cloud:t-fold"
+            ]
+        );
+    }
+
+    /// §4: while a phrase is active, typing its trigger runs the phrase and the personal rule
+    /// with the same trigger is not in the engine; the other personal rules keep working and
+    /// keep their relative order (`order` stays the index in the effective `config.rules`).
+    #[test]
+    fn an_active_phrase_wins_over_the_personal_rule_with_its_trigger() {
+        let personal = personal(vec![
+            text_rule("first", "aa", "personal first"),
+            text_rule("dup", "tk", "personal dup"),
+            text_rule("last", "zz", "personal last"),
+        ]);
+        let phrases = table(vec![text_rule("t", "tk", "team")]);
+        let context = ForegroundContext::default();
+        let merge = merge_cloud(&personal, Some(&phrases), &none());
+        let hit = merge
+            .compiled
+            .match_input("tk", Some("space"), &context)
+            .unwrap();
+        assert_eq!(hit.rule_id, "cloud:t");
+        assert!(hit.tied_rule_ids.is_empty());
+        assert!(merge.compiled.rule("dup").is_none());
+        let ids: Vec<_> = merge
+            .compiled
+            .config
+            .rules
+            .iter()
+            .map(|rule| rule.id.as_str())
+            .collect();
+        assert_eq!(ids, ["first", "last", "cloud:t"]);
+        let orders: Vec<_> = merge
+            .compiled
+            .rules
+            .iter()
+            .map(|rule| (rule.rule.id.as_str(), rule.order()))
+            .collect();
+        assert_eq!(orders, [("first", 0), ("last", 1), ("cloud:t", 2)]);
+        for kept in [("aa", "first"), ("zz", "last")] {
+            let hit = merge
+                .compiled
+                .match_input(kept.0, Some("space"), &context)
+                .unwrap();
+            assert_eq!(hit.rule_id, kept.1);
+        }
+        // The personal configuration itself is untouched.
+        assert_eq!(personal.config.rules.len(), 3);
+        assert!(personal.rule("dup").is_some());
+
+        // A phrase that does not run replaces nothing: the personal rule answers again.
+        let switched_off = BTreeSet::from(["t".to_string()]);
+        let mut remote_off = text_rule("t", "tk", "team");
+        remote_off.enabled = false;
+        let mut broken = text_rule("t", "tk", "team");
+        broken.terminator = Some(Terminator {
+            keys: vec![],
+            consume: true,
+        });
+        let mut regex = text_rule("t", "tk", "team");
+        regex.match_spec.kind = MatchKind::Regex;
+        for (table, disabled) in [
+            (table(vec![text_rule("t", "tk", "team")]), switched_off),
+            (table(vec![remote_off]), none()),
+            (table(vec![broken]), none()),
+            (table(vec![regex]), none()),
+        ] {
+            let merge = merge_cloud(&personal, Some(&table), &disabled);
+            assert_ne!(merge.rules[0].status, CloudRuleStatus::Active);
+            assert!(merge.rules[0].overrides.is_empty());
+            let ids: Vec<_> = merge
+                .compiled
+                .config
+                .rules
+                .iter()
+                .map(|rule| rule.id.as_str())
+                .collect();
+            assert_eq!(ids, ["first", "dup", "last"]);
+            let hit = merge
+                .compiled
+                .match_input("tk", Some("space"), &context)
+                .unwrap();
+            assert_eq!(hit.rule_id, "dup");
+        }
+    }
+
+    /// A disabled personal rule is not replaced (it is not in the engine anyway): it has
+    /// no `overrides` entry, and stays in the effective configuration as it was.
+    #[test]
+    fn a_disabled_personal_rule_is_left_alone() {
+        let mut off = text_rule("off", "tk", "personal");
+        off.enabled = false;
+        let personal = personal(vec![off, text_rule("on", "zz", "x")]);
+        let merge = merge_cloud(
+            &personal,
+            Some(&table(vec![text_rule("t", "tk", "team")])),
+            &none(),
+        );
+        assert!(merge.rules[0].overrides.is_empty());
+        let ids: Vec<_> = merge
+            .compiled
+            .config
+            .rules
+            .iter()
+            .map(|rule| rule.id.as_str())
+            .collect();
+        assert_eq!(ids, ["off", "on", "cloud:t"]);
+        let orders: Vec<_> = merge
+            .compiled
+            .rules
+            .iter()
+            .map(|rule| rule.order())
+            .collect();
+        assert_eq!(orders, [1, 2]);
     }
 
     /// §4: a phrase that does not compile, or is more than text, is `invalid` with a
@@ -1245,21 +1418,27 @@ mod tests {
         let table = table(vec![
             needs_compiling,
             regex,
-            text_rule("shadowed", "same", "x"),
+            text_rule("overrides", "same", "x"),
         ]);
         let states = cloud_rule_states(&personal.config, Some(&table), &none());
         let statuses: Vec<_> = states.iter().map(|state| state.status).collect();
         use CloudRuleStatus::*;
-        assert_eq!(statuses, [Active, Invalid, Shadowed]);
+        assert_eq!(statuses, [Active, Invalid, Active]);
+        // Without compiling nothing is known to fail, but what an active phrase replaces is
+        // listed all the same.
+        assert!(states[0].overrides.is_empty());
+        assert_eq!(states[2].overrides, ["mine"]);
         let merged = merge_cloud(&personal, Some(&table), &none());
         let statuses: Vec<_> = merged.rules.iter().map(|state| state.status).collect();
-        assert_eq!(statuses, [Invalid, Invalid, Shadowed]);
+        assert_eq!(statuses, [Invalid, Invalid, Active]);
+        assert_eq!(merged.rules[2].overrides, ["mine"]);
         assert!(cloud_rule_states(&personal.config, None, &none()).is_empty());
     }
 
     /// §4: overlapping triggers keep the existing priority (team phrases are literal: a
-    /// literal beats a personal regex on the same input, the longer trigger wins, equal
-    /// triggers are `shadowed`). The global switch also stops team phrases.
+    /// literal beats a personal regex on the same input, the longer trigger wins; equal
+    /// triggers are not left to the priority: the team phrase replaces the personal rule).
+    /// The global switch also stops team phrases.
     #[test]
     fn priority_and_the_global_switch_cover_team_phrases() {
         let mut personal_regex = text_rule("p-re", "a.c", "x");
@@ -1308,11 +1487,16 @@ mod tests {
         assert_eq!(value[0]["rule"]["id"], "a");
         assert_eq!(value[0]["rule"]["match"]["value"], "aa");
         assert_eq!(value[0]["disabled_local"], false);
-        assert!(value[0].get("shadowed_by").is_none());
+        assert!(value[0].get("overrides").is_none());
         assert!(value[0].get("problem").is_none());
         assert!(value[0].get("problem_codes").is_none());
-        assert_eq!(value[1]["status"], "shadowed");
-        assert_eq!(value[1]["shadowed_by"], "mine");
+        assert_eq!(value[1]["status"], "active");
+        assert_eq!(value[1]["overrides"], json!(["mine"]));
+        assert!(value
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|rule| rule.get("shadowed_by").is_none()));
         for (status, wire) in [
             (CloudRuleStatus::DisabledRemote, "disabled_remote"),
             (CloudRuleStatus::DisabledLocal, "disabled_local"),

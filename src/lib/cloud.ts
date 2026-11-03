@@ -23,7 +23,6 @@ export const cloudStatusNames: Readonly<Record<string, string>> = {
   active: '生效',
   disabled_remote: '云端已停用',
   disabled_local: '本机停用',
-  shadowed: '被我的指令覆盖',
   invalid: '无法使用',
 };
 
@@ -106,16 +105,21 @@ export function cloudRows(state: CloudState | null): CloudRow[] {
 /** 缩写 of a team phrase, else its id. */
 const phraseName = (row: CloudRow): string => row.rule?.match.value || row.entry.id;
 
+/** The 我的指令 rule ids an active team phrase takes the place of (`overrides`, §4). */
+export function overriddenIds(entry: CloudRow['entry']): string[] {
+  if (entry.status !== 'active' || !Array.isArray(entry.overrides)) return [];
+  return entry.overrides.filter((id): id is string => typeof id === 'string');
+}
+
 /**
- * 我的指令 rules that take the place of a team phrase (status `shadowed`), by personal rule id:
- * the names of the phrases each one covers, for 「覆盖团队话术」.
+ * 我的指令 rules that an active team phrase takes the place of, by personal rule id: the names of
+ * the phrases that cover each one, for 「被团队话术覆盖」.
  */
-export function shadowedPhrases(state: CloudState | null): Map<string, string[]> {
+export function overridingPhrases(state: CloudState | null): Map<string, string[]> {
   const result = new Map<string, string[]>();
   for (const row of cloudRows(state)) {
-    const by = row.entry.shadowed_by;
-    if (row.entry.status !== 'shadowed' || !by) continue;
-    result.set(by, [...(result.get(by) ?? []), phraseName(row)]);
+    for (const id of overriddenIds(row.entry))
+      result.set(id, [...(result.get(id) ?? []), phraseName(row)]);
   }
   return result;
 }
@@ -163,7 +167,7 @@ export function actionBody(action: unknown): string {
 // enabled, outside any check the table's merge made. So nothing of the phrase is copied as it is:
 // the copy is a new rule with its defaults, and only the fields below, rebuilt one by one from what
 // passed, are taken over. Only fixed text qualifies. The status alone does not tell, since
-// disabled_remote, disabled_local and shadowed are decided before the action is ever checked (§4).
+// disabled_remote and disabled_local are decided before the action is ever checked (§4).
 
 /** Placeholders the engine fills from this computer: the clipboard, the selection, a parameter. */
 export const LOCAL_INPUT_PLACEHOLDERS: readonly string[] = ['{cliptext}', '{selection}', '{param:'];

@@ -329,12 +329,15 @@ fn a_sync_caches_and_merges_and_the_cache_survives_failures_and_restarts() {
         statuses(&state),
         [
             ("a".to_string(), CloudRuleStatus::Active),
-            ("b".to_string(), CloudRuleStatus::Shadowed)
+            ("b".to_string(), CloudRuleStatus::Active)
         ]
     );
-    assert_eq!(state.rules[1].shadowed_by.as_deref(), Some("mine"));
-    assert_eq!(engine_ids(&store), ["mine", "cloud:a"]);
-    assert_eq!(compiled_ids(&store), ["mine", "cloud:a"]);
+    // The phrase with the personal rule's trigger wins: the personal rule is not in the
+    // engine (it is still in `active`, below).
+    assert!(state.rules[0].overrides.is_empty());
+    assert_eq!(state.rules[1].overrides, ["mine"]);
+    assert_eq!(engine_ids(&store), ["cloud:a", "cloud:b"]);
+    assert_eq!(compiled_ids(&store), ["cloud:a", "cloud:b"]);
     {
         let s = store.lock();
         // The revision stays the personal one; `active` and `load_state` are personal.
@@ -366,7 +369,7 @@ fn a_sync_caches_and_merges_and_the_cache_survives_failures_and_restarts() {
     let state = run(&store, &hub, Trigger::Timer);
     assert_eq!(state.status.last_error, None);
     assert_eq!(state.status.revision, Some(12));
-    assert_eq!(engine_ids(&store), ["mine", "cloud:a"]);
+    assert_eq!(engine_ids(&store), ["cloud:a", "cloud:b"]);
     let requests = server.requests();
     assert!(
         requests[0].contains("Bearer qtk_1.secret") || requests[0].contains("bearer qtk_1.secret")
@@ -391,7 +394,7 @@ fn a_sync_caches_and_merges_and_the_cache_survives_failures_and_restarts() {
         json!({ "code": "unauthorized", "message": error.message })
     );
     assert_eq!(state.status.revision, Some(12));
-    assert_eq!(engine_ids(&store), ["mine", "cloud:a"]);
+    assert_eq!(engine_ids(&store), ["cloud:a", "cloud:b"]);
     assert!(dir.join("cloud-phrases.json").exists());
     // The key never reaches the state.
     assert!(!serde_json::to_string(&state).unwrap().contains("qtk_1"));
@@ -400,7 +403,7 @@ fn a_sync_caches_and_merges_and_the_cache_survives_failures_and_restarts() {
     // Restart without the network: the cache is loaded before anything runs.
     drop(store);
     let store = load(&dir);
-    assert_eq!(engine_ids(&store), ["mine", "cloud:a"]);
+    assert_eq!(engine_ids(&store), ["cloud:a", "cloud:b"]);
     let state = store.lock().cloud_state();
     assert_eq!(state.status.revision, Some(12));
     assert_eq!(
@@ -491,8 +494,8 @@ fn a_sync_that_cannot_run_says_why() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// §4: saving the personal configuration re-merges (a new personal rule shadows a
-/// team phrase) and never writes a team phrase.
+/// §4: saving the personal configuration re-merges (a new personal rule with a team
+/// phrase's trigger is replaced by the phrase) and never writes a team phrase.
 #[test]
 fn a_personal_save_remerges_and_stays_personal() {
     let dir = temp_dir();
@@ -509,19 +512,27 @@ fn a_personal_save_remerges_and_stays_personal() {
     run(&store, &hub, Trigger::Manual);
     assert_eq!(engine_ids(&store), ["first", "cloud:a", "cloud:b"]);
     publish(&store, vec![personal_rule("mine", "bb")]);
-    assert_eq!(engine_ids(&store), ["mine", "cloud:a"]);
-    // The save is reported as `cloud-state` (after the earlier events, in order).
-    let shadowed = [
-        ("a".to_string(), CloudRuleStatus::Active),
-        ("b".to_string(), CloudRuleStatus::Shadowed),
-    ];
+    assert_eq!(engine_ids(&store), ["cloud:a", "cloud:b"]);
+    // The save is reported as `cloud-state` (after the earlier events, in order): the
+    // phrase `b` now lists the personal rule it replaces.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let event = events
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .expect("the save sends cloud-state");
-        if statuses(&event) == shadowed {
-            assert_eq!(event.rules[1].shadowed_by.as_deref(), Some("mine"));
+        // Earlier events may come before the table is loaded.
+        if event
+            .rules
+            .get(1)
+            .is_some_and(|rule| rule.overrides == ["mine"])
+        {
+            assert_eq!(
+                statuses(&event),
+                [
+                    ("a".to_string(), CloudRuleStatus::Active),
+                    ("b".to_string(), CloudRuleStatus::Active),
+                ]
+            );
             break;
         }
     }

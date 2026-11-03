@@ -123,8 +123,10 @@ describe('团队话术 list', () => {
     expect(status('tnh')).toBe('生效');
     expect(status('tjh')).toBe('云端已停用');
     expect(status('tfh')).toBe('本机停用');
-    expect(status(';s2')).toBe('被我的指令覆盖');
-    expect(rowOf(host, ';s2')?.textContent).toContain('我的指令「;s2」生效');
+    // The same abbreviation as a rule of 我的指令: the phrase is in effect and says what it replaces.
+    expect(status(';s2')).toBe('生效');
+    expect(rowOf(host, ';s2')?.textContent).toContain('覆盖我的指令「;s2」');
+    expect(rowOf(host, 'tnh')?.textContent).not.toContain('覆盖我的指令');
     expect(status('(DD[0-9')).toBe('无法使用');
     expect(rowOf(host, '(DD[0-9')?.querySelector('.cloud-problem')?.textContent).toBe(
       '缩写的正则表达式写法有误，无法使用。',
@@ -255,7 +257,7 @@ describe('团队话术 list', () => {
         (b) => b.textContent === '复制到我的指令',
       );
     expect(copy('tnh')?.disabled).toBe(false);
-    // Disabled by the table or on this computer, or shadowed: still fixed text, still copyable.
+    // Disabled by the table or on this computer, or replacing a rule: still fixed text, still copyable.
     for (const ok of ['tjh', 'tfh', ';s2']) expect(copy(ok)?.disabled, ok).toBe(false);
     for (const [abbreviation, why] of [
       ['(DD[0-9', '无法使用'],
