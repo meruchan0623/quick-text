@@ -76,7 +76,7 @@ Quicktext 可以订阅 TSim 客服系统维护的一张「团队话术」表。�
 | `disabled_remote` | 云端 `enabled` 为 false | 否 |
 | `disabled_local` | id 在 `disabled_ids` 里 | 否 |
 | `shadowed` | 有**已启用**的个人规则与它触发相同：`match.kind` 相同，且 `match.value` 相同（任一方 `ignore_case` 为 true 时按小写比较） | 否，`shadowed_by` 记个人规则 id |
-| `invalid` | 编译前的检查：个人规则已占用 `cloud:<id>` 这个 id；动作不是「`text` + `inline` 正文」；`match.kind` 不是 `literal`（`regex_not_allowed`，「团队话术只支持普通缩写，不支持正则」）；缩写超过 64 个字符（`match_too_long`）；正文超过 20000 个字符（`body_too_long`）；正文含 `{cliptext}`、`{selection}` 或 `{param:`（子串判断，偏保守）。通过以上检查的才进宽松编译，编译失败的也判 `invalid`。`problem` 记中文原因 | 否 |
+| `invalid` | 编译前的检查：个人规则已占用 `cloud:<id>` 这个 id；动作不是「`text` + `inline` 正文」或「`send_keys` + `inline` 正文 + 空 `syntax_variables`」（文字与按键组合）；`match.kind` 不是 `literal`（`regex_not_allowed`，「团队话术只支持普通缩写，不支持正则」）；缩写超过 64 个字符（`match_too_long`）；正文超过 20000 个字符（`body_too_long`）；正文含 `{cliptext}`、`{selection}` 或 `{param:`（子串判断，偏保守）。通过以上检查的才进宽松编译，编译失败的也判 `invalid`。`problem` 记中文原因 | 否 |
 
 团队话术只接受「粘贴/键入固定文字」：即使服务器被攻破或配置错误，也不会下发打开程序、读取本机文件等动作，正文也不能把本机剪贴板、选中文字或动作参数带进输出（这三种占位符的诊断码为 `local_data_placeholder`，problem「正文含 {cliptext}、{selection} 或 {param:…}，团队话术只输出固定文字」）。日期占位符 `{0:…}` 照常可用。被判 `invalid` 的话术不进生效配置，执行时也就不会为它们读取剪贴板或选区。TSim 服务端保存时同样拒绝这三种占位符。
 

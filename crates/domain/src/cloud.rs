@@ -223,19 +223,31 @@ pub struct CloudMerge {
 /// Diagnostic code of a team phrase that is not a plain text phrase.
 pub const ACTION_NOT_ALLOWED: &str = "action_not_allowed";
 
-/// Team phrases only paste or type their own inline text (the server allows nothing else,
-/// TSim_CS spec §2.1). Anything else (opening programs, reading local files, key macros,
+/// Team phrases only paste or type their own inline text, or send their own inline key
+/// combination (the server allows nothing else, TSim_CS spec §2.1). Anything else (opening
+/// programs, reading local files, key combinations with syntax variables,
 /// reusable actions) is refused here as well, so a table that reaches the client some other
 /// way still cannot run more than text. The text itself must not read local data either
 /// ([`cloud_text_reads_local_data`]).
 pub fn cloud_action_allowed(action: &Action) -> bool {
-    matches!(
-        action,
+    cloud_inline_text(action).is_some()
+}
+
+/// The inline text of a team phrase action: plain text, or a key combination
+/// (`send_keys`, e.g. `您好{Enter}`) without syntax variables, so the keys come only
+/// from the phrase itself. `None` for anything else.
+fn cloud_inline_text(action: &Action) -> Option<&str> {
+    match action {
         Action::Text {
-            source: ContentSource::Inline { .. },
+            source: ContentSource::Inline { value },
             ..
-        }
-    )
+        } => Some(value),
+        Action::SendKeys {
+            source: ContentSource::Inline { value },
+            syntax_variables,
+        } if syntax_variables.is_empty() => Some(value),
+        _ => None,
+    }
 }
 
 /// Merges `table` into the compiled personal configuration (§4).
@@ -424,11 +436,7 @@ fn precheck(rule: &Rule, personal_ids: &BTreeSet<&str>) -> Option<&'static str> 
     if rule.id.trim().is_empty() || personal_ids.contains(cloud_rule_id(&rule.id).as_str()) {
         return Some(CLOUD_RULE_ID);
     }
-    let Action::Text {
-        source: ContentSource::Inline { value },
-        ..
-    } = &rule.action
-    else {
+    let Some(value) = cloud_inline_text(&rule.action) else {
         return Some(ACTION_NOT_ALLOWED);
     };
     if rule.match_spec.kind != MatchKind::Literal {
@@ -448,7 +456,7 @@ fn precheck(rule: &Rule, personal_ids: &BTreeSet<&str>) -> Option<&'static str> 
 pub fn cloud_problem_text(code: &str) -> String {
     match code {
         CLOUD_RULE_ID => "话术编号为空、重复，或与我的指令的编号冲突".into(),
-        ACTION_NOT_ALLOWED => "团队话术只能粘贴或键入纯文本".into(),
+        ACTION_NOT_ALLOWED => "团队话术只能粘贴、键入纯文本或使用文字与按键组合".into(),
         REGEX_NOT_ALLOWED => "团队话术只支持普通缩写，不支持正则".into(),
         MATCH_TOO_LONG => format!("缩写超过 {CLOUD_MAX_TRIGGER_CHARS} 个字符"),
         BODY_TOO_LONG => format!("正文超过 {CLOUD_MAX_BODY_CHARS} 个字符"),
@@ -962,6 +970,13 @@ mod tests {
                 encoding: Encoding::Utf8,
             },
         };
+        let mut keys_with_vars = text_rule("kv", "kv", "x");
+        keys_with_vars.action = Action::SendKeys {
+            source: ContentSource::Inline {
+                value: "{cliptext}".into(),
+            },
+            syntax_variables: vec!["cliptext".into()],
+        };
         let mut blank_id = text_rule("  ", "bl", "x");
         blank_id.id = "  ".into();
         let merge = merge_cloud(
@@ -972,6 +987,7 @@ mod tests {
                 immediate_regex,
                 open,
                 file,
+                keys_with_vars,
                 text_rule("dup", "d2", "second"),
                 blank_id,
                 text_rule("taken", "tk", "x"),
@@ -992,6 +1008,7 @@ mod tests {
                 (Active, None),
                 invalid("match_empty"),
                 invalid(REGEX_NOT_ALLOWED),
+                invalid(ACTION_NOT_ALLOWED),
                 invalid(ACTION_NOT_ALLOWED),
                 invalid(ACTION_NOT_ALLOWED),
                 invalid("rule_id"),
@@ -1022,7 +1039,7 @@ mod tests {
         assert_eq!(merge.rules[1].problem.as_deref(), Some("缩写为空"));
         assert_eq!(
             merge.rules[3].problem.as_deref(),
-            Some("团队话术只能粘贴或键入纯文本")
+            Some("团队话术只能粘贴、键入纯文本或使用文字与按键组合")
         );
         for state in &merge.rules {
             if let Some(problem) = &state.problem {
@@ -1317,5 +1334,19 @@ mod tests {
                 "{shown}"
             );
         }
+    }
+
+    #[test]
+    fn inline_send_keys_without_syntax_variables_is_admitted() {
+        let mut combo = text_rule("combo", "nh", "x");
+        combo.action = Action::SendKeys {
+            source: ContentSource::Inline {
+                value: "您好{Enter}".into(),
+            },
+            syntax_variables: vec![],
+        };
+        assert!(cloud_action_allowed(&combo.action));
+        let merge = merge_cloud(&personal(vec![]), Some(&table(vec![combo])), &none());
+        assert_eq!(merge.rules[0].status, CloudRuleStatus::Active);
     }
 }
