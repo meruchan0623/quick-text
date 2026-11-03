@@ -1,1 +1,1 @@
-{}
+{"main-events":{"identifier":"main-events","description":"Allow the main window to receive runtime status events.","local":true,"windows":["main"],"permissions":["core:event:default"]}}

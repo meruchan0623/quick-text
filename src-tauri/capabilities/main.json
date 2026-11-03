@@ -1,0 +1,6 @@
+{
+  "identifier": "main-events",
+  "description": "Allow the main window to receive runtime status events.",
+  "windows": ["main"],
+  "permissions": ["core:event:default"]
+}
