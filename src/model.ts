@@ -102,11 +102,9 @@ export const actionChoice = (action: Data): string =>
   action.type === 'text' ? (action.method === 'paste' ? 'text_paste' : 'text_keys') : action.type;
 export const actionLabel = (action: Data): string =>
   actionNames[actionChoice(action)] || action.type;
-export const actionOptions = Object.entries(actionNames).filter(([type]) => type !== 'text');
 /**
- * The choices offered for a new action: what everyday replies need. The other types stay readable,
- * runnable and selectable on a rule that already has one (an import, an older version), but are
- * not offered for new rules.
+ * The choices offered by the action picker. Legacy types remain readable and runnable on existing
+ * rules, but are never offered as a replacement action.
  */
 export const offeredChoices: ReadonlySet<string> = new Set([
   'text_paste',
@@ -117,6 +115,9 @@ export const offeredChoices: ReadonlySet<string> = new Set([
   'steps',
   'open',
 ]);
+export const actionOptions = Object.entries(actionNames).filter(([type]) =>
+  offeredChoices.has(type),
+);
 export const clone = <T>(x: T): T => structuredClone(x);
 export const keys = ['space', 'tab', 'enter', 'semicolon'];
 export const keyNames: Record<string, string> = {

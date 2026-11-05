@@ -153,7 +153,7 @@ describe('choiceOffer', () => {
     expect(offer(entry('recording', 'experimental', 'experimental_platform'))).toEqual({
       hidden: false,
       disabled: false,
-      note: '（实验性）',
+      note: '',
     });
     expect(offer(entry('quicker_private_action', 'unavailable', 'not_implemented'))).toEqual({
       hidden: true,

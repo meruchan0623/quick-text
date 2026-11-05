@@ -3048,7 +3048,40 @@ describe('action types by capability status (S-16, principle 5)', () => {
     expect(typeSelect(mounted).value).toBe('text_keys');
   });
 
-  it('keeps listing a type not offered for new actions on a rule that has it', async () => {
+  it('offers 粘贴图片 by its own capability', async () => {
+    // The clipboard is down here, as for 粘贴纯文本.
+    const mounted = await editRule('windows', { type: 'none' });
+    expect(offered(mounted).image?.text).toMatch(/^粘贴图片（暂不可用：.+）$/);
+    expect(offered(mounted).image?.disabled).toBe(true);
+  });
+
+  it('refuses to save 粘贴图片 without a picture, and saves it once one is chosen', async () => {
+    const mounted = await editRule('windows', { type: 'image', asset: '', name: '' });
+    const { backend, container } = mounted;
+    await clickIn(mounted, dialog(container, EDITOR), '保存');
+    await waitFor(mounted, () => {
+      expect(container.querySelector('.action-diagnostics')?.textContent).toContain(
+        '请选择要粘贴的图片。',
+      );
+    });
+    expect(callsOf(backend, 'save_config')).toHaveLength(0);
+    await clickIn(mounted, dialog(container, EDITOR), '选择图片');
+    await waitFor(mounted, () => {
+      expect(dialog(container, EDITOR)?.querySelector('img.image-preview')).not.toBeNull();
+    });
+    await clickIn(mounted, dialog(container, EDITOR), '保存');
+    await waitFor(mounted, () => {
+      expect(callsOf(backend, 'save_config')).toHaveLength(1);
+    });
+    const saved = backend.active.rules.filter(isRule).find((r) => r.action.type === 'image');
+    expect(saved?.action).toEqual({
+      type: 'image',
+      asset: `${'0'.repeat(64)}.png`,
+      name: '示例图片.png',
+    });
+  });
+
+  it('shows the legacy type without offering it, and preserves it on save', async () => {
     const action = {
       type: 'replay',
       plan: { version: 1, dialect: 'structured', source: null, steps: [] },
@@ -3056,11 +3089,8 @@ describe('action types by capability status (S-16, principle 5)', () => {
     };
     const mounted = await editRule('macos', action);
     expect(typeSelect(mounted).value).toBe('replay');
-    // Experimental (macOS): selectable, tagged.
-    expect(offered(mounted).replay).toEqual({
-      text: '重放鼠标和键盘操作（实验性）',
-      disabled: false,
-    });
+    expect(typeSelect(mounted).textContent).toContain('重放鼠标和键盘操作');
+    expect(offered(mounted).replay).toBeUndefined();
     expect(offered(mounted).html).toBeUndefined();
     expect(await save(mounted)).toEqual(action);
   });
@@ -3081,10 +3111,8 @@ describe('action types by capability status (S-16, principle 5)', () => {
     const action = { type: 'quicker', action_id: 'abc', parameter: '' };
     const mounted = await editRule('windows', action);
     expect(typeSelect(mounted).value).toBe('quicker');
-    expect(offered(mounted).quicker).toEqual({
-      text: '保留 Quicker 动作信息（暂不能执行）',
-      disabled: false,
-    });
+    expect(typeSelect(mounted).textContent).toContain('保留 Quicker 动作信息（暂不能执行）');
+    expect(offered(mounted).quicker).toBeUndefined();
     expect(await save(mounted)).toEqual(action);
   });
 });
@@ -3210,7 +3238,7 @@ describe('settings kept for rules that have them stay for the whole edit (Codex 
     expect(() => field(editor(mounted), FOLDER)).toThrow();
   });
 
-  it('keeps a type not offered for new actions listed after switching away from it', async () => {
+  it('does not reintroduce a legacy type after switching to a supported action', async () => {
     const replay = {
       type: 'replay',
       plan: { version: 1, dialect: 'structured', source: null, steps: [] },
@@ -3218,8 +3246,11 @@ describe('settings kept for rules that have them stay for the whole edit (Codex 
     };
     const mounted = await editKept(rule(replay));
     await chooseType(mounted, 'text_paste');
-    await chooseType(mounted, 'replay');
-    expect((await save(mounted))?.action).toMatchObject({ type: 'replay' });
+    await mounted.act(() => {
+      editor(mounted).querySelector<HTMLButtonElement>('[role="combobox"]')?.click();
+    });
+    expect(editor(mounted).querySelector('[role="option"][data-value="replay"]')).toBeNull();
+    expect((await save(mounted))?.action).toMatchObject({ type: 'text', method: 'paste' });
   });
 
   it('keeps the text source choice of a file-reading rule after switching to inline', async () => {

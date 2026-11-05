@@ -7,7 +7,7 @@ import { ActionTypePicker } from './ActionTypePicker';
 const cleanups: (() => void)[] = [];
 afterEach(() => cleanups.splice(0).forEach((cleanup) => cleanup()));
 
-function mount() {
+function mount(value = 'text_keys') {
   const host = document.createElement('dialog');
   document.body.append(host);
   const root = createRoot(host);
@@ -15,7 +15,7 @@ function mount() {
   act(() =>
     root.render(
       <ActionTypePicker
-        value="text_keys"
+        value={value}
         onChange={change}
         options={[
           { value: 'text_keys', label: '键入纯文本', disabled: false },
@@ -39,6 +39,22 @@ function mount() {
 }
 
 describe('ActionTypePicker', () => {
+  it('keeps a legacy label but browses supported choices without changing it on open', () => {
+    const { host, trigger, change, press } = mount('quicker');
+    expect(trigger.textContent).toContain('保留 Quicker 动作信息（暂不能执行）');
+    act(() => trigger.click());
+    expect(host.querySelector('[data-value="quicker"]')).toBeNull();
+    expect(host.querySelector('[data-active="true"]')?.getAttribute('data-value')).toBe(
+      'text_keys',
+    );
+    expect(change).not.toHaveBeenCalled();
+    expect(
+      document.getElementById(trigger.getAttribute('aria-activedescendant') ?? ''),
+    ).not.toBeNull();
+    press('Enter');
+    expect(change).toHaveBeenCalledExactlyOnceWith('text_keys');
+  });
+
   it('only shows guidance while expanded, previews disabled options without changing the action', () => {
     const { host, trigger, change, press } = mount();
     expect(host.querySelector('.action-guide')).toBeNull();

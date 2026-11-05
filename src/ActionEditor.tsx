@@ -3,15 +3,7 @@ import { call } from './ipc/transport';
 import type { ImageAsset } from './ipc/types';
 import { diagnosticText, parseCommandError } from './ipc/errors';
 import { choiceCapability, choiceOffer, findCapability } from './lib/capabilities';
-import {
-  actionChoice,
-  actionLabel,
-  actionOptions,
-  clone,
-  Data,
-  offeredChoices,
-  Rule,
-} from './model';
+import { actionChoice, actionLabel, actionOptions, clone, Data, Rule } from './model';
 import { moveItem, withoutKey } from './lib/list';
 import {
   actionDiagnostics,
@@ -459,7 +451,6 @@ export default function ActionEditor({
   // What the action had when the editor opened. Choices and fields kept only for rules that use them
   // stay on screen for the whole edit, so clearing one or switching away can be taken back.
   const [opened] = useState(() => ({
-    choice: actionChoice(a),
     fileSource: a.source?.type === 'file',
     syntaxVariables: (a.syntax_variables ?? []).length > 0,
     args: (a.args ?? []).length > 0,
@@ -669,8 +660,6 @@ export default function ActionEditor({
           value={actionChoice(a)}
           platform={platform}
           options={actionOptions.flatMap(([k, v]) => {
-            // Types not offered for new rules keep an entry on a rule that has one.
-            if (!offeredChoices.has(k) && k !== actionChoice(a) && k !== opened.choice) return [];
             const { hidden, disabled, note } = offer(k);
             return hidden ? [] : [{ value: k, label: `${v}${note}`, disabled }];
           })}

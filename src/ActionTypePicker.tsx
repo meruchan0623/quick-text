@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { actionGuides } from './actionHelp';
+import { actionNames } from './model';
 
 type Option = { value: string; label: string; disabled: boolean };
 type Props = {
@@ -39,7 +40,9 @@ export function ActionTypePicker({ options, value, onChange, platform }: Props) 
       width,
       height,
     });
-    setActive(value);
+    setActive(
+      options.some((option) => option.value === value) ? value : (options[0]?.value ?? value),
+    );
   };
   const confirm = (option: Option) => {
     if (option.disabled) return;
@@ -112,7 +115,7 @@ export function ActionTypePicker({ options, value, onChange, platform }: Props) 
           }
         }}
       >
-        <span>{selected?.label ?? value}</span>
+        <span>{selected?.label ?? actionNames[value] ?? value}</span>
         <span aria-hidden="true">▾</span>
       </button>
       {placement &&

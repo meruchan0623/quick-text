@@ -105,15 +105,14 @@ export interface ChoiceOffer {
   hidden: boolean;
   /** Listed but cannot be picked: unavailable for now. */
   disabled: boolean;
-  /** Appended to the entry's text: 「（暂不可用：原因）」, 「（降级：原因）」, 「（实验性）」 or ''. */
+  /** Appended to the entry's text: 「（暂不可用：原因）」, 「（降级：原因）」, or ''. */
   note: string;
 }
 
 /**
  * Principle 5 for a choice list (S-16): never provided is hidden; unavailable for now is listed
  * but disabled, with the reason; degraded stays selectable with its reason (a rule is lasting
- * configuration, not held back by a passing run-time state); experimental stays selectable with
- * its tag. The value the edited rule holds (`current`) is always listed and selectable, so opening
+ * configuration, not held back by a passing run-time state); experimental stays selectable, untagged. The value the edited rule holds (`current`) is always listed and selectable, so opening
  * and saving a rule never rewrites it. `view` null: nothing is known, offered plainly.
  */
 export function choiceOffer(view: CapabilityView | null, current: boolean): ChoiceOffer {
@@ -128,7 +127,7 @@ export function choiceOffer(view: CapabilityView | null, current: boolean): Choi
     case 'degraded':
       return { ...plain, note: because(view.tag) };
     case 'experimental':
-      return { ...plain, note: `（${view.tag}）` };
+      return plain;
     case 'available':
       return plain;
   }
