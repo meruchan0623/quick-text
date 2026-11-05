@@ -248,7 +248,7 @@ export interface CloudSettingsInput {
   auto_sync_minutes: number;
 }
 
-/** `code` is open: not_configured, invalid_url, unauthorized, network, timeout, … (§3). */
+/** `code` is open: not_configured, invalid_url, unauthorized, network, timeout, asset_download, … (§3). */
 export interface CloudError {
   code: string;
   message: string;

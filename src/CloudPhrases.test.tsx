@@ -3,7 +3,14 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import CloudPhrases, { CloudSettingsSection } from './CloudPhrases';
 import type { CloudView } from './ipc/events';
-import { MockBackend, sampleCloudRules, type MockOptions, type MockRule } from './ipc/mock';
+import {
+  createMockTransport,
+  MockBackend,
+  sampleCloudRules,
+  type MockOptions,
+  type MockRule,
+} from './ipc/mock';
+import { setTransport } from './ipc/transport';
 import type { CloudSettingsInput, CloudState } from './ipc/types';
 import type { CloudRow } from './lib/cloud';
 
@@ -236,6 +243,69 @@ describe('团队话术 list', () => {
     click(button(detail ?? host, '复制到我的指令'));
     expect(vi.mocked(props.onCopy).mock.lastCall?.[0].entry.id).toBe('mock-cloud-3');
     expect(host.querySelector('dialog[aria-label="查看团队话术"]')).toBeNull();
+  });
+
+  describe('an image phrase', () => {
+    const asset = `${'a'.repeat(64)}.png`;
+    const flush = () => act(() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+    afterEach(() => setTransport(null));
+
+    async function detailOf(action: Record<string, unknown>, fail = false) {
+      const backend = new MockBackend({ rules: 3, cloud: 'sample' });
+      backend.cloudCache?.rules.push({
+        ...sampleCloudRules()[0],
+        id: 'mock-cloud-image',
+        match: { kind: 'literal', value: 'timg' },
+        action,
+      } as MockRule);
+      const state = (await backend.handle('get_cloud_state')) as CloudState;
+      const transport = createMockTransport(backend);
+      setTransport(
+        fail
+          ? {
+              ...transport,
+              invoke: () => Promise.reject(new Error('missing')),
+            }
+          : transport,
+      );
+      const { host } = phrases(ready(state));
+      click(rowOf(host, 'timg')?.querySelector('.row-tools button'));
+      await flush();
+      return {
+        host,
+        calls: backend.calls.filter((c) => c.command === 'preview_image_asset'),
+        detail: host.querySelector('dialog[aria-label="查看团队话术"]'),
+      };
+    }
+
+    it('shows the picture and its name in the detail view, and offers copying', async () => {
+      const { host, detail, calls } = await detailOf({ type: 'image', asset, name: '二维码.png' });
+      expect(detail?.querySelector('pre')?.textContent).toBe('二维码.png');
+      expect(calls[0]?.args).toEqual({ asset });
+      expect(detail?.querySelector('img.image-preview')?.getAttribute('src')).toMatch(/^data:/);
+      expect(button(detail ?? host, '复制到我的指令')?.disabled).toBe(false);
+    });
+
+    it('says so when the picture cannot be shown', async () => {
+      const { detail } = await detailOf({ type: 'image', asset, name: '二维码.png' }, true);
+      expect(detail?.querySelector('img')).toBeNull();
+      expect(detail?.textContent).toContain('这张图片暂时无法预览');
+    });
+
+    it('never asks for an asset that is not one', async () => {
+      const { detail, calls } = await detailOf({ type: 'image', asset: '../a.png', name: 'x' });
+      expect(calls).toHaveLength(0);
+      expect(detail?.querySelector('img')).toBeNull();
+    });
+  });
+
+  it('does not call the table old when only a picture failed to download', async () => {
+    const state = await cloudState();
+    state.status.last_error = { code: 'asset_download', message: '' };
+    const { host } = phrases(ready(state));
+    const alert = host.querySelector('[role="alert"]');
+    expect(alert?.textContent).toContain('有图片没能下载');
+    expect(alert?.textContent).not.toContain('目前仍使用上次同步的内容');
   });
 
   it('offers copying fixed text only, and says why not otherwise', async () => {

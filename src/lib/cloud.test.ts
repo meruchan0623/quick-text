@@ -107,6 +107,9 @@ describe('cloudErrorText', () => {
     ).toBe('服务器上没有团队话术接口（HTTP 404），请检查服务器地址是否填对。');
     expect(cloudErrorText({ code: 'io', message: '缓存无法写入。' })).toBe('缓存无法写入。');
     expect(cloudErrorText({ code: 'http_status', message: '' })).toBe(cloudErrorNames.http_status);
+    expect(cloudErrorText({ code: 'asset_download', message: 'x' })).toBe(
+      '有图片没能下载，用到它的话术暂时无法使用，将在下次同步时重试。',
+    );
     expect(cloudErrorText({ code: 'rate_limited', message: 'slow down' })).toBe(
       '同步失败（错误代码 rate_limited）：slow down',
     );
@@ -239,6 +242,9 @@ describe('detail texts', () => {
       '读取文件：a.txt',
     );
     expect(actionBody({ type: 'html', html: '', plain_text: '纯文本' })).toBe('纯文本');
+    expect(actionBody({ type: 'html', html: '<b>粗</b>', plain_text: '粗' })).toBe('<b>粗</b>');
+    expect(actionBody({ type: 'image', asset: 'x.png', name: '二维码.png' })).toBe('二维码.png');
+    expect(actionBody({ type: 'image', asset: 'x.png', name: '' })).toBe('（未选择图片）');
     expect(actionBody({ type: 'open', target: 'https://example.com' })).toBe('https://example.com');
     expect(actionBody({ type: 'none' })).toBe('—');
     expect(actionBody(null)).toBe('—');
@@ -342,6 +348,34 @@ describe('phraseCopy (「复制到我的指令」 whitelist)', () => {
     expect(refused(rule('x', 'a', { match: { kind: 'regex', value: 'a+' } }))).toMatch(/正则/);
     expect(refused(rule('x', ''))).toMatch(/没有缩写/);
     expect(refused({ id: 'x', action: { type: 'from_0_9' } })).toMatch(/无法读取/);
+  });
+
+  it('copies a picture rebuilt, and only with a well-formed asset', () => {
+    const asset = `${'0123456789abcdef'.repeat(4)}.webp`;
+    const action = { type: 'image', asset, name: '二维码.png' };
+    const phrase = { ...rule('x', 'a'), action };
+    const { copy, reason } = phraseCopy(row(phrase, 'disabled_remote'));
+    expect(reason).toBeNull();
+    expect(copy?.action).toEqual(action);
+    expect(copy?.action).not.toBe(action);
+    expect(phraseCopy(row({ ...phrase, action: { type: 'image', asset } })).copy?.action).toEqual({
+      type: 'image',
+      asset,
+      name: '',
+    });
+    for (const bad of ['', '../secret.png', `${'A'.repeat(64)}.png`, `${'a'.repeat(64)}.jpeg`])
+      expect(
+        phraseCopy(row({ ...phrase, action: { type: 'image', asset: bad, name: '' } })).reason,
+        bad,
+      ).toMatch(/图片资源名称/);
+    expect(phraseCopy(row(phrase, 'invalid')).reason).toMatch(/无法使用/);
+    // Only the picture and fixed text: the refusal says so.
+    expect(
+      phraseCopy(row({ ...rule('x', 'a'), action: { type: 'html', html: 'a', plain_text: 'a' } }))
+        .reason,
+    ).toBe(
+      '这条的操作是「粘贴带格式的文字」；团队话术只能复制输出固定文字（纯文本）或粘贴图片的。',
+    );
   });
 
   it('refuses text that reads the clipboard, the selection or a parameter', () => {

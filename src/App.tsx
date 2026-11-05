@@ -47,7 +47,13 @@ import {
   unknownRuleKeys,
   unreadableEntries,
 } from './lib/rules';
-import { cloudRuleName, overridingPhrases, phraseCopy, type CloudRow } from './lib/cloud';
+import {
+  ASSET_DOWNLOAD_ERROR,
+  cloudRuleName,
+  overridingPhrases,
+  phraseCopy,
+  type CloudRow,
+} from './lib/cloud';
 import { unsupportedTerminators } from './lib/terminators';
 import { fixedImeErasure } from './lib/capabilities';
 import { ruleEditDiagnostics } from './lib/numberFields';
@@ -788,7 +794,7 @@ export default function App() {
     );
   /**
    * 「复制到我的指令」: a new rule (its defaults, a new id, enabled) with only what `phraseCopy`
-   * lets through of a team phrase: fixed text, never the phrase as it came from the server. Checked
+   * lets through of a team phrase: fixed text or a picture, never the phrase as it came from the server. Checked
    * here, where it is written, whatever the button offered. Saved into 我的指令 like any rule change
    * (`save`: the same readiness, one write at a time, the revision checked). While the phrase is
    * active the team phrase wins over its copy (§4 overrides): the copy runs once the phrase is
@@ -823,7 +829,9 @@ export default function App() {
       const s = await cloudSyncer.syncNow();
       setMessage(
         s.status.last_error
-          ? '团队话术同步失败，仍使用上次同步的内容'
+          ? s.status.last_error.code === ASSET_DOWNLOAD_ERROR
+            ? '团队话术已同步，但有图片没能下载，将在下次同步时重试'
+            : '团队话术同步失败，仍使用上次同步的内容'
           : `团队话术已同步${s.status.revision === null ? '' : ` · v${s.status.revision}`}`,
       );
     });

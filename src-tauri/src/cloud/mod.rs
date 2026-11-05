@@ -44,6 +44,9 @@ pub mod code {
     pub const SCHEMA_NEWER: &str = "schema_newer";
     /// The cache file could not be read or written.
     pub const IO: &str = "io";
+    /// An image of the table could not be fetched, verified or stored; its phrase is `invalid`
+    /// (`asset_missing`) and the next sync retries.
+    pub const ASSET_DOWNLOAD: &str = "asset_download";
 }
 
 /// `CloudState.status.last_error`: a code from [`code`] and `message`, the text the

@@ -316,14 +316,17 @@ impl Store {
     pub(crate) fn apply_engine(&mut self) {
         let table = self.cloud.table();
         let disabled = self.cloud.disabled_ids();
+        let dir = &self.dir;
+        let assets = |asset: &str| crate::assets::contains(dir, asset);
         let compiled = if self.safe_mode.is_some() {
             // Team phrases do not run in safe mode: their statuses are shown, but
             // nothing of theirs is compiled until safe mode ends (this is called
             // again then, `set_safe_mode`).
-            self.cloud.rules = cloud_rule_states(&self.personal_compiled.config, table, &disabled);
+            self.cloud.rules =
+                cloud_rule_states(&self.personal_compiled.config, table, &disabled, &assets);
             self.personal_compiled.clone()
         } else {
-            let merge = merge_cloud(&self.personal_compiled, table, &disabled);
+            let merge = merge_cloud(&self.personal_compiled, table, &disabled, &assets);
             self.cloud.rules = merge.rules;
             merge.compiled
         };

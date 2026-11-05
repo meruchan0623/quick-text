@@ -6,9 +6,11 @@ import { useEffect, useRef, useState } from 'react';
 import { describeError, diagnosticText, parseCommandError } from './ipc/errors';
 import type { CloudView } from './ipc/events';
 import { label } from './ipc/labels';
+import { call } from './ipc/transport';
 import type { CloudSettings, CloudSettingsInput, CloudState } from './ipc/types';
 import {
   actionBody,
+  ASSET_DOWNLOAD_ERROR,
   AUTO_SYNC_MINUTES,
   autoSyncLabel,
   cloudErrorText,
@@ -29,6 +31,7 @@ import {
   summarizeAction,
   type ReadableRule,
 } from './lib/rules';
+import { isImageAsset } from './lib/ruleShape';
 import { actionLabel } from './model';
 import { Modal } from './Modal';
 import { TerminatorList } from './TerminatorList';
@@ -74,6 +77,31 @@ function StatusTag({ status }: { status: string }) {
     <span className={`cloud-status ${cloudStatusClass(status)}`}>
       {label(cloudStatusNames, status)}
     </span>
+  );
+}
+
+/** The picture of an image phrase; one not downloaded yet (or no longer there) says so. */
+function PhraseImage({ asset }: { asset: string }) {
+  const [preview, setPreview] = useState<{ asset: string; url: string | null } | null>(null);
+  useEffect(() => {
+    let current = true;
+    call<string>('preview_image_asset', { asset }).then(
+      (url) => {
+        if (current) setPreview({ asset, url });
+      },
+      () => {
+        if (current) setPreview({ asset, url: null });
+      },
+    );
+    return () => {
+      current = false;
+    };
+  }, [asset]);
+  if (preview?.asset !== asset) return null;
+  return preview.url === null ? (
+    <small className="muted">这张图片暂时无法预览。</small>
+  ) : (
+    <img className="image-preview" src={preview.url} alt="话术图片预览" />
   );
 }
 
@@ -132,6 +160,9 @@ function PhraseDetail({
           </dl>
           <h3>正文</h3>
           <pre>{actionBody(rule.action)}</pre>
+          {rule.action.type === 'image' && isImageAsset(rule.action.asset) && (
+            <PhraseImage asset={rule.action.asset} />
+          )}
           <details>
             <summary>完整内容（高级）</summary>
             <pre>{JSON.stringify(rule, null, 2)}</pre>
@@ -229,7 +260,9 @@ function SourceBar({
         <div className="alert error" role="alert">
           {`同步失败${status.last_attempt_at ? `（${syncTime(status.last_attempt_at) ?? ''}）` : ''}：`}
           {cloudErrorText(error)}
-          {status.revision !== null && '目前仍使用上次同步的内容。'}
+          {status.revision !== null &&
+            error.code !== ASSET_DOWNLOAD_ERROR &&
+            '目前仍使用上次同步的内容。'}
           {SETTINGS_ERRORS.includes(error.code) && (
             <button className="retry" onClick={onOpenSettings}>
               去参数设置

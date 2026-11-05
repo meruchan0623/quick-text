@@ -178,7 +178,8 @@ pub enum CloudRuleStatus {
     DisabledRemote,
     /// Switched off on this computer (`app.cloud.disabled_ids`).
     DisabledLocal,
-    /// Does not compile (or is not a plain text phrase); `problem` says why.
+    /// Does not compile, or is refused before compiling (an action type that does not run through
+    /// the sync, an image not downloaded yet); `problem` says why.
     Invalid,
 }
 
@@ -220,34 +221,89 @@ pub struct CloudMerge {
     pub rules: Vec<CloudRuleState>,
 }
 
-/// Diagnostic code of a team phrase that is not a plain text phrase.
+/// Diagnostic code of a `text` or `send_keys` phrase that is not self-contained: its text comes
+/// from a local file, or its key combination takes syntax variables.
 pub const ACTION_NOT_ALLOWED: &str = "action_not_allowed";
+/// Diagnostic code of a phrase whose action type never runs through the sync (§4).
+pub const AUTOMATION_NOT_ALLOWED: &str = "automation_not_allowed";
+/// Diagnostic code of an image phrase whose file is not in the asset library yet.
+pub const ASSET_MISSING: &str = "asset_missing";
 
-/// Team phrases only paste or type their own inline text, or send their own inline key
-/// combination (the server allows nothing else, TSim_CS spec §2.1). Anything else (opening
-/// programs, reading local files, key combinations with syntax variables,
-/// reusable actions) is refused here as well, so a table that reaches the client some other
-/// way still cannot run more than text. The text itself must not read local data either
-/// ([`cloud_text_reads_local_data`]).
-pub fn cloud_action_allowed(action: &Action) -> bool {
-    cloud_inline_text(action).is_some()
-}
-
-/// The inline text of a team phrase action: plain text, or a key combination
-/// (`send_keys`, e.g. `您好{Enter}`) without syntax variables, so the keys come only
-/// from the phrase itself. `None` for anything else.
-fn cloud_inline_text(action: &Action) -> Option<&str> {
+/// What a team phrase may run: its own inline text or key combination, HTML, a hotkey, an image
+/// from the library, what it opens and its steps. The allowlist is the match below, exhaustive so
+/// a new action type has to be decided on here. Opening programs and steps run on every agent's
+/// computer as soon as they sync, so whoever holds the sync key or the server can run programs
+/// there (docs/image-and-zip-package.md §4). Returns the texts that are limited by
+/// [`CLOUD_MAX_BODY_CHARS`] and must not read local data ([`cloud_text_reads_local_data`]).
+fn cloud_action_texts(action: &Action) -> Result<Vec<&str>, &'static str> {
     match action {
         Action::Text {
             source: ContentSource::Inline { value },
             ..
-        } => Some(value),
+        } => Ok(vec![value]),
         Action::SendKeys {
             source: ContentSource::Inline { value },
             syntax_variables,
-        } if syntax_variables.is_empty() => Some(value),
-        _ => None,
+        } if syntax_variables.is_empty() => Ok(vec![value]),
+        Action::Text { .. } | Action::SendKeys { .. } => Err(ACTION_NOT_ALLOWED),
+        Action::Html { html, plain_text } => Ok(vec![html, plain_text]),
+        Action::Hotkey { .. } | Action::Image { .. } | Action::Open { .. } => Ok(vec![]),
+        Action::Steps { plan } | Action::Replay { plan, .. } => cloud_plan_texts(plan),
+        Action::None
+        | Action::Reusable { .. }
+        | Action::Common { .. }
+        | Action::Quicker { .. } => Err(AUTOMATION_NOT_ALLOWED),
     }
+}
+
+/// [`cloud_action_texts`] for steps: the text and HTML a run renders. A step may not do what its
+/// action type could not do on its own, so steps are no way around the allowlist.
+fn cloud_plan_texts(plan: &ActionPlan) -> Result<Vec<&str>, &'static str> {
+    let mut texts = vec![];
+    for step in &plan.steps {
+        match &step.operation {
+            Operation::Text { text, .. } => texts.push(text.as_str()),
+            Operation::Html { html, plain_text } => {
+                texts.push(html.as_str());
+                texts.push(plain_text.as_str());
+            }
+            Operation::KeyDown { .. }
+            | Operation::KeyUp { .. }
+            | Operation::KeyPress { .. }
+            | Operation::Hotkey { .. }
+            | Operation::Delay { .. }
+            | Operation::MouseMove { .. }
+            | Operation::MouseButton { .. }
+            | Operation::Wheel { .. }
+            | Operation::Open { .. } => {}
+            Operation::PasteFiles { .. } | Operation::PasteImage { .. } => {
+                return Err(ACTION_NOT_ALLOWED)
+            }
+            Operation::Common { .. } | Operation::Reusable { .. } => {
+                return Err(AUTOMATION_NOT_ALLOWED)
+            }
+        }
+    }
+    Ok(texts)
+}
+
+/// Whether team phrases may run this action type ([`cloud_action_texts`]).
+pub fn cloud_action_allowed(action: &Action) -> bool {
+    cloud_action_texts(action).is_ok()
+}
+
+/// The library files `table`'s image phrases need, each once, whatever the phrase's status (a
+/// phrase switched off here can be switched on while offline). Names that are not asset names
+/// are left out: they are never requested or looked up, only refused by the merge.
+pub fn cloud_image_assets(table: &CloudTable) -> BTreeSet<String> {
+    table
+        .rules
+        .iter()
+        .filter_map(|rule| match &rule.action {
+            Action::Image { asset, .. } if is_asset_name(asset) => Some(asset.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Merges `table` into the compiled personal configuration (§4).
@@ -255,8 +311,10 @@ fn cloud_inline_text(action: &Action) -> Option<&str> {
 /// Each readable phrase gets the first status that applies: `disabled_remote` (`enabled`
 /// false), `disabled_local` (its id in `disabled_ids`), `invalid`, else `active`. `invalid`
 /// covers an empty id, a `cloud:<id>`
-/// a personal rule already uses, an action other than inline text
-/// ([`cloud_action_allowed`]), and the admission limits: a regex trigger
+/// a personal rule already uses, an action outside the allowlist
+/// ([`cloud_action_allowed`]), an image that `assets` says is not in the library
+/// ([`ASSET_MISSING`]; the merge itself stays pure, the host answers from its asset library),
+/// and the admission limits: a regex trigger
 /// ([`REGEX_NOT_ALLOWED`]), a trigger over [`CLOUD_MAX_TRIGGER_CHARS`] or a text over
 /// [`CLOUD_MAX_BODY_CHARS`] characters, text that reads local data
 /// ([`cloud_text_reads_local_data`]). All of these are decided before anything is
@@ -279,6 +337,7 @@ pub fn merge_cloud(
     personal: &CompiledConfig,
     table: Option<&CloudTable>,
     disabled_ids: &BTreeSet<String>,
+    assets: &dyn Fn(&str) -> bool,
 ) -> CloudMerge {
     let Some(table) = table.filter(|table| !table.rules.is_empty()) else {
         return CloudMerge {
@@ -286,7 +345,7 @@ pub fn merge_cloud(
             rules: vec![],
         };
     };
-    let (mut states, candidates) = classify(&personal.config, table, disabled_ids);
+    let (mut states, candidates) = classify(&personal.config, table, disabled_ids, assets);
     let candidate_config = Config {
         version: personal.config.version,
         revision: personal.config.revision,
@@ -351,9 +410,10 @@ pub fn cloud_rule_states(
     personal: &Config,
     table: Option<&CloudTable>,
     disabled_ids: &BTreeSet<String>,
+    assets: &dyn Fn(&str) -> bool,
 ) -> Vec<CloudRuleState> {
     table.map_or_else(Vec::new, |table| {
-        let (mut states, _) = classify(personal, table, disabled_ids);
+        let (mut states, _) = classify(personal, table, disabled_ids, assets);
         mark_overrides(&personal.rules, &mut states);
         states
     })
@@ -365,6 +425,7 @@ fn classify(
     personal: &Config,
     table: &CloudTable,
     disabled_ids: &BTreeSet<String>,
+    assets: &dyn Fn(&str) -> bool,
 ) -> (Vec<CloudRuleState>, Vec<(usize, Rule)>) {
     let personal_ids: BTreeSet<&str> = personal.rules.iter().map(|rule| rule.id.as_str()).collect();
     let mut states = Vec::with_capacity(table.rules.len());
@@ -384,7 +445,7 @@ fn classify(
             state.status = CloudRuleStatus::DisabledRemote;
         } else if disabled_local {
             state.status = CloudRuleStatus::DisabledLocal;
-        } else if let Some(code) = precheck(rule, &personal_ids) {
+        } else if let Some(code) = precheck(rule, &personal_ids, assets) {
             state.mark_invalid(&[code]);
         } else {
             candidates.push((
@@ -445,12 +506,17 @@ pub const BODY_TOO_LONG: &str = "body_too_long";
 
 /// The checks made before compiling (what compiling the candidates on their own cannot see,
 /// and the admission limits, so a phrase over them is never compiled); the diagnostic code.
-fn precheck(rule: &Rule, personal_ids: &BTreeSet<&str>) -> Option<&'static str> {
+fn precheck(
+    rule: &Rule,
+    personal_ids: &BTreeSet<&str>,
+    assets: &dyn Fn(&str) -> bool,
+) -> Option<&'static str> {
     if rule.id.trim().is_empty() || personal_ids.contains(cloud_rule_id(&rule.id).as_str()) {
         return Some(CLOUD_RULE_ID);
     }
-    let Some(value) = cloud_inline_text(&rule.action) else {
-        return Some(ACTION_NOT_ALLOWED);
+    let texts = match cloud_action_texts(&rule.action) {
+        Ok(texts) => texts,
+        Err(code) => return Some(code),
     };
     if rule.match_spec.kind != MatchKind::Literal {
         return Some(REGEX_NOT_ALLOWED);
@@ -458,18 +524,40 @@ fn precheck(rule: &Rule, personal_ids: &BTreeSet<&str>) -> Option<&'static str> 
     if rule.match_spec.value.chars().count() > CLOUD_MAX_TRIGGER_CHARS {
         return Some(MATCH_TOO_LONG);
     }
-    if value.chars().count() > CLOUD_MAX_BODY_CHARS {
+    if texts
+        .iter()
+        .any(|text| text.chars().count() > CLOUD_MAX_BODY_CHARS)
+    {
         return Some(BODY_TOO_LONG);
     }
-    cloud_text_reads_local_data(value).then_some(LOCAL_DATA_PLACEHOLDER)
+    if texts.iter().any(|text| cloud_text_reads_local_data(text)) {
+        return Some(LOCAL_DATA_PLACEHOLDER);
+    }
+    if let Action::Image { asset, .. } = &rule.action {
+        // The name is checked first: `assets` is only ever asked about a plain file name.
+        if !is_asset_name(asset) {
+            return Some(IMAGE_ASSET);
+        }
+        if !assets(asset) {
+            return Some(ASSET_MISSING);
+        }
+    }
+    None
 }
 
 /// What the user reads for one diagnostic code of a team phrase (`CloudRuleState::problem`).
-/// The codes are [`compile_config`]'s plus [`ACTION_NOT_ALLOWED`]; an unknown one is named.
+/// The codes are [`compile_config`]'s plus the admission codes above; an unknown one is named.
 pub fn cloud_problem_text(code: &str) -> String {
     match code {
         CLOUD_RULE_ID => "话术编号为空、重复，或与我的指令的编号冲突".into(),
-        ACTION_NOT_ALLOWED => "团队话术只能粘贴、键入纯文本或使用文字与按键组合".into(),
+        ACTION_NOT_ALLOWED => "团队话术只能使用自带的内容，不能读取本机文件或变量".into(),
+        AUTOMATION_NOT_ALLOWED => {
+            "这类操作不通过团队话术同步运行；可导出配置包后导入「我的指令」，审阅后启用".into()
+        }
+        ASSET_MISSING => "图片尚未下载，将在下次同步时重试".into(),
+        IMAGE_ASSET => "图片资源名无效".into(),
+        IMAGE_NAME => "图片名称超过 200 个字符".into(),
+        "hotkey" | "key" | "key_duplicate" => "组合键设置无效".into(),
         REGEX_NOT_ALLOWED => "团队话术只支持普通缩写，不支持正则".into(),
         MATCH_TOO_LONG => format!("缩写超过 {CLOUD_MAX_TRIGGER_CHARS} 个字符"),
         BODY_TOO_LONG => format!("正文超过 {CLOUD_MAX_BODY_CHARS} 个字符"),
@@ -604,6 +692,21 @@ mod tests {
     }
     fn none() -> BTreeSet<String> {
         BTreeSet::new()
+    }
+    /// With every image in the library; the tests about images pass their own answer.
+    fn merge_all(
+        personal: &CompiledConfig,
+        table: Option<&CloudTable>,
+        disabled_ids: &BTreeSet<String>,
+    ) -> CloudMerge {
+        merge_cloud(personal, table, disabled_ids, &|_| true)
+    }
+    fn rule_states(
+        personal: &Config,
+        table: Option<&CloudTable>,
+        disabled_ids: &BTreeSet<String>,
+    ) -> Vec<CloudRuleState> {
+        cloud_rule_states(personal, table, disabled_ids, &|_| true)
     }
     fn statuses(merge: &CloudMerge) -> Vec<(String, CloudRuleStatus)> {
         merge
@@ -771,7 +874,7 @@ mod tests {
     fn without_team_phrases_the_effective_config_is_the_personal_one() {
         let personal = personal(vec![text_rule("p", "pp", "body")]);
         for table in [None, Some(table(vec![]))] {
-            let merge = merge_cloud(&personal, table.as_ref(), &none());
+            let merge = merge_all(&personal, table.as_ref(), &none());
             assert_eq!(merge.compiled.config, personal.config);
             assert_eq!(merge.compiled.rules.len(), personal.rules.len());
             assert!(merge.rules.is_empty());
@@ -789,7 +892,7 @@ mod tests {
         };
         personal_config.globals.terminators = vec!["semicolon".into()];
         let personal = compile_config(&personal_config).unwrap();
-        let merge = merge_cloud(
+        let merge = merge_all(
             &personal,
             Some(&table(vec![
                 text_rule("t2", "zz", "two"),
@@ -865,7 +968,7 @@ mod tests {
         });
         let fine = text_rule("fine", "fine", "x");
         let disabled = BTreeSet::from(["local".to_string(), "ghost".to_string()]);
-        let merge = merge_cloud(
+        let merge = merge_all(
             &personal,
             Some(&table(vec![
                 remote_off,
@@ -897,7 +1000,7 @@ mod tests {
             .map(|state| state.disabled_local)
             .collect();
         assert_eq!(local, [false, true, false, false, false]);
-        let both = merge_cloud(
+        let both = merge_all(
             &personal,
             Some(&table(vec![{
                 let mut rule = text_rule("local", "zz", "x");
@@ -939,7 +1042,7 @@ mod tests {
         ]);
         let mut cloud_folding = text_rule("t-fold", "Case", "x");
         cloud_folding.ignore_case = true;
-        let merge = merge_cloud(
+        let merge = merge_all(
             &personal,
             Some(&table(vec![
                 text_rule("t-dis", "dis", "x"),
@@ -1016,7 +1119,7 @@ mod tests {
         ]);
         let phrases = table(vec![text_rule("t", "tk", "team")]);
         let context = ForegroundContext::default();
-        let merge = merge_cloud(&personal, Some(&phrases), &none());
+        let merge = merge_all(&personal, Some(&phrases), &none());
         let hit = merge
             .compiled
             .match_input("tk", Some("space"), &context)
@@ -1067,7 +1170,7 @@ mod tests {
             (table(vec![broken]), none()),
             (table(vec![regex]), none()),
         ] {
-            let merge = merge_cloud(&personal, Some(&table), &disabled);
+            let merge = merge_all(&personal, Some(&table), &disabled);
             assert_ne!(merge.rules[0].status, CloudRuleStatus::Active);
             assert!(merge.rules[0].overrides.is_empty());
             let ids: Vec<_> = merge
@@ -1093,7 +1196,7 @@ mod tests {
         let mut off = text_rule("off", "tk", "personal");
         off.enabled = false;
         let personal = personal(vec![off, text_rule("on", "zz", "x")]);
-        let merge = merge_cloud(
+        let merge = merge_all(
             &personal,
             Some(&table(vec![text_rule("t", "tk", "team")])),
             &none(),
@@ -1129,11 +1232,9 @@ mod tests {
         let mut immediate_regex = text_rule("imm", "a+b", "x");
         immediate_regex.match_spec.kind = MatchKind::Regex;
         immediate_regex.trigger_mode = TriggerMode::Immediate;
-        let mut open = text_rule("open", "op", "x");
-        open.action = Action::Open {
-            target: "calc.exe".into(),
-            args: vec![],
-            working_directory: None,
+        let mut common = text_rule("common", "co", "x");
+        common.action = Action::Common {
+            function: "copy".into(),
         };
         let mut file = text_rule("file", "fi", "x");
         file.action = Action::Text {
@@ -1152,13 +1253,13 @@ mod tests {
         };
         let mut blank_id = text_rule("  ", "bl", "x");
         blank_id.id = "  ".into();
-        let merge = merge_cloud(
+        let merge = merge_all(
             &personal,
             Some(&table(vec![
                 text_rule("dup", "d1", "first"),
                 empty,
                 immediate_regex,
-                open,
+                common,
                 file,
                 keys_with_vars,
                 text_rule("dup", "d2", "second"),
@@ -1181,7 +1282,7 @@ mod tests {
                 (Active, None),
                 invalid("match_empty"),
                 invalid(REGEX_NOT_ALLOWED),
-                invalid(ACTION_NOT_ALLOWED),
+                invalid(AUTOMATION_NOT_ALLOWED),
                 invalid(ACTION_NOT_ALLOWED),
                 invalid(ACTION_NOT_ALLOWED),
                 invalid("rule_id"),
@@ -1212,7 +1313,7 @@ mod tests {
         assert_eq!(merge.rules[1].problem.as_deref(), Some("缩写为空"));
         assert_eq!(
             merge.rules[3].problem.as_deref(),
-            Some("团队话术只能粘贴、键入纯文本或使用文字与按键组合")
+            Some("这类操作不通过团队话术同步运行；可导出配置包后导入「我的指令」，审阅后启用")
         );
         for state in &merge.rules {
             if let Some(problem) = &state.problem {
@@ -1234,7 +1335,7 @@ mod tests {
     #[test]
     fn phrases_that_read_local_data_are_invalid() {
         let personal = personal(vec![text_rule("mine", "pp", "fixed")]);
-        let merge = merge_cloud(
+        let merge = merge_all(
             &personal,
             Some(&table(vec![
                 text_rule("clip", "c1", "前缀 {cliptext} 后缀"),
@@ -1295,7 +1396,7 @@ mod tests {
         // Even switched off remotely or locally they keep their earlier status.
         let mut remote_off = text_rule("clip", "c1", "{cliptext}");
         remote_off.enabled = false;
-        let merge = merge_cloud(&personal, Some(&table(vec![remote_off])), &none());
+        let merge = merge_all(&personal, Some(&table(vec![remote_off])), &none());
         assert_eq!(merge.rules[0].status, CloudRuleStatus::DisabledRemote);
     }
 
@@ -1347,7 +1448,7 @@ mod tests {
         harmless_regex.match_spec.kind = MatchKind::Regex;
         let long_trigger = "缩".repeat(CLOUD_MAX_TRIGGER_CHARS + 1);
         let long_body = "字".repeat(CLOUD_MAX_BODY_CHARS + 1);
-        let merge = merge_cloud(
+        let merge = merge_all(
             &personal,
             Some(&table(vec![
                 regex,
@@ -1420,7 +1521,7 @@ mod tests {
             regex,
             text_rule("overrides", "same", "x"),
         ]);
-        let states = cloud_rule_states(&personal.config, Some(&table), &none());
+        let states = rule_states(&personal.config, Some(&table), &none());
         let statuses: Vec<_> = states.iter().map(|state| state.status).collect();
         use CloudRuleStatus::*;
         assert_eq!(statuses, [Active, Invalid, Active]);
@@ -1428,11 +1529,11 @@ mod tests {
         // listed all the same.
         assert!(states[0].overrides.is_empty());
         assert_eq!(states[2].overrides, ["mine"]);
-        let merged = merge_cloud(&personal, Some(&table), &none());
+        let merged = merge_all(&personal, Some(&table), &none());
         let statuses: Vec<_> = merged.rules.iter().map(|state| state.status).collect();
         assert_eq!(statuses, [Invalid, Invalid, Active]);
         assert_eq!(merged.rules[2].overrides, ["mine"]);
-        assert!(cloud_rule_states(&personal.config, None, &none()).is_empty());
+        assert!(rule_states(&personal.config, None, &none()).is_empty());
     }
 
     /// §4: overlapping triggers keep the existing priority (team phrases are literal: a
@@ -1448,7 +1549,7 @@ mod tests {
         let personal = personal(vec![personal_regex, personal_short]);
         let mut cloud_long = text_rule("t-long", "tkdz", "x");
         cloud_long.trigger_mode = TriggerMode::Immediate;
-        let merge = merge_cloud(
+        let merge = merge_all(
             &personal,
             Some(&table(vec![text_rule("t-abc", "abc", "x"), cloud_long])),
             &none(),
@@ -1473,7 +1574,7 @@ mod tests {
     #[test]
     fn rule_states_serialize_as_the_contract_says() {
         let personal = personal(vec![text_rule("mine", "same", "x")]);
-        let merge = merge_cloud(
+        let merge = merge_all(
             &personal,
             Some(&table(vec![
                 text_rule("a", "aa", "x"),
@@ -1511,7 +1612,7 @@ mod tests {
     fn debug_output_is_redacted() {
         let personal = personal(vec![]);
         let table = table(vec![text_rule("a", "zqabbr", "phrase-body")]);
-        let merge = merge_cloud(&personal, Some(&table), &none());
+        let merge = merge_all(&personal, Some(&table), &none());
         for shown in [format!("{table:?}"), format!("{merge:?}")] {
             assert!(
                 !shown.contains("zqabbr") && !shown.contains("phrase-body"),
@@ -1530,7 +1631,267 @@ mod tests {
             syntax_variables: vec![],
         };
         assert!(cloud_action_allowed(&combo.action));
-        let merge = merge_cloud(&personal(vec![]), Some(&table(vec![combo])), &none());
+        let merge = merge_all(&personal(vec![]), Some(&table(vec![combo])), &none());
         assert_eq!(merge.rules[0].status, CloudRuleStatus::Active);
+    }
+
+    const ASSET: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08.png";
+
+    fn with_action(id: &str, action: Action) -> Rule {
+        let mut rule = text_rule(id, &format!("t{id}"), "x");
+        rule.action = action;
+        rule
+    }
+
+    /// docs/image-and-zip-package.md §4: every action type, what the sync runs and what it refuses.
+    #[test]
+    fn admission_of_every_action_type() {
+        let plan = ActionPlan {
+            steps: vec![Step::new(
+                Operation::Text {
+                    text: "x".into(),
+                    method: OutputMethod::Keys,
+                },
+                SourceSpan::default(),
+            )],
+            ..ActionPlan::default()
+        };
+        let allowed = [
+            Action::Text {
+                method: OutputMethod::Paste,
+                source: ContentSource::inline("正文"),
+            },
+            Action::SendKeys {
+                source: ContentSource::inline("您好{Enter}"),
+                syntax_variables: vec![],
+            },
+            Action::Html {
+                html: "<b>您好</b>".into(),
+                plain_text: "您好".into(),
+            },
+            Action::Hotkey {
+                keys: vec![Key::named("CTRL"), Key::named("A")],
+            },
+            Action::Image {
+                asset: ASSET.into(),
+                name: "码.png".into(),
+            },
+            Action::Steps { plan: plan.clone() },
+            Action::Replay { plan, speed: 1.0 },
+            Action::Open {
+                target: "https://example.com".into(),
+                args: vec![],
+                working_directory: None,
+            },
+        ];
+        let refused = [
+            Action::None,
+            Action::Reusable {
+                action_id: "x".into(),
+                parameters: Default::default(),
+            },
+            Action::Common {
+                function: "copy".into(),
+            },
+            Action::Quicker {
+                action_id: "x".into(),
+                parameter: String::new(),
+            },
+        ];
+        let rules: Vec<Rule> = allowed
+            .iter()
+            .chain(&refused)
+            .enumerate()
+            .map(|(i, action)| with_action(&i.to_string(), action.clone()))
+            .collect();
+        let merged = merge_all(&personal(vec![]), Some(&table(rules)), &none());
+        for (state, action) in merged.rules.iter().zip(allowed.iter().chain(&refused)) {
+            if allowed.contains(action) {
+                assert_eq!(state.status, CloudRuleStatus::Active, "{action:?}");
+                assert!(cloud_action_allowed(action), "{action:?}");
+                assert!(
+                    merged.compiled.rule(&cloud_rule_id(&state.id)).is_some(),
+                    "{action:?}"
+                );
+            } else {
+                assert_eq!(state.status, CloudRuleStatus::Invalid, "{action:?}");
+                assert_eq!(state.problem_codes, [AUTOMATION_NOT_ALLOWED], "{action:?}");
+                assert_eq!(
+                    state.problem.as_deref(),
+                    Some("这类操作不通过团队话术同步运行；可导出配置包后导入「我的指令」，审阅后启用")
+                );
+                assert!(!cloud_action_allowed(action), "{action:?}");
+                assert!(merged.compiled.rule(&cloud_rule_id(&state.id)).is_none());
+            }
+        }
+    }
+
+    /// §4: steps run, but cannot do what their action type could not do on its own, and their
+    /// text and HTML follow the rules of an inline text.
+    #[test]
+    fn steps_stay_inside_the_allowlist() {
+        let steps = |operation: Operation| Action::Steps {
+            plan: ActionPlan {
+                steps: vec![Step::new(operation, SourceSpan::default())],
+                ..ActionPlan::default()
+            },
+        };
+        let text = |text: &str| Operation::Text {
+            text: text.into(),
+            method: OutputMethod::Keys,
+        };
+        let long = "x".repeat(CLOUD_MAX_BODY_CHARS + 1);
+        let cases = [
+            (
+                steps(Operation::Common {
+                    function: "copy".into(),
+                }),
+                AUTOMATION_NOT_ALLOWED,
+            ),
+            (
+                steps(Operation::Reusable {
+                    action_id: "x".into(),
+                    parameters: Default::default(),
+                }),
+                AUTOMATION_NOT_ALLOWED,
+            ),
+            (
+                steps(Operation::PasteFiles {
+                    paths: vec!["/etc/passwd".into()],
+                }),
+                ACTION_NOT_ALLOWED,
+            ),
+            (
+                steps(Operation::PasteImage {
+                    path: "/tmp/x.png".into(),
+                }),
+                ACTION_NOT_ALLOWED,
+            ),
+            (steps(text("{cliptext}")), LOCAL_DATA_PLACEHOLDER),
+            (
+                steps(Operation::Html {
+                    html: "x".into(),
+                    plain_text: "{selection}".into(),
+                }),
+                LOCAL_DATA_PLACEHOLDER,
+            ),
+            (steps(text(&long)), BODY_TOO_LONG),
+        ];
+        for (action, code) in cases {
+            let merged = merge_all(
+                &personal(vec![]),
+                Some(&table(vec![with_action("s", action)])),
+                &none(),
+            );
+            assert_eq!(merged.rules[0].problem_codes, [code]);
+            assert!(merged.compiled.rule("cloud:s").is_none());
+        }
+        let open_step = steps(Operation::Open {
+            target: "https://example.com".into(),
+            args: vec![],
+            working_directory: None,
+        });
+        let merged = merge_all(
+            &personal(vec![]),
+            Some(&table(vec![with_action("s", open_step)])),
+            &none(),
+        );
+        assert_eq!(merged.rules[0].status, CloudRuleStatus::Active);
+    }
+
+    /// §4: HTML and its plain text follow the rules of an inline text.
+    #[test]
+    fn html_cannot_read_local_data_or_exceed_the_body_limit() {
+        let html = |html: &str, plain: &str| Action::Html {
+            html: html.into(),
+            plain_text: plain.into(),
+        };
+        let long = "x".repeat(CLOUD_MAX_BODY_CHARS + 1);
+        let cases = [
+            (html("{cliptext}", ""), LOCAL_DATA_PLACEHOLDER),
+            (html("<b>x</b>", "{selection}"), LOCAL_DATA_PLACEHOLDER),
+            (html("{param:a}", ""), LOCAL_DATA_PLACEHOLDER),
+            (html(&long, ""), BODY_TOO_LONG),
+            (html("x", &long), BODY_TOO_LONG),
+        ];
+        for (action, code) in cases {
+            let merged = merge_all(
+                &personal(vec![]),
+                Some(&table(vec![with_action("h", action)])),
+                &none(),
+            );
+            assert_eq!(merged.rules[0].problem_codes, [code]);
+        }
+    }
+
+    /// §5: an image not in the library yet is `invalid` with the contract's text, replaces no
+    /// personal rule and does not stop the other phrases; once it is there the phrase runs.
+    #[test]
+    fn an_image_phrase_waits_for_its_file() {
+        let image = Action::Image {
+            asset: ASSET.into(),
+            name: String::new(),
+        };
+        let mut phrase = with_action("img", image);
+        phrase.match_spec.value = "same".into();
+        let mine = personal(vec![text_rule("mine", "same", "personal")]);
+        let phrases = table(vec![phrase, text_rule("other", "oo", "x")]);
+        let asked = std::cell::RefCell::new(vec![]);
+        let missing = |asset: &str| {
+            asked.borrow_mut().push(asset.to_string());
+            false
+        };
+        let merged = merge_cloud(&mine, Some(&phrases), &none(), &missing);
+        assert_eq!(asked.borrow().as_slice(), [ASSET]);
+        assert_eq!(merged.rules[0].status, CloudRuleStatus::Invalid);
+        assert_eq!(merged.rules[0].problem_codes, [ASSET_MISSING]);
+        assert_eq!(
+            merged.rules[0].problem.as_deref(),
+            Some("图片尚未下载，将在下次同步时重试")
+        );
+        assert!(merged.rules[0].overrides.is_empty());
+        assert_eq!(merged.rules[1].status, CloudRuleStatus::Active);
+        assert!(merged.compiled.rule("mine").is_some());
+        // Safe mode shows the same status.
+        let states = cloud_rule_states(&mine.config, Some(&phrases), &none(), &|_| false);
+        assert_eq!(states[0].problem_codes, [ASSET_MISSING]);
+        let merged = merge_cloud(&mine, Some(&phrases), &none(), &|_| true);
+        assert_eq!(merged.rules[0].status, CloudRuleStatus::Active);
+        assert_eq!(merged.rules[0].overrides, ["mine"]);
+        assert!(merged.compiled.rule("cloud:img").is_some());
+        assert!(merged.compiled.rule("mine").is_none());
+    }
+
+    /// A name that is not an asset name is refused without asking the host about it, and never
+    /// listed for download: it could point anywhere.
+    #[test]
+    fn a_wrong_asset_name_never_reaches_the_host() {
+        let bad = with_action(
+            "bad",
+            Action::Image {
+                asset: "../../secret.png".into(),
+                name: String::new(),
+            },
+        );
+        let phrases = table(vec![
+            bad,
+            with_action(
+                "ok",
+                Action::Image {
+                    asset: ASSET.into(),
+                    name: String::new(),
+                },
+            ),
+        ]);
+        let merged = merge_cloud(&personal(vec![]), Some(&phrases), &none(), &|asset| {
+            assert_eq!(asset, ASSET);
+            true
+        });
+        assert_eq!(merged.rules[0].problem_codes, [IMAGE_ASSET]);
+        assert_eq!(merged.rules[0].problem.as_deref(), Some("图片资源名无效"));
+        assert_eq!(
+            cloud_image_assets(&phrases).into_iter().collect::<Vec<_>>(),
+            [ASSET]
+        );
     }
 }

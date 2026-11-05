@@ -3,7 +3,7 @@
 import type { CloudError, CloudRuleEntry, CloudState } from '../ipc/types';
 import { actionLabel } from '../model';
 import { completeRules, isReadableRule, summarizeAction, type ReadableRule } from './rules';
-import { isRecord } from './ruleShape';
+import { isImageAsset, isRecord } from './ruleShape';
 
 /** The engine's rule id of a team phrase is its table id with this prefix (§4). */
 export const CLOUD_PREFIX = 'cloud:';
@@ -45,7 +45,11 @@ export const cloudErrorNames: Readonly<Record<string, string>> = {
   invalid_format: '下载到的内容不是团队话术表，请检查服务器地址是否填错。',
   schema_newer: '团队话术表使用了更新的格式，需要升级 Quicktext 后才能同步。',
   io: '无法读写本机的团队话术缓存文件，请检查数据目录的权限和剩余空间。',
+  asset_download: '有图片没能下载，用到它的话术暂时无法使用，将在下次同步时重试。',
 };
+
+/** The table itself did update: only the phrases of the pictures that failed are out (§5). */
+export const ASSET_DOWNLOAD_ERROR = 'asset_download';
 
 /** Codes fixed in 「团队话术同步」 settings: the error offers a way there. */
 export const SETTINGS_ERRORS: readonly string[] = ['not_configured', 'invalid_url', 'unauthorized'];
@@ -166,7 +170,7 @@ export function actionBody(action: unknown): string {
 // A team phrase comes from a server; a copy becomes a rule of 我的指令 that runs as the user's own,
 // enabled, outside any check the table's merge made. So nothing of the phrase is copied as it is:
 // the copy is a new rule with its defaults, and only the fields below, rebuilt one by one from what
-// passed, are taken over. Only fixed text qualifies. The status alone does not tell, since
+// passed, are taken over. Only fixed text and a picture qualify. The status alone does not tell, since
 // disabled_remote and disabled_local are decided before the action is ever checked (§4).
 
 /** Placeholders the engine fills from this computer: the clipboard, the selection, a parameter. */
@@ -183,17 +187,37 @@ export interface PhraseCopy {
   terminator: { keys: string[]; consume: boolean } | null;
   group: string;
   description: string;
-  action: { type: 'text'; method: 'paste' | 'keys'; source: { type: 'inline'; value: string } };
+  action:
+    | { type: 'text'; method: 'paste' | 'keys'; source: { type: 'inline'; value: string } }
+    | { type: 'image'; asset: string; name: string };
 }
 
 export type PhraseCopyCheck = { copy: PhraseCopy; reason: null } | { copy: null; reason: string };
 
 const refuse = (reason: string): PhraseCopyCheck => ({ copy: null, reason });
 
+/** The action of a copy, rebuilt from what passed; else why there is none. */
+function copiedAction(action: ReadableRule['action']): PhraseCopy['action'] | string {
+  if (action.type === 'image') {
+    if (!isImageAsset(action.asset)) return '这条的图片资源名称不正确，不能复制。';
+    return { type: 'image', asset: action.asset, name: str(action.name) };
+  }
+  if (action.type !== 'text')
+    return `这条的操作是「${actionLabel(action)}」；团队话术只能复制输出固定文字（纯文本）或粘贴图片的。`;
+  const method = action.method === 'paste' ? 'paste' : action.method === 'keys' ? 'keys' : null;
+  const source = isRecord(action.source) ? action.source : {};
+  if (method === null || source.type !== 'inline' || typeof source.value !== 'string')
+    return '这条的正文不是直接写在话术里的文字；团队话术只能复制固定文字。';
+  const value = source.value;
+  if (LOCAL_INPUT_PLACEHOLDERS.some((placeholder) => value.includes(placeholder)))
+    return '正文会读取本机的剪贴板、选中文字或参数（{cliptext}、{selection}、{param:…}）；团队话术只能复制固定文字。';
+  return { type: 'text', method, source: { type: 'inline', value } };
+}
+
 /**
  * The copy 「复制到我的指令」 makes of a team phrase, or why it makes none: the phrase is unreadable
- * or `invalid`, matches by regex, does something other than output fixed text inline, or reads
- * this computer's clipboard, selection or a parameter. A terminator keeps 空格 and 分号 only; with
+ * or `invalid`, matches by regex, does something other than output fixed text inline or paste a
+ * picture, or reads this computer's clipboard, selection or a parameter. A terminator keeps 空格 and 分号 only; with
  * neither left, or triggered at once, the copy uses the default keys.
  */
 export function phraseCopy(row: CloudRow): PhraseCopyCheck {
@@ -202,20 +226,8 @@ export function phraseCopy(row: CloudRow): PhraseCopyCheck {
   if (entry.status === 'invalid') return refuse('这条团队话术无法使用，不能复制。');
   if (rule.match.kind !== 'literal') return refuse('这条按正则表达式匹配；只能复制普通缩写。');
   if (rule.match.value === '') return refuse('这条团队话术没有缩写，不能复制。');
-  const { action } = rule;
-  if (action.type !== 'text')
-    return refuse(
-      `这条的操作是「${actionLabel(action)}」；团队话术只能复制输出固定文字的（纯文本）。`,
-    );
-  const method = action.method === 'paste' ? 'paste' : action.method === 'keys' ? 'keys' : null;
-  const source = isRecord(action.source) ? action.source : {};
-  if (method === null || source.type !== 'inline' || typeof source.value !== 'string')
-    return refuse('这条的正文不是直接写在话术里的文字；团队话术只能复制固定文字。');
-  const value = source.value;
-  if (LOCAL_INPUT_PLACEHOLDERS.some((placeholder) => value.includes(placeholder)))
-    return refuse(
-      '正文会读取本机的剪贴板、选中文字或参数（{cliptext}、{selection}、{param:…}）；团队话术只能复制固定文字。',
-    );
+  const action = copiedAction(rule.action);
+  if (typeof action === 'string') return refuse(action);
   const keys = [...new Set(rule.terminator?.keys ?? [])].filter((k) =>
     COPY_TERMINATOR_KEYS.includes(k),
   );
@@ -230,7 +242,7 @@ export function phraseCopy(row: CloudRow): PhraseCopyCheck {
           : null,
       group: rule.group,
       description: rule.description,
-      action: { type: 'text', method, source: { type: 'inline', value } },
+      action,
     },
     reason: null,
   };

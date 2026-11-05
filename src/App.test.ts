@@ -4521,6 +4521,25 @@ describe('团队话术 (docs/cloud-phrases.md §6)', () => {
     expect(row?.querySelector('.overridden')).not.toBeNull();
   });
 
+  it('copies an image phrase with its picture, keeping nothing else of the action', async () => {
+    const asset = `${'a'.repeat(64)}.png`;
+    const mounted = await mountCloud(
+      {},
+      withPhrase({
+        id: 'mock-cloud-image',
+        match: { kind: 'literal', value: 'timg' },
+        action: { type: 'image', asset, name: '二维码.png' },
+      }),
+    );
+    const { backend, container } = mounted;
+    await switchTo(mounted, '团队话术');
+    expect(cloudRow(container, 'timg')?.textContent).toContain('二维码.png');
+    await clickIn(mounted, cloudRow(container, 'timg') ?? null, '复制到我的指令');
+    await waitFor(mounted, () => expect(backend.active.revision).toBe(2));
+    const copy = backend.active.rules.filter(isRule).find((r) => r.match.value === 'timg');
+    expect(copy?.action).toEqual({ type: 'image', asset, name: '二维码.png' });
+  });
+
   /** Add `phrase` to the synced table, after the sample's own (as the server would send it). */
   const withPhrase =
     (...phrases: Record<string, unknown>[]) =>

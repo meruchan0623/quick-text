@@ -16,6 +16,8 @@ use std::time::Duration;
 /// Appended to the server address (`base_url` without trailing `/`, and without this
 /// path when it was pasted in already).
 pub const DOWNLOAD_PATH: &str = "/integrations/quick-text/v1/phrase-table";
+/// Followed by the asset name; next to [`DOWNLOAD_PATH`] on the same server.
+const ASSET_PATH: &str = "/integrations/quick-text/v1/phrase-assets/";
 const USER_AGENT: &str = concat!("Quicktext/", env!("CARGO_PKG_VERSION"));
 
 /// The budget of one download.
@@ -115,29 +117,7 @@ pub async fn fetch(
     etag: Option<&str>,
     limits: &FetchLimits,
 ) -> Result<Fetched, SyncError> {
-    let mut builder = reqwest::Client::builder()
-        .timeout(limits.timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(USER_AGENT);
-    if is_loopback(url) {
-        // A local development server is never reached through a proxy.
-        builder = builder.no_proxy();
-    }
-    let client = builder
-        .build()
-        .map_err(|e| request_error(e, "client", limits))?;
-    let mut auth = HeaderValue::from_str(&format!("Bearer {key}")).map_err(|_| {
-        SyncError::new(
-            code::NOT_CONFIGURED,
-            "同步密钥含有无效字符，请重新填写",
-            "the sync key contains characters a header cannot carry",
-        )
-    })?;
-    auth.set_sensitive(true);
-    let mut request = client
-        .get(url.clone())
-        .header(AUTHORIZATION, auth)
-        .header(ACCEPT, "application/json");
+    let mut request = authorized_get(url, key, limits)?.header(ACCEPT, "application/json");
     if let Some(etag) = etag.and_then(|etag| HeaderValue::from_str(etag).ok()) {
         request = request.header(IF_NONE_MATCH, etag);
     }
@@ -186,11 +166,52 @@ pub async fn fetch(
             format!("body larger than {} bytes", limits.max_bytes),
         )
     };
+    let body = read_limited(&mut response, limits)
+        .await?
+        .ok_or_else(too_large)?;
+    Ok(Fetched::Modified { body, etag })
+}
+
+/// A GET with the download rules (docs/cloud-phrases.md §3): the time budget, no redirects, the
+/// User-Agent, the sync key marked sensitive; no proxy for a local development server.
+fn authorized_get(
+    url: &Url,
+    key: &str,
+    limits: &FetchLimits,
+) -> Result<reqwest::RequestBuilder, SyncError> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(limits.timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(USER_AGENT);
+    if is_loopback(url) {
+        // A local development server is never reached through a proxy.
+        builder = builder.no_proxy();
+    }
+    let client = builder
+        .build()
+        .map_err(|e| request_error(e, "client", limits))?;
+    let mut auth = HeaderValue::from_str(&format!("Bearer {key}")).map_err(|_| {
+        SyncError::new(
+            code::NOT_CONFIGURED,
+            "同步密钥含有无效字符，请重新填写",
+            "the sync key contains characters a header cannot carry",
+        )
+    })?;
+    auth.set_sensitive(true);
+    Ok(client.get(url.clone()).header(AUTHORIZATION, auth))
+}
+
+/// The body, `None` as soon as it is known to be over `limits.max_bytes`: announced, or while it
+/// streams in (dropping the response closes the connection, nothing more is read).
+async fn read_limited(
+    response: &mut reqwest::Response,
+    limits: &FetchLimits,
+) -> Result<Option<Vec<u8>>, SyncError> {
     if response
         .content_length()
         .is_some_and(|len| len > limits.max_bytes)
     {
-        return Err(too_large());
+        return Ok(None);
     }
     let mut body = Vec::new();
     while let Some(chunk) = response
@@ -199,12 +220,63 @@ pub async fn fetch(
         .map_err(|e| request_error(e, "body", limits))?
     {
         if (body.len() + chunk.len()) as u64 > limits.max_bytes {
-            // Dropping the response closes the connection: nothing more is read.
-            return Err(too_large());
+            return Ok(None);
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(Fetched::Modified { body, etag })
+    Ok(Some(body))
+}
+
+/// Where `asset` is for the table at `table_url`: the same server, the sibling path. `asset` has
+/// passed `is_asset_name`, so it needs no escaping.
+pub fn asset_url(table_url: &Url, asset: &str) -> Result<Url, SyncError> {
+    let path = table_url.path();
+    let base = path.strip_suffix(DOWNLOAD_PATH).unwrap_or(path);
+    let mut url = table_url.clone();
+    url.set_path(&format!("{base}{ASSET_PATH}{asset}"));
+    Ok(url)
+}
+
+/// One image (docs/image-and-zip-package.md §5), under the rules of the table download; the body
+/// limit is the asset limit. Failures are coded like the table's: `unauthorized` for 401 and 403,
+/// else `network`, `timeout`, `http_status` or `too_large`. Messages are the caller's to replace.
+pub async fn fetch_asset(
+    table_url: &Url,
+    key: &str,
+    asset: &str,
+    limits: &FetchLimits,
+) -> Result<Vec<u8>, SyncError> {
+    let url = asset_url(table_url, asset)?;
+    let limits = FetchLimits {
+        timeout: limits.timeout,
+        max_bytes: quicker_domain::MAX_ASSET_BYTES,
+    };
+    let mut response = authorized_get(&url, key, &limits)?
+        .send()
+        .await
+        .map_err(|e| request_error(e, "request", &limits))?;
+    let status = response.status();
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        return Err(SyncError::new(
+            code::UNAUTHORIZED,
+            "同步密钥无效或已作废，请向管理员索取新的同步密钥",
+            format!("HTTP {}", status.as_u16()),
+        ));
+    }
+    if !status.is_success() {
+        return Err(SyncError::new(
+            code::HTTP_STATUS,
+            "服务器没有返回图片",
+            format!("HTTP {}", status.as_u16()),
+        ));
+    }
+    read_limited(&mut response, &limits).await?.ok_or_else(|| {
+        SyncError::new(
+            code::TOO_LARGE,
+            "图片超过 10 MiB",
+            format!("body larger than {} bytes", limits.max_bytes),
+        )
+    })
 }
 
 /// `timeout` or `network`. The detail is reqwest's error chain without the URL (the

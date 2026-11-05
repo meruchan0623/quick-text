@@ -15,6 +15,9 @@
 //!   lock: a settings change in between raised the epoch and the result is dropped
 //!   (it belongs to the old address or key); the change already queued a new sync.
 //! - 200: format checked, cache written, engine reloaded. 304: `last_success_at` only.
+//!   After either, images the table needs and the library lacks are downloaded
+//!   (docs/image-and-zip-package.md §5) before the result is installed, so a new table's image
+//!   phrases do not flicker through `invalid`. A failed image only keeps its own phrase out.
 //!   Failure: cache and engine stay as they were, `last_error` says why. Each step is a
 //!   `cloud-state` event (start and end of a sync, settings, local disable).
 //! - Safe mode is left alone: the store merges into the engine only outside it.
@@ -25,6 +28,7 @@ use super::{
 };
 use crate::{
     app_state::Managed,
+    assets,
     error::CommandError,
     store::{
         prefs::{self, CloudPrefs, AUTO_SYNC_MINUTES},
@@ -33,8 +37,8 @@ use crate::{
 };
 use parking_lot::{Condvar, Mutex};
 use quicker_domain::{
-    cloud_table_from_value, strip_utf8_bom, CloudRuleStatus, CloudTable, CloudTableError,
-    Diagnostic, SourceSpan, CLOUD_MAX_RULES,
+    cloud_image_assets, cloud_table_from_value, strip_utf8_bom, verify_asset, CloudRuleStatus,
+    CloudTable, CloudTableError, Diagnostic, SourceSpan, ASSET_MISSING, CLOUD_MAX_RULES,
 };
 use reqwest::Url;
 use serde_json::Value;
@@ -310,10 +314,111 @@ async fn run(store: &Managed, hub: &CloudSync, trigger: Trigger) -> (CloudState,
         Ok(Fetched::NotModified) => Ok(Downloaded::Same),
         Err(e) => Err(e),
     };
+    let wanted = match &outcome {
+        Ok(Downloaded::New { table, .. }) => cloud_image_assets(table),
+        Ok(Downloaded::Same) => {
+            let s = store.lock();
+            s.cloud
+                .cache
+                .as_ref()
+                .map(|cache| cloud_image_assets(&cache.table))
+                .unwrap_or_default()
+        }
+        Err(_) => BTreeSet::new(),
+    };
+    let assets = download_assets(store, hub, &plan, wanted).await;
     (
-        finish(store, hub, &plan, outcome, trigger, begun),
+        finish(store, hub, &plan, outcome, assets, trigger, begun),
         plan.epoch,
     )
+}
+
+/// What a sync's image downloads came to.
+#[derive(Default)]
+struct AssetSync {
+    arrived: usize,
+    /// The first failure, `last_error` of the sync.
+    error: Option<SyncError>,
+}
+
+/// After this many failed connections in a row the rest waits for the next sync: the server is
+/// gone, and each attempt could cost the whole time budget while the sync holds its gate.
+const MAX_ASSET_CONNECTION_FAILURES: usize = 3;
+
+/// Downloads the images of `wanted` the library lacks, one at a time, without any lock. A failure
+/// does not stop the others, except a refused key and a server that stopped answering. What
+/// arrived stays in the library even if the sync's result is dropped: files are named after their
+/// bytes and nothing refers to them by itself. A settings change stops the loop, so the old key
+/// is not sent any further.
+async fn download_assets(
+    store: &Managed,
+    hub: &CloudSync,
+    plan: &Plan,
+    wanted: BTreeSet<String>,
+) -> AssetSync {
+    let mut result = AssetSync::default();
+    let mut connection_failures = 0;
+    for asset in wanted {
+        if assets::contains(&plan.dir, &asset) {
+            continue;
+        }
+        if store.lock().cloud.epoch != plan.epoch {
+            break;
+        }
+        let fetched = fetch::fetch_asset(&plan.url, &plan.key, &asset, &hub.limits).await;
+        let stored = fetched.and_then(|bytes| store_download(&plan.dir, &asset, &bytes));
+        let Err(e) = stored else {
+            result.arrived += 1;
+            connection_failures = 0;
+            continue;
+        };
+        tracing::warn!(
+            event = "cloud.asset_download_failed",
+            asset = %asset,
+            code = e.code,
+            error = %e.detail,
+            "image not downloaded; the next sync retries"
+        );
+        let unauthorized = e.code == code::UNAUTHORIZED;
+        if e.code == code::NETWORK || e.code == code::TIMEOUT {
+            connection_failures += 1;
+        } else {
+            connection_failures = 0;
+        }
+        if result.error.is_none() {
+            result.error = Some(if unauthorized {
+                e
+            } else {
+                SyncError::new(
+                    code::ASSET_DOWNLOAD,
+                    "部分图片未能下载，相关话术暂不可用，将在下次同步时重试",
+                    format!("{asset}: {}: {}", e.code, e.detail),
+                )
+            });
+        }
+        if unauthorized || connection_failures >= MAX_ASSET_CONNECTION_FAILURES {
+            break;
+        }
+    }
+    result
+}
+
+/// Verifies a download against its name (hash, signature, size) and writes it atomically.
+fn store_download(dir: &Path, asset: &str, bytes: &[u8]) -> Result<(), SyncError> {
+    verify_asset(asset, bytes).map_err(|e| {
+        SyncError::new(
+            code::ASSET_DOWNLOAD,
+            e.message(),
+            format!("not stored: {e}"),
+        )
+    })?;
+    assets::write(dir, asset, bytes).map_err(|e| {
+        SyncError::new(
+            code::ASSET_DOWNLOAD,
+            "图片无法写入本机，请检查数据目录是否可写",
+            format!("not written ({:?})", e.kind()),
+        )
+    })
 }
 
 /// What a sync downloads with, read under the store lock.
@@ -440,6 +545,7 @@ fn finish(
     hub: &CloudSync,
     plan: &Plan,
     outcome: Result<Downloaded, SyncError>,
+    assets: AssetSync,
     trigger: Trigger,
     begun: Instant,
 ) -> CloudState {
@@ -483,8 +589,14 @@ fn finish(
     match installed {
         Ok(outcome) => {
             s.cloud.status.last_success_at = Some(now);
-            s.cloud.status.last_error = None;
-            if outcome == "updated" {
+            s.cloud.status.last_error = assets.error;
+            // A phrase still waiting for its image may have got it another way (an import).
+            let waiting = s
+                .cloud
+                .rules
+                .iter()
+                .any(|rule| rule.problem_codes.iter().any(|code| code == ASSET_MISSING));
+            if outcome == "updated" || assets.arrived > 0 || waiting {
                 s.apply_engine();
             }
             s.report_cloud();

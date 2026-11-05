@@ -1250,4 +1250,302 @@ fn an_oversized_cache_is_not_loaded_at_startup() {
         "本机缓存的团队话术超过 2000 条上限，未使用；将在下次同步成功后恢复"
     );
     std::fs::remove_dir_all(dir).unwrap();
+
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\nimage one";
+const PNG_TWO: &[u8] = b"\x89PNG\r\n\x1a\nimage two";
+
+fn image_phrase(id: &str, trigger: &str, asset: &str) -> Value {
+    let mut rule = phrase(id, trigger, "x");
+    rule["action"] = json!({ "type": "image", "asset": asset, "name": "码.png" });
+    rule
+}
+
+fn image_reply(bytes: &[u8]) -> Reply {
+    Reply::now(http("200 OK", &[("Content-Type", "image/png")], bytes))
+}
+
+/// docs/image-and-zip-package.md §5: after a 200 the missing image is fetched with the key from
+/// the sibling path and the phrase runs, in the same sync; a second sync asks for nothing more.
+#[test]
+fn a_sync_downloads_the_images_of_the_table() {
+    let dir = temp_dir();
+    let store = load(&dir);
+    let asset = asset_name_for(PNG).unwrap();
+    let server = FakeServer::start(vec![
+        ok("\"e\"", &table(1, vec![image_phrase("img", "qr", &asset)])),
+        image_reply(PNG),
+        Reply::now(http("304 Not Modified", &[], b"")),
+    ]);
+    let hub = hub();
+    apply_settings(&store, &hub, settings(&server.base_url(), Some("qtk_s"))).unwrap();
+    let state = run(&store, &hub, Trigger::Manual);
+    assert_eq!(state.status.last_error, None, "{:?}", state.status);
+    assert_eq!(
+        statuses(&state),
+        [("img".to_string(), CloudRuleStatus::Active)]
+    );
+    assert_eq!(engine_ids(&store), ["cloud:img"]);
+    assert_eq!(
+        std::fs::read(crate::assets::dir(&dir).join(&asset)).unwrap(),
+        PNG
+    );
+    let requests = server.requests();
+    let head = requests[1].to_ascii_lowercase();
+    assert!(
+        head.starts_with(&format!(
+            "get /integrations/quick-text/v1/phrase-assets/{asset} http/1.1"
+        )),
+        "{head}"
+    );
+    assert!(head.contains("authorization: bearer qtk_s"));
+    run(&store, &hub, Trigger::Manual);
+    assert_eq!(server.requests().len(), 3, "the image is not fetched again");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// §5: a 304 still fills in what is missing (the earlier try failed), and the engine is reloaded
+/// though the table did not change. The failure was `asset_download`, on this phrase only.
+#[test]
+fn a_304_downloads_a_missing_image_and_reloads_the_engine() {
+    let dir = temp_dir();
+    let store = load(&dir);
+    let asset = asset_name_for(PNG).unwrap();
+    let server = FakeServer::start(vec![
+        ok(
+            "\"e\"",
+            &table(
+                1,
+                vec![image_phrase("img", "qr", &asset), phrase("a", "aa", "x")],
+            ),
+        ),
+        Reply::now(http("404 Not Found", &[], b"{}")),
+        Reply::now(http("304 Not Modified", &[], b"")),
+        image_reply(PNG),
+    ]);
+    let hub = hub();
+    apply_settings(&store, &hub, settings(&server.base_url(), Some("k"))).unwrap();
+    let state = run(&store, &hub, Trigger::Manual);
+    let error = state.status.last_error.clone().unwrap();
+    assert_eq!(error.code, code::ASSET_DOWNLOAD);
+    assert!(state.status.last_success_at.is_some(), "the table is fine");
+    assert_eq!(state.status.revision, Some(1));
+    assert_eq!(state.rules[0].status, CloudRuleStatus::Invalid);
+    assert_eq!(
+        state.rules[0].problem.as_deref(),
+        Some("图片尚未下载，将在下次同步时重试")
+    );
+    assert_eq!(state.rules[1].status, CloudRuleStatus::Active);
+    assert_eq!(engine_ids(&store), ["cloud:a"]);
+    // The serialized state does not carry the problem codes, only the text.
+    assert!(!serde_json::to_string(&state.rules[0])
+        .unwrap()
+        .contains("asset_missing"));
+
+    let state = run(&store, &hub, Trigger::Manual);
+    assert_eq!(state.status.last_error, None);
+    assert_eq!(state.rules[0].status, CloudRuleStatus::Active);
+    assert_eq!(engine_ids(&store), ["cloud:img", "cloud:a"]);
+    assert!(crate::assets::contains(&dir, &asset));
+    let requests = server.requests();
+    assert!(requests[2].to_ascii_lowercase().contains("if-none-match"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// §5: what comes back is checked against the name; a failure does not stop the next image.
+#[test]
+fn a_download_that_does_not_fit_its_name_is_not_stored() {
+    let dir = temp_dir();
+    let store = load(&dir);
+    let good = asset_name_for(PNG_TWO).unwrap();
+    let bad = asset_name_for(PNG).unwrap();
+    // Both answers are the good image, so it only fits one of the two names, in either order.
+    let server = FakeServer::start(vec![
+        ok(
+            "\"e\"",
+            &table(
+                1,
+                vec![
+                    image_phrase("bad", "b1", &bad),
+                    image_phrase("good", "g1", &good),
+                ],
+            ),
+        ),
+        image_reply(PNG_TWO),
+        image_reply(PNG_TWO),
+    ]);
+    let hub = hub();
+    apply_settings(&store, &hub, settings(&server.base_url(), Some("k"))).unwrap();
+    let state = run(&store, &hub, Trigger::Manual);
+    assert_eq!(
+        state.status.last_error.as_ref().map(|e| e.code),
+        Some(code::ASSET_DOWNLOAD)
+    );
+    assert!(!crate::assets::contains(&dir, &bad), "wrong bytes refused");
+    assert!(crate::assets::contains(&dir, &good));
+    assert_eq!(
+        statuses(&state),
+        [
+            ("bad".to_string(), CloudRuleStatus::Invalid),
+            ("good".to_string(), CloudRuleStatus::Active)
+        ]
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// §5: the size limit counts, and a key the server refuses is reported as such and stops the
+/// rest; a redirect is not followed.
+#[test]
+fn asset_downloads_follow_the_rules_of_the_table() {
+    let dir = temp_dir();
+    let store = load(&dir);
+    let names: Vec<String> = [PNG, PNG_TWO, b"\x89PNG\r\n\x1a\nimage 3".as_slice()]
+        .iter()
+        .map(|bytes| asset_name_for(bytes).unwrap())
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    let mut big = PNG.to_vec();
+    big.resize(MAX_ASSET_BYTES as usize + 1, 0);
+    let server = FakeServer::start(vec![
+        ok(
+            "\"e\"",
+            &table(
+                1,
+                names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, asset)| image_phrase(&format!("p{i}"), &format!("t{i}"), asset))
+                    .collect(),
+            ),
+        ),
+        Reply::now(http(
+            "302 Found",
+            &[("Location", "http://example.invalid/")],
+            b"",
+        )),
+        image_reply(&big),
+        Reply::now(http("401 Unauthorized", &[], b"")),
+    ]);
+    let hub = hub();
+    apply_settings(&store, &hub, settings(&server.base_url(), Some("k"))).unwrap();
+    let state = run(&store, &hub, Trigger::Manual);
+    assert_eq!(server.requests().len(), 4);
+    // The first failure is what `last_error` says.
+    assert_eq!(
+        state.status.last_error.as_ref().map(|e| e.code),
+        Some(code::ASSET_DOWNLOAD)
+    );
+    assert!(sorted
+        .iter()
+        .all(|asset| !crate::assets::contains(&dir, asset)));
+    assert!(state
+        .rules
+        .iter()
+        .all(|rule| rule.status == CloudRuleStatus::Invalid));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A key the server refuses while fetching images is `unauthorized`, as for the table.
+#[test]
+fn a_refused_key_stops_the_image_downloads() {
+    let dir = temp_dir();
+    let store = load(&dir);
+    let (one, two) = (
+        asset_name_for(PNG).unwrap(),
+        asset_name_for(PNG_TWO).unwrap(),
+    );
+    let server = FakeServer::start(vec![
+        ok(
+            "\"e\"",
+            &table(
+                1,
+                vec![image_phrase("a", "aa", &one), image_phrase("b", "bb", &two)],
+            ),
+        ),
+        Reply::now(http("401 Unauthorized", &[], b"")),
+    ]);
+    let hub = hub();
+    apply_settings(&store, &hub, settings(&server.base_url(), Some("k"))).unwrap();
+    let state = run(&store, &hub, Trigger::Manual);
+    assert_eq!(
+        server.requests().len(),
+        2,
+        "the second image is not asked for"
+    );
+    assert_eq!(
+        state.status.last_error.as_ref().map(|e| e.code),
+        Some(code::UNAUTHORIZED)
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A table cannot name a file outside the library, nor have it requested.
+#[test]
+fn an_asset_name_outside_the_pattern_is_never_requested() {
+    let dir = temp_dir();
+    let store = load(&dir);
+    let server = FakeServer::start(vec![ok(
+        "\"e\"",
+        &table(1, vec![image_phrase("evil", "ee", "../../active.json")]),
+    )]);
+    let hub = hub();
+    apply_settings(&store, &hub, settings(&server.base_url(), Some("k"))).unwrap();
+    let state = run(&store, &hub, Trigger::Manual);
+    assert_eq!(server.requests().len(), 1);
+    assert_eq!(state.status.last_error, None);
+    assert_eq!(state.rules[0].status, CloudRuleStatus::Invalid);
+    assert_eq!(state.rules[0].problem.as_deref(), Some("图片资源名无效"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// §4: opening a program runs through the sync; an action type outside the allowlist stays out of
+/// the engine and the text says where else it can go.
+#[test]
+fn only_allowed_automation_from_the_server_reaches_the_engine() {
+    let dir = temp_dir();
+    let store = load(&dir);
+    let mut common = phrase("common", "cc", "x");
+    common["action"] = json!({ "type": "common", "function": "copy" });
+    let mut open = phrase("open", "oo", "x");
+    open["action"] = json!({ "type": "open", "target": "https://example.com" });
+    let mut html = phrase("html", "hh", "x");
+    html["action"] = json!({ "type": "html", "html": "<b>x</b>", "plain_text": "x" });
+    let mut hotkey = phrase("hotkey", "kk", "x");
+    hotkey["action"] = json!({ "type": "hotkey", "keys": [{ "type": "named", "name": "CTRL" }, { "type": "named", "name": "A" }] });
+    let server = FakeServer::start(vec![ok(
+        "\"e\"",
+        &table(1, vec![common, open, html, hotkey]),
+    )]);
+    let hub = hub();
+    apply_settings(&store, &hub, settings(&server.base_url(), Some("k"))).unwrap();
+    let state = run(&store, &hub, Trigger::Manual);
+    assert_eq!(state.rules[0].status, CloudRuleStatus::Invalid);
+    assert_eq!(
+        state.rules[0].problem.as_deref(),
+        Some("这类操作不通过团队话术同步运行；可导出配置包后导入「我的指令」，审阅后启用")
+    );
+    assert_eq!(engine_ids(&store), ["cloud:open", "cloud:html", "cloud:hotkey"]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Safe mode: images are still fetched, nothing runs.
+#[test]
+fn in_safe_mode_images_download_and_nothing_runs() {
+    let dir = temp_dir();
+    std::fs::write(dir.join("active.json"), b"{").unwrap();
+    let store = load(&dir);
+    let asset = asset_name_for(PNG).unwrap();
+    let server = FakeServer::start(vec![
+        ok("\"e\"", &table(1, vec![image_phrase("img", "qr", &asset)])),
+        image_reply(PNG),
+    ]);
+    let hub = hub();
+    apply_settings(&store, &hub, settings(&server.base_url(), Some("k"))).unwrap();
+    let state = run(&store, &hub, Trigger::Manual);
+    assert_eq!(state.rules[0].status, CloudRuleStatus::Active);
+    assert!(crate::assets::contains(&dir, &asset));
+    assert!(engine_is_personal(&store));
+    assert!(engine_ids(&store).is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}
 }
