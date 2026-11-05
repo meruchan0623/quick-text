@@ -2790,6 +2790,7 @@ where
     C: ClipboardBackend,
     B: Fn() -> Result<C, String>,
 {
+    context.assets_dir = shared.assets_dir.get().cloned();
     context.parameters.insert(
         "action_parameter".into(),
         candidate

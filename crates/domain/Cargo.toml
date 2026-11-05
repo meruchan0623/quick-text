@@ -10,6 +10,8 @@ serde_json = "1"
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
 encoding_rs = "0.8"
+# Asset names are the SHA-256 of the image; already in the tree (src-tauri).
+sha2 = "0.10"
 
 [dev-dependencies]
 proptest = "1"

@@ -167,6 +167,7 @@ const WINDOWS: &[Row] = &[
     row("keys", Needs::Adapter, &[Executor]),
     row("paste", Needs::Adapter, &[Executor, Clipboard]),
     row("html", Needs::Adapter, &[Executor, Clipboard]),
+    row("image", Needs::Adapter, &[Executor, Clipboard]),
     row("file_clipboard", Needs::Adapter, &[Executor, Clipboard]),
     row("image_clipboard", Needs::Adapter, &[Executor, Clipboard]),
     row("mouse", Needs::Adapter, &[Executor]),
@@ -186,6 +187,7 @@ const MACOS: &[Row] = &[
     row("keys", Needs::Adapter, &[Executor]),
     row("paste", Needs::Adapter, &[Executor, Clipboard]),
     row("html", Needs::Adapter, &[Executor, Clipboard]),
+    row("image", Needs::Adapter, &[Executor, Clipboard]),
     row("file_clipboard", Needs::Adapter, &[Executor, Clipboard]),
     row("image_clipboard", Needs::Adapter, &[Executor, Clipboard]),
     row("mouse", Needs::Adapter, &[Executor]),
@@ -379,6 +381,7 @@ mod tests {
             ("keys", (A, None), (U, hook), (A, None)),
             ("paste", (A, None), (U, hook), (A, None)),
             ("html", (A, None), (U, hook), (A, None)),
+            ("image", (A, None), (U, hook), (A, None)),
             ("file_clipboard", (A, None), (U, hook), (A, None)),
             ("image_clipboard", (A, None), (U, hook), (A, None)),
             ("mouse", (A, None), (U, hook), (A, None)),
@@ -419,7 +422,13 @@ mod tests {
 
     #[test]
     fn degraded_clipboard_degrades_only_clipboard_capabilities() {
-        let clipboard = ["paste", "html", "file_clipboard", "image_clipboard"];
+        let clipboard = [
+            "paste",
+            "html",
+            "image",
+            "file_clipboard",
+            "image_clipboard",
+        ];
         let baseline = table(READY, &[]);
         let busy = table(
             READY,
@@ -522,6 +531,7 @@ mod tests {
                 "keys",
                 "paste",
                 "html",
+                "image",
                 "file_clipboard",
                 "image_clipboard",
                 "mouse",
@@ -636,6 +646,7 @@ mod tests {
                 r#"{"id":"keys","status":"available","reason":null,"available":true},"#,
                 r#"{"id":"paste","status":"degraded","reason":"clipboard_busy","available":true},"#,
                 r#"{"id":"html","status":"degraded","reason":"clipboard_busy","available":true},"#,
+                r#"{"id":"image","status":"degraded","reason":"clipboard_busy","available":true},"#,
                 r#"{"id":"file_clipboard","status":"degraded","reason":"clipboard_busy","available":true},"#,
                 r#"{"id":"image_clipboard","status":"degraded","reason":"clipboard_busy","available":true},"#,
                 r#"{"id":"mouse","status":"available","reason":null,"available":true},"#,

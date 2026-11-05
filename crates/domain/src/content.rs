@@ -2,7 +2,7 @@ use crate::*;
 use chrono::{DateTime, Datelike, FixedOffset, Timelike};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
 pub struct VariableContext {
@@ -11,6 +11,9 @@ pub struct VariableContext {
     pub now: DateTime<FixedOffset>,
     pub syntax_variables: BTreeSet<String>,
     pub parameters: BTreeMap<String, serde_json::Value>,
+    /// The asset library (`assets/` in the data directory), where [`Action::Image`] finds its
+    /// file. `None` outside a store-backed run: an image action then fails before any erasure.
+    pub assets_dir: Option<PathBuf>,
 }
 /// Clipboard text, selection and parameter values are redacted (B-09).
 impl fmt::Debug for VariableContext {
@@ -21,6 +24,7 @@ impl fmt::Debug for VariableContext {
             .field("now", &self.now)
             .field("syntax_variables", &self.syntax_variables)
             .field("parameters", &RedactedValues(&self.parameters))
+            .field("assets_dir", &self.assets_dir.is_some())
             .finish()
     }
 }
@@ -32,6 +36,7 @@ impl Default for VariableContext {
             now: chrono::Local::now().fixed_offset(),
             syntax_variables: BTreeSet::new(),
             parameters: BTreeMap::new(),
+            assets_dir: None,
         }
     }
 }
@@ -183,7 +188,13 @@ pub fn render_template(
 /// so a run reads the clipboard or the selection only for rules that can use it. Errs on
 /// the side of yes: content read from a file is unknown until the run, and an action that
 /// references another rule counts every rule in `config`.
+///
+/// An image action renders nothing: its display name is never read as a template, so a name
+/// that looks like a placeholder must not make a run read the clipboard or the selection.
 pub fn action_uses_variable(action: &Action, config: &Config, token: &str) -> bool {
+    if matches!(action, Action::Image { .. }) {
+        return false;
+    }
     let placeholder = format!("{{{token}}}");
     let uses = |json: &str| json.contains(&placeholder) || json.contains(r#""type":"file""#);
     let json = serde_json::to_string(action).unwrap_or_default();
@@ -192,6 +203,7 @@ pub fn action_uses_variable(action: &Action, config: &Config, token: &str) -> bo
             && config
                 .rules
                 .iter()
+                .filter(|rule| !matches!(rule.action, Action::Image { .. }))
                 .any(|rule| uses(&serde_json::to_string(&rule.action).unwrap_or_default()))
 }
 pub fn read_content_source(source: &ContentSource) -> Result<String, Vec<Diagnostic>> {
@@ -307,6 +319,11 @@ pub fn action_to_plan(
  Action::Common{function}=>plan.steps.push(Step::new(Operation::Common{function:function.clone()},SourceSpan::default())),
  Action::Reusable{action_id,parameters}=>plan.steps.push(Step::new(Operation::Reusable{action_id:action_id.clone(),parameters:parameters.clone()},SourceSpan::default())),
  Action::Quicker{..}=>return Err(content_error("quicker_bridge","Quicker-specific actions require an explicitly configured Windows bridge or portable replacement")),
+ Action::Image{asset,..}=>{
+  if !is_asset_name(asset){return Err(content_error(IMAGE_ASSET,"图片资源名无效，请重新选择图片"));}
+  let dir=context.assets_dir.as_deref().ok_or_else(||content_error("image_library","图片资源库不可用"))?;
+  plan.steps.push(Step::new(Operation::PasteImage{path:dir.join(asset).to_string_lossy().into_owned()},SourceSpan::default()));
+ },
  }
     let errors = validate_plan(&plan);
     if !errors.is_empty() {
@@ -344,21 +361,51 @@ pub fn preflight_action(
                 }
             }
             Operation::PasteImage { path } => {
-                let metadata = std::fs::metadata(path.as_str())
-                    .map_err(|_| content_error("image_missing", "Image source is missing"))?;
+                // The file of an image action is the app's own, so the user can only act on it by
+                // choosing the image again: these reach the run's result as they are.
+                let library = matches!(action, Action::Image { .. });
+                let text = |asset_text: &'static str, other: &'static str| {
+                    if library {
+                        asset_text
+                    } else {
+                        other
+                    }
+                };
+                let metadata = std::fs::metadata(path.as_str()).map_err(|_| {
+                    content_error(
+                        "image_missing",
+                        text(
+                            "图片文件不在资源库中，请重新选择图片",
+                            "Image source is missing",
+                        ),
+                    )
+                })?;
                 if metadata.len() > 32_000_000 {
                     return Err(content_error("image_size", "Image exceeds 32 MB"));
                 }
-                let bytes = std::fs::read(path.as_str())
-                    .map_err(|_| content_error("image_read", "Image source cannot be read"))?;
-                let known = bytes.starts_with(b"\x89PNG\r\n\x1a\n")
-                    || bytes.starts_with(&[0xff, 0xd8, 0xff])
-                    || bytes.starts_with(b"GIF87a")
-                    || bytes.starts_with(b"GIF89a")
-                    || bytes.starts_with(b"BM")
-                    || bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP");
-                if !known {
-                    return Err(content_error("image_format","Unsupported image signature; decoder must verify complete image before erasure"));
+                let bytes = std::fs::read(path.as_str()).map_err(|_| {
+                    content_error(
+                        "image_read",
+                        text(
+                            "图片文件无法读取，请重新选择图片",
+                            "Image source cannot be read",
+                        ),
+                    )
+                })?;
+                if image_extension(&bytes).is_none() {
+                    return Err(content_error(
+                        "image_format",
+                        text(
+                            "图片文件已损坏，请重新选择图片",
+                            "Unsupported image signature; decoder must verify complete image before erasure",
+                        ),
+                    ));
+                }
+                // A library file is named after its bytes, so damage shows before any erasure.
+                if let Action::Image { asset, .. } = action {
+                    verify_asset(asset, &bytes).map_err(|_| {
+                        content_error("image_corrupt", "图片文件已损坏，请重新选择图片")
+                    })?;
                 }
             }
             _ => {}

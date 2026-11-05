@@ -1,4 +1,5 @@
 //! Versioned, platform-independent rules and action semantics. No input hooks or logging.
+mod asset;
 mod cloud;
 mod content;
 mod erasure;
@@ -10,6 +11,7 @@ mod parser;
 mod stored;
 mod transaction;
 mod typing;
+pub use asset::*;
 pub use cloud::*;
 pub use content::*;
 pub use erasure::*;

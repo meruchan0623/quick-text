@@ -386,3 +386,17 @@ fn fields_from_newer_releases_are_kept_by_0_4_and_rejected_by_0_3_1() {
     assert_eq!(config, sample());
     assert_0_3_1_reads(&serde_json::to_string_pretty(&config).unwrap());
 }
+
+/// docs/image-and-zip-package.md §1: a 0.3.1 client has no image action. It fails the one rule, and
+/// so counts it as unreadable; that is why `schema_version` stays as it is.
+#[test]
+fn the_image_action_is_unknown_to_0_3_1() {
+    let action = Action::Image {
+        asset: format!("{}.png", "a".repeat(64)),
+        name: String::new(),
+    };
+    let text = serde_json::to_string(&rule("image", action)).unwrap();
+    assert!(serde_json::from_str::<v0_3_1::Rule>(&text).is_err());
+    let plain = serde_json::to_string(&rule("none", Action::None)).unwrap();
+    assert!(serde_json::from_str::<v0_3_1::Rule>(&plain).is_ok());
+}

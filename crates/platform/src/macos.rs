@@ -939,6 +939,7 @@ pub fn start_engine(shared: Arc<Shared>) -> Result<(), String> {
             selection: action_uses_variable(action, &config, "selection")
                 .then(capture_selection)
                 .and_then(Result::ok),
+            assets_dir: worker.assets_dir.get().cloned(),
             ..base
         };
         context.parameters.insert(

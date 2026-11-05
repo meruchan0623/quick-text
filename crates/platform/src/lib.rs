@@ -86,6 +86,8 @@ pub struct Shared {
     pub last: Mutex<Option<ExecutionResult>>,
     pub recording: Mutex<Option<Vec<Step>>>,
     pub shutdown: AtomicBool,
+    /// The asset library image actions read from (set once by the store); unset until then.
+    pub assets_dir: std::sync::OnceLock<std::path::PathBuf>,
 }
 impl Shared {
     pub fn new() -> Arc<Self> {
@@ -99,6 +101,7 @@ impl Shared {
             last: Mutex::new(None),
             recording: Mutex::new(None),
             shutdown: AtomicBool::new(false),
+            assets_dir: std::sync::OnceLock::new(),
         })
     }
 }

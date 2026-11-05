@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod app_state;
+mod assets;
 mod autostart;
 mod cloud;
 mod commands;
@@ -159,6 +160,8 @@ fn main() {
             commands::rules::preview_file,
             commands::rules::preview_image,
             commands::system::get_cursor,
+            commands::rules::import_image_asset,
+            commands::rules::preview_image_asset,
             commands::system::capture_selection,
             commands::system::exit_app,
             commands::system::request_permissions,

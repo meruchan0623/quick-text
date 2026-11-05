@@ -588,6 +588,22 @@ pub fn validate_action(action: &Action) -> Vec<Diagnostic> {
                 ));
             }
         }
+        Action::Image { asset, name } => {
+            if !is_asset_name(asset) {
+                errors.push(diag(
+                    IMAGE_ASSET,
+                    "Image asset must be <sha256>.<png|jpg|gif|bmp|webp>",
+                    "asset",
+                ));
+            }
+            if name.chars().count() > MAX_ASSET_DISPLAY_NAME_CHARS {
+                errors.push(diag(
+                    IMAGE_NAME,
+                    "Image name exceeds 200 characters",
+                    "name",
+                ));
+            }
+        }
         _ => {}
     }
     errors

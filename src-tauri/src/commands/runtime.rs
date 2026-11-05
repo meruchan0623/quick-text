@@ -110,6 +110,7 @@ pub async fn execute_action(
                     &compiled.config,
                     "cliptext",
                 )),
+                assets_dir: engine.assets_dir.get().cloned(),
                 ..Default::default()
             };
             checkpoint()?;

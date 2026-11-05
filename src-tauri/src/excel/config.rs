@@ -788,4 +788,22 @@ mod tests {
         let error = read_bytes(&book.save_to_buffer().unwrap()).unwrap_err();
         assert!(error[0].message.contains("缺少原始配置页"));
     }
+
+    /// docs/image-and-zip-package.md §1: an image action goes through the advanced action column.
+    #[test]
+    fn an_image_action_round_trips_through_the_advanced_json_column() {
+        let action = Action::Image {
+            asset: format!("{}.png", "a".repeat(64)),
+            name: "二维码.png".into(),
+        };
+        let config = Config {
+            rules: vec![rule("image", action.clone())],
+            ..Config::default()
+        };
+        let bytes = export_config(&export_package(&config).unwrap()).unwrap();
+        let (report, full) = read_bytes(&bytes).unwrap();
+        assert!(full);
+        assert_eq!(report.config.rules[0].action, action);
+        assert!(report.config.rules[0].enabled);
+    }
 }

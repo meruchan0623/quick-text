@@ -67,8 +67,35 @@ pub fn preview_file(source: ContentSource) -> Result<String, CommandError> {
 }
 #[tauri::command]
 pub fn preview_image(path: String) -> Result<String, CommandError> {
+    thumbnail_data_url(Path::new(&path))
+}
+/// `import_image_asset` (docs/image-and-zip-package.md §7): checks the image and copies it into
+/// the asset library; the rule no longer depends on the original file.
+#[tauri::command]
+pub fn import_image_asset(
+    path: String,
+    store: State<Managed>,
+) -> Result<crate::assets::ImportedAsset, CommandError> {
+    let dir = store.lock().dir().to_path_buf();
+    crate::assets::import_file(&dir, Path::new(&path))
+}
+/// `preview_image_asset` (§7): a library image as `preview_image` shows a file. Only an asset name
+/// is accepted, so this cannot be pointed at any other file.
+#[tauri::command]
+pub fn preview_image_asset(asset: String, store: State<Managed>) -> Result<String, CommandError> {
+    if !is_asset_name(&asset) {
+        return Err(CommandError::validation(vec![Diagnostic::error(
+            IMAGE_ASSET,
+            AssetError::InvalidName.message(),
+            SourceSpan::default(),
+        )
+        .at("asset")]));
+    }
+    let dir = store.lock().dir().to_path_buf();
+    thumbnail_data_url(&crate::assets::dir(&dir).join(asset))
+}
+fn thumbnail_data_url(file: &Path) -> Result<String, CommandError> {
     use base64::Engine;
-    let file = Path::new(&path);
     let metadata = fs::metadata(file).map_err(|e| CommandError::io(IoOp::Read, Some(file), &e))?;
     if metadata.len() > 32_000_000 {
         return Err(CommandError::invalid_file(

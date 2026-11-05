@@ -36,6 +36,8 @@ impl Store {
         // Attached before `install`, so safe mode lands in the runtime's
         // reasons; the engine starts paused (adopted as MANUAL).
         let engine = Shared::new();
+        // A fresh `Shared`, so this is its only value.
+        let _ = engine.assets_dir.set(crate::assets::dir(&dir));
         let runtime = engine_runtime();
         runtime.attach(&engine);
         let mut store = Self {

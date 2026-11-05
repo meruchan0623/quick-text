@@ -583,10 +583,19 @@ pub enum Action {
         #[serde(default)]
         parameter: String,
     },
+    /// Pastes a preset image from the asset library (docs/image-and-zip-package.md §1).
+    Image {
+        /// `<sha256 hex>.<ext>`: see [`crate::is_asset_name`]. Any string reads here, so a rule
+        /// being edited stays a rule; [`crate::validate_action`] reports a wrong one.
+        asset: String,
+        /// The original file name, for display only.
+        #[serde(default)]
+        name: String,
+    },
 }
-/// HTML and plain-text bodies, parameter values, plans and what an `Open` opens (target and
-/// arguments: paths, URLs and parameters can carry user data) are redacted; kinds, methods,
-/// hotkeys, working directories and ids are shown.
+/// HTML and plain-text bodies, parameter values, plans, what an `Open` opens (target and
+/// arguments: paths, URLs and parameters can carry user data) and an image's display name are
+/// redacted; kinds, methods, hotkeys, working directories, ids and asset hashes are shown.
 impl fmt::Debug for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -645,6 +654,11 @@ impl fmt::Debug for Action {
                 .debug_struct("Quicker")
                 .field("action_id", action_id)
                 .field("parameter", &Redacted(parameter))
+                .finish(),
+            Self::Image { asset, name } => f
+                .debug_struct("Image")
+                .field("asset", asset)
+                .field("name", &Redacted(name))
                 .finish(),
         }
     }
