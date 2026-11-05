@@ -213,6 +213,16 @@ export interface LastMiss {
   reason: ReasonCode;
 }
 
+// ---- picture assets (docs/image-and-zip-package.md §7) ----
+
+/** `import_image_asset`: the picture as copied into the asset library. */
+export interface ImageAsset {
+  /** `<sha256>.<ext>`, the file name in the library. */
+  asset: string;
+  /** The original file name, for display only. */
+  name: string;
+}
+
 // ---- team phrases (docs/cloud-phrases.md §5) ----
 
 /** Pushed with the whole CloudState; carries no `seq` and is not one of the runtime events. */

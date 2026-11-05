@@ -54,6 +54,7 @@ export const capabilityNames: Readonly<Record<string, string>> = {
   keys: '逐字键入',
   paste: '粘贴文本',
   html: '粘贴 HTML',
+  image: '粘贴图片',
   file_clipboard: '粘贴文件对象',
   image_clipboard: '粘贴图片对象',
   mouse: '鼠标操作',

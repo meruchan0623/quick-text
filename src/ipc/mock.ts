@@ -305,6 +305,7 @@ const SHARED_ROWS: CapabilityRow[] = [
   ['keys', true, ['executor']],
   ['paste', true, ['executor', 'clipboard']],
   ['html', true, ['executor', 'clipboard']],
+  ['image', true, ['executor', 'clipboard']],
   ['file_clipboard', true, ['executor', 'clipboard']],
   ['image_clipboard', true, ['executor', 'clipboard']],
   ['mouse', true, ['executor']],
@@ -821,6 +822,15 @@ export class MockBackend {
     },
     preview_file: () => '浏览器预览：文件内容示例',
     preview_image: () =>
+      'data:image/svg+xml,' +
+      encodeURIComponent(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="90"><rect width="160" height="90" fill="#ddd"/></svg>',
+      ),
+    import_image_asset: (args) => ({
+      asset: `${'0'.repeat(64)}.png`,
+      name: String(args.path).split('/').pop() ?? '',
+    }),
+    preview_image_asset: () =>
       'data:image/svg+xml,' +
       encodeURIComponent(
         '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="90"><rect width="160" height="90" fill="#ddd"/></svg>',

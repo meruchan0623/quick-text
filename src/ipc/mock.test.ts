@@ -176,6 +176,7 @@ describe('mock backend commands', () => {
       'keys',
       'paste',
       'html',
+      'image',
       'file_clipboard',
       'image_clipboard',
       'mouse',
@@ -191,7 +192,7 @@ describe('mock backend commands', () => {
       reason: 'not_implemented',
       available: false,
     });
-    expect(windows.filter((c) => c.status === 'available')).toHaveLength(11);
+    expect(windows.filter((c) => c.status === 'available')).toHaveLength(12);
     for (const c of windows) expect(c.available).toBe(c.status !== 'unavailable');
 
     const macos = mockCapabilities('macos');

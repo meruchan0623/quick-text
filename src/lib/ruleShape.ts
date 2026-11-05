@@ -26,6 +26,10 @@
 /** A runtime type check for one JSON value. */
 export type Guard = (value: unknown) => boolean;
 
+/** The file name of a picture in the asset library (docs/image-and-zip-package.md §1). */
+export const isImageAsset = (value: unknown): value is string =>
+  typeof value === 'string' && /^[a-f0-9]{64}\.(png|jpg|gif|bmp|webp)$/.test(value);
+
 export const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
@@ -282,6 +286,9 @@ const action = tagged({
   none: {},
   text: { method: outputMethod, source: contentSource },
   html: { html: str, plain_text: str },
+  // The asset's form is left to Rust, like the limits above: an empty one is a rule still being
+  // edited, and the editor refuses to save it (./numberFields.ts).
+  image: { asset: str, name: withDefault(str, () => '') },
   hotkey: { keys },
   send_keys: { source: contentSource, syntax_variables: withDefault(strings, () => []) },
   steps: { plan },

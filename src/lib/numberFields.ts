@@ -173,7 +173,7 @@ export function actionNumberProblems(action: unknown, path = ''): NumberProblem[
 
 /** A diagnostic of the editor's own checks, shaped like the backend's (ipc-contract §2). */
 export interface EditDiagnostic {
-  code: 'number_range' | 'not_savable';
+  code: 'number_range' | 'not_savable' | 'image_required';
   message: string;
   path: string;
   span: { line: number; column: number; length: number };
@@ -202,11 +202,17 @@ const NOT_SAVABLE = '含有无法识别的内容，请检查后再试。';
 const unsendableAt = (value: unknown, root: string): string | null =>
   unsendablePath(value, root)?.replace(/\.nan$/, '') ?? null;
 
+/** A 「粘贴图片」 action with no picture chosen yet: readable, but there is nothing to paste. */
+const lacksImage = (action: unknown): boolean =>
+  isRecord(action) && action.type === 'image' && action.asset === '';
+
+const NO_IMAGE = '请选择要粘贴的图片。';
+
 /**
  * Why the edited rule, at position `index` of the config, cannot be saved or tested as it is:
  * number fields holding no number in their range; else an invalid-number marker or other number
  * JSON cannot carry anywhere else in it; else a shape the backend would not read as the editor
- * means it (`isReadableRule`). Empty when it can.
+ * means it (`isReadableRule`); else a 「粘贴图片」 without a picture. Empty when it can.
  */
 export function ruleEditDiagnostics(rule: unknown, index: number): EditDiagnostic[] {
   const base = `rules[${String(index)}]`;
@@ -214,7 +220,10 @@ export function ruleEditDiagnostics(rule: unknown, index: number): EditDiagnosti
   if (found.length > 0) return found.map(toDiagnostic);
   const unsendable = unsendableAt(rule, base);
   if (unsendable !== null) return [diagnostic('not_savable', NOT_SAVABLE, unsendable)];
-  return isReadableRule(rule) ? [] : [diagnostic('not_savable', NOT_SAVABLE, base)];
+  if (!isReadableRule(rule)) return [diagnostic('not_savable', NOT_SAVABLE, base)];
+  return lacksImage(rule.action)
+    ? [diagnostic('image_required', NO_IMAGE, `${base}.action.asset`)]
+    : [];
 }
 
 /** `ruleEditDiagnostics` for an action on its own (「测试动作」); paths start at the action. */
@@ -223,7 +232,7 @@ export function actionDiagnostics(action: unknown): EditDiagnostic[] {
   if (found.length > 0) return found.map(toDiagnostic);
   const unsendable = unsendableAt(action, '');
   if (unsendable !== null) return [diagnostic('not_savable', NOT_SAVABLE, unsendable)];
-  return isAction(action) && !hasUnsafeNumber(action)
-    ? []
-    : [diagnostic('not_savable', NOT_SAVABLE, '')];
+  if (!isAction(action) || hasUnsafeNumber(action))
+    return [diagnostic('not_savable', NOT_SAVABLE, '')];
+  return lacksImage(action) ? [diagnostic('image_required', NO_IMAGE, 'asset')] : [];
 }

@@ -87,6 +87,7 @@ export const actionNames: Record<string, string> = {
   text_paste: '粘贴纯文本',
   text_keys: '键入纯文本',
   html: '粘贴带格式的文字',
+  image: '粘贴图片',
   hotkey: '按快捷键',
   send_keys: '文字与按键组合',
   steps: '按顺序执行多个操作',
@@ -110,6 +111,7 @@ export const actionOptions = Object.entries(actionNames).filter(([type]) => type
 export const offeredChoices: ReadonlySet<string> = new Set([
   'text_paste',
   'text_keys',
+  'image',
   'send_keys',
   'hotkey',
   'steps',

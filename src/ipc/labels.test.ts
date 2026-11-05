@@ -52,6 +52,7 @@ const CAPABILITY_IDS = [
   'keys',
   'paste',
   'html',
+  'image',
   'file_clipboard',
   'image_clipboard',
   'mouse',

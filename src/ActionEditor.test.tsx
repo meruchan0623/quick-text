@@ -2,6 +2,8 @@ import { act, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import ActionEditor from './ActionEditor';
+import { createMockTransport, MockBackend } from './ipc/mock';
+import { setTransport } from './ipc/transport';
 import type { Data } from './model';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -46,6 +48,88 @@ function mount(keys: Data[], platform = 'windows') {
   return { host, click, change };
 }
 const named = (name: string) => ({ type: 'named', name });
+
+describe('粘贴图片', () => {
+  const asset = `${'0'.repeat(64)}.png`;
+  const flush = () => act(() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+
+  function mountImage(action: Data, options: ConstructorParameters<typeof MockBackend>[0] = {}) {
+    const backend = new MockBackend(options);
+    setTransport(createMockTransport(backend));
+    cleanups.push(() => setTransport(null));
+    const host = document.createElement('div');
+    document.body.append(host);
+    const root = createRoot(host);
+    const change = vi.fn();
+    function Harness() {
+      const [current, setCurrent] = useState(action);
+      return (
+        <ActionEditor
+          platform="windows"
+          rules={[]}
+          action={current}
+          onChange={(next) => {
+            change(next);
+            setCurrent(next);
+          }}
+          run={async (fn) => {
+            await fn();
+          }}
+          show={() => {}}
+        />
+      );
+    }
+    act(() => root.render(<Harness />));
+    cleanups.push(() => {
+      act(() => root.unmount());
+      host.remove();
+    });
+    const button = (label: string) => {
+      const found = Array.from(host.querySelectorAll('button')).find(
+        (item) => item.textContent === label,
+      );
+      if (!found) throw new Error(`missing button ${label}`);
+      return found;
+    };
+    const calls = (command: string) => backend.calls.filter((c) => c.command === command);
+    return { host, button, change, calls };
+  }
+
+  it('copies the chosen file into the library, stores it and previews it', async () => {
+    const { host, button, change, calls } = mountImage({ type: 'image', asset: '', name: '' });
+    expect(host.textContent).toContain('还没有选择图片');
+    expect(button('预览图片').disabled).toBe(true);
+    act(() => button('选择图片').click());
+    await flush();
+    expect(calls('choose_file')[0]?.args).toEqual({ kind: 'image' });
+    expect(calls('import_image_asset')[0]?.args).toEqual({ path: 'mock://示例图片.png' });
+    expect(change).toHaveBeenLastCalledWith({ type: 'image', asset, name: '示例图片.png' });
+    expect(host.textContent).toContain('示例图片.png');
+    expect(calls('preview_image_asset')[0]?.args).toEqual({ asset });
+    expect(host.querySelector('img.image-preview')?.getAttribute('src')).toMatch(/^data:image/);
+  });
+
+  it('leaves the action as it is when the dialog is cancelled', async () => {
+    const { button, change, calls } = mountImage(
+      { type: 'image', asset: '', name: '' },
+      { dialog: 'cancel' },
+    );
+    act(() => button('选择图片').click());
+    await flush();
+    expect(calls('import_image_asset')).toHaveLength(0);
+    expect(change).not.toHaveBeenCalled();
+  });
+
+  it('previews the picture a saved rule holds on request', async () => {
+    const { host, button, calls } = mountImage({ type: 'image', asset, name: '' });
+    expect(host.textContent).toContain('已选择图片');
+    expect(host.querySelector('img.image-preview')).toBeNull();
+    act(() => button('预览图片').click());
+    await flush();
+    expect(calls('preview_image_asset')[0]?.args).toEqual({ asset });
+    expect(host.querySelector('img.image-preview')).not.toBeNull();
+  });
+});
 
 describe('shortcut keyboard', () => {
   it('toggles keys and previews ordered combinations without changing legacy keys', () => {

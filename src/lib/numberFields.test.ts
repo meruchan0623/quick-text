@@ -182,6 +182,26 @@ describe('actionNumberProblems / ruleEditDiagnostics', () => {
     expect(actionDiagnostics(reusable)).toEqual([]);
   });
 
+  it('refuses a 「粘贴图片」 without a picture, and only that', () => {
+    const empty = { type: 'image', asset: '', name: '' };
+    expect(ruleEditDiagnostics(rule(empty), 2)).toEqual([
+      {
+        code: 'image_required',
+        message: '请选择要粘贴的图片。',
+        path: 'rules[2].action.asset',
+        span: { line: 0, column: 0, length: 0 },
+        severity: 'error',
+      },
+    ]);
+    expect(actionDiagnostics(empty).map((d) => d.code)).toEqual(['image_required']);
+    const chosen = { type: 'image', asset: `${'a'.repeat(64)}.png`, name: '二维码.png' };
+    expect(ruleEditDiagnostics(rule(chosen), 2)).toEqual([]);
+    expect(actionDiagnostics(chosen)).toEqual([]);
+    expect(actionDiagnostics({ type: 'image', name: 'x' }).map((d) => d.code)).toEqual([
+      'not_savable',
+    ]);
+  });
+
   it('flags a reusable parameter past the IPC number contract, or held as NaN', () => {
     for (const n of [9007199254740992, NaN, Infinity]) {
       const action = { type: 'reusable', action_id: 'x', parameters: { text: 'a', n } };

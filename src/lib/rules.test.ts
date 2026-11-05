@@ -91,6 +91,10 @@ describe('summarizeAction', () => {
     );
     expect(summarizeAction({ type: 'html', html: '', plain_text: '纯文本' })).toBe('纯文本');
     expect(summarizeAction({ type: 'html' })).toBe('（空内容）');
+    expect(summarizeAction({ type: 'image', asset: 'x.png', name: '二维码.png' })).toBe(
+      '二维码.png',
+    );
+    expect(summarizeAction({ type: 'image', asset: '', name: '' })).toBe('（未选择图片）');
   });
 
   it('does not call a hotkey or 「不执行操作」 a step count', () => {

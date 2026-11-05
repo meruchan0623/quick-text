@@ -199,6 +199,8 @@ export function summarizeAction(action: unknown): string {
     }
     case 'html':
       return text(a.html) || text(a.plain_text) || '（空内容）';
+    case 'image':
+      return text(a.name) || '（未选择图片）';
     case 'hotkey': {
       const keys = Array.isArray(a.keys) ? a.keys : [];
       return keys.length > 0 ? keys.map(keyName).join(' + ') : '（未设置按键）';

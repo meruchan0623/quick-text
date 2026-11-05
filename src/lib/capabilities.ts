@@ -90,6 +90,7 @@ const choiceCapabilities: Readonly<Record<string, string>> = {
   send_keys: 'keys',
   hotkey: 'keys',
   html: 'html',
+  image: 'image',
   replay: 'recording',
   open: 'open',
   quicker: 'quicker_private_action',

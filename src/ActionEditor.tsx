@@ -1,5 +1,6 @@
 import { Fragment, useId, useRef, useState } from 'react';
 import { call } from './ipc/transport';
+import type { ImageAsset } from './ipc/types';
 import { diagnosticText, parseCommandError } from './ipc/errors';
 import { choiceCapability, choiceOffer, findCapability } from './lib/capabilities';
 import {
@@ -197,6 +198,8 @@ function defaultAction(t: string): Data {
       return { type: t, source: { type: 'inline', value: '' }, syntax_variables: [] };
     case 'html':
       return { type: t, html: '', plain_text: '' };
+    case 'image':
+      return { type: t, asset: '', name: '' };
     case 'hotkey':
       return { type: t, keys: [key('Ctrl'), key('C')] };
     case 'steps':
@@ -601,6 +604,20 @@ export default function ActionEditor({
       const p = await call<string[] | null>('choose_file', { kind });
       if (p?.length) fn(p);
     });
+  const previewAsset = async (asset: string) =>
+    setImagePreview({
+      path: asset,
+      url: await call<string>('preview_image_asset', { asset }),
+    });
+  // Copied into the asset library right away: the rule no longer depends on the file chosen.
+  const chooseImage = () =>
+    run(async () => {
+      const p = await call<string[] | null>('choose_file', { kind: 'image' });
+      if (!p?.length) return;
+      const { asset, name } = await call<ImageAsset>('import_image_asset', { path: p[0] });
+      edit({ asset, name });
+      await previewAsset(asset);
+    });
   // Principle 5 (S-16): the capability the chosen action needs, and how every action type is
   // offered by the capability it needs (the type the action has keeps a selectable entry).
   const needed = findCapability(capabilities, choiceCapability(actionChoice(a)), platform);
@@ -880,6 +897,23 @@ export default function ActionEditor({
             <summary>查看文字效果（不会运行网页脚本）</summary>
             <iframe title="HTML 预览" sandbox="" srcDoc={a.html} />
           </details>
+        </>
+      )}
+      {a.type === 'image' && (
+        <>
+          <div className="field">
+            <span>要粘贴的图片</span>
+            <small>{a.asset ? a.name || '已选择图片' : '还没有选择图片'}</small>
+          </div>
+          <div className="inline">
+            <button onClick={chooseImage}>选择图片</button>
+            <button disabled={!a.asset} onClick={() => run(() => previewAsset(a.asset))}>
+              预览图片
+            </button>
+          </div>
+          {a.asset && imagePreview?.path === a.asset && (
+            <img className="image-preview" src={imagePreview?.url} alt="待粘贴图片预览" />
+          )}
         </>
       )}
       {a.type === 'hotkey' && (
