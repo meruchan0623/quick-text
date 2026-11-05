@@ -11,6 +11,7 @@ mod events;
 mod excel;
 mod faults;
 mod lkg;
+mod package_zip;
 mod startup;
 mod store;
 mod tray;
@@ -159,9 +160,9 @@ fn main() {
             commands::settings::set_auto_listen,
             commands::rules::preview_file,
             commands::rules::preview_image,
-            commands::system::get_cursor,
             commands::rules::import_image_asset,
             commands::rules::preview_image_asset,
+            commands::system::get_cursor,
             commands::system::capture_selection,
             commands::system::exit_app,
             commands::system::request_permissions,

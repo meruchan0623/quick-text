@@ -865,11 +865,15 @@ export default function App() {
     </div>
   );
   const choose = async (kind = 'file') => call<string[] | null>('choose_file', { kind });
-  const exportData = (format: 'json' | 'xlsx' = 'json') =>
+  const exportData = (format: 'zip' | 'xlsx' | 'template' = 'zip') =>
     run(async () => {
       requireReady();
       const path = await call<string | null>(
-        format === 'xlsx' ? 'export_excel_config' : 'export_config',
+        format === 'template'
+          ? 'export_excel_template'
+          : format === 'xlsx'
+            ? 'export_excel_config'
+            : 'export_config',
       );
       // null: the save dialog was cancelled; say nothing (ipc-contract §4).
       if (path) setMessage(`已导出：${path}`);
@@ -881,7 +885,8 @@ export default function App() {
       if (!p?.length) return;
       const strategy = await askValue({
         title: '遇到重复的指令时怎么处理？',
-        detail: '用文件更新会替换编号相同的指令并保留其他指令；替换全部会移除文件中没有的指令。',
+        detail:
+          '文件可以是 ZIP 配置包、JSON 或 Excel（.xlsx）。用文件更新会替换编号相同的指令并保留其他指令；替换全部会移除文件中没有的指令。',
         confirm: '导入',
         input: {
           label: '重复的指令',
@@ -1129,7 +1134,7 @@ export default function App() {
               <button
                 disabled={!ready}
                 onClick={importData}
-                title="导入 JSON 或 Excel（.xlsx）配置文件"
+                title="导入 ZIP 配置包、JSON 或 Excel（.xlsx）配置文件"
               >
                 导入
               </button>

@@ -7,7 +7,7 @@ export default function ExportMenu({
 }: {
   disabled: boolean;
   excelDisabled: boolean;
-  onExport: (format: 'json' | 'xlsx') => void;
+  onExport: (format: 'zip' | 'xlsx' | 'template') => void;
 }) {
   const [open, setOpen] = useState(false);
   const root = useRef<HTMLDivElement>(null);
@@ -20,7 +20,7 @@ export default function ExportMenu({
     document.addEventListener('pointerdown', outside);
     return () => document.removeEventListener('pointerdown', outside);
   }, [open]);
-  const choose = (format: 'json' | 'xlsx') => {
+  const choose = (format: 'zip' | 'xlsx' | 'template') => {
     setOpen(false);
     toggle.current?.focus();
     onExport(format);
@@ -39,7 +39,7 @@ export default function ExportMenu({
         }
       }}
     >
-      <button disabled={disabled} onClick={() => choose('json')} title="导出当前配置为 JSON 文件">
+      <button disabled={disabled} onClick={() => choose('zip')} title="导出当前配置为 ZIP 配置包">
         导出
       </button>
       <button
@@ -53,9 +53,12 @@ export default function ExportMenu({
       </button>
       {open && !disabled && (
         <div className="export-options" role="group" aria-label="导出文件格式">
-          <button onClick={() => choose('json')}>导出 JSON 文件</button>
+          <button onClick={() => choose('zip')}>导出配置包（ZIP）</button>
           <button disabled={excelDisabled} onClick={() => choose('xlsx')}>
             导出 Excel 文件
+          </button>
+          <button disabled={excelDisabled} onClick={() => choose('template')}>
+            导出 Excel 填写模板
           </button>
         </div>
       )}

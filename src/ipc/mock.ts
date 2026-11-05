@@ -108,7 +108,7 @@ export interface MockOptions {
   /** How file dialogs answer. Default `accept`. */
   dialog?: 'accept' | 'cancel';
   /** Format returned by the synthetic import picker. */
-  importFormat?: 'json' | 'xlsx';
+  importFormat?: 'json' | 'xlsx' | 'zip';
   /** Mix in the B-43 sample (unreadable entries, unknown fields). Default false. */
   unreadable?: boolean;
   /**
@@ -781,7 +781,7 @@ export class MockBackend {
         if (this.options.legacy) this.#fail({ code: 'cancelled' }, 'Export cancelled');
         return null;
       }
-      return 'mock://quicktext-package.json';
+      return 'mock://quicktext-config.zip';
     },
     export_excel_template: () => {
       if (this.options.dialog === 'cancel') return null;

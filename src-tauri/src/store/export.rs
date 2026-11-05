@@ -1,4 +1,4 @@
-//! `export_config`: writes the active configuration as a package to a path the user chose.
+//! `export_config`: writes the active configuration as a ZIP package to a path the user chose.
 //! The target is checked against the safe mode and the data directory with
 //! the store lock held, so the checks and the write see the same state.
 //!
@@ -28,18 +28,24 @@ impl Store {
     /// A target inside the data directory is refused in every mode, so an
     /// export never replaces `active.json`, a revision or another store file
     /// behind the atomic writes and the revision logic.
+    ///
+    /// The `export_config` command takes the same steps with the store lock released while it
+    /// packs the images: [`Store::export_snapshot`], `package_zip::build`, [`Store::export_bytes`].
+    #[cfg(test)]
     pub fn export_active(&self, target: &Path) -> Result<(), CommandError> {
         self.export_active_with(target, &mut ())
     }
 
     /// [`Store::export_active`] with the staging steps behind `hooks`.
+    #[cfg(test)]
     pub(crate) fn export_active_with(
         &self,
         target: &Path,
         hooks: &mut impl StageHooks,
     ) -> Result<(), CommandError> {
         let package = self.export_snapshot()?;
-        self.export_bytes_with(target, package.as_bytes(), hooks)
+        let bytes = crate::package_zip::build(&self.dir, &self.active, &package)?;
+        self.export_bytes_with(target, &bytes, hooks)
     }
 
     /// A package of the same active configuration and migration originals that JSON exports.

@@ -737,16 +737,17 @@ describe('rule list, editor and settings (F-04)', () => {
     const { container } = mounted;
     await click(mounted, '导出');
     await waitFor(mounted, () => {
-      expect(statusText(container)).toMatch(/mock:\/\/quicktext-package\.json/);
+      expect(statusText(container)).toMatch(/mock:\/\/quicktext-config\.zip/);
     });
   });
 
-  it('offers JSON and Excel from the export arrow and closes after selection', async () => {
+  it('offers the ZIP package and Excel from the export arrow and closes after selection', async () => {
     const mounted = await mount();
-    expect(button(mounted.container, '导出 JSON 文件')).toBeUndefined();
+    expect(button(mounted.container, '导出')?.title).toBe('导出当前配置为 ZIP 配置包');
+    expect(button(mounted.container, '导出配置包（ZIP）')).toBeUndefined();
     await click(mounted, '▾');
     expect(button(mounted.container, '导出 Excel 文件')).toBeDefined();
-    await click(mounted, '导出 JSON 文件');
+    await click(mounted, '导出配置包（ZIP）');
     await waitFor(mounted, () => {
       expect(callsOf(mounted.backend, 'export_config')).toHaveLength(1);
     });
@@ -793,7 +794,18 @@ describe('rule list, editor and settings (F-04)', () => {
     },
   );
 
-  it.each(['json', 'xlsx'] as const)(
+  it('says which files 导入 takes', async () => {
+    const mounted = await mount();
+    expect(button(mounted.container, '导入')?.title).toContain('ZIP 配置包');
+    await click(mounted, '导入');
+    await waitFor(mounted, () => {
+      expect(dialog(mounted.container, '遇到重复的指令时怎么处理？')?.textContent).toContain(
+        'ZIP 配置包',
+      );
+    });
+  });
+
+  it.each(['zip', 'json', 'xlsx'] as const)(
     'previews %s then publishes exactly once when confirmed',
     async (importFormat) => {
       const mounted = await mount({ importFormat });

@@ -6,8 +6,8 @@ use crate::error::CommandError;
 pub type Filter = (&'static str, &'static [&'static str]);
 
 /// Configuration packages (`export_config`, `import_config`, `choose_file("import")`).
-pub const CONFIG_FILTERS: &[Filter] = &[("JSON 配置", &["json"])];
-pub const IMPORT_FILTERS: &[Filter] = &[("配置或 Excel 指令表", &["json", "xlsx"])];
+pub const CONFIG_FILTERS: &[Filter] = &[("Quicktext 配置包", &["zip"])];
+pub const IMPORT_FILTERS: &[Filter] = &[("配置包或 Excel 指令表", &["json", "xlsx", "zip"])];
 /// Formats `preview_image` can decode: the `image` crate features in Cargo.toml.
 const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "bmp", "ico", "tif", "tiff", "webp",
@@ -99,8 +99,8 @@ mod tests {
     #[test]
     fn filters_follow_the_file_kind() {
         assert_eq!(filters("import"), IMPORT_FILTERS);
-        assert_eq!(IMPORT_FILTERS[0].1, ["json", "xlsx"]);
-        assert_eq!(CONFIG_FILTERS[0].1, ["json"]);
+        assert_eq!(IMPORT_FILTERS[0].1, ["json", "xlsx", "zip"]);
+        assert_eq!(CONFIG_FILTERS[0].1, ["zip"]);
         assert_eq!(filters("image")[0].1, IMAGE_EXTENSIONS);
         assert!(filters("text").iter().any(|(_, x)| x == &["*"]));
         assert!(filters("files").is_empty());

@@ -6,7 +6,12 @@ use crate::{
     store::merge_import_metadata,
 };
 use quicker_domain::*;
-use std::{fs, io::Read, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::{Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
+};
 use tauri::{Manager, State};
 
 #[tauri::command]
@@ -56,16 +61,27 @@ pub fn export_config(
     // must not block other commands and the tray while it is open.
     let target = path.map(PathBuf::from).or_else(|| {
         dialog(CONFIG_FILTERS)
-            .set_file_name("quicktext-package.json")
+            .set_file_name("quicktext-config.zip")
             .save_file()
     });
     let Some(target) = target else {
         return Ok(None);
     };
-    store.lock().export_active(&target)?;
+    // Reading and packing the images happens outside the store lock; only the protected atomic
+    // write holds it, as for Excel.
+    let (snapshot, dir, active) = {
+        let s = store.lock();
+        (
+            s.export_snapshot()?,
+            s.dir().to_path_buf(),
+            s.active.clone(),
+        )
+    };
+    let bytes = crate::package_zip::build(&dir, &active, &snapshot)?;
+    store.lock().export_bytes(&target, &bytes)?;
     Ok(Some(target.to_string_lossy().into_owned()))
 }
-/// Without `path`, asks for JSON or Excel; `Ok(None)` when the user cancels.
+/// Without `path`, asks for a package (ZIP or JSON) or Excel; `Ok(None)` when the user cancels.
 #[tauri::command]
 pub fn import_config(
     path: Option<String>,
@@ -79,23 +95,139 @@ pub fn import_config(
             None => return Ok(None),
         },
     };
-    let excel = path
+    import_from(&path, &strategy, &store).map(Some)
+}
+
+/// What an import file turned out to be, by its content: a ZIP holds a package or is a workbook
+/// (the extension only decides for a file that is neither ZIP nor JSON).
+struct ImportSource {
+    report: ImportReport,
+    excel: bool,
+    full_excel: bool,
+    rules_only: bool,
+    /// Verified images of a ZIP package, by name.
+    assets: BTreeMap<String, Vec<u8>>,
+    label: &'static str,
+}
+
+fn read_import_source(path: &Path) -> Result<ImportSource, CommandError> {
+    let read_error = |e: std::io::Error| CommandError::io(IoOp::Read, Some(path), &e);
+    let mut head = [0u8; 2];
+    let mut file = fs::File::open(path).map_err(read_error)?;
+    let zip = match file.read_exact(&mut head) {
+        Ok(()) => head == *b"PK",
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => false,
+        Err(e) => return Err(read_error(e)),
+    };
+    file.seek(SeekFrom::Start(0)).map_err(read_error)?;
+    let named_xlsx = path
         .extension()
         .is_some_and(|x| x.eq_ignore_ascii_case("xlsx"));
-    let (mut imported, full_excel) = if excel {
-        crate::excel::read_config(&path).map_err(CommandError::validation)?
+    let workbook = if zip {
+        crate::package_zip::classify(&mut file).map_err(CommandError::validation)?
+            == crate::package_zip::ZipKind::Workbook
+    } else {
+        named_xlsx
+    };
+    if workbook {
+        let (report, full_excel) =
+            crate::excel::read_config(path).map_err(CommandError::validation)?;
+        return Ok(ImportSource {
+            report,
+            excel: true,
+            full_excel,
+            rules_only: false,
+            assets: BTreeMap::new(),
+            label: "Excel",
+        });
+    }
+    file.seek(SeekFrom::Start(0)).map_err(read_error)?;
+    let (source, assets, label) = if zip {
+        let package = crate::package_zip::read(std::io::BufReader::new(file))
+            .map_err(CommandError::validation)?;
+        (package.json, package.assets, "配置包")
     } else {
         let mut source = String::new();
-        fs::File::open(&path)
-            .and_then(|file| file.take(16_777_217).read_to_string(&mut source))
-            .map_err(|e| CommandError::io(IoOp::Read, Some(&path), &e))?;
-        (
-            crate::config_package::import(&source).map_err(CommandError::validation)?,
-            false,
-        )
+        file.take(16_777_217)
+            .read_to_string(&mut source)
+            .map_err(read_error)?;
+        (source, BTreeMap::new(), "JSON")
     };
+    let imported =
+        crate::config_package::import_source(&source).map_err(CommandError::validation)?;
+    Ok(ImportSource {
+        report: imported.report,
+        excel: false,
+        full_excel: false,
+        rules_only: imported.rules_only,
+        assets,
+        label,
+    })
+}
+
+/// docs/image-and-zip-package.md §3: a rule whose image is neither among `packaged` nor in the
+/// library still imports, disabled, with a warning in the report.
+fn disable_rules_missing_assets(
+    report: &mut ImportReport,
+    packaged: &BTreeMap<String, Vec<u8>>,
+    data_dir: &Path,
+) {
+    for rule in &mut report.config.rules {
+        let Action::Image { asset, .. } = &rule.action else {
+            continue;
+        };
+        if !is_asset_name(asset)
+            || packaged.contains_key(asset)
+            || crate::assets::contains(data_dir, asset)
+        {
+            continue;
+        }
+        let mut warning = Diagnostic::error(
+            ASSET_MISSING,
+            "图片不在配置包和资源库中，已停用；补齐图片后可手动启用",
+            SourceSpan::default(),
+        );
+        warning.severity = Severity::Warning;
+        let original = serde_json::to_value(&*rule).unwrap_or_default();
+        rule.enabled = false;
+        match report.items.iter_mut().find(|item| item.rule_id == rule.id) {
+            Some(item) => item.diagnostics.push(warning),
+            None => report.items.push(MigrationItem {
+                rule_id: rule.id.clone(),
+                status: MigrationStatus::Compatible,
+                diagnostics: vec![warning],
+                original,
+            }),
+        }
+    }
+}
+
+fn import_from(
+    path: &Path,
+    strategy: &str,
+    store: &Managed,
+) -> Result<serde_json::Value, CommandError> {
+    let ImportSource {
+        report: mut imported,
+        excel,
+        full_excel,
+        rules_only,
+        assets,
+        label,
+    } = read_import_source(path)?;
+    let data_dir = store.lock().dir().to_path_buf();
+    disable_rules_missing_assets(&mut imported, &assets, &data_dir);
+    let strategy = strategy.to_string();
     let mut incoming = imported.config;
-    let mut s = store.lock();
+    let s = store.lock();
+    if rules_only {
+        // A table has no settings of its own; "replace" replaces the rules only.
+        incoming = Config {
+            rules: incoming.rules,
+            unreadable_rules: incoming.unreadable_rules,
+            ..s.active.clone()
+        };
+    }
     let mut candidate = s.active.clone();
     let conflicts: Vec<_> = incoming
         .rules
@@ -118,10 +250,12 @@ pub fn import_config(
         .collect();
     report.push(format!(
         "{} 导入 {} 条指令；确认后保存并立即生效",
-        if excel { "Excel" } else { "JSON" },
+        label,
         incoming.rules.len()
     ));
-    if !excel || full_excel {
+    if rules_only {
+        report.push("话术表不含全局设置，导入后保留当前全局设置".into());
+    } else if !excel || full_excel {
         report.push(if strategy == "replace" {
             "完整替换将恢复导出时的全局设置，并保留未知字段及未识别指令".into()
         } else {
@@ -178,10 +312,20 @@ pub fn import_config(
         &imported.unresolved,
     );
     candidate.revision = s.active.revision;
-    let token = s.preview_import(candidate.clone(), unresolved);
-    Ok(Some(
-        serde_json::json!({"config":candidate,"report":report,"token":token}),
-    ))
+    drop(s);
+    // Every check has passed: only now do the images reach the library. Without the store lock,
+    // since a package can hold thousands of files to sync. A preview that is then cancelled leaves
+    // unused files, which the library allows (nothing refers to them; §2).
+    for rule in &incoming.rules {
+        if let Action::Image { asset, .. } = &rule.action {
+            if let Some(bytes) = assets.get(asset) {
+                crate::assets::write(&data_dir, asset, bytes)
+                    .map_err(|e| CommandError::io(IoOp::Write, Some(Path::new(asset)), &e))?;
+            }
+        }
+    }
+    let token = store.lock().preview_import(candidate.clone(), unresolved);
+    Ok(serde_json::json!({"config":candidate,"report":report,"token":token}))
 }
 
 fn import_item_summary(item: &MigrationItem, rule: Option<&Rule>) -> String {
@@ -771,5 +915,234 @@ mod excel_preview_tests {
         merge_readable_rules(&mut merged, &incoming_known, "overwrite", &mut vec![]);
         assert_eq!(merged.rules.len(), 1);
         assert!(merged.unreadable_rules.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod package_import_tests {
+    use super::*;
+    use crate::store::Store;
+    use std::io::Write;
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\nimage";
+
+    struct World {
+        data: PathBuf,
+        store: Managed,
+        files: PathBuf,
+    }
+    impl World {
+        fn new() -> Self {
+            let root =
+                std::env::temp_dir().join(format!("quicker-import-{}", uuid::Uuid::new_v4()));
+            let data = root.join("data");
+            let files = root.join("files");
+            fs::create_dir_all(&files).unwrap();
+            Self {
+                store: Managed::new(Store::load(data.clone())),
+                data,
+                files,
+            }
+        }
+        fn file(&self, name: &str, bytes: &[u8]) -> PathBuf {
+            let path = self.files.join(name);
+            fs::write(&path, bytes).unwrap();
+            path
+        }
+    }
+    impl Drop for World {
+        fn drop(&mut self) {
+            if let Some(root) = self.files.parent() {
+                let _ = fs::remove_dir_all(root);
+            }
+        }
+    }
+
+    fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, bytes) in entries {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    fn image_rule(id: &str, asset: &str) -> Rule {
+        Rule {
+            id: id.into(),
+            match_spec: MatchSpec {
+                kind: MatchKind::Literal,
+                value: format!("t{id}"),
+            },
+            action: Action::Image {
+                asset: asset.into(),
+                name: "码.png".into(),
+            },
+            ..Rule::default()
+        }
+    }
+
+    fn package_of(rules: Vec<Rule>) -> String {
+        export_package(&Config {
+            rules,
+            ..Config::default()
+        })
+        .unwrap()
+    }
+
+    fn rule_enabled(preview: &serde_json::Value, id: &str) -> bool {
+        preview["config"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rule| rule["id"] == id)
+            .unwrap()["enabled"]
+            .as_bool()
+            .unwrap()
+    }
+
+    /// §3: the images of a package reach the library, the rule stays on, the file on disk is told
+    /// by its content whatever it is called.
+    #[test]
+    fn a_zip_imports_rules_and_images_whatever_its_extension() {
+        for name in ["package.zip", "renamed.json", "renamed.xlsx"] {
+            let world = World::new();
+            let asset = asset_name_for(PNG).unwrap();
+            let json = package_of(vec![image_rule("a", &asset)]);
+            let path = world.file(
+                name,
+                &zip_of(&[
+                    ("package.json", json.as_bytes()),
+                    (&format!("assets/{asset}"), PNG),
+                ]),
+            );
+            let preview = import_from(&path, "merge", &world.store).unwrap();
+            assert!(rule_enabled(&preview, "a"), "{name}");
+            assert!(crate::assets::contains(&world.data, &asset), "{name}");
+            assert!(preview["report"]
+                .to_string()
+                .contains("配置包 导入 1 条指令"));
+        }
+    }
+
+    /// Legacy JSON still imports, also named differently.
+    #[test]
+    fn bare_json_still_imports() {
+        let world = World::new();
+        let json = package_of(vec![]);
+        let path = world.file("old.json", json.as_bytes());
+        import_from(&path, "merge", &world.store).unwrap();
+        let path = world.file("named.zip", json.as_bytes());
+        import_from(&path, "merge", &world.store).unwrap();
+    }
+
+    /// §3: a rule whose image is in neither place imports disabled, with a warning; the same rule
+    /// stays on when the library already has it, in every source format.
+    #[test]
+    fn a_rule_without_its_image_imports_disabled_with_a_warning() {
+        let world = World::new();
+        let asset = asset_name_for(PNG).unwrap();
+        let json = package_of(vec![image_rule("a", &asset)]);
+        let zip = world.file("missing.zip", &zip_of(&[("package.json", json.as_bytes())]));
+        let bare = world.file("missing.json", json.as_bytes());
+        for path in [&zip, &bare] {
+            let preview = import_from(path, "merge", &world.store).unwrap();
+            assert!(!rule_enabled(&preview, "a"));
+            let report = preview["report"].to_string();
+            assert!(report.contains("图片不在配置包和资源库中"), "{report}");
+        }
+        crate::assets::write(&world.data, &asset, PNG).unwrap();
+        for path in [&zip, &bare] {
+            let preview = import_from(path, "merge", &world.store).unwrap();
+            assert!(rule_enabled(&preview, "a"));
+        }
+    }
+
+    /// §3: refused means nothing written, also when other images in it were fine.
+    #[test]
+    fn a_refused_package_writes_nothing() {
+        let world = World::new();
+        let good = asset_name_for(PNG).unwrap();
+        let other = b"\x89PNG\r\n\x1a\nother";
+        let wrong = format!("{}.png", "0".repeat(64));
+        let json = package_of(vec![image_rule("a", &good)]);
+        let cases = [
+            zip_of(&[
+                ("package.json", json.as_bytes()),
+                (&format!("assets/{good}"), PNG),
+                (&format!("assets/{wrong}"), other),
+            ]),
+            // Rejected by the JSON after every image passed.
+            zip_of(&[
+                ("package.json", b"{\"format\":\"unknown\"}"),
+                (&format!("assets/{good}"), PNG),
+            ]),
+        ];
+        for bytes in &cases {
+            let path = world.file("bad.zip", bytes);
+            assert!(import_from(&path, "merge", &world.store).is_err());
+            assert!(!crate::assets::dir(&world.data).exists());
+        }
+    }
+
+    /// §3: a phrase table from TSim in a ZIP. Replacing keeps the settings it does not have.
+    #[test]
+    fn a_table_package_keeps_the_settings() {
+        let world = World::new();
+        {
+            let mut s = world.store.lock();
+            let mut config = s.active.clone();
+            config.globals.word_separators = ",".into();
+            s.save_config(config, None).unwrap();
+        }
+        let asset = asset_name_for(PNG).unwrap();
+        let table = serde_json::json!({
+            "format": "quicktext-cloud-phrases", "schema_version": 1, "revision": 3,
+            "updated_at": null,
+            "rules": [
+                serde_json::to_value(image_rule("a", &asset)).unwrap(),
+                { "id": "raw", "action": { "type": "future" } }
+            ]
+        });
+        let path = world.file(
+            "table.zip",
+            &zip_of(&[
+                ("package.json", table.to_string().as_bytes()),
+                (&format!("assets/{asset}"), PNG),
+            ]),
+        );
+        let preview = import_from(&path, "replace", &world.store).unwrap();
+        assert_eq!(preview["config"]["globals"]["word_separators"], ",");
+        assert!(rule_enabled(&preview, "a"));
+        assert!(preview["config"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| rule["id"] == "raw"));
+        assert!(crate::assets::contains(&world.data, &asset));
+    }
+
+    /// An export and an import through the file, with the image, into a fresh data directory.
+    #[test]
+    fn an_exported_package_imports_elsewhere_with_its_image() {
+        let from = World::new();
+        let asset = asset_name_for(PNG).unwrap();
+        crate::assets::write(&from.data, &asset, PNG).unwrap();
+        {
+            let mut s = from.store.lock();
+            let mut config = s.active.clone();
+            config.rules.push(image_rule("a", &asset));
+            s.save_config(config, None).unwrap();
+        }
+        let path = from.files.join("quicktext-config.zip");
+        from.store.lock().export_active(&path).unwrap();
+        let to = World::new();
+        let preview = import_from(&path, "replace", &to.store).unwrap();
+        assert!(rule_enabled(&preview, "a"));
+        assert_eq!(
+            fs::read(crate::assets::dir(&to.data).join(&asset)).unwrap(),
+            PNG
+        );
     }
 }

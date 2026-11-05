@@ -1,6 +1,8 @@
 //! Native packages use the stored model's lossless reader. Quicker command
-//! arrays continue through the domain migration importer.
+//! arrays continue through the domain migration importer. A team phrase table
+//! (`quicktext-cloud-phrases`) is read rule by rule and takes the same review.
 use quicker_domain::*;
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -9,13 +11,35 @@ fn invalid(code: &str, message: &str) -> Vec<Diagnostic> {
 }
 
 pub(crate) fn import(source: &str) -> Result<ImportReport, Vec<Diagnostic>> {
+    import_source(source).map(|imported| imported.report)
+}
+
+/// What [`import_source`] read.
+pub(crate) struct Imported {
+    pub report: ImportReport,
+    /// The source has rules but no settings (a team phrase table): the importing configuration
+    /// keeps its own globals, whatever the strategy.
+    pub rules_only: bool,
+}
+
+pub(crate) fn import_source(source: &str) -> Result<Imported, Vec<Diagnostic>> {
     if source.len() > 16_777_216 {
         return Err(invalid("package_size", "配置包超过16MiB限制"));
     }
     let value: Value = serde_json::from_str(source.strip_prefix('\u{feff}').unwrap_or(source))
         .map_err(|_| invalid("package_json", "配置包JSON格式错误"))?;
     if value.is_array() {
-        return import_package(source);
+        return Ok(Imported {
+            report: import_package(source)?,
+            rules_only: false,
+        });
+    }
+    if value.get("format").and_then(Value::as_str) == Some(CLOUD_FORMAT) {
+        let config = config_from_table(&value)?;
+        return Ok(Imported {
+            report: review(config, &value, vec![])?,
+            rules_only: true,
+        });
     }
     let (raw, unresolved) = if value.get("format").is_some() {
         if value.get("format").and_then(Value::as_str) != Some("quicker-text")
@@ -54,6 +78,47 @@ pub(crate) fn import(source: &str) -> Result<ImportReport, Vec<Diagnostic>> {
     if config.version != SCHEMA_VERSION {
         return Err(invalid("schema_version", "配置版本不受支持"));
     }
+    Ok(Imported {
+        report: review(std::mem::take(&mut config), &raw, unresolved)?,
+        rules_only: false,
+    })
+}
+
+/// A team phrase table as a configuration: the checks of a download for the table as a whole,
+/// then each entry as a [`Rule`]; one that does not read is kept as an unreadable rule.
+fn config_from_table(value: &Value) -> Result<Config, Vec<Diagnostic>> {
+    cloud_table_from_value(value.clone()).map_err(|e| match e {
+        CloudTableError::SchemaNewer { .. } => {
+            invalid("package_version", "话术表的格式较新，请升级 Quicktext")
+        }
+        CloudTableError::TooManyRules { .. } => {
+            invalid("package_size", "话术表超过 2000 条上限，未导入任何内容")
+        }
+        CloudTableError::Malformed { .. } => {
+            invalid("package_schema", "话术表字段不正确，未导入任何内容")
+        }
+    })?;
+    let mut config = Config::default();
+    let entries = value.get("rules").and_then(Value::as_array);
+    for (index, raw) in entries.into_iter().flatten().enumerate() {
+        match Rule::deserialize(raw) {
+            Ok(rule) => config.rules.push(rule),
+            Err(_) => config.unreadable_rules.push(UnreadableRule {
+                index,
+                raw: raw.clone(),
+            }),
+        }
+    }
+    Ok(config)
+}
+
+/// The review every native import takes: ids checked, each rule compiled on its own terms,
+/// automation and what does not compile disabled with the reason.
+fn review(
+    mut config: Config,
+    raw: &Value,
+    unresolved: Vec<MigrationItem>,
+) -> Result<ImportReport, Vec<Diagnostic>> {
     let mut ids = BTreeSet::new();
     for rule in &config.rules {
         if rule.id.trim().is_empty() || !ids.insert(rule.id.clone()) {
@@ -216,5 +281,103 @@ mod tests {
                 .len(),
             4
         );
+    }
+
+    fn table(rules: Value) -> String {
+        serde_json::json!({
+            "format": "quicktext-cloud-phrases",
+            "schema_version": 1,
+            "revision": 12,
+            "updated_at": "2026-10-28T08:30:00+00:00",
+            "rules": rules
+        })
+        .to_string()
+    }
+
+    /// docs/image-and-zip-package.md §3: the phrase table imports into 「我的指令」: every action
+    /// type, unreadable entries kept, automation disabled for review.
+    #[test]
+    fn a_phrase_table_imports_with_review_and_unreadable_entries_kept() {
+        let rule = |id: &str, action: Value| {
+            serde_json::json!({
+                "id": id,
+                "match": { "kind": "literal", "value": format!("t{id}") },
+                "action": action
+            })
+        };
+        let future = serde_json::json!({ "id": "future", "action": { "type": "future" } });
+        let source = table(serde_json::json!([
+            rule(
+                "text",
+                serde_json::json!({
+                    "type": "text", "method": "paste",
+                    "source": { "type": "inline", "value": "您好" }
+                })
+            ),
+            rule(
+                "open",
+                serde_json::json!({ "type": "open", "target": "https://example.com" })
+            ),
+            future,
+            rule(
+                "hotkey",
+                serde_json::json!({
+                    "type": "hotkey", "keys": [{ "type": "named", "name": "CTRL" }]
+                })
+            ),
+        ]));
+        let imported = import_source(&source).unwrap();
+        assert!(imported.rules_only);
+        let config = &imported.report.config;
+        let by_id = |id: &str| config.rules.iter().find(|rule| rule.id == id).unwrap();
+        assert!(by_id("text").enabled);
+        assert!(by_id("hotkey").enabled);
+        assert!(!by_id("open").enabled, "automation waits for review");
+        assert_eq!(config.unreadable_rules.len(), 1);
+        assert_eq!(config.unreadable_rules[0].index, 2);
+        assert_eq!(config.unreadable_rules[0].id(), Some("future"));
+        let open = imported
+            .report
+            .items
+            .iter()
+            .find(|item| item.rule_id == "open")
+            .unwrap();
+        assert_eq!(open.diagnostics[0].code, "import_confirmation");
+        // Through the plain entry too.
+        assert_eq!(import(&source).unwrap().config.rules.len(), 3);
+    }
+
+    #[test]
+    fn a_phrase_table_is_refused_as_a_whole_like_a_download() {
+        for (source, code) in [
+            (
+                serde_json::json!({
+                    "format": "quicktext-cloud-phrases", "schema_version": 2,
+                    "revision": 1, "rules": []
+                })
+                .to_string(),
+                "package_version",
+            ),
+            (
+                serde_json::json!({
+                    "format": "quicktext-cloud-phrases", "schema_version": 1, "rules": []
+                })
+                .to_string(),
+                "package_schema",
+            ),
+            (
+                table(Value::Array(vec![serde_json::json!({}); 2001])),
+                "package_size",
+            ),
+            (
+                table(serde_json::json!([{ "id": "x" }, { "id": "x" }])),
+                "rule_id",
+            ),
+        ] {
+            assert_eq!(import(&source).err().unwrap()[0].code, code);
+        }
+        // A native package keeps its settings: only a table is rules-only.
+        let native = export_package(&Config::default()).unwrap();
+        assert!(!import_source(&native).unwrap().rules_only);
     }
 }

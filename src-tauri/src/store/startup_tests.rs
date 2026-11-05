@@ -1630,7 +1630,7 @@ fn crash_loop_exports_outside_the_data_dir() {
         fs::create_dir_all(&sibling.0).unwrap();
         for target in [elsewhere.join("backup.json"), sibling.join("backup.json")] {
             store.export_active(&target).unwrap();
-            let package = fs::read_to_string(&target).unwrap();
+            let package = exported_json(&target);
             let imported = import_package(&package).unwrap();
             assert_eq!(imported.config.rules, store.active.rules, "{mode:?}");
         }
@@ -1726,6 +1726,13 @@ fn export_refuses_other_spellings_of_the_data_dir() {
         assert!(refused_as_data_dir(result), "{}", target.display());
     }
     assert_eq!(files(&dir), before);
+}
+
+/// `package.json` of an exported ZIP.
+fn exported_json(target: &Path) -> String {
+    crate::package_zip::read(fs::File::open(target).unwrap())
+        .unwrap()
+        .json
 }
 
 /// Replaces the staging steps of `export_config` ([`StageHooks`]).
@@ -1849,7 +1856,7 @@ fn export_replaces_a_swapped_target_instead_of_writing_through_it() {
                     .unwrap()
                     .file_type()
                     .is_symlink());
-                let package = fs::read_to_string(&target).unwrap();
+                let package = exported_json(&target);
                 let imported = import_package(&package).unwrap();
                 assert_eq!(imported.config.rules, store.active.rules, "{case}");
             }

@@ -98,6 +98,7 @@
 //! | `executor.unwound` | error | a task unwound without settling; its held keys were released; `epoch`, `released` |
 //! | `export.refused_data_dir` | warn | an export target inside the data directory was refused; file name and the check that caught it (`stage`) |
 //! | `export.temp_cleanup_failed` | warn | the export temp file could not be removed; file name, error |
+//! | `export.asset_unavailable` | warn | a library image a rule refers to is missing or damaged and the package was exported without it: `asset` (the file's hash name) |
 //! | `fault.config_corrupt` | warn | fault injection damaged active.json, or could not write it (error) |
 //! | `fault.injected` | warn | an injected fault was armed or fired; fault `point`, and `param` when armed by `debug_inject_fault` |
 //! | `frontend.error` | warn | `log_frontend_error`; error class (a built-in name or `other`), message length and fingerprint, source and stack frames as `<chunk hash>.js:line:col` only for Vite chunks embedded in the binary (the list `AssetResolver::iter` gives; empty in dev builds) at a line and column inside the chunk, printed from the parsed numbers, whether the source was dropped, count of dropped stack lines; never any caller text |

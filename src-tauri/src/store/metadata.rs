@@ -337,8 +337,8 @@ mod tests {
         assert_eq!(store.active.unreadable_rules[0].raw, raw);
         let target = elsewhere.join("backup.json");
         store.export_active(&target).unwrap();
-        let package: serde_json::Value =
-            serde_json::from_slice(&fs::read(&target).unwrap()).unwrap();
+        let package = crate::package_zip::read(fs::File::open(&target).unwrap()).unwrap();
+        let package: serde_json::Value = serde_json::from_str(&package.json).unwrap();
         let exported: Vec<MigrationItem> =
             serde_json::from_value(package["unresolved"].clone()).unwrap();
         assert_eq!(metadata_sources(exported), expected);
