@@ -580,7 +580,7 @@ interface Draft {
 }
 
 const draftOf = (settings: CloudSettings | null): Draft => ({
-  enabled: settings?.enabled ?? false,
+  enabled: settings?.enabled ?? true,
   base_url: settings?.base_url ?? '',
   auto_sync_minutes: settings?.auto_sync_minutes ?? 30,
   key: '',

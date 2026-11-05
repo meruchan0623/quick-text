@@ -463,18 +463,17 @@ fn a_sync_that_cannot_run_says_why() {
     let dir = temp_dir();
     let store = load(&dir);
     let hub = hub();
+    // Subscribed by default; a manual sync without a key says so, a timer one stays silent.
+    let state = run(&store, &hub, Trigger::Startup);
+    assert!(state.status.last_error.is_none());
     let state = run(&store, &hub, Trigger::Manual);
     assert_eq!(
-        state.status.last_error.as_ref().map(|e| e.code),
-        Some(code::NOT_CONFIGURED)
-    );
-    assert_eq!(
         state.status.last_error.as_ref().unwrap().message,
-        "团队话术同步未开启"
+        "未设置同步密钥"
     );
     assert!(state.status.last_attempt_at.is_some());
     apply_settings(&store, &hub, settings("https://example.invalid", None)).unwrap();
-    let state = run(&store, &hub, Trigger::Startup);
+    let state = run(&store, &hub, Trigger::Manual);
     assert_eq!(
         state.status.last_error.as_ref().map(|e| e.code),
         Some(code::NOT_CONFIGURED)
@@ -1250,6 +1249,7 @@ fn an_oversized_cache_is_not_loaded_at_startup() {
         "本机缓存的团队话术超过 2000 条上限，未使用；将在下次同步成功后恢复"
     );
     std::fs::remove_dir_all(dir).unwrap();
+}
 
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\nimage one";
 const PNG_TWO: &[u8] = b"\x89PNG\r\n\x1a\nimage two";
@@ -1547,5 +1547,4 @@ fn in_safe_mode_images_download_and_nothing_runs() {
     assert!(engine_is_personal(&store));
     assert!(engine_ids(&store).is_empty());
     std::fs::remove_dir_all(dir).unwrap();
-}
 }

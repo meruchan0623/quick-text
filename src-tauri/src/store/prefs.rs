@@ -237,7 +237,8 @@ pub struct CloudPrefs {
 impl Default for CloudPrefs {
     fn default() -> Self {
         Self {
-            enabled: false,
+            // Subscribed by default: once a server and key are set, synced phrases apply.
+            enabled: true,
             base_url: String::new(),
             key: String::new(),
             auto_sync_minutes: DEFAULT_AUTO_SYNC_MINUTES,
@@ -755,7 +756,7 @@ mod tests {
         fs::write(dir.join(FILE), serde_json::to_vec(&bad).unwrap()).unwrap();
         let prefs = load_prefs(&dir).unwrap();
         let cloud = prefs.app.cloud.unwrap();
-        assert!(!cloud.enabled);
+        assert!(cloud.enabled);
         assert_eq!((cloud.base_url.as_str(), cloud.key.as_str()), ("", ""));
         assert_eq!(cloud.auto_sync_minutes, 30);
         assert_eq!(cloud.disabled_ids, ["a"]);

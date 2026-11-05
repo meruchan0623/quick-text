@@ -454,7 +454,7 @@ fn prepare(store: &Managed, trigger: Trigger) -> Prepared {
     let mut s = store.lock();
     let epoch = s.cloud.epoch;
     let prefs = &s.cloud.prefs;
-    if !prefs.enabled && trigger.automatic() {
+    if trigger.automatic() && (!prefs.enabled || prefs.key.is_empty() || prefs.base_url.is_empty()) {
         return Prepared::Skip(epoch);
     }
     let ready = if !prefs.enabled {
