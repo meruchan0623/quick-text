@@ -71,7 +71,7 @@ jobs:
             echo "::warning::MAC_DEV_CERTIFICATE not set: DMG is ad-hoc signed"
             unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
           fi
-          npm run tauri -- build --target aarch64-apple-darwin --bundles dmg \
+          npm run tauri -- build --target aarch64-apple-darwin --bundles app,dmg \
             --config '{"build":{"beforeBundleCommand":""}}'
 
       - name: Verify signature
