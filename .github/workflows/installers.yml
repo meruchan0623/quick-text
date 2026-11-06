@@ -1,0 +1,204 @@
+# Test-signed installers: macOS DMG (arm64) + Windows MSI, published as a public GitHub pre-release.
+#
+# Trigger: push of a tag vMAJOR.MINOR.PATCH, or a manual run (workflow_dispatch).
+#
+# This is NOT the compliance release (release.yml). It skips build.beforeBundleCommand (the release gate that
+# demands the generated third-party notices and the dependency-sources archive), so these installers carry no
+# distribution compliance files. They are for testing and are always published as a pre-release.
+#
+# Signing uses self-signed test certificates from repository secrets (all optional):
+#   MAC_DEV_CERTIFICATE / MAC_DEV_CERTIFICATE_PASSWORD / MAC_DEV_SIGNING_IDENTITY   base64 .p12 + password + identity name
+#   WINDOWS_DEV_CERTIFICATE / WINDOWS_DEV_CERTIFICATE_PASSWORD                      base64 .pfx + password
+# Without them the DMG is ad-hoc signed and the MSI is unsigned (a warning is printed).
+# A self-signed certificate is not trusted by Gatekeeper / SmartScreen: macOS needs right-click -> Open on first launch.
+name: installers
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+
+concurrency:
+  group: installers-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  macos-dmg:
+    name: macos-dmg
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Placeholder frontend dist
+        run: mkdir -p dist
+
+      # Tauri imports APPLE_CERTIFICATE into a temporary keychain and signs the .app. Without the secret the
+      # identity is "-" (ad-hoc), so the bundle is still a consistently signed bundle.
+      - name: Build DMG
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.MAC_DEV_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.MAC_DEV_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.MAC_DEV_SIGNING_IDENTITY || '-' }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "::warning::MAC_DEV_CERTIFICATE not set: DMG is ad-hoc signed"
+            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
+          fi
+          npm run tauri -- build --target aarch64-apple-darwin --bundles dmg \
+            --config '{"build":{"beforeBundleCommand":""}}'
+
+      - name: Verify signature
+        run: |
+          app="target/aarch64-apple-darwin/release/bundle/macos/Quicktext.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv --verbose=2 "$app" 2>&1 | grep -E 'Identifier|Authority|Signature|flags' || true
+
+      - name: Collect DMG
+        run: |
+          mkdir -p out
+          dmg=$(ls target/aarch64-apple-darwin/release/bundle/dmg/*.dmg | head -n1)
+          [ -n "$dmg" ] || { echo "DMG not found" >&2; exit 1; }
+          cp "$dmg" out/
+          cd out && shasum -a 256 *.dmg > SHA256SUMS-macos.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers-macos
+          path: out/*
+          if-no-files-found: error
+          retention-days: 30
+
+  windows-msi:
+    name: windows-msi
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Placeholder frontend dist
+        shell: bash
+        run: mkdir -p dist
+
+      - name: Build MSI
+        run: |
+          npm run tauri -- build --bundles msi --config '{"build":{"beforeBundleCommand":""}}'
+          if ($LASTEXITCODE -ne 0) { throw 'tauri build failed' }
+
+      # Set-Authenticode works on .msi. The certificate is self-signed, so the check compares the signer
+      # thumbprint instead of validating a trust chain.
+      - name: Sign MSI (test certificate)
+        id: sign
+        env:
+          CERT_B64: ${{ secrets.WINDOWS_DEV_CERTIFICATE }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_DEV_CERTIFICATE_PASSWORD }}
+        run: |
+          $msi = Get-ChildItem -LiteralPath target/release/bundle/msi -Filter '*.msi' | Select-Object -First 1
+          if (-not $msi) { throw 'MSI not found' }
+          New-Item -ItemType Directory -Path out | Out-Null
+          Copy-Item -LiteralPath $msi.FullName -Destination out/
+          if (-not $env:CERT_B64) {
+            Write-Host '::warning::WINDOWS_DEV_CERTIFICATE not set: MSI is unsigned'
+            return
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP 'dev-signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_B64))
+          $secure = ConvertTo-SecureString $env:CERT_PASSWORD -AsPlainText -Force
+          $cert = Get-PfxCertificate -FilePath $pfx -Password $secure
+          $target = Join-Path 'out' $msi.Name
+          $result = Set-AuthenticodeSignature -FilePath $target -Certificate $cert -HashAlgorithm SHA256 -TimestampServer 'http://timestamp.digicert.com'
+          Remove-Item -LiteralPath $pfx -Force
+          $check = Get-AuthenticodeSignature -FilePath $target
+          if (-not $check.SignerCertificate -or $check.SignerCertificate.Thumbprint -ne $cert.Thumbprint) {
+            throw "MSI signature missing or signer mismatch (status: $($result.Status))"
+          }
+          Write-Host "signed by $($check.SignerCertificate.Subject) ($($check.SignerCertificate.Thumbprint))"
+
+      - name: Checksums
+        run: |
+          Set-Location out
+          Get-ChildItem -Filter '*.msi' | ForEach-Object {
+            "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
+          } | Set-Content -LiteralPath SHA256SUMS-windows.txt -Encoding utf8
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers-windows
+          path: out/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: publish
+    needs: [macos-dmg, windows-msi]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Only this job may write; it publishes a public pre-release so the files are downloadable without login.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: installers-*
+          path: files
+          merge-multiple: true
+
+      - name: Create pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ]; then
+            tag="$REF_NAME"
+          else
+            tag="test-build-${RUN_NUMBER}"
+          fi
+          cat > notes.md <<EOF
+          Test-signed installers built from commit \`${SHA}\`.
+
+          - macOS: Apple-silicon DMG, self-signed (not notarized). First launch: right-click the app, then Open.
+          - Windows: MSI, self-signed test certificate (SmartScreen will warn).
+          - Built without the compliance release gate (third-party notices / dependency sources); not for redistribution. The compliance release is \`release.yml\`.
+
+          Checksums: SHA256SUMS-macos.txt, SHA256SUMS-windows.txt.
+          EOF
+          ls -l files
+          gh release create "$tag" files/* --repo "$REPO" --target "$SHA" --prerelease \
+            --title "Quicktext test build ${tag}" --notes-file notes.md
