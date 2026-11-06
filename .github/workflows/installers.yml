@@ -1,4 +1,4 @@
-# Test-signed installers: macOS DMG (arm64) + Windows MSI/NSIS exe, published as a public GitHub pre-release.
+# Test-signed installers: macOS DMG (arm64) + Windows portable ZIP (no installer), published as a public GitHub pre-release.
 #
 # Trigger: push of a tag vMAJOR.MINOR.PATCH, or a manual run (workflow_dispatch).
 #
@@ -9,7 +9,7 @@
 # Signing uses self-signed test certificates from repository secrets (all optional):
 #   MAC_DEV_CERTIFICATE / MAC_DEV_CERTIFICATE_PASSWORD / MAC_DEV_SIGNING_IDENTITY   base64 .p12 + password + identity name
 #   WINDOWS_DEV_CERTIFICATE / WINDOWS_DEV_CERTIFICATE_PASSWORD                      base64 .pfx + password
-# Without them the DMG is ad-hoc signed and the MSI is unsigned (a warning is printed).
+# Without them the DMG is ad-hoc signed and the Windows exe is unsigned (a warning is printed).
 # A self-signed certificate is not trusted by Gatekeeper / SmartScreen: macOS needs right-click -> Open on first launch.
 name: installers
 
@@ -95,8 +95,8 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  windows-msi:
-    name: windows-msi
+  windows-portable:
+    name: windows-portable
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -118,50 +118,50 @@ jobs:
         shell: bash
         run: mkdir -p dist
 
-      - name: Build MSI
+      # Portable build: only the exe is compiled (--no-bundle), no installer of any kind is produced.
+      - name: Build portable exe
         run: |
-          npm run tauri -- build --bundles msi,nsis --config '{"build":{"beforeBundleCommand":""}}'
+          npm run tauri -- build --no-bundle --config '{"build":{"beforeBundleCommand":""}}'
           if ($LASTEXITCODE -ne 0) { throw 'tauri build failed' }
 
-      # Set-Authenticode works on .msi. The certificate is self-signed, so the check compares the signer
-      # thumbprint instead of validating a trust chain.
-      - name: Sign MSI (test certificate)
-        id: sign
+      # The certificate is self-signed, so the check compares the signer thumbprint instead of validating a
+      # trust chain.
+      - name: Sign exe (test certificate)
         env:
           CERT_B64: ${{ secrets.WINDOWS_DEV_CERTIFICATE }}
           CERT_PASSWORD: ${{ secrets.WINDOWS_DEV_CERTIFICATE_PASSWORD }}
         run: |
-          $msi = Get-ChildItem -LiteralPath target/release/bundle/msi -Filter '*.msi' | Select-Object -First 1
-          if (-not $msi) { throw 'MSI not found' }
-          $exe = Get-ChildItem -LiteralPath target/release/bundle/nsis -Filter '*-setup.exe' | Select-Object -First 1
-          if (-not $exe) { throw 'NSIS installer not found' }
-          New-Item -ItemType Directory -Path out | Out-Null
-          Copy-Item -LiteralPath $msi.FullName, $exe.FullName -Destination out/
+          $exe = 'target/release/quicktext.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "Missing build output: $exe" }
           if (-not $env:CERT_B64) {
-            Write-Host '::warning::WINDOWS_DEV_CERTIFICATE not set: MSI is unsigned'
+            Write-Host '::warning::WINDOWS_DEV_CERTIFICATE not set: exe is unsigned'
             return
           }
           $pfx = Join-Path $env:RUNNER_TEMP 'dev-signing.pfx'
           [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_B64))
           $secure = ConvertTo-SecureString $env:CERT_PASSWORD -AsPlainText -Force
           $cert = Get-PfxCertificate -FilePath $pfx -Password $secure
-          foreach ($name in @($msi.Name, $exe.Name)) {
-            $target = Join-Path 'out' $name
-            $result = Set-AuthenticodeSignature -FilePath $target -Certificate $cert -HashAlgorithm SHA256 -TimestampServer 'http://timestamp.digicert.com'
-            $check = Get-AuthenticodeSignature -FilePath $target
-            if (-not $check.SignerCertificate -or $check.SignerCertificate.Thumbprint -ne $cert.Thumbprint) {
-              throw "$name signature missing or signer mismatch (status: $($result.Status))"
-            }
-            Write-Host "$name signed by $($check.SignerCertificate.Subject)"
-          }
+          $result = Set-AuthenticodeSignature -FilePath $exe -Certificate $cert -HashAlgorithm SHA256 -TimestampServer 'http://timestamp.digicert.com'
           Remove-Item -LiteralPath $pfx -Force
+          $check = Get-AuthenticodeSignature -FilePath $exe
+          if (-not $check.SignerCertificate -or $check.SignerCertificate.Thumbprint -ne $cert.Thumbprint) {
+            throw "exe signature missing or signer mismatch (status: $($result.Status))"
+          }
+          Write-Host "exe signed by $($check.SignerCertificate.Subject)"
 
-      - name: Checksums
+      - name: Package portable ZIP
+        env:
+          SHA: ${{ github.sha }}
         run: |
+          $version = (Get-Content -LiteralPath package.json -Raw -Encoding UTF8 | ConvertFrom-Json).version
+          $name = "Quicktext-$version-Windows-x64-Portable"
+          $folder = Join-Path $env:RUNNER_TEMP $name
+          New-Item -ItemType Directory -Path $folder, out | Out-Null
+          Copy-Item -LiteralPath target/release/quicktext.exe -Destination $folder
+          Copy-Item -LiteralPath README.md, LICENSE, THIRD_PARTY_NOTICES.md -Destination $folder
+          Compress-Archive -Path $folder -DestinationPath "out/$name.zip"
           Set-Location out
-          Get-ChildItem -File | Where-Object { $_.Extension -in '.msi','.exe' } | ForEach-Object {
-            "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
-          } | Set-Content -LiteralPath SHA256SUMS-windows.txt -Encoding utf8
+          "$((Get-FileHash -LiteralPath "$name.zip" -Algorithm SHA256).Hash.ToLowerInvariant())  $name.zip" | Set-Content -LiteralPath SHA256SUMS-windows.txt -Encoding utf8
 
       - uses: actions/upload-artifact@v4
         with:
@@ -172,7 +172,7 @@ jobs:
 
   publish:
     name: publish
-    needs: [macos-dmg, windows-msi]
+    needs: [macos-dmg, windows-portable]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     if: github.event_name != 'workflow_dispatch' || inputs.publish
@@ -204,7 +204,7 @@ jobs:
           Test-signed installers built from commit \`${SHA}\`.
 
           - macOS: Apple-silicon DMG, self-signed (not notarized). First launch: right-click the app, then Open.
-          - Windows: MSI and NSIS setup exe, self-signed test certificate (SmartScreen will warn).
+          - Windows: portable ZIP (unzip and run quicktext.exe, no installer), exe signed with a self-signed test certificate (SmartScreen will warn).
           - Built without the compliance release gate (third-party notices / dependency sources); not for redistribution. The compliance release is \`release.yml\`.
 
           Checksums: SHA256SUMS-macos.txt, SHA256SUMS-windows.txt.
