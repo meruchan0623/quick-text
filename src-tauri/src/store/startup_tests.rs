@@ -1806,7 +1806,9 @@ fn export_refuses_a_temp_file_that_lands_in_the_data_dir() {
         fs::write(&target, b"old backup").unwrap();
         let before = files(&dir);
         let mut seams = Seams {
-            lands_in: Some(dir.join("revisions")),
+            // Canonical like the data directory the export compares with (the temp directory may
+            // be reached through a symlink such as /var -> /private/var, or an 8.3 short name).
+            lands_in: Some(fs::canonicalize(&*dir).unwrap().join("revisions")),
             ..Seams::default()
         };
         let result = store.export_active_with(&target, &mut seams);
