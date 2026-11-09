@@ -6,7 +6,7 @@ export interface CandidateHint {
   duration_ms: number;
 }
 
-export const DEFAULT_HINT: CandidateHint = { enabled: false, duration_ms: 2000 };
+export const DEFAULT_HINT: CandidateHint = { enabled: true, duration_ms: 2000 };
 export const HINT_SECONDS = { min: 1, max: 10, step: 0.5 } as const;
 
 /** One rule in the list (`quicker_domain::HintItem`). */

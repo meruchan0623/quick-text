@@ -53,9 +53,13 @@ impl fmt::Debug for HintMatch {
     }
 }
 
+/// The hint shows from the second character of a word on: one character offers too many
+/// abbreviations to be of help.
+pub const HINT_MIN_CHARS: usize = 2;
+
 impl CompiledConfig {
-    /// The literal rules whose abbreviation starts with a word at the end of `typed`, or `None`
-    /// when there is none. A word starts at the beginning of `typed` or after a word separator,
+    /// The literal rules whose abbreviation starts with a word of at least [`HINT_MIN_CHARS`]
+    /// characters at the end of `typed`, or `None` when there is none. A word starts at the beginning of `typed` or after a word separator,
     /// so ordinary prose (`...the`) does not suggest an abbreviation starting with `e`. Of the
     /// words ending the text, the longest that some abbreviation starts with wins: with `a b`
     /// typed and a rule `a bc`, that rule is offered rather than those starting with `b`.
@@ -99,6 +103,11 @@ impl CompiledConfig {
                 // The text ends with a separator: no word is being typed.
                 return None;
             }
+            let typed_chars = word.chars().count();
+            if typed_chars < HINT_MIN_CHARS {
+                // Later words are shorter still.
+                return None;
+            }
             let mut found: Vec<&CompiledRule> = self
                 .rules
                 .iter()
@@ -107,7 +116,6 @@ impl CompiledConfig {
             if found.is_empty() {
                 continue;
             }
-            let typed_chars = word.chars().count();
             // Exact first (it runs now, or on the terminator), then the fewest characters left,
             // then the matching priority (S-17).
             found.sort_by_key(|compiled| {
@@ -268,10 +276,19 @@ mod tests {
     fn only_a_word_counts_and_a_trailing_separator_ends_it() {
         let config = compiled(vec![rule("e", "eml", "mail")]);
         let fg = windows("notepad.exe");
-        // `e` ends the word `the`, which no abbreviation starts with.
-        assert!(config.hint_candidates("the", &fg, 10).is_none());
-        assert!(config.hint_candidates("the e", &fg, 10).is_some());
+        // `em` ends the word `them`, which no abbreviation starts with.
+        assert!(config.hint_candidates("them", &fg, 10).is_none());
+        assert!(config.hint_candidates("the em", &fg, 10).is_some());
         assert!(config.hint_candidates("the em ", &fg, 10).is_none());
+    }
+
+    #[test]
+    fn a_single_character_offers_nothing() {
+        let config = compiled(vec![rule("e", "eml", "mail")]);
+        let fg = windows("notepad.exe");
+        assert!(config.hint_candidates("e", &fg, 10).is_none());
+        assert!(config.hint_candidates("the e", &fg, 10).is_none());
+        assert!(config.hint_candidates("em", &fg, 10).is_some());
     }
 
     #[test]
@@ -283,7 +300,7 @@ mod tests {
         assert_eq!(found.typed, "a b");
         assert_eq!(ids(&found), ["ab"]);
         let found = config
-            .hint_candidates("q b", &windows("x.exe"), 10)
+            .hint_candidates("q bz", &windows("x.exe"), 10)
             .unwrap();
         assert_eq!(ids(&found), ["b"]);
     }

@@ -122,7 +122,7 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 | 全部 | 错误类型改为 `CommandError` |
 | `load_state` | 返回值在原字段之外新增 `health: HealthSnapshot`、`engine_state: EngineState`（不含 `seq`）、`startup_problems: StartupProblem[]`、`safe_mode: SafeModeReason \| null`；`engine_status` 字符串保留。`health`、`engine_state` 是调用时运行时的实时值（不是 EventBus 最后发出的值，需要 `seq` 基准时用 `get_runtime_snapshot`）；`capabilities` 与 `get_capabilities` 同源，按这份 `health` 的组件降级 |
 | `load_state.auto_listen_on_start` | 新增 `boolean`：`prefs.json` 的 `app.auto_listen_on_start`（启动自检通过后是否自动开始监听），prefs 读不出时为 `false`。由 `set_auto_listen` 修改 |
-| `load_state.candidate_hint` | 新增 `{ enabled: boolean, duration_ms: number }`：`prefs.json` 的 `app.candidate_hint`（新手提示：输入时是否显示候选列表、停止输入后保留多久），默认 `{ false, 2000 }`，prefs 读不出或值不合法时为默认值。由 `set_candidate_hint` 修改 |
+| `load_state.candidate_hint` | 新增 `{ enabled: boolean, duration_ms: number }`：`prefs.json` 的 `app.candidate_hint`（新手提示：输入时是否显示候选列表、停止输入后保留多久），默认 `{ true, 2000 }`，prefs 读不出或值不合法时为默认值。由 `set_candidate_hint` 修改 |
 | `load_state.platform` | 取 `std::env::consts::OS`：`"windows"`、`"macos"`，或没有输入适配器的平台名（如 `"linux"`）。0.3 在 macOS 以外一律返回 `"windows"`；Windows 与 macOS 上的值不变 |
 | `set_paused(paused)` | 只置位或清除 `manual`；其他暂停原因仍在时，返回的状态仍是暂停。恢复（`paused: false`）在安全模式下返回 `safe_mode`；Health 不是 `healthy` / `degraded` 时返回 `engine_unavailable { health }`；录制中恢复不再返回 `busy`，而是清除 `manual` 后仍因 `recording` 保持暂停。托盘菜单项走同一逻辑：监听中显示「暂停监听」，否则显示「恢复监听」；托盘恢复被拒绝时发系统通知说明原因（安全模式、引擎启动中、恢复中、已停止） |
 | `start_recording`、`stop_recording` | 录制期间置位 `recording` 暂停原因，录制结束即清除；结束后引擎回到其他原因决定的状态（录制前已手动暂停的仍暂停，原来在监听的恢复监听） |

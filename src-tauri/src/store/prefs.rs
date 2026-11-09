@@ -62,7 +62,7 @@ pub struct AppPrefs {
     /// prefs are never exported or kept in the revision history.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cloud: Option<CloudPrefs>,
-    /// The beginner typing hint overlay (`crate::hint`); off by default. Left out of the file
+    /// The beginner typing hint overlay (`crate::hint`); on by default. Left out of the file
     /// while it is the default, so a file without it is written back unchanged.
     #[serde(skip_serializing_if = "CandidateHintPrefs::is_default")]
     pub candidate_hint: CandidateHintPrefs,
@@ -102,7 +102,7 @@ pub struct CandidateHintPrefs {
 impl Default for CandidateHintPrefs {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             duration_ms: DEFAULT_HINT_DURATION_MS,
             extra: Map::new(),
         }
@@ -125,11 +125,11 @@ impl CandidateHintPrefs {
             return Self::default();
         };
         let enabled = match fields.remove("enabled") {
-            None => false,
+            None => true,
             Some(Value::Bool(on)) => on,
             Some(other) => {
                 invalid("app.candidate_hint.enabled", &other, "not_a_bool");
-                false
+                true
             }
         };
         let duration_ms = match fields.remove("duration_ms") {
@@ -588,7 +588,7 @@ pub fn auto_listen_on_start(dir: &Path) -> bool {
     load_prefs(dir).is_ok_and(|prefs| prefs.app.auto_listen_on_start)
 }
 
-/// `app.candidate_hint`; the default (off) when prefs cannot be read.
+/// `app.candidate_hint`; the default (on) when prefs cannot be read.
 pub fn candidate_hint(dir: &Path) -> CandidateHintPrefs {
     load_prefs(dir)
         .map(|prefs| prefs.app.candidate_hint)

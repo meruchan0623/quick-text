@@ -152,8 +152,11 @@ mod tests {
         let dir = temp_dir();
         let store = Managed::new(Store::load(dir.clone()));
         assert_eq!(prefs::candidate_hint(&dir), CandidateHintPrefs::default());
-        assert!(!prefs::candidate_hint(&dir).enabled);
+        assert!(prefs::candidate_hint(&dir).enabled);
         assert_eq!(prefs::candidate_hint(&dir).duration_ms, 2000);
+        let stored = write_candidate_hint(&store, false, 2000).unwrap();
+        assert!(!stored.enabled);
+        assert!(!prefs::candidate_hint(&dir).enabled);
         let stored = write_candidate_hint(&store, true, 3500).unwrap();
         assert!(stored.enabled);
         assert_eq!(prefs::candidate_hint(&dir).duration_ms, 3500);

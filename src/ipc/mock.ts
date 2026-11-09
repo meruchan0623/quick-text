@@ -493,7 +493,7 @@ export class MockBackend {
   /** S-09 `auto_listen_on_start`; a 0.3 backend has no such setting. */
   autoListen = false;
   /** Beginner typing hint (`app.candidate_hint`). */
-  candidateHint = { enabled: false, duration_ms: 2000 };
+  candidateHint = { enabled: true, duration_ms: 2000 };
   recording = false;
   /** Team phrase sync settings (`app.cloud`). */
   cloudPrefs: MockCloudPrefs;

@@ -56,19 +56,21 @@ export default function CandidateHintSection({
     <section className="hint-card" aria-label="新手提示">
       <h3>新手提示</h3>
       <div className="hint-row">
-        <label className="switch">
-          <input
-            type="checkbox"
-            checked={value.enabled}
-            disabled={disabled || saving}
-            onChange={(e) => void save({ ...value, enabled: e.target.checked })}
-          />
-          <span />
-          输入时显示候选提示
-        </label>
-        <span className="hint-badge">适合新手</span>
+        <div className="hint-head">
+          <label className="switch">
+            <input
+              type="checkbox"
+              checked={value.enabled}
+              disabled={disabled || saving}
+              onChange={(e) => void save({ ...value, enabled: e.target.checked })}
+            />
+            <span />
+            输入时显示候选提示
+          </label>
+          <span className="hint-badge">适合新手</span>
+        </div>
         <p className="muted">
-          记不住缩写时打开。输入缩写的开头几个字母后，屏幕右侧会短暂列出可用的指令，只提示，不会替你选择。
+          记不住缩写时打开。输入缩写的前两个字符后，屏幕右侧会短暂列出可用的指令，只提示，不会替你选择。
         </p>
       </div>
       {value.enabled && (
