@@ -19,7 +19,11 @@
 # Signing uses self-signed test certificates from repository secrets (all optional):
 #   MAC_DEV_CERTIFICATE / MAC_DEV_CERTIFICATE_PASSWORD / MAC_DEV_SIGNING_IDENTITY   base64 .p12 + password + identity name
 #   WINDOWS_DEV_CERTIFICATE / WINDOWS_DEV_CERTIFICATE_PASSWORD                      base64 .pfx + password
-# Without them the DMG is ad-hoc signed and the Windows exe is unsigned (a warning is printed).
+# The macOS certificate is required: `scripts/setup-macos-signing.sh --github` stores it (the same one local builds
+# use). Every build signed with it has the designated requirement
+# `identifier "com.quicktext.desktop" and certificate leaf = H"..."`, so macOS keeps the granted privacy permissions
+# across updates; an ad-hoc build (requirement = cdhash) would ask for them again after each update.
+# Without the Windows secrets the exe is unsigned (a warning is printed).
 # A self-signed certificate is not trusted by Gatekeeper / SmartScreen: macOS needs right-click -> Open on first launch.
 name: installers
 
@@ -96,20 +100,21 @@ jobs:
       - name: Placeholder frontend dist
         run: mkdir -p dist
 
-      # Tauri imports APPLE_CERTIFICATE into a temporary keychain and signs the .app. Without the secret the
-      # identity is "-" (ad-hoc), so the bundle is still a consistently signed bundle.
+      # Tauri imports APPLE_CERTIFICATE into a temporary keychain and signs the .app with the bundle identifier.
+      # The fixed certificate keeps the designated requirement stable across builds (see the header); there is
+      # no ad-hoc fallback, since such a build would make macOS ask for the permissions again.
       # The build version replaces tauri.conf.json's; CFBundleVersion takes integers only, so it gets X.Y.Z.
       - name: Build DMG
         env:
           APPLE_CERTIFICATE: ${{ secrets.MAC_DEV_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.MAC_DEV_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.MAC_DEV_SIGNING_IDENTITY || '-' }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.MAC_DEV_SIGNING_IDENTITY }}
           VERSION: ${{ needs.version.outputs.version }}
           BUNDLE_VERSION: ${{ needs.version.outputs.bundle_version }}
         run: |
-          if [ -z "$APPLE_CERTIFICATE" ]; then
-            echo "::warning::MAC_DEV_CERTIFICATE not set: DMG is ad-hoc signed"
-            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
+          if [ -z "$APPLE_CERTIFICATE" ] || [ -z "$APPLE_CERTIFICATE_PASSWORD" ] || [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "::error::MAC_DEV_CERTIFICATE / _PASSWORD / MAC_DEV_SIGNING_IDENTITY not set: run scripts/setup-macos-signing.sh --github"
+            exit 1
           fi
           config=$(printf '{"version":"%s","build":{"beforeBundleCommand":""},"bundle":{"macOS":{"bundleVersion":"%s"}}}' "$VERSION" "$BUNDLE_VERSION")
           npm run tauri -- build --target aarch64-apple-darwin --bundles app,dmg --config "$config"
@@ -121,6 +126,16 @@ jobs:
           app="target/aarch64-apple-darwin/release/bundle/macos/Quicktext.app"
           codesign --verify --deep --strict --verbose=2 "$app"
           codesign -dv --verbose=2 "$app" 2>&1 | grep -E 'Identifier|Authority|Signature|flags' || true
+          # The permissions survive updates only with this requirement: fixed identifier + certificate hash.
+          requirement=$(codesign -d -r- "$app" 2>&1 | grep designated)
+          echo "$requirement"
+          case "$requirement" in
+            *'identifier "com.quicktext.desktop" and certificate leaf = H"'*) ;;
+            *) echo "::error::unstable designated requirement (macOS would re-ask for permissions): $requirement"; exit 1 ;;
+          esac
+          short=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
+          echo "CFBundleShortVersionString=$short CFBundleVersion=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")"
+          [ "$short" = "$VERSION" ] || echo "::warning::CFBundleShortVersionString is $short, build version is $VERSION"
 
       # Named by tauri after the build version: Quicktext_<version>_aarch64.dmg.
       - name: Collect DMG

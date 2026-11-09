@@ -47,6 +47,8 @@
 
 每次启动时只要缺少辅助功能、输入监控或模拟输入权限，Quicktext 就立即弹出系统授权请求，按提示到“系统设置 → 隐私与安全性”中给实际安装的 Quicktext 应用打开这些项；都已授权时不再弹出。等待授权期间状态显示“等待系统授权…”，授权后引擎自动恢复（输入监控有时需重启本程序）。macOS 的系统弹窗每个应用只显示一次，被拒绝过（或重新构建、换过签名）后就不再显示；首次没拿到授权时 Quicktext 会直接打开“系统设置 → 隐私与安全性”对应面板，之后可点状态栏的「去授权」再次请求并打开该面板。开发运行可能需要给当前可执行文件或宿主终端授权；以实际系统提示为准。权限不足时 GUI 保持可用、引擎保持暂停并显示原因；不会绕过 Secure Input。更换应用路径或签名后重新核对授权。
 
+macOS 按应用的签名要求（designated requirement）记住这些授权。默认的 ad-hoc 签名以 cdhash 为准，每次重新构建都会变，覆盖安装后就要重新授权。先运行一次 `scripts/setup-macos-signing.sh --github`：它生成一张自签名代码签名证书（保存在 `~/.config/quicktext-signing/`，有效 10 年），导入登录钥匙串，并写入 GitHub secrets `MAC_DEV_CERTIFICATE` / `MAC_DEV_CERTIFICATE_PASSWORD` / `MAC_DEV_SIGNING_IDENTITY`。之后本机 `scripts/build-macos.sh` 与 CI `installers.yml` 都用这张证书签名，签名要求固定为 `identifier "com.quicktext.desktop" and certificate leaf = H"…"`，在同一台 Mac 上覆盖更新（本机构建与 CI 安装包之间也一样）后授权保持有效。请保留该证书目录：换证书会改变证书哈希，需要再授权一次。CI 缺少这些 secrets 时 macOS 构建直接失败，不回退到 ad-hoc 签名。
+
 在 TextEdit 的纯文本窗口测试 `qtzzx`；无需切换输入源。监听的是按键事件，不保证输入法候选中的字符已经上屏或能被正确删除，具体输入法和目标应用需要实测。安全输入、不可识别的窗口/控件或本应用自身均拒绝触发。Ctrl 导入仍为 Ctrl；新动作可用平台常用修饰键，在 Mac 映射 Cmd。Windows `#键值` 只走显式映射，未知值在删除缩写前报错。
 
 Mac adapter 已实现 CGEventTap、CGEvent、AX 焦点/选区、NSPasteboard 文本/HTML/file-URL/PNG、多屏 Quartz 坐标、键鼠及媒体/音量/亮度事件。不同应用和硬件可能不消费这些事件，成功发送返回“未知”。Windows 1/120-click 滚轮 delta 没有经过验证的 Mac 等价映射，预检拒绝并提示使用 clicks。
