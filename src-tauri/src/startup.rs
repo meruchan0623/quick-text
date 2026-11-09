@@ -204,6 +204,7 @@ pub fn start_engine(engine: Arc<Shared>, runtime: Arc<Runtime>) {
 }
 
 /// Marks that the privacy pane was opened for the user once.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const PERMISSIONS_PANE_OPENED: &str = "macos-permissions-pane-opened";
 
 /// macOS, every launch: when Accessibility, Input Monitoring or synthetic
