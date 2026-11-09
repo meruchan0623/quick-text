@@ -501,7 +501,13 @@ mod tests {
         let port = closed.local_addr().unwrap().port();
         drop(closed);
         let url = endpoint(&format!("http://127.0.0.1:{port}")).unwrap();
-        let error = tauri::async_runtime::block_on(fetch(&url, "k", None, &limits())).unwrap_err();
+        // Windows reports a refused loopback connection only after its connect retries (about
+        // two seconds); a shorter budget would end in `timeout` there.
+        let patient = FetchLimits {
+            timeout: Duration::from_secs(if cfg!(windows) { 10 } else { 1 }),
+            ..limits()
+        };
+        let error = tauri::async_runtime::block_on(fetch(&url, "k", None, &patient)).unwrap_err();
         assert_eq!(error.code, code::NETWORK, "{error}");
         assert_eq!(error.message, "无法连接服务器，请检查网络和服务器地址");
         assert!(!error.detail.contains("127.0.0.1"), "{error}");
