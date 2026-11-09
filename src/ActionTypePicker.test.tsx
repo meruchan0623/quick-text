@@ -55,27 +55,29 @@ describe('ActionTypePicker', () => {
     expect(change).toHaveBeenCalledExactlyOnceWith('text_keys');
   });
 
-  it('only shows guidance while expanded, previews disabled options without changing the action', () => {
+  it('lists the options only while expanded, without guidance, and never picks a disabled one', () => {
     const { host, trigger, change, press } = mount();
-    expect(host.querySelector('.action-guide')).toBeNull();
+    expect(host.querySelector('.action-type-popup')).toBeNull();
     act(() => {
       trigger.click();
     });
     expect(host.querySelector('.action-type-popup')?.parentElement).toBe(host);
+    expect(host.querySelector('.action-guide')).toBeNull();
+    expect(
+      [...host.querySelectorAll('[role="option"]')].map((option) => option.textContent),
+    ).toEqual(['键入纯文本', '粘贴带格式的文字（暂不可用）', '打开网页、文件或程序']);
     const option = host.querySelector<HTMLElement>('[data-value="html"]');
     act(() => {
       option?.dispatchEvent(new MouseEvent('mousemove', { bubbles: true }));
     });
-    expect(host.querySelector('.action-guide')?.textContent).toContain(
-      '把带加粗、颜色或链接的内容粘贴',
-    );
+    expect(host.querySelector('[data-active="true"]')?.getAttribute('data-value')).toBe('html');
     act(() => {
       option?.click();
     });
     expect(change).not.toHaveBeenCalled();
     expect(trigger.value).toBe('text_keys');
     press('Escape');
-    expect(host.querySelector('.action-guide')).toBeNull();
+    expect(host.querySelector('.action-type-popup')).toBeNull();
     expect(trigger.getAttribute('aria-expanded')).toBe('false');
   });
 
@@ -90,7 +92,7 @@ describe('ActionTypePicker', () => {
     press('Enter');
     expect(change).not.toHaveBeenCalled();
     press('End');
-    expect(host.querySelector('.action-guide')?.textContent).toContain('打开常用网页');
+    expect(host.querySelector('[data-active="true"]')?.getAttribute('data-value')).toBe('open');
     press('Home');
     expect(host.querySelector('[data-active="true"]')?.getAttribute('aria-selected')).toBe('true');
     press('ArrowUp');

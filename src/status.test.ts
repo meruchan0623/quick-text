@@ -194,13 +194,13 @@ describe('problemText', () => {
       [
         'terminator_unsupported',
         { keys: ['tab', 'enter'] },
-        '配置中的触发键 Tab、回车 在当前平台上暂不支持，按下它们不会执行指令；可在「文本指令参数设置」中改用空格或分号。',
+        '配置中的触发键 Tab、回车 在当前平台上暂不支持，按下它们不会执行指令；可在编辑指令时改用空格或分号。',
       ],
       ['autostart_repaired', {}, '登录自动启动项指向的程序位置已过期，已自动修正。'],
       [
         'self_test_failed',
         { checks: ['raw_input', 'hook_heartbeat'] },
-        '启动自检未通过：原始键盘输入、键盘鼠标监听，没有自动开始监听。可在「运行状态与恢复」中查看详情或导出诊断包；排除问题后可点「恢复监听」。',
+        '启动自检未通过：原始键盘输入、键盘鼠标监听，没有自动开始监听；排除问题后可点「恢复监听」。',
       ],
       ['log_level_elevated', { level: 'debug', until_ms: null }, '日志已临时调为「调试」级别。'],
       ['store_meta_reset', {}, '启动记录文件无法读取，已重新建立；连续启动失败的计数已清零。'],
@@ -261,7 +261,7 @@ describe('problemText', () => {
 
   it('shows an unknown kind verbatim with a generic text', () => {
     expect(problemText({ kind: 'disk_almost_full', severity: 'warning', args: { free: 1 } })).toBe(
-      '启动时发现一个问题：其他（disk_almost_full）。可在「运行状态与恢复」中导出诊断包了解详情。',
+      '启动时发现一个问题：其他（disk_almost_full）。',
     );
   });
 });
@@ -272,14 +272,11 @@ describe('self_test_failed, worded by the engine state now (review A6-2)', () =>
     severity: 'warning',
     args: { checks: ['clipboard'] },
   };
-  const PAUSED =
-    '启动自检未通过：剪贴板，没有自动开始监听。可在「运行状态与恢复」中查看详情或导出诊断包；排除问题后可点「恢复监听」。';
+  const PAUSED = '启动自检未通过：剪贴板，没有自动开始监听；排除问题后可点「恢复监听」。';
 
   it('says listening is on, and points to no resume, while the engine listens', () => {
     const text = problemText(failed, { listening: true, paused_reasons: [] });
-    expect(text).toBe(
-      '启动自检未通过：剪贴板。输入监听当前已开启，但可能无法正常工作；可在「运行状态与恢复」中查看详情或导出诊断包。',
-    );
+    expect(text).toBe('启动自检未通过：剪贴板。输入监听当前已开启，但可能无法正常工作。');
     expect(text).not.toMatch(/恢复监听|没有自动开始监听/);
   });
 
@@ -300,9 +297,7 @@ describe('self_test_failed, worded by the engine state now (review A6-2)', () =>
         listening: false,
         paused_reasons: paused_reasons as EngineState['paused_reasons'],
       });
-      expect(text).toBe(
-        '启动自检未通过：剪贴板，输入监听可能无法正常工作。可在「运行状态与恢复」中查看详情或导出诊断包。',
-      );
+      expect(text).toBe('启动自检未通过：剪贴板，输入监听可能无法正常工作。');
     }
   });
 

@@ -219,7 +219,7 @@ export function describeError(error: CommandError): string | null {
     case 'busy':
       return '上一个动作仍在执行，请稍后再试。';
     case 'engine_unavailable':
-      return `输入引擎暂时不可用（${label(healthNames, error.detail.health)}），请稍后再试，或在「运行状态」中修复引擎。`;
+      return `输入引擎暂时不可用（${label(healthNames, error.detail.health)}），请稍后再试，或点击「修复引擎」。`;
     case 'unsupported':
       return `当前平台不支持此功能：${label(capabilityNames, error.detail.capability)}。`;
     case 'hotkey_conflict':
@@ -231,7 +231,7 @@ export function describeError(error: CommandError): string | null {
     case 'internal': {
       if (error.message !== undefined) return error.message;
       const trace = error.detail.trace_id ? `（追踪编号 ${error.detail.trace_id}）` : '';
-      return `操作没有完成，发生了内部错误${trace}。可在「运行状态」中导出诊断包反馈问题。`;
+      return `操作没有完成，发生了内部错误${trace}。`;
     }
     case 'update':
       return error.detail.message || `更新操作没有完成（${error.detail.kind || '未知原因'}）。`;

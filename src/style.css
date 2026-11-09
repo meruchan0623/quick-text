@@ -55,6 +55,7 @@
   --icon-search: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='m20 20-3.5-3.5'/%3E%3C/svg%3E");
   --icon-keyboard: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='2.5' y='6' width='19' height='12' rx='2.5'/%3E%3Cpath d='M6.5 10h.01M10 10h.01M14 10h.01M17.5 10h.01M8 14h8'/%3E%3C/svg%3E");
   --icon-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  --icon-gear: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3Cpath d='M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z'/%3E%3C/svg%3E");
 
   color: var(--text);
   background: var(--bg);
@@ -331,7 +332,6 @@ header {
 }
 .header-summary {
   color: var(--text-secondary);
-  margin-left: auto;
 }
 .header-status {
   display: flex;
@@ -480,36 +480,60 @@ header {
   transform: rotate(-20deg) scale(1.1);
 }
 
-/* Main tabs: a segmented control. */
-.main-tabs {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
-  padding: 0 24px 12px;
+/* 设置: a pill like the theme toggle, with a gear; a dot when a newer release was found. */
+.settings-toggle {
+  position: relative;
+  display: inline-flex;
   flex-shrink: 0;
-}
-.main-tabs > button {
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  min-height: 32px;
+  margin-left: auto;
+  padding: 6px 14px 6px 10px;
   border: 0;
   border-radius: 999px;
-  background: none;
+  background: var(--surface-3);
   box-shadow: none;
-  padding: 7px 18px;
-  color: var(--text-secondary);
   font-weight: 500;
 }
-.main-tabs > button:hover {
-  background: var(--surface-3);
-  color: var(--text);
+.settings-toggle:hover {
+  background: var(--accent-soft);
+  color: var(--accent-soft-text);
 }
-.main-tabs > button.active {
+.settings-toggle.active {
   background: var(--accent-soft);
   color: var(--accent-soft-text);
   font-weight: 600;
 }
-.revision {
+.settings-icon {
+  width: 17px;
+  height: 17px;
+  background: currentColor;
+  transition: transform 0.35s cubic-bezier(0.3, 0.7, 0.4, 1);
+  -webkit-mask: var(--icon-gear) center / contain no-repeat;
+  mask: var(--icon-gear) center / contain no-repeat;
+}
+.settings-toggle:hover .settings-icon {
+  transform: rotate(45deg);
+}
+.update-dot {
+  position: absolute;
+  top: 3px;
+  right: 5px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dot-fail);
+  box-shadow: 0 0 0 2px var(--surface);
+}
+header > .revision {
   margin-left: auto;
+}
+header > .revision + .settings-toggle {
+  margin-left: 0;
+}
+.revision {
   font-size: 12px;
   background: var(--accent-soft);
   color: var(--accent-soft-text);
@@ -892,14 +916,91 @@ footer .primary {
   padding: 4px 22px;
   min-width: 0;
 }
+.settings-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 8px;
+}
+.settings-head > .back {
+  border-radius: 999px;
+}
 .settings h2 {
   font-size: 22px;
   font-weight: 700;
-  margin: 0 0 6px;
+  margin: 0;
   letter-spacing: 0.2px;
 }
-.settings h2 + p {
-  margin-top: 0;
+.settings h3:first-of-type {
+  margin-top: 16px;
+}
+/* 更新 (src/UpdateSection.tsx). */
+.update-card {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+  padding: 14px 22px;
+}
+.update-head,
+.update-title,
+.update-download {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+}
+.update-head > span {
+  margin-right: auto;
+}
+.update-card button {
+  border-radius: 999px;
+}
+.update-card p {
+  margin: 10px 0 0;
+}
+.update-found {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  display: grid;
+  gap: 10px;
+}
+.update-notes {
+  margin: 0;
+}
+.update-notes pre {
+  max-height: 220px;
+  overflow: auto;
+  margin: 8px 0 0;
+}
+.update-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 200px;
+}
+.update-progress progress {
+  flex: 1;
+  height: 8px;
+  accent-color: var(--accent);
+}
+.update-latest,
+.update-ok {
+  color: var(--success);
+  font-weight: 500;
+}
+.update-warning {
+  color: var(--warning);
+  font-weight: 500;
+}
+.update-error {
+  color: var(--danger);
+}
+.update-options {
+  margin: 12px 0 0;
+  gap: 18px;
 }
 .settings h3 {
   font-size: 14px;
@@ -994,42 +1095,11 @@ dd {
   margin-bottom: 8px;
 }
 .license {
-  max-width: 640px;
-  line-height: 1.7;
+  margin-top: 32px;
+  font-size: 12px;
 }
-.execution-result,
-.health-card {
-  padding: 18px 20px;
-  max-width: 860px;
-  border: 1px solid var(--border);
-  background: var(--surface);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-md);
-  margin-bottom: 16px;
-}
-.execution-result > strong {
-  font-size: 15px;
-  font-weight: 600;
-}
-.execution-result dl {
-  max-width: none;
-}
-.expert-details {
-  margin-top: 24px;
-  color: var(--text-secondary);
-}
-.health-head {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-.health-head strong {
-  font-size: 16px;
-  font-weight: 600;
-}
-/* Capability and health status (principle 5, S-16; S-03, S-19): text always accompanies colour. */
-.capability-tag,
-.health-tag {
+/* Capability status (principle 5, S-16): text always accompanies colour. */
+.capability-tag {
   display: inline-block;
   padding: 1px 10px;
   border-radius: 999px;
@@ -1043,36 +1113,9 @@ dd {
   color: var(--violet);
 }
 .capability-tag.degraded,
-.capability-tag.unavailable,
-.health-tag.degraded {
+.capability-tag.unavailable {
   color: var(--warning);
 }
-.health-tag.failed {
-  color: var(--danger);
-}
-.health-tag.starting,
-.health-tag.recovering {
-  color: var(--text-secondary);
-}
-.capability-row.unavailable {
-  opacity: 0.55;
-}
-.capability-table {
-  min-width: 0;
-  max-width: 1000px;
-  margin-top: 14px;
-}
-.capability-table td {
-  max-width: none;
-  vertical-align: top;
-}
-.capability-table td:first-child {
-  width: 170px;
-}
-.capability-table td:nth-child(2) {
-  width: 130px;
-}
-.component-table,
 .history-table {
   min-width: 0;
   max-width: 860px;
@@ -1083,9 +1126,6 @@ dd {
 }
 .history-table tr:not(.outcome-succeeded) td:nth-child(5) {
   color: var(--warning);
-}
-.diagnostics {
-  margin-top: 12px;
 }
 details {
   margin-top: 15px;
@@ -1305,6 +1345,7 @@ dialog.overlay.windowed {
 .modal-footer {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 10px;
   padding: 12px 20px;
   background: var(--surface-2);
@@ -1716,9 +1757,8 @@ input[aria-invalid='true'] {
 .action-type-popup {
   position: fixed;
   z-index: 20;
-  display: grid;
-  grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr);
-  gap: 0;
+  display: flex;
+  flex-direction: column;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--surface);
@@ -1726,37 +1766,10 @@ input[aria-invalid='true'] {
   box-shadow: var(--shadow-lg);
   overflow: hidden;
 }
-.action-guide,
 .action-type-options {
   min-width: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
-}
-.action-guide {
-  padding: 16px 18px;
-  border-right: 1px solid var(--border);
-  background: var(--surface-2);
-  font-size: 13px;
-  line-height: 1.65;
-  overflow-wrap: anywhere;
-}
-.action-guide h3 {
-  margin: 0 0 10px;
-  font-size: 14px;
-}
-.action-guide p {
-  margin: 0 0 8px;
-}
-.action-guide p > strong {
-  margin-right: 10px;
-}
-.action-guide ol,
-.action-guide ul {
-  margin: 5px 0 10px;
-  padding-left: 22px;
-}
-.action-guide li + li {
-  margin-top: 4px;
 }
 .action-type-options {
   padding: 6px;
@@ -1786,14 +1799,14 @@ input[aria-invalid='true'] {
   min-width: 0;
   max-width: 100%;
 }
-.action-windows-note {
-  color: var(--text-secondary);
-  font-size: 12px;
-}
 
 @media (max-width: 1000px) {
-  .header-summary {
+  .header-summary,
+  header > .revision {
     display: none;
+  }
+  header > .revision + .settings-toggle {
+    margin-left: auto;
   }
 }
 @media (max-width: 850px) {
@@ -1806,21 +1819,12 @@ input[aria-invalid='true'] {
   .workspace {
     padding: 12px;
   }
-  .revision {
-    display: none;
-  }
   .edit-grid {
     grid-template-columns: 1fr;
   }
   .trigger-panel {
     border-right: 0;
     border-bottom: 1px solid var(--border);
-  }
-  .main-tabs {
-    padding: 0 12px 10px;
-  }
-  .main-tabs button {
-    padding: 7px 12px;
   }
   .overlay {
     padding: 9px;
@@ -2191,4 +2195,60 @@ td .cloud-problem {
   .modal-footer {
     padding: 10px 12px;
   }
+}
+/* 新手提示 (src/CandidateHintSection.tsx). */
+.hint-card {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+  padding: 4px 22px;
+  margin: 16px 0;
+  max-width: 620px;
+}
+.hint-card h3 {
+  margin: 14px 0 0;
+}
+.hint-row {
+  padding: 14px 0;
+}
+.hint-row + .hint-row {
+  border-top: 1px solid var(--border);
+}
+.hint-row .muted {
+  margin: 6px 0 0 45px;
+  font-size: 12px;
+}
+.hint-badge {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-soft-text);
+  margin-left: 8px;
+}
+.hint-duration {
+  padding-left: 45px;
+}
+.hint-duration .muted {
+  margin-left: 0;
+}
+.hint-duration label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: 12px;
+}
+.hint-duration input {
+  width: 76px;
+  text-align: right;
+  font-family: var(--mono);
+}
+.hint-duration button {
+  border-radius: 999px;
+}
+.hint-error {
+  color: var(--danger);
+  font-size: 12px;
+  margin: 0 0 12px;
 }

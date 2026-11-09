@@ -160,7 +160,7 @@ describe('ruleDiagnostics / diagnosticField', () => {
     expect(diagnosticField('rules[0].terminator.keys', 0)).toBe('触发键');
     expect(diagnosticField('rules[0]', 0)).toBe('这条指令');
     expect(diagnosticField('rules[4].id', 0)).toBe('第 5 条指令');
-    expect(diagnosticField('globals.blacklist', 0)).toBe('文本指令参数设置');
+    expect(diagnosticField('globals.blacklist', 0)).toBe('设置');
     expect(diagnosticField('', 0)).toBe('配置');
     expect(diagnosticField(undefined, 0)).toBe('配置');
   });

@@ -54,12 +54,12 @@ function PhraseEndKeys({
   terminators: string[];
   platform: string | undefined;
 }) {
-  if (rule.trigger_mode === 'immediate') return <>—（输入完成后立即执行，不需要结束键）</>;
+  if (rule.trigger_mode === 'immediate') return <>即时</>;
   if (!rule.terminator)
     return (
       <>
         <TerminatorList keys={terminators} platform={platform} />
-        <small className="muted">使用「文本指令参数设置」里的默认触发键</small>
+        <small className="muted">默认触发键</small>
       </>
     );
   return (
@@ -169,9 +169,7 @@ function PhraseDetail({
           </details>
         </div>
         <div className="modal-footer">
-          <span>
-            {reason === null ? '只读：团队话术由 TSim 客服系统维护' : `不能复制：${reason}`}
-          </span>
+          <span>{reason === null ? '只读' : `不能复制：${reason}`}</span>
           <button onClick={onClose}>关闭</button>
           <button
             className="primary"
@@ -203,11 +201,7 @@ function PhraseNote({
 }) {
   const overridden = overriddenIds(entry);
   if (overridden.length > 0)
-    return (
-      <small className="muted" title="同一缩写的我的指令不会触发；在本机停用这条后才会恢复">
-        覆盖我的指令「{overridden.map(ruleName).join('」「')}」
-      </small>
-    );
+    return <small className="muted">覆盖我的指令「{overridden.map(ruleName).join('」「')}」</small>;
   // The table's switch shows first (§4); what this computer chose holds once it is on again.
   if (entry.status === 'disabled_remote' && entry.disabled_local)
     return <small className="muted">本机也已停用</small>;
@@ -265,7 +259,7 @@ function SourceBar({
             '目前仍使用上次同步的内容。'}
           {SETTINGS_ERRORS.includes(error.code) && (
             <button className="retry" onClick={onOpenSettings}>
-              去参数设置
+              去设置
             </button>
           )}
         </div>
@@ -274,7 +268,7 @@ function SourceBar({
   );
 }
 
-/** The 团队话术 page of 「文本指令管理」. */
+/** The 团队话术 page of the rule list. */
 export default function CloudPhrases({
   view,
   platform,
@@ -329,12 +323,8 @@ export default function CloudPhrases({
         <div className="empty cloud-guide">
           <div className="empty-art" aria-hidden="true" />
           <strong>还没有订阅团队话术</strong>
-          <p>
-            团队话术由 TSim
-            客服系统统一维护，订阅后自动同步到本机，与「我的指令」一起生效，但不会改动「我的指令」。
-          </p>
           <button className="primary" onClick={onOpenSettings}>
-            去参数设置开启
+            去设置开启
           </button>
         </div>
       </div>
@@ -529,7 +519,6 @@ export default function CloudPhrases({
                   <strong>无法显示的团队话术</strong>
                   <span className="unreadable-id">{entry.id}</span>
                   <StatusTag status={entry.status} />
-                  <small className="muted">这条团队话术含有当前界面无法显示的内容。</small>
                 </td>
               </tr>
             ))}
@@ -544,11 +533,6 @@ export default function CloudPhrases({
                   ? '还没有同步到团队话术'
                   : '团队话术表是空的'}
             </strong>
-            <p>
-              {state.status.revision === null
-                ? '点「立即同步」从 TSim 客服系统下载团队话术。'
-                : '团队话术由 TSim 客服系统维护，这里只能查看。'}
-            </p>
           </div>
         )}
       </div>
@@ -622,7 +606,7 @@ function saveErrorText(error: unknown): string {
 
 type Outcome = { tone: 'ok' | 'error'; text: string };
 
-/** 「团队话术同步」 in 「文本指令参数设置」: saved on its own, apart from the settings above. */
+/** 「团队话术同步」 in 「设置」: saved on its own, apart from the settings above. */
 export function CloudSettingsSection({
   view,
   focusOnMount = false,
@@ -630,7 +614,7 @@ export function CloudSettingsSection({
   onSync,
 }: {
   view: CloudView;
-  /** Put the focus on the switch when shown (from the 团队话术 page's 「去参数设置」). */
+  /** Put the focus on the switch when shown (from the 团队话术 page's 「去设置」). */
   focusOnMount?: boolean;
   onSave: (input: CloudSettingsInput) => Promise<CloudState>;
   onSync: () => Promise<CloudState>;
@@ -700,10 +684,6 @@ export function CloudSettingsSection({
   return (
     <>
       <h3>团队话术同步</h3>
-      <p className="muted">
-        订阅 TSim
-        客服系统维护的团队话术表。同步只下载、不上传；团队话术与「我的指令」分开保存，不进导出和版本历史。「启用文本指令」总开关同时控制两者。
-      </p>
       {!ready ? (
         <p className="muted">
           {view.loadError === null
@@ -733,10 +713,6 @@ export function CloudSettingsSection({
                 spellCheck={false}
                 onChange={(e) => edit({ base_url: e.target.value })}
               />
-              <small>
-                TSim 客服系统的根地址，不用带接口路径；只支持 https://（本机调试可用
-                http://localhost）。
-              </small>
             </label>
             <div className="field">
               <span>同步密钥</span>
@@ -773,7 +749,6 @@ export function CloudSettingsSection({
                   </>
                 )}
               </div>
-              <small>密钥只保存在本机，保存后不再显示。</small>
             </div>
             <label className="field">
               <span>自动同步间隔</span>

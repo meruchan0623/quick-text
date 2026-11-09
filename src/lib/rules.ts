@@ -269,7 +269,7 @@ export function diagnosticField(path: unknown, index: number): string {
     const rest = p.slice(rule[0].length);
     return fieldNames.find(([prefix]) => rest.startsWith(prefix))?.[1] ?? '这条指令';
   }
-  if (p.startsWith('globals')) return '文本指令参数设置';
+  if (p.startsWith('globals')) return '设置';
   return p || '配置';
 }
 

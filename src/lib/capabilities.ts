@@ -112,7 +112,8 @@ export interface ChoiceOffer {
 /**
  * Principle 5 for a choice list (S-16): never provided is hidden; unavailable for now is listed
  * but disabled, with the reason; degraded stays selectable with its reason (a rule is lasting
- * configuration, not held back by a passing run-time state); experimental stays selectable, untagged. The value the edited rule holds (`current`) is always listed and selectable, so opening
+ * configuration, not held back by a passing run-time state); experimental stays selectable,
+ * untagged. The value the edited rule holds (`current`) is always listed and selectable, so opening
  * and saving a rule never rewrites it. `view` null: nothing is known, offered plainly.
  */
 export function choiceOffer(view: CapabilityView | null, current: boolean): ChoiceOffer {

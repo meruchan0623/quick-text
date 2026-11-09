@@ -61,12 +61,12 @@ const texts: Record<CommandError['code'], string | null> = {
   io: '写入文件失败：active.json（系统错误 32）。',
   not_found: '找不到规则「r9」，可能已被删除。',
   busy: '上一个动作仍在执行，请稍后再试。',
-  engine_unavailable: '输入引擎暂时不可用（故障），请稍后再试，或在「运行状态」中修复引擎。',
+  engine_unavailable: '输入引擎暂时不可用（故障），请稍后再试，或点击「修复引擎」。',
   unsupported: '当前平台不支持此功能：键鼠录制。',
   hotkey_conflict: '快捷键 Ctrl+Alt+Q 已被占用，请换一个。',
   token_expired: '确认已过期，请重新操作。',
   cancelled: null,
-  internal: '操作没有完成，发生了内部错误（追踪编号 6f1c）。可在「运行状态」中导出诊断包反馈问题。',
+  internal: '操作没有完成，发生了内部错误（追踪编号 6f1c）。',
   update: '无法连接 GitHub',
 };
 
@@ -169,9 +169,7 @@ describe('parseCommandError', () => {
     expect(errorText(new Error('本地错误'))).toBe('本地错误');
     for (const junk of [undefined, null, 42, [1, 2], '{not json'])
       expect(parseCommandError(junk).code).toBe('internal');
-    expect(errorText(null)).toBe(
-      '操作没有完成，发生了内部错误。可在「运行状态」中导出诊断包反馈问题。',
-    );
+    expect(errorText(null)).toBe('操作没有完成，发生了内部错误。');
   });
 });
 

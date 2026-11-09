@@ -362,7 +362,7 @@ describe('团队话术 list', () => {
     expect(alert?.textContent).toMatch(/^同步失败（\S+ \d\d:\d\d）：同步密钥无效/);
     expect(alert?.textContent).toContain('目前仍使用上次同步的内容');
     expect(host.querySelectorAll('tbody tr').length).toBeGreaterThan(0);
-    click(button(alert ?? host, '去参数设置'));
+    click(button(alert ?? host, '去设置'));
     expect(props.onOpenSettings).toHaveBeenCalledTimes(1);
   });
 
@@ -370,7 +370,7 @@ describe('团队话术 list', () => {
     const { host, props } = phrases(ready(await cloudState({ cloud: 'off' })));
     expect(host.textContent).toContain('还没有订阅团队话术');
     expect(host.querySelector('table')).toBeNull();
-    click(button(host, '去参数设置开启'));
+    click(button(host, '去设置开启'));
     expect(props.onOpenSettings).toHaveBeenCalledTimes(1);
 
     const failed = phrases({

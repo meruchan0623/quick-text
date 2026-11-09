@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { call } from './ipc/transport';
+import { call, usesMock } from './ipc/transport';
 import {
   errorText as describe,
   diagnosticText,
@@ -24,7 +24,6 @@ import {
 import ActionEditor from './ActionEditor';
 import ExportMenu from './ExportMenu';
 import CaptureTemplate from './CaptureTemplate';
-import RuntimeStatus from './RuntimeStatus';
 import CloudPhrases, { CloudSettingsSection } from './CloudPhrases';
 import { TerminatorList } from './TerminatorList';
 import { useAsk } from './Ask';
@@ -33,8 +32,11 @@ import { WindowFrame } from './WindowFrame';
 import { cloudSync, runtimeSync, useCloud, useRuntime } from './ipc/events';
 import type { SafeModeReason } from './ipc/types';
 import { liveStatus } from './status';
-import { BannerStack, HealthCard, HistoryList } from './StatusArea';
+import { BannerStack, HistoryList } from './StatusArea';
+import UpdateSection, { AUTO_CHECK_DELAY_MS, updateAvailable, useUpdates } from './UpdateSection';
 import { LinesInput } from './LinesInput';
+import CandidateHintSection from './CandidateHintSection';
+import { isCandidateHint } from './lib/hint';
 import {
   countByGroup,
   diagnosticField,
@@ -58,6 +60,7 @@ import { unsupportedTerminators } from './lib/terminators';
 import { fixedImeErasure } from './lib/capabilities';
 import { ruleEditDiagnostics } from './lib/numberFields';
 import { describeMatch } from './lib/describe';
+import { summaryText } from './lib/summary';
 import { useTheme } from './theme';
 
 // `null` from describe() means the user cancelled: show nothing.
@@ -65,11 +68,11 @@ const errorText = (e: unknown) => describe(e) ?? '';
 // How many times one load_state is asked for while commands keep overtaking it (review C2).
 const LOAD_ATTEMPTS = 3;
 const OVERTAKEN = '读取期间状态一再变化，读到的内容已过时';
-/** What 「刷新状态」 and the notice's 「重新读取」 say when they read, and when every load was overtaken. */
-const REFRESHED = {
-  refresh: ['状态已刷新', `${OVERTAKEN}，这次没有刷新。请再点一次「刷新状态」。`],
-  reread: ['已重新读取配置', `${OVERTAKEN}，这次没有读取到。请再点一次「重新读取」。`],
-} as const;
+/** What the notice's 「重新读取」 says when it read, and when every load was overtaken. */
+const REREAD = [
+  '已重新读取配置',
+  `${OVERTAKEN}，这次没有读取到。请再点一次「重新读取」。`,
+] as const;
 const NOT_READY = '还没有读取到当前配置，暂时不能修改指令和设置。';
 const SAVE_PENDING = '上一次保存尚未完成，请稍候。';
 const SAFE_MODE_CHANGED = '安全模式状态已变化，正在重新读取当前配置；读取完成前暂时不能修改。';
@@ -82,29 +85,20 @@ const STALE_READ = '读到的仍是较早的版本';
 const stale = (shown: number | undefined, caught: number | null) =>
   shown !== undefined && caught !== null && shown < caught;
 /** Commands that write the store and answer with the whole state. */
-type StoreWrite = 'save_config' | 'rollback';
+type StoreWrite = 'save_config';
 /** A confirmed rule/list operation applied to the configuration. */
 type Change = (c: Config) => Config;
 /** The writes that publish a revision of their own, and how a notice about it names them. */
-const MADE_BY = { rollback: '恢复上一个版本', save_config: '保存配置' } as const;
+const MADE_BY = { save_config: '保存配置' } as const;
 type Own = keyof typeof MADE_BY;
 /** State fields a command answers alone, without the state around them. */
 const SETTINGS = ['autostart', 'auto_listen_on_start'] as const;
 type Setting = (typeof SETTINGS)[number];
-function Field({
-  label,
-  children,
-  hint,
-}: {
-  label: string;
-  children: React.ReactNode;
-  hint?: string | undefined;
-}) {
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="field">
       <span>{label}</span>
       {children}
-      {hint && <small>{hint}</small>}
     </label>
   );
 }
@@ -158,10 +152,18 @@ function EndKeys({
   );
 }
 
-export default function App() {
+export default function App({
+  updateCheckDelayMs = usesMock ? null : AUTO_CHECK_DELAY_MS,
+}: {
+  /**
+   * When 「自动检查更新」 checks after start; null never (the mock backend of the browser preview
+   * and the tests, which pass a delay to see it).
+   */
+  updateCheckDelayMs?: number | null;
+}) {
   const [state, setState] = useState<State | null>(null),
     [config, setConfig] = useState<Config>(emptyConfig),
-    [tab, setTab] = useState('manage'),
+    [tab, setTab] = useState<'manage' | 'settings'>('manage'),
     [theme, setTheme] = useTheme(),
     [search, setSearch] = useState(''),
     [group, setGroup] = useState('全部'),
@@ -191,6 +193,7 @@ export default function App() {
   const { askDialog, confirmAction, askValue } = useAsk();
   // Health, engine state and history arrive as events (S-19); no polling.
   const sync = runtimeSync();
+  const updates = useUpdates(updateCheckDelayMs);
   const runtime = useRuntime(sync);
   const live = liveStatus(runtime);
   // Team phrases (docs/cloud-phrases.md): a table of their own, pushed with cloud-state. They are
@@ -198,7 +201,7 @@ export default function App() {
   const cloudSyncer = cloudSync();
   const cloud = useCloud(cloudSyncer);
   const [manageView, setManageView] = useState<'mine' | 'team'>('mine');
-  // 「去参数设置」 from the 团队话术 page focuses 「团队话术同步」 there, until another page is shown.
+  // 「去设置」 from the 团队话术 page focuses 「团队话术同步」 there, until another page is shown.
   const [cloudFocus, setCloudFocus] = useState(false);
   if (cloudFocus && tab !== 'settings') setCloudFocus(false);
   // Without a subscription the engine runs no team phrase, so none is counted or takes a rule's place.
@@ -265,7 +268,7 @@ export default function App() {
     // A rule field with a serde default may be absent; the editor reads it filled in, as Rust does.
     const active = completeConfig(s.active);
     putConfig(active);
-    // Rules removed by a delete, rollback or import must not stay selected (F-04).
+    // Rules removed by a delete or import must not stay selected (F-04).
     setSelected((current) => pruneSelection(current, active.rules));
     setLocalDirty(false);
     edited.current = false;
@@ -440,7 +443,7 @@ export default function App() {
     loaded.current = true;
     setReady(true);
     setLoadFailure('');
-    setMessage('已连接 · 保存后立即生效');
+    setMessage('已连接');
   };
   /**
    * load_state, applied; resolves whether it was. Its answer is installed by the rule above. One
@@ -450,7 +453,7 @@ export default function App() {
    * answered reads that command's change, so the next answer applies. The check and the apply run
    * in one step after the answer arrives, with nothing in between.
    *
-   * Loads overlap (start, focus, 「刷新状态」, a revision read). One not installed after a later one
+   * Loads overlap (start, focus, 「重新读取」, a revision read). One not installed after a later one
    * was is dropped, and resolves as applied, the later one standing for it (review C5).
    */
   const lastLoad = useRef(0);
@@ -506,7 +509,7 @@ export default function App() {
     void loadFirstRef.current();
   }, []);
   // The legacy load_state fields (target observation, capabilities, configuration) have no event:
-  // reload them when the window regains focus and on 「刷新状态」. Unsaved local edits are kept.
+  // reload them when the window regains focus and on 「重新读取」. Unsaved local edits are kept.
   const reload = load;
   const reloadRef = useRef(reload);
   useEffect(() => {
@@ -515,7 +518,7 @@ export default function App() {
   useEffect(() => {
     const onFocus = () => {
       reloadRef.current().catch(() => {
-        // Keep showing the last known state; 「刷新状态」 reports errors and an overtaken load.
+        // Keep showing the last known state; 「重新读取」 reports errors and an overtaken load.
       });
     };
     window.addEventListener('focus', onFocus);
@@ -608,9 +611,9 @@ export default function App() {
   }, []);
   // The revision the notice says could not be read.
   const unread = readFailure !== null && behind ? target : null;
-  /** 「刷新状态」, or the notice's 「重新读取」 (`reread`): the messages name the button pressed. */
-  const refresh = (source: keyof typeof REFRESHED) => {
-    const [done, overtaken] = REFRESHED[source];
+  /** The notice's 「重新读取」. */
+  const reread = () => {
+    const [done, overtaken] = REREAD;
     return run(async () => {
       const applied = await reload();
       if (runtime.status !== 'unsupported') await sync.resync();
@@ -633,28 +636,7 @@ export default function App() {
       const view = install(await call<State>('set_paused', { paused: !manual }), request);
       if (view !== null) show(view);
     });
-  const exportDiagnostics = () =>
-    run(async () => {
-      const redaction = await askValue({
-        title: '导出诊断包？',
-        detail:
-          '诊断包包含最近 7 天的日志、崩溃记录、健康与能力快照和配置摘要，不含剪贴板与输入内容。只有选择「包含短语内容」时才附带完整配置。',
-        confirm: '导出',
-        input: {
-          label: '短语内容',
-          value: 'summary',
-          options: [
-            { value: 'summary', label: '不包含短语内容（推荐）' },
-            { value: 'full', label: '包含短语内容' },
-          ],
-        },
-      });
-      if (!redaction) return;
-      const path = await call<string | null>('export_diagnostics', { redaction });
-      // null: the save dialog was cancelled; nothing to report.
-      if (path) setMessage(`诊断包已导出：${path}`);
-    });
-  const openDir = (command: 'open_log_dir' | 'open_data_dir') => run(() => call(command));
+  const openDataDir = () => run(() => call('open_data_dir'));
   const platform: string | undefined = state?.platform ?? state?.engine_detail?.platform;
   // S-09: a 0.3 backend has no such setting and load_state leaves the field out; the toggle is hidden.
   const autoListen: boolean | null =
@@ -810,8 +792,8 @@ export default function App() {
         await save((c) => ({ ...c, rules: [...c.rules, rule] }));
       },
       row.entry.status === 'active'
-        ? `已复制「${copy?.match.value ?? ''}」到我的指令。同一缩写以团队话术为准，在本机停用团队话术那条后，这份副本才会生效`
-        : `已复制「${copy?.match.value ?? ''}」到我的指令并立即生效`,
+        ? `已复制「${copy?.match.value ?? ''}」到我的指令；团队话术那条启用期间以团队话术为准`
+        : `已复制「${copy?.match.value ?? ''}」到我的指令`,
     );
   };
   // Team phrase commands write prefs, not the config: none of `write` applies. Nor do they hold
@@ -956,6 +938,15 @@ export default function App() {
         setMessage('已保存的内容立即生效；保存期间新增的修改尚未保存');
       }
     });
+  // What is in effect, from the state the backend answered: not the editor's unsaved copy.
+  const summary = summaryText({
+    config: state?.active ?? null,
+    cloud: cloud.state,
+    loaded: ready,
+    safeMode,
+  });
+  const settingsOpen = tab === 'settings';
+  const hasUpdate = updateAvailable(updates);
   return (
     <div className="app">
       <header>
@@ -987,13 +978,20 @@ export default function App() {
             {(live ? live.manualPause : state?.paused) ? '恢复监听' : '暂停监听'}
           </button>
         </div>
-        <span className="header-summary">
-          {!ready
-            ? ''
-            : config.enabled
-              ? `已启用 ${readable.filter((r) => r.enabled).length} / ${config.rules.length} 条指令`
-              : '文本指令总开关已关闭'}
-        </span>
+        {/* Unsaved parameters stay in view from the list too; 设置 shows them in its head. */}
+        {localDirty && !settingsOpen && <span className="revision">参数有未保存修改</span>}
+        <button
+          type="button"
+          className={`settings-toggle${settingsOpen ? ' active' : ''}`}
+          aria-pressed={settingsOpen}
+          aria-label={hasUpdate ? '设置（有新版本）' : undefined}
+          onClick={() => setTab(settingsOpen ? 'manage' : 'settings')}
+        >
+          <span aria-hidden="true" className="settings-icon" />
+          设置
+          {hasUpdate && <span aria-hidden="true" className="update-dot" />}
+        </button>
+        <span className="header-summary">{summary}</span>
         <label className="switch startup-toggle">
           <input
             type="checkbox"
@@ -1015,19 +1013,7 @@ export default function App() {
           {theme === 'dark' ? '暗黑' : '白天'}
         </button>
       </header>
-      <nav className="main-tabs">
-        <button className={tab === 'manage' ? 'active' : ''} onClick={() => setTab('manage')}>
-          文本指令管理
-        </button>
-        <button className={tab === 'settings' ? 'active' : ''} onClick={() => setTab('settings')}>
-          文本指令参数设置
-        </button>
-        <button className={tab === 'status' ? 'active' : ''} onClick={() => setTab('status')}>
-          运行状态与恢复
-        </button>
-        {localDirty && <span className="revision">参数有未保存修改</span>}
-      </nav>
-      <BannerStack view={runtime} onOpenDataDir={() => openDir('open_data_dir')} />
+      <BannerStack view={runtime} onOpenDataDir={() => void openDataDir()} />
       {!ready && loadFailure && (
         <div className="alert error" role="alert">
           未能读取当前配置：{loadFailure}。读取成功前不能修改指令和设置。
@@ -1041,7 +1027,7 @@ export default function App() {
         // the editor. Saving is not silent: the notice stands until a load catches up.
         <div className="alert notice" role="status">
           {`后台配置已更新为 v${unread}，但未能读取最新配置（${readFailure ?? ''}）。保存前请重新读取；版本冲突时不会覆盖后台配置。`}
-          <button disabled={busy} onClick={() => refresh('reread')}>
+          <button disabled={busy} onClick={() => void reread()}>
             重新读取
           </button>
         </div>
@@ -1263,7 +1249,7 @@ export default function App() {
                           {overridden.has(r.id) && (
                             <i
                               className="overridden"
-                              title={`同一缩写的团队话术「${(overridden.get(r.id) ?? []).join('」「')}」优先，这条不会触发；在团队话术中本机停用那条后才会恢复`}
+                              title={`团队话术「${(overridden.get(r.id) ?? []).join('」「')}」优先`}
                             >
                               被团队话术覆盖
                             </i>
@@ -1331,9 +1317,7 @@ export default function App() {
                           backend may still read and run it, so the row makes no claim either way.
                           Only a backend rule_unreadable diagnostic may say it is not in effect, and
                           the list has none to map to a rule. */}
-                        <small className="muted">
-                          这条规则含有当前界面无法编辑的内容，只能查看；已保留在配置中。
-                        </small>
+                        <small className="muted">只读</small>
                         {u.unsafeNumber && (
                           <small className="unreadable-reason">
                             含超出可安全保存范围的数值，保存其他内容时该数值可能被改写。
@@ -1349,8 +1333,7 @@ export default function App() {
               {ready && !rows.length && !unreadableRows.length && (
                 <div className="empty">
                   <div className="empty-art" aria-hidden="true" />
-                  <strong>{search ? '没有匹配的指令' : '建立你的第一条文本指令'}</strong>
-                  <p>设置缩写、触发条件和操作，保存后立即生效。</p>
+                  <strong>{search ? '没有匹配的指令' : '还没有文本指令'}</strong>
                   <button
                     className="primary"
                     disabled={!editable}
@@ -1364,14 +1347,18 @@ export default function App() {
           </div>
         </div>
       )}
-      {tab === 'settings' && (
+      {settingsOpen && (
         <section className="settings">
-          <h2>文本指令参数设置</h2>
-          <p className="muted">确认保存后立即生效，单条指令可覆盖触发字符。</p>
+          <div className="settings-head">
+            <button type="button" className="back" onClick={() => setTab('manage')}>
+              返回
+            </button>
+            <h2>设置</h2>
+            {localDirty && <span className="revision">参数有未保存修改</span>}
+          </div>
           {platform === 'macos' && (
             <p className="muted">
-              <span className="capability-tag experimental">实验性</span> macOS
-              版尚未经过实机验收，各项功能均为实验性，可能不稳定。
+              <span className="capability-tag experimental">实验性</span> macOS 版功能均为实验性。
             </p>
           )}
           {/* IPC number contract (docs/ipc-contract-0.4.md §6); saving is not blocked. */}
@@ -1380,23 +1367,14 @@ export default function App() {
               配置中含超出可安全保存范围的数值，保存时可能被改写。
             </p>
           )}
+          <h3>参数</h3>
           {/* Edits here only become a write on 「保存参数设置」, but made before the config is read
               they would be edits of emptyConfig, dropped by the first snapshot. */}
           <fieldset className="settings-fields" disabled={!editable}>
-            <Field label="默认触发字符">
-              <EndKeys
-                platform={platform}
-                value={config.globals.terminators}
-                onChange={(v) => change({ ...config.globals, terminators: v })}
-              />
-            </Field>
             {/* Principle 5 (S-16): the Windows input backend only erases by Backspace, so there is
                 nothing to choose there; a stored `escape` is kept for other platforms. */}
             {!fixedImeErasure(platform) && (
-              <Field
-                label="默认输入法删除方式"
-                hint="中文选字中的数字或空格可能选择候选词，建议切到英文输入后使用。"
-              >
+              <Field label="默认输入法删除方式">
                 <select
                   value={config.globals.ime_erasure}
                   onChange={(e) => change({ ...config.globals, ime_erasure: e.target.value })}
@@ -1406,19 +1384,17 @@ export default function App() {
                 </select>
               </Field>
             )}
-            <Field
-              label="黑名单程序"
-              hint="每行一个 Windows 进程名或 Mac 应用标识；黑名单内不执行文本指令。"
-            >
+            <Field label="黑名单程序">
               <LinesInput
                 rows={5}
+                placeholder="每行一个进程名或应用标识"
                 value={config.globals.blacklist}
                 onChange={(blacklist) => change({ ...config.globals, blacklist })}
               />
             </Field>
             <details className="advanced-settings">
-              <summary>高级设置（通常不用修改）</summary>
-              <Field label="词分隔符" hint="空格、Tab、换行用于确定触发边界。">
+              <summary>高级设置</summary>
+              <Field label="词分隔符">
                 <input
                   value={config.globals.word_separators}
                   onChange={(e) => change({ ...config.globals, word_separators: e.target.value })}
@@ -1447,13 +1423,7 @@ export default function App() {
           </button>
           <div className="section-line">
             {autoListen !== null && (
-              <label
-                title={
-                  autoListenMissing
-                    ? '当前版本的桌面引擎不支持此设置'
-                    : '启动后先完成自检，全部通过才开始监听；未通过时保持暂停并提示原因。'
-                }
-              >
+              <label title={autoListenMissing ? '当前版本的桌面引擎不支持此设置' : undefined}>
                 {/* Not `editable`: safe mode allows set_auto_listen, unlike set_autostart
                     (ipc-contract §5; prefs live apart from what safe mode protects), and turning
                     it off can be the way out of a crash loop. */}
@@ -1484,6 +1454,15 @@ export default function App() {
           >
             取消修改
           </button>
+          <CandidateHintSection
+            key={
+              isCandidateHint(state?.candidate_hint)
+                ? `${state.candidate_hint.enabled}-${state.candidate_hint.duration_ms}`
+                : 'none'
+            }
+            stored={isCandidateHint(state?.candidate_hint) ? state.candidate_hint : undefined}
+            disabled={!ready}
+          />
           {cloud.status !== 'unsupported' && (
             <CloudSettingsSection
               view={cloud}
@@ -1492,85 +1471,14 @@ export default function App() {
               onSync={() => cloudSyncer.syncNow()}
             />
           )}
-          <h3>许可证与第三方声明</h3>
+          <UpdateSection updates={updates} />
+          <HistoryList
+            rows={runtime.status === 'ready' ? runtime.history : []}
+            ruleName={ruleName}
+          />
           <p className="muted license">
-            Quicktext 是自由软件，按 GNU 通用公共许可证第 3 版或（由你选择）任何更新的版本授权
-            （GPL-3.0-or-later），不提供任何担保。许可证全文见源码中的
-            LICENSE，所用第三方组件及其许可证见 THIRD_PARTY_NOTICES.md。
+            Quicktext · GPL-3.0-or-later · 第三方组件见 THIRD_PARTY_NOTICES.md
           </p>
-        </section>
-      )}
-      {tab === 'status' && (
-        <section className="settings">
-          <h2>运行状态与恢复</h2>
-          <HealthCard
-            view={runtime}
-            busy={busy}
-            onRepair={repair}
-            onRequestPermissions={requestPermissions}
-          />
-          <dl>
-            <dt>引擎状态</dt>
-            <dd>
-              {live?.text ??
-                (({ running: '正在执行动作', paused: '已暂停监听', listening: '正在监听' } as Data)[
-                  state?.engine_status || ''
-                ] ||
-                  state?.engine_status ||
-                  '尚未连接')}
-            </dd>
-          </dl>
-          <div className="inline">
-            <button onClick={() => refresh('refresh')}>刷新状态</button>
-            <button
-              disabled={!writable}
-              onClick={async () => {
-                if (await confirmAction({ title: '回滚到上一个生效版本？', confirm: '回滚' }))
-                  void run(async () => {
-                    requireReady();
-                    await write('rollback');
-                  });
-              }}
-            >
-              恢复上一个版本
-            </button>
-            <button onClick={() => run(() => call('cancel_execution'), '已请求停止')}>
-              停止当前动作
-            </button>
-            <button
-              className="danger"
-              onClick={async () => {
-                if (
-                  await confirmAction({
-                    title: '退出 Quicktext？',
-                    detail: '退出后文本指令不再生效，直到再次启动。',
-                    confirm: '退出',
-                  })
-                )
-                  void run(() => call('exit_app'));
-              }}
-            >
-              退出全部
-            </button>
-          </div>
-          {runtime.status === 'ready' && (
-            <div className="inline diagnostics">
-              <button onClick={exportDiagnostics}>导出诊断包</button>
-              <button onClick={() => openDir('open_log_dir')}>打开日志目录</button>
-            </div>
-          )}
-          <RuntimeStatus
-            state={state}
-            history={
-              runtime.status === 'ready' ? (
-                <HistoryList
-                  rows={runtime.history}
-                  available={runtime.historyAvailable}
-                  ruleName={ruleName}
-                />
-              ) : undefined
-            }
-          />
         </section>
       )}
       <footer>
@@ -1607,12 +1515,10 @@ export default function App() {
                   </p>
                 )}
                 <h3>什么时候执行</h3>
-                <Field
-                  label="缩写词"
-                  hint="输入一个容易记住的短词，例如 /hello。以后输入它，就能执行右侧设置的操作。"
-                >
+                <Field label="缩写词">
                   <input
                     autoFocus
+                    placeholder="例如 /hello"
                     value={editing.match.value}
                     onChange={(e) =>
                       setEditing({ ...editing, match: { ...editing.match, value: e.target.value } })
@@ -1634,7 +1540,7 @@ export default function App() {
                       checked={editing.ignore_case}
                       onChange={(e) => setEditing({ ...editing, ignore_case: e.target.checked })}
                     />
-                    英文不区分大小写（如 abc 和 ABC）
+                    不区分大小写
                   </label>
                   {/* Regular expressions are not offered for new rules; one that has it can turn it off. */}
                   {editingShown.regex && (
@@ -1653,17 +1559,17 @@ export default function App() {
                           })
                         }
                       />
-                      用正则表达式匹配（不勾选则按普通缩写匹配）
+                      正则表达式
                     </label>
                   )}
                 </div>
-                <Field label="说明" hint="写下这条指令的用途，方便以后查找。">
+                <Field label="说明">
                   <input
                     value={editing.description}
                     onChange={(e) => setEditing({ ...editing, description: e.target.value })}
                   />
                 </Field>
-                <Field label="分组" hint="把用途相似的指令放在同一组，例如“工作回复”。">
+                <Field label="分组">
                   <input
                     list="groups"
                     value={editing.group}
@@ -1677,14 +1583,7 @@ export default function App() {
                       ))}
                   </datalist>
                 </Field>
-                <Field
-                  label="什么时候执行"
-                  hint={
-                    state?.platform === 'windows'
-                      ? 'Windows 支持缩写输入完成后立即执行，也支持再按空格或分号执行。Tab、回车触发暂不可用；这两个按键仍由目标程序正常处理。'
-                      : undefined
-                  }
-                >
+                <Field label="什么时候执行">
                   <select value={editing.trigger_mode} onChange={(e) => changeMode(e.target.value)}>
                     <option value="terminator">输入缩写后，再按空格、分号等指定键执行</option>
                     <option value="immediate">缩写输入完成后立即执行</option>
@@ -1705,7 +1604,7 @@ export default function App() {
                           })
                         }
                       />
-                      使用“文本指令参数设置”里的默认触发键
+                      默认触发键
                     </label>
                     <EndKeys
                       platform={platform}
@@ -1740,10 +1639,7 @@ export default function App() {
                 )}
                 {/* Each rule follows the default; an override from an older version stays editable. */}
                 {!fixedImeErasure(platform) && editingShown.ime && (
-                  <Field
-                    label="如何清除输入法中的缩写"
-                    hint="通常使用默认设置；输出后请查看目标结果。"
-                  >
+                  <Field label="如何清除输入法中的缩写">
                     <select
                       value={editing.ime_erasure ?? 'inherit'}
                       onChange={(e) =>
@@ -1767,10 +1663,7 @@ export default function App() {
                 )}
                 {/* Not offered for new rules; a rule that already sets it can change it back. */}
                 {editingShown.parameter && (
-                  <Field
-                    label="传给操作的内容来自哪里"
-                    hint="通常保持默认。调用另一条指令或打开链接时，可把匹配到的文字作为附带内容传过去。"
-                  >
+                  <Field label="传给操作的内容来自哪里">
                     <select
                       value={editing.parameter.type}
                       onChange={(e) =>
@@ -1874,7 +1767,7 @@ export default function App() {
                   {editing.notification.enabled && (
                     <input
                       aria-label="提示内容"
-                      placeholder="输入执行时要显示的提示，避免填写隐私内容"
+                      placeholder="提示内容"
                       value={editing.notification.message}
                       onChange={(e) =>
                         setEditing({
@@ -1888,7 +1781,6 @@ export default function App() {
               </div>
             </div>
             <div className="modal-footer">
-              <span>保存后立即生效</span>
               <button onClick={() => void closeEditor()}>取消</button>
               <button disabled={busy || !writable} className="primary" onClick={commitEdit}>
                 保存

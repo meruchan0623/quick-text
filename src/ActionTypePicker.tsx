@@ -1,6 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { actionGuides } from './actionHelp';
 import { actionNames } from './model';
 
 type Option = { value: string; label: string; disabled: boolean };
@@ -8,11 +7,10 @@ type Props = {
   options: Option[];
   value: string;
   onChange: (value: string) => void;
-  platform?: string | undefined;
 };
 
 /** Keep keyboard focus on the combobox while browsing; selection only changes on confirmation. */
-export function ActionTypePicker({ options, value, onChange, platform }: Props) {
+export function ActionTypePicker({ options, value, onChange }: Props) {
   const id = useId();
   const trigger = useRef<HTMLButtonElement>(null);
   const popup = useRef<HTMLDivElement>(null);
@@ -21,24 +19,24 @@ export function ActionTypePicker({ options, value, onChange, platform }: Props) 
     left: number;
     top: number;
     width: number;
-    height: number;
+    maxHeight: number;
   } | null>(null);
   const [active, setActive] = useState(value);
   const selected = options.find((option) => option.value === value);
-  const guide = actionGuides[active] ?? actionGuides.none;
   const open = placement !== null;
   const close = () => setPlacement(null);
   const expand = () => {
     const rect = trigger.current?.getBoundingClientRect();
     if (!rect) return;
     setPortalHost(trigger.current?.closest('dialog') ?? document.body);
-    const width = Math.min(860, window.innerWidth - 16);
-    const height = Math.min(520, window.innerHeight - 24);
+    const width = Math.min(Math.max(rect.width, 280), window.innerWidth - 16);
+    // About one 40px row per option, so a short list is not lifted above the trigger.
+    const height = Math.min(options.length * 40 + 14, 420, window.innerHeight - 24);
     setPlacement({
       left: Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8)),
       top: Math.max(8, Math.min(rect.bottom + 6, window.innerHeight - height - 8)),
       width,
-      height,
+      maxHeight: height,
     });
     setActive(
       options.some((option) => option.value === value) ? value : (options[0]?.value ?? value),
@@ -121,35 +119,6 @@ export function ActionTypePicker({ options, value, onChange, platform }: Props) 
       {placement &&
         createPortal(
           <div ref={popup} className="action-type-popup" style={placement}>
-            <section className="action-guide" aria-label="操作使用说明">
-              <h3>{options.find((option) => option.value === active)?.label}</h3>
-              <p>
-                <strong>作用</strong>
-                {guide.purpose}
-              </p>
-              <strong>怎么设置</strong>
-              <ol>
-                {guide.steps.map((step) => (
-                  <li key={step}>{step}</li>
-                ))}
-              </ol>
-              <p>
-                <strong>例子</strong>
-                {guide.example}
-              </p>
-              <strong>特别设置与注意事项</strong>
-              <ul>
-                {guide.special.map((note) => (
-                  <li key={note}>{note}</li>
-                ))}
-              </ul>
-              {platform === 'windows' && (
-                <p className="action-windows-note">
-                  Windows：切换目标、继续按键或停止动作会中断后续输入；已执行的操作无法自动撤销。输入框不提供正文时，结果可能显示“目标处理结果未知”，请查看目标是否收到。
-                </p>
-              )}
-              <small>设置完成后，点击编辑窗口的“保存”即可立即生效。</small>
-            </section>
             <div id={id} role="listbox" aria-label="操作类型选项" className="action-type-options">
               {options.map((option) => (
                 <div

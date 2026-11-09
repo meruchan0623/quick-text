@@ -49,12 +49,10 @@ export function KeyRecorder({
       <div className="recorder-blocks" aria-label="录下的内容">
         {items === null ? (
           <p className="recorder-note" role="note">
-            这条指令用了录制框无法显示的写法，请在下方“高级”里修改，或点“清空”后重新录制。
+            录制框无法显示这段内容，请在下方“高级”中修改，或清空后重新录制。
           </p>
         ) : items.length === 0 ? (
-          <span className="recorder-empty">
-            还没有内容。点“开始录制”，然后像平时一样打字、按键。
-          </span>
+          <span className="recorder-empty">还没有内容</span>
         ) : (
           items.map((item, i) => {
             const label = itemLabel(item);
@@ -174,7 +172,6 @@ export function KeyRecorder({
           </button>
         ))}
       </div>
-      <small>录错了点块上的 × 删除；插入的内容会在执行时换成当时的文字、日期或时间。</small>
     </div>
   );
 }

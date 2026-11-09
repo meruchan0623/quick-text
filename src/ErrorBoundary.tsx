@@ -39,7 +39,6 @@ export class ErrorBoundary extends Component<Props, State> {
         <p>
           界面遇到问题，已停止显示。后台的文本指令不受影响；正在编辑但还没保存的内容可能会丢失。
         </p>
-        <p className="muted">错误类型已写入日志，不含指令内容。</p>
         <button className="primary" onClick={this.#retry}>
           重新加载界面
         </button>

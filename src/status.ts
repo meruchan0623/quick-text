@@ -203,7 +203,7 @@ export function problemText(problem: StartupProblem, engine: EngineNow | null = 
     case 'terminator_unsupported': {
       const keys = strs(a.keys).map((k) => label(keyNames, k));
       const which = keys.length > 0 ? keys.join('、') : '部分按键';
-      return `配置中的触发键 ${which} 在当前平台上暂不支持，按下它们不会执行指令；可在「文本指令参数设置」中改用空格或分号。`;
+      return `配置中的触发键 ${which} 在当前平台上暂不支持，按下它们不会执行指令；可在编辑指令时改用空格或分号。`;
     }
     case 'autostart_repaired':
       return '登录自动启动项指向的程序位置已过期，已自动修正。';
@@ -217,10 +217,10 @@ export function problemText(problem: StartupProblem, engine: EngineNow | null = 
       // as listening; 「恢复监听」 is pointed to only while the user's own pause is set, the one
       // reason it clears (the header button reads 「暂停监听」 otherwise).
       if (engine?.listening)
-        return `启动自检未通过${which}。输入监听当前已开启，但可能无法正常工作；可在「运行状态与恢复」中查看详情或导出诊断包。`;
+        return `启动自检未通过${which}。输入监听当前已开启，但可能无法正常工作。`;
       if (engine && !engine.paused_reasons.includes('manual'))
-        return `启动自检未通过${which}，输入监听可能无法正常工作。可在「运行状态与恢复」中查看详情或导出诊断包。`;
-      return `启动自检未通过${which}，没有自动开始监听。可在「运行状态与恢复」中查看详情或导出诊断包；排除问题后可点「恢复监听」。`;
+        return `启动自检未通过${which}，输入监听可能无法正常工作。`;
+      return `启动自检未通过${which}，没有自动开始监听；排除问题后可点「恢复监听」。`;
     }
     case 'log_level_elevated': {
       const until = num(a.until_ms);
@@ -235,7 +235,7 @@ export function problemText(problem: StartupProblem, engine: EngineNow | null = 
       // Wording from docs/ipc-contract-0.4.md §3 (R6): every write is refused and retried.
       return '升级前备份失败，暂时不能保存，已有配置照常生效。';
     default:
-      return `启动时发现一个问题：${other(problem.kind)}。可在「运行状态与恢复」中导出诊断包了解详情。`;
+      return `启动时发现一个问题：${other(problem.kind)}。`;
   }
 }
 

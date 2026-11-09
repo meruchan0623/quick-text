@@ -33,10 +33,10 @@ export const cloudStatusClass = (status: string): string =>
 /** One sentence per sync error code (§3). */
 export const cloudErrorNames: Readonly<Record<string, string>> = {
   not_configured:
-    '团队话术同步还没有设置完整：请在「文本指令参数设置」中开启订阅，并填写服务器地址和同步密钥。',
+    '团队话术同步还没有设置完整：请在「设置」中开启订阅，并填写服务器地址和同步密钥。',
   invalid_url:
-    '服务器地址无效：只支持 https:// 开头的地址（本机调试可用 http://localhost）。请在「文本指令参数设置」中修改。',
-  unauthorized: '同步密钥无效或已被停用，请向管理员获取新的密钥后在「文本指令参数设置」中替换。',
+    '服务器地址无效：只支持 https:// 开头的地址（本机调试可用 http://localhost）。请在「设置」中修改。',
+  unauthorized: '同步密钥无效或已被停用，请向管理员获取新的密钥后在「设置」中替换。',
   network: '连不上服务器，请检查网络连接和服务器地址。',
   timeout: '服务器 15 秒内没有响应，请稍后再试。',
   http_status: '服务器返回了错误，请稍后再试；一直失败时请联系管理员。',

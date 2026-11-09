@@ -148,7 +148,7 @@ describe('shortcut keyboard', () => {
     expect(host.querySelector('.shortcut-advanced input')?.getAttribute('value')).toBe('F24');
     click('清空');
     expect(change).toHaveBeenLastCalledWith([]);
-    expect(host.querySelector('.shortcut-chord')?.textContent).toContain('还没有设置');
+    expect(host.querySelector('.shortcut-chord')?.textContent).toContain('未设置');
   });
 
   it('records a Mac shortcut, cancels with Escape, and offers Cmd on the keyboard', () => {

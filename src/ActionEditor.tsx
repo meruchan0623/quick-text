@@ -293,7 +293,7 @@ function Shortcut({
       <div className="shortcut-preview" aria-label="当前快捷键">
         <span className="shortcut-caption">当前组合</span>
         <div className="shortcut-chord" aria-live="polite">
-          {value.length === 0 && <span className="muted">还没有设置，点下方“录制快捷键”</span>}
+          {value.length === 0 && <span className="muted">未设置</span>}
           {value.map((k, i) => (
             <Fragment key={i}>
               {i > 0 && (
@@ -372,12 +372,8 @@ function Shortcut({
           />
         )}
       </div>
-      <small className="shortcut-hint">
-        点“录制快捷键”，再按一次想要的组合键（例如 Ctrl+C）即可；Esc 取消。
-      </small>
       <details className="shortcut-manual">
         <summary>录不了？手动点选按键</summary>
-        <small className="shortcut-hint">点一下选中，再点一下取消；按点选的顺序组合。</small>
         <div className="shortcut-keyboard" aria-label="点击选择快捷键">
           {groups.map((group) => (
             <div className="shortcut-group" role="group" aria-label={group.label} key={group.label}>
@@ -413,7 +409,6 @@ function Shortcut({
         </div>
         <details className="shortcut-advanced">
           <summary>更多按键与 Windows 键码</summary>
-          <small>可填写 F13–F24、自定义按键名称或 # 键码；已有按键会保持原顺序。</small>
           {value.map((k, i) => (
             <div className="shortcut-custom-key" key={i}>
               <KeySelect
@@ -647,18 +642,19 @@ export default function ActionEditor({
               '当前电脑暂不支持此操作'
             )}
           </strong>
-          <p>
-            {needed.id === 'quicker_private_action'
-              ? '当前版本不能执行原 Quicker 动作；请改成这里支持的操作。'
-              : (needed.reason ?? '暂无额外说明')}
-          </p>
+          {(needed.id === 'quicker_private_action' || needed.reason) && (
+            <p>
+              {needed.id === 'quicker_private_action'
+                ? '当前版本不能执行原 Quicker 动作；请改成这里支持的操作。'
+                : needed.reason}
+            </p>
+          )}
         </div>
       )}
       <label className="field">
         <span>操作类型</span>
         <ActionTypePicker
           value={actionChoice(a)}
-          platform={platform}
           options={actionOptions.flatMap(([k, v]) => {
             const { hidden, disabled, note } = offer(k);
             return hidden ? [] : [{ value: k, label: `${v}${note}`, disabled }];
@@ -734,7 +730,6 @@ export default function ActionEditor({
                     </option>
                   ))}
                 </select>
-                <small>文字显示乱码时，可尝试更换文件编码；不确定时先选 UTF-8。</small>
                 <button
                   onClick={() =>
                     run(async () =>
@@ -787,7 +782,6 @@ export default function ActionEditor({
                     </tbody>
                   </table>
                 </div>
-                <small>这里和上面录下的内容是同一份，改哪边都行。</small>
               </details>
             </>
           ) : (
@@ -819,7 +813,6 @@ export default function ActionEditor({
                   </button>
                 ))}
               </div>
-              <small>这些按钮会加入一个标记，执行指令时再换成当时的文字、日期或时间。</small>
             </>
           )}
           {/* Only for a rule already running copied text as key commands. */}
@@ -861,9 +854,6 @@ export default function ActionEditor({
                     </select>
                   </label>
                 ))}
-                <small>
-                  默认把复制或选中的内容当作普通文字。只有选择“作为按键命令执行”的项目才会触发按键操作。此操作类型读取文件时，也会把文件内容当作按键命令检查和执行。
-                </small>
               </div>
             )}
         </>
@@ -1013,17 +1003,10 @@ export default function ActionEditor({
                 <span>传给该动作的内容（可选）</span>
                 <input value={a.parameter} onChange={(e) => edit({ parameter: e.target.value })} />
               </label>
-              <p className="muted">
-                这些信息来自原来的 Quicker
-                动作，当前版本只保留信息，不能执行。请改选这里支持的操作类型，再填写相应内容。
-              </p>
             </>
           ) : (
             <div className="typed-parameters">
               <h4>传给另一条指令的内容（可选）</h4>
-              <small>
-                名称要与另一条指令需要的名称一致；内容可以是文字、数字、“是或否”，也可以留空。
-              </small>
               {Object.entries<ParameterValue>(a.parameters ?? {}).map(([name, value], i) => (
                 <div className="inline" key={i}>
                   <input
@@ -1112,9 +1095,6 @@ export default function ActionEditor({
               >
                 ＋ 添加参数
               </button>
-              <small>
-                执行时会使用当前已保存的那条指令。如果两条指令互相调用，或最终调用回自己，软件会停止执行。
-              </small>
             </div>
           )}
         </>
@@ -1179,9 +1159,6 @@ export default function ActionEditor({
               >
                 检查命令并转换为步骤
               </button>
-              <small>
-                适合熟悉操作命令的用户。检查通过后才会转换为步骤；有错误时保留原文并提示位置。
-              </small>
             </>
           ) : (
             <>
@@ -1232,7 +1209,6 @@ export default function ActionEditor({
                 <label className="field">
                   <span>要输入的文字（\t 表示制表符，\r\n 表示换行）</span>
                   <textarea rows={2} value={bText} onChange={(e) => setBText(e.target.value)} />
-                  <small>添加步骤时，会把这些标记转换成真正的制表符或换行。</small>
                 </label>
               )}
               {command === 'sendkeys' && a.type === 'steps' && (
@@ -1262,16 +1238,12 @@ export default function ActionEditor({
                     value={repeat}
                     onChange={setRepeat}
                   />
-                  <small>选好按键和重复次数后，点击“添加步骤”。</small>
                 </div>
               )}
               {a.type === 'replay' && (
                 <label className="field">
-                  <span>执行新增操作前等待多久（毫秒，1000 毫秒是 1 秒）</span>
+                  <span>执行新增操作前等待（毫秒）</span>
                   <NumberField range={ranges.delayMs} value={eventDelay} onChange={setEventDelay} />
-                  <small>
-                    会添加一个等待步骤。调整倍速只改变等待时间，鼠标位置和滚动距离保持不变。
-                  </small>
                 </label>
               )}
               <div className="step-layout">
@@ -1317,9 +1289,7 @@ export default function ActionEditor({
                 </ol>
                 <div ref={stepForm} className="step-form">
                   {!current ? (
-                    <p className="muted">
-                      先选择操作并点击“添加步骤”，再在这里填写文字、按键或鼠标位置。按从上到下的顺序执行，可拖动步骤调整顺序。
-                    </p>
+                    <p className="muted">还没有步骤</p>
                   ) : (
                     // Keyed by step: text typed into one step's fields is not shown for another.
                     <Fragment key={stepIndex}>
@@ -1455,7 +1425,6 @@ export default function ActionEditor({
                       )}
                       {o.type === 'wheel' && (
                         <>
-                          <small>正数向上或向右滚动，负数向下或向左滚动。</small>
                           <select
                             aria-label="滚动方向"
                             value={o.axis}
@@ -1490,9 +1459,6 @@ export default function ActionEditor({
                           <button onClick={() => choosePath('files', (p) => setOp({ paths: p }))}>
                             选择多个文件
                           </button>
-                          <small>
-                            把文件本身粘贴到接收窗口，例如聊天附件；这里的文件位置文字不会作为正文输出。
-                          </small>
                         </>
                       )}
                       {o.type === 'paste_image' && (
@@ -1654,7 +1620,6 @@ export default function ActionEditor({
               >
                 停止录制
               </button>
-              <small>点击“开始录制”后才会记录鼠标和按键；平时不会自动录制。</small>
             </div>
           )}
         </>
@@ -1673,9 +1638,6 @@ export default function ActionEditor({
           测试动作（真实执行）
         </button>
         <button onClick={() => run(() => call('cancel_execution'), '已请求停止')}>停止动作</button>
-        <small>
-          测试会暂时隐藏本窗口，并在刚才使用的窗口中真正输入文字或执行操作。请先打开一个可以安全测试的输入框。显示发送完成后，仍需自行查看目标窗口是否成功。
-        </small>
       </div>
     </>
   );

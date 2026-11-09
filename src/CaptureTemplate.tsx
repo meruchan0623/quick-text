@@ -34,10 +34,6 @@ export default function CaptureTemplate({
   };
   return (
     <div className="capture-template">
-      <small>
-        把匹配规则中括号里的文字取出来，作为附带内容。例如规则中的第一对括号对应“第 1
-        组”。用于网址时，取出的文字会自动转换为网址可用的格式，且只转换一次。
-      </small>
       {compatible ? (
         <>
           {rows.map((r, i) => (
@@ -83,9 +79,7 @@ export default function CaptureTemplate({
           </button>
         </>
       ) : (
-        <p className="muted">
-          导入的内容含有自定义写法，已保留原文；需要修改时可展开下方高级编辑。
-        </p>
+        <p className="muted">含自定义写法，请在下方高级编辑中修改。</p>
       )}
       <details>
         <summary>查看或直接修改组合方式（高级）</summary>
