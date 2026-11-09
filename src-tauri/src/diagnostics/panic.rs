@@ -568,9 +568,13 @@ mod tests {
             let task = tauri::async_runtime::spawn_blocking(move || {
                 tracing::dispatcher::with_default(&dispatch, || {
                     let _crash_dir = ThreadCrashDir::set(crash_dir);
-                    // byte index 1 is not a char boundary; ... of `éSENTINEL`
+                    // The message of a char-boundary slice panic, quoting the string as older
+                    // Rust versions did (newer ones no longer print it, which would void the
+                    // premise below); the class comes from the prefix, as for the real panic.
                     let phrase = std::hint::black_box(format!("é{S}"));
-                    std::hint::black_box(&phrase[..1]);
+                    panic!(
+                        "end byte index 1 is not a char boundary; it is inside 'é' (bytes 0..2) of `{phrase}`"
+                    );
                 });
             });
             let join = tauri::async_runtime::block_on(task).expect_err("the task panicked");
