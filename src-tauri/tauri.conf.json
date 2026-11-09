@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Quicktext",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "identifier": "com.quicktext.desktop",
   "build": { "beforeDevCommand": "npm run dev", "devUrl": "http://localhost:1420", "beforeBuildCommand": "npm run build", "beforeBundleCommand": "pwsh -NoProfile -File scripts/check-bundle-preconditions.ps1", "frontendDist": "../dist" },
   "app": { "windows": [{ "label": "main", "title": "Quicktext", "create": false, "visible": false, "width": 1240, "height": 840, "minWidth": 900, "minHeight": 650 }], "security": { "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data:; connect-src ipc: http://ipc.localhost" } },
