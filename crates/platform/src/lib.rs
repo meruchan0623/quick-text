@@ -107,6 +107,7 @@ impl Shared {
 }
 pub mod fault;
 pub mod health;
+pub mod hint;
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
 pub mod traits;

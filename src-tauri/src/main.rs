@@ -10,6 +10,7 @@ mod error;
 mod events;
 mod excel;
 mod faults;
+mod hint;
 mod lkg;
 mod package_zip;
 mod startup;
@@ -71,6 +72,7 @@ fn main() {
             cloud::init(&mut store);
             let engine = store.engine.clone();
             let runtime = store.runtime.clone();
+            let engine_for_hint = store.engine.clone();
             app.manage(Managed::new(store));
             // The tray and the EventBus come before anything that can
             // change the engine or find a problem, so the frontend and the
@@ -123,6 +125,9 @@ fn main() {
             if let Some(config) = app.config().app.windows.first() {
                 tauri::WebviewWindowBuilder::from_config(app.handle(), config)?.build()?;
             }
+            // The beginner typing hint (settings 「新手提示」), off unless turned on.
+            let hint_prefs = hint::initial_prefs(&app.state::<DataDir>().0);
+            app.manage(hint::HintControl::start(app.handle(), engine_for_hint, hint_prefs));
             if !std::env::args().any(|x| x == "--background") {
                 tray::notify(
                     app.handle(),
@@ -158,6 +163,9 @@ fn main() {
             commands::runtime::stop_recording,
             commands::settings::set_autostart,
             commands::settings::set_auto_listen,
+            commands::settings::set_candidate_hint,
+            commands::settings::preview_candidate_hint,
+            commands::settings::candidate_hint_measured,
             commands::rules::preview_file,
             commands::rules::preview_image,
             commands::rules::import_image_asset,

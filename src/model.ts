@@ -1,3 +1,4 @@
+import type { CandidateHint } from './lib/hint';
 import type { SafeModeReason } from './ipc/types';
 import { completeRules, hasUnsafeNumber, isReadableRule } from './lib/rules';
 import { DEFAULT_TERMINATORS } from './lib/terminators';
@@ -52,6 +53,8 @@ export interface State extends Data {
   capabilities: any;
   /** S-09 「启动时自动开始监听」; absent on a 0.3 backend. */
   auto_listen_on_start?: boolean;
+  /** Beginner typing hint (src/CandidateHintSection.tsx); absent on older backends. */
+  candidate_hint?: CandidateHint;
   /** Absent on a 0.3 backend. */
   safe_mode?: SafeModeReason | null;
 }

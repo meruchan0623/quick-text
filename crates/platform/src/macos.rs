@@ -648,6 +648,7 @@ unsafe extern "C" fn tap(_: Id, kind: u32, event: Event, _: Id) -> Event {
     // Secure Input session.
     if IsSecureEventInputEnabled() {
         buffer.value.clear();
+        crate::hint::clear();
         shared.generation.fetch_add(1, Ordering::SeqCst);
         return event;
     }
@@ -692,6 +693,7 @@ unsafe extern "C" fn tap(_: Id, kind: u32, event: Event, _: Id) -> Event {
         if !matches!(kind, 5 | 6 | 7 | 27) {
             shared.generation.fetch_add(1, Ordering::SeqCst);
             buffer.value.clear();
+            crate::hint::clear();
         }
         let p = CGEventGetLocation(event);
         let b = CGEventGetIntegerValueField(event, 3) as u32;
@@ -801,10 +803,12 @@ unsafe extern "C" fn tap(_: Id, kind: u32, event: Event, _: Id) -> Event {
     }
     let Ok(env) = ENVIRONMENT.get().unwrap().try_lock() else {
         buffer.value.clear();
+        crate::hint::clear();
         return event;
     };
     if shared.paused.load(Ordering::SeqCst) || shared.busy.load(Ordering::SeqCst) || env.id == 0 {
         buffer.value.clear();
+        crate::hint::clear();
         return event;
     }
     let focus = env.clone();
@@ -828,14 +832,21 @@ unsafe extern "C" fn tap(_: Id, kind: u32, event: Event, _: Id) -> Event {
     let previous = typed_terminator(&edit).map(|key| (buffer.value.clone(), key));
     apply_key_edit(&mut buffer.value, &edit);
     if !matches!(edit, KeyEdit::Text(_)) {
+        match edit {
+            KeyEdit::Backspace => crate::hint::edited(&buffer.value),
+            KeyEdit::Reset => crate::hint::clear(),
+            _ => {}
+        }
         return event;
     }
     let Ok(config) = shared.config.try_lock() else {
         buffer.value.clear();
+        crate::hint::clear();
         return event;
     };
     let Ok(compiled) = shared.compiled.try_lock() else {
         buffer.value.clear();
+        crate::hint::clear();
         return event;
     };
     let foreground_context = ForegroundContext {
@@ -849,8 +860,11 @@ unsafe extern "C" fn tap(_: Id, kind: u32, event: Event, _: Id) -> Event {
         previous.as_ref().map(|(text, key)| (text.as_str(), *key)),
         &foreground_context,
     ) else {
+        // Beginner hints (crate::hint): the word typed so far, in a target that can match.
+        crate::hint::typed(&buffer.value, &focus.process);
         return event;
     };
+    crate::hint::clear();
     if let Some(rule) = config.rules.iter().find(|r| r.id == matched.rule_id) {
         let candidate = Candidate {
             rule: rule.clone(),
@@ -2427,4 +2441,15 @@ pub fn execute(
     };
     *s.last.lock().unwrap() = Some(result.clone());
     Ok(result)
+}
+
+/// The caret in screen pixels for the beginner hint overlay; unknown here, so the app places
+/// the overlay by the pointer.
+pub fn hint_anchor() -> Option<(i32, i32)> {
+    None
+}
+
+/// Not used on this platform: the app shows its non-focusable window itself.
+pub fn show_without_activation(_hwnd: isize, _x: i32, _y: i32, _w: i32, _h: i32) -> bool {
+    false
 }

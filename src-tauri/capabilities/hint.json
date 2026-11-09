@@ -1,0 +1,6 @@
+{
+  "identifier": "hint-events",
+  "description": "Allow the beginner typing hint window to receive what it shows.",
+  "windows": ["hint"],
+  "permissions": ["core:event:default"]
+}

@@ -40,6 +40,8 @@ pub struct AppState {
     /// `prefs.json` `app.auto_listen_on_start` (B-10); false when prefs
     /// cannot be read. Written by `set_auto_listen`.
     auto_listen_on_start: bool,
+    /// `prefs.json` `app.candidate_hint`; written by `set_candidate_hint`.
+    candidate_hint: crate::commands::settings::CandidateHint,
     engine_detail: serde_json::Value,
     platform: String,
     startup_problems: Vec<StartupProblem>,
@@ -65,6 +67,7 @@ impl Store {
             capabilities: capabilities(&health),
             autostart: autostart::is_enabled(),
             auto_listen_on_start: crate::store::prefs::auto_listen_on_start(self.dir()),
+            candidate_hint: (&crate::store::prefs::candidate_hint(self.dir())).into(),
             engine_detail: quicker_platform::input_status(),
             platform: PLATFORM.into(),
             startup_problems: self.startup_problems().to_vec(),

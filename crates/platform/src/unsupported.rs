@@ -40,3 +40,14 @@ pub fn execute(
 pub fn preflight(_: &ActionPlan) -> Result<(), String> {
     Err("Native actions unavailable on this platform".into())
 }
+
+/// The caret in screen pixels for the beginner hint overlay; unknown here, so the app places
+/// the overlay by the pointer.
+pub fn hint_anchor() -> Option<(i32, i32)> {
+    None
+}
+
+/// Not used on this platform: the app shows its non-focusable window itself.
+pub fn show_without_activation(_hwnd: isize, _x: i32, _y: i32, _w: i32, _h: i32) -> bool {
+    false
+}

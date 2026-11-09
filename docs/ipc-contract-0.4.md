@@ -122,6 +122,7 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 | 全部 | 错误类型改为 `CommandError` |
 | `load_state` | 返回值在原字段之外新增 `health: HealthSnapshot`、`engine_state: EngineState`（不含 `seq`）、`startup_problems: StartupProblem[]`、`safe_mode: SafeModeReason \| null`；`engine_status` 字符串保留。`health`、`engine_state` 是调用时运行时的实时值（不是 EventBus 最后发出的值，需要 `seq` 基准时用 `get_runtime_snapshot`）；`capabilities` 与 `get_capabilities` 同源，按这份 `health` 的组件降级 |
 | `load_state.auto_listen_on_start` | 新增 `boolean`：`prefs.json` 的 `app.auto_listen_on_start`（启动自检通过后是否自动开始监听），prefs 读不出时为 `false`。由 `set_auto_listen` 修改 |
+| `load_state.candidate_hint` | 新增 `{ enabled: boolean, duration_ms: number }`：`prefs.json` 的 `app.candidate_hint`（新手提示：输入时是否显示候选列表、停止输入后保留多久），默认 `{ false, 2000 }`，prefs 读不出或值不合法时为默认值。由 `set_candidate_hint` 修改 |
 | `load_state.platform` | 取 `std::env::consts::OS`：`"windows"`、`"macos"`，或没有输入适配器的平台名（如 `"linux"`）。0.3 在 macOS 以外一律返回 `"windows"`；Windows 与 macOS 上的值不变 |
 | `set_paused(paused)` | 只置位或清除 `manual`；其他暂停原因仍在时，返回的状态仍是暂停。恢复（`paused: false`）在安全模式下返回 `safe_mode`；Health 不是 `healthy` / `degraded` 时返回 `engine_unavailable { health }`；录制中恢复不再返回 `busy`，而是清除 `manual` 后仍因 `recording` 保持暂停。托盘菜单项走同一逻辑：监听中显示「暂停监听」，否则显示「恢复监听」；托盘恢复被拒绝时发系统通知说明原因（安全模式、引擎启动中、恢复中、已停止） |
 | `start_recording`、`stop_recording` | 录制期间置位 `recording` 暂停原因，录制结束即清除；结束后引擎回到其他原因决定的状态（录制前已手动暂停的仍暂停，原来在监听的恢复监听） |
@@ -146,6 +147,9 @@ interface HistoryEntry { seq: number; at_ms: number; rule_id: string; trigger: T
 | `request_permissions` | — | `{ granted: boolean, supported: boolean }`：macOS 再次请求辅助功能、输入监控与合成输入权限（系统提示每个应用最多弹一次，被拒绝过就不再弹），仍未授予时打开「系统设置 → 隐私与安全性」对应面板；授予后引擎自行安装钩子，不必重启。其他平台返回 `{ granted: true, supported: false }`，不做任何事 |
 | `self_test` | — | `{ passed: boolean, checks: { name: "raw_input" \| "hook_heartbeat" \| "foreground" \| "clipboard", passed: boolean, reason: ReasonCode \| null, elapsed_ms: number }[] }`；`checks` 恒为这四项、按此顺序；`reason` 在 `passed` 为真时为 `null`。细则见下方「自检」 |
 | `set_auto_listen` | `{ enabled: boolean }` | `boolean`：写入 `prefs.json` 的 `app.auto_listen_on_start`，返回写入后的值。与 `set_autostart` 对称，但安全模式下也允许（prefs 与安全模式保护的配置、修订、导出分开存放；无法读取的 prefs 文件不会被覆盖，此时返回错误，通常是 `io`）。只影响下次启动，不改变当前的监听状态 |
+| `set_candidate_hint` | `{ enabled: boolean, duration_ms: number }` | `{ enabled, duration_ms }`：写入 `prefs.json` 的 `app.candidate_hint` 并立即生效，返回写入后的值。`duration_ms` 须在 1000–10000 之间，否则返回 `validation`（`candidate_hint_duration`）。安全模式下也允许 |
+| `preview_candidate_hint` | 无 | `null`：用示例数据显示一次候选提示窗口（设置页「预览效果」） |
+| `candidate_hint_measured` | `{ seq: number, height: number }` | `null`：仅供候选提示窗口（`hint`）回报第 `seq` 份列表排版后的高度（CSS 像素），后端据此定位并显示窗口 |
 | `log_frontend_error` | `{ message: string, stack: string \| null, source: string \| null }` | `null`；后端截断到 8 KiB 后写日志 |
 | `report_metric` | `{ name: string, value: number }` | `null`；只接受白名单内的名称（0.4：`ui_first_paint_ms`、`ui_event_lag_ms`），其他名称忽略 |
 | `list_history` | `{ since_seq: number \| null }` | `HistoryEntry[]`，按 `seq` 升序，只含 `seq > since_seq` 的条目；`null` 返回全部（内存中最多 200 条、30 分钟内） |

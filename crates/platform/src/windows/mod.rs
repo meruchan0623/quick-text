@@ -28,6 +28,7 @@ mod input;
 mod keystate;
 mod liveness;
 mod observer;
+mod overlay;
 #[cfg(test)]
 mod pipeline_tests;
 #[cfg(test)]
@@ -43,6 +44,7 @@ pub use actions::{execute, preflight};
 pub use clipboard::clipboard_health;
 pub(crate) use clipboard::read_clipboard_text;
 pub use foreground::{cursor, foreground};
+pub use overlay::{hint_anchor, show_without_activation};
 pub use input::{engine_ready, input_status, native_ready};
 pub use input::{input_health, reattach};
 pub use recording::finish_and_take;

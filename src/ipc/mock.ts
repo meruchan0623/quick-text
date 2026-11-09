@@ -426,6 +426,8 @@ export class MockBackend {
   autostart = false;
   /** S-09 `auto_listen_on_start`; a 0.3 backend has no such setting. */
   autoListen = false;
+  /** Beginner typing hint (`app.candidate_hint`). */
+  candidateHint = { enabled: false, duration_ms: 2000 };
   recording = false;
   /** Team phrase sync settings (`app.cloud`). */
   cloudPrefs: MockCloudPrefs;
@@ -932,6 +934,32 @@ export class MockBackend {
       this.autoListen = args.enabled === true;
       return this.autoListen;
     },
+    // Beginner typing hint: prefs, allowed in safe mode (src-tauri commands/settings.rs).
+    set_candidate_hint: (args) => {
+      const ms = args.duration_ms;
+      if (typeof ms !== 'number' || ms < 1000 || ms > 10000)
+        this.#fail(
+          {
+            code: 'validation',
+            detail: {
+              diagnostics: [
+                {
+                  code: 'candidate_hint_duration',
+                  message: '显示时长须在 1 到 10 秒之间',
+                  path: 'candidate_hint.duration_ms',
+                  severity: 'error',
+                },
+              ],
+            },
+          },
+          '',
+        );
+      this.candidateHint = { enabled: args.enabled === true, duration_ms: ms };
+      return clone(this.candidateHint);
+    },
+    // There is no hint window in the browser preview.
+    preview_candidate_hint: () => null,
+    candidate_hint_measured: () => null,
     // Team phrases (docs/cloud-phrases.md §5); prefs too, so not refused in safe mode here.
     get_cloud_state: () => this.#cloudState(),
     set_cloud_settings: (args) => {
@@ -1025,6 +1053,7 @@ export class MockBackend {
       ...legacy,
       capabilities: this.#capabilities(),
       auto_listen_on_start: this.autoListen,
+      candidate_hint: clone(this.candidateHint),
       health: clone(this.health),
       engine_state: clone(this.engine),
       startup_problems: clone(this.problems),

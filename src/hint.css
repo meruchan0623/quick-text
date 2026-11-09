@@ -1,0 +1,170 @@
+/* The beginner typing hint window (src/hint/). Tokens from style.css; the green frame is
+   --dot-ok, the colour of the 「正常」 status dot. */
+html:has(.hint-body),
+.hint-body {
+  background: transparent;
+  overflow: hidden;
+  margin: 0;
+}
+.hint-panel {
+  box-sizing: border-box;
+  background: var(--surface);
+  border: 2px solid var(--dot-ok);
+  border-radius: 12px;
+  padding: 3px;
+  overflow: hidden;
+  user-select: none;
+  cursor: default;
+}
+.hint-inner {
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  overflow: hidden;
+  background: var(--surface);
+}
+.hint-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--dot-ok) 12%, var(--surface));
+  border-bottom: 1px solid var(--border);
+}
+.hint-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dot-ok);
+}
+.hint-typed {
+  font-family: var(--mono);
+  color: var(--accent-soft-text);
+  background: var(--accent-soft);
+  padding: 0 6px;
+  border-radius: 6px;
+}
+.hint-count {
+  margin-left: auto;
+}
+.hint-item {
+  padding: 7px 12px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  min-width: 0;
+}
+.hint-head + .hint-item {
+  border-top: 0;
+}
+.hint-top {
+  background: var(--surface-2);
+  box-shadow: inset 3px 0 0 var(--dot-ok);
+}
+.hint-compact {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  white-space: nowrap;
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+.hint-line {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.hint-abbr {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  flex-shrink: 0;
+}
+.hint-abbr b {
+  color: var(--accent);
+  font-weight: 600;
+}
+.hint-tag {
+  font-size: 11px;
+  padding: 0 6px;
+  border-radius: 6px;
+  background: var(--accent-soft);
+  color: var(--accent-soft-text);
+  flex-shrink: 0;
+}
+.hint-tag-me {
+  background: var(--info-soft);
+  color: var(--info);
+}
+.hint-trigger {
+  font-size: 11px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+.hint-desc {
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hint-preview {
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.hint-standard .hint-preview,
+.hint-detail .hint-preview {
+  margin-top: 2px;
+}
+.hint-body-preview {
+  margin-top: 4px;
+  padding: 5px 8px;
+  max-height: 72px;
+  overflow: hidden;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--text-secondary);
+  background: var(--surface-3);
+  border-radius: 8px;
+}
+.hint-more {
+  padding: 4px 12px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  border-top: 1px solid var(--border);
+  background: var(--surface-2);
+}
+.hint-timer {
+  height: 3px;
+  background: var(--dot-ok);
+  transform-origin: left;
+  animation-name: hint-countdown;
+  animation-timing-function: linear;
+  animation-fill-mode: forwards;
+}
+@keyframes hint-countdown {
+  from {
+    transform: scaleX(1);
+  }
+  to {
+    transform: scaleX(0);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .hint-timer {
+    animation: none;
+  }
+}
+.hint-opaque .hint-panel {
+  border-radius: 0;
+}
+.hint-opaque .hint-inner {
+  border-radius: 6px;
+}

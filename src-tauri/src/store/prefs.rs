@@ -62,6 +62,10 @@ pub struct AppPrefs {
     /// prefs are never exported or kept in the revision history.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cloud: Option<CloudPrefs>,
+    /// The beginner typing hint overlay (`crate::hint`); off by default. Left out of the file
+    /// while it is the default, so a file without it is written back unchanged.
+    #[serde(skip_serializing_if = "CandidateHintPrefs::is_default")]
+    pub candidate_hint: CandidateHintPrefs,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -73,7 +77,75 @@ impl Default for AppPrefs {
             log_level: None,
             clipboard: ClipboardPrefs::default(),
             cloud: None,
+            candidate_hint: CandidateHintPrefs::default(),
             extra: Map::new(),
+        }
+    }
+}
+
+/// Bounds of `app.candidate_hint.duration_ms`: 1 to 10 seconds.
+pub const HINT_DURATION_MS: RangeInclusive<u64> = 1000..=10_000;
+pub const DEFAULT_HINT_DURATION_MS: u64 = 2000;
+
+/// `app.candidate_hint`: whether the typing hint shows, and for how long after the last key.
+/// Read field by field like [`ClipboardPrefs`]: a wrong value takes its default and never
+/// makes the file count as damaged.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CandidateHintPrefs {
+    pub enabled: bool,
+    /// Within [`HINT_DURATION_MS`].
+    pub duration_ms: u64,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl Default for CandidateHintPrefs {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            duration_ms: DEFAULT_HINT_DURATION_MS,
+            extra: Map::new(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CandidateHintPrefs {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Value::deserialize(deserializer).map(Self::from_value)
+    }
+}
+
+impl CandidateHintPrefs {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+    fn from_value(value: Value) -> Self {
+        let Value::Object(mut fields) = value else {
+            invalid("app.candidate_hint", &value, "not_an_object");
+            return Self::default();
+        };
+        let enabled = match fields.remove("enabled") {
+            None => false,
+            Some(Value::Bool(on)) => on,
+            Some(other) => {
+                invalid("app.candidate_hint.enabled", &other, "not_a_bool");
+                false
+            }
+        };
+        let duration_ms = match fields.remove("duration_ms") {
+            None => DEFAULT_HINT_DURATION_MS,
+            Some(other) => match other.as_u64().filter(|ms| HINT_DURATION_MS.contains(ms)) {
+                Some(ms) => ms,
+                None => {
+                    invalid("app.candidate_hint.duration_ms", &other, "out_of_range");
+                    DEFAULT_HINT_DURATION_MS
+                }
+            },
+        };
+        Self {
+            enabled,
+            duration_ms,
+            extra: fields,
         }
     }
 }
@@ -514,6 +586,13 @@ pub fn update_prefs(
 /// `app.auto_listen_on_start`; false when prefs cannot be read.
 pub fn auto_listen_on_start(dir: &Path) -> bool {
     load_prefs(dir).is_ok_and(|prefs| prefs.app.auto_listen_on_start)
+}
+
+/// `app.candidate_hint`; the default (off) when prefs cannot be read.
+pub fn candidate_hint(dir: &Path) -> CandidateHintPrefs {
+    load_prefs(dir)
+        .map(|prefs| prefs.app.candidate_hint)
+        .unwrap_or_default()
 }
 
 /// Moves a damaged file aside, keeping its bytes. Only the error category

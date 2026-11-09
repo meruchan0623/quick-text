@@ -1,1 +1,1 @@
-{"main-events":{"identifier":"main-events","description":"Allow the main window to receive runtime status events.","local":true,"windows":["main"],"permissions":["core:event:default"]}}
+{"hint-events":{"identifier":"hint-events","description":"Allow the beginner typing hint window to receive what it shows.","local":true,"windows":["hint"],"permissions":["core:event:default"]},"main-events":{"identifier":"main-events","description":"Allow the main window to receive runtime status events.","local":true,"windows":["main"],"permissions":["core:event:default"]}}

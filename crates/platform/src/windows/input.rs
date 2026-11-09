@@ -260,6 +260,8 @@ impl Consumer {
                 // Presses go to the click cross-check.
                 if record.down() {
                     self.seen.push(Sighting::Click(Source::Raw));
+                    // A click may move the caret: the hinted word is over.
+                    crate::hint::clear();
                 }
                 continue;
             }

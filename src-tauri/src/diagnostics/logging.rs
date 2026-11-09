@@ -103,6 +103,7 @@
 //! | `fault.injected` | warn | an injected fault was armed or fired; fault `point`, and `param` when armed by `debug_inject_fault` |
 //! | `frontend.error` | warn | `log_frontend_error`; error class (a built-in name or `other`), message length and fingerprint, source and stack frames as `<chunk hash>.js:line:col` only for Vite chunks embedded in the binary (the list `AssetResolver::iter` gives; empty in dev builds) at a line and column inside the chunk, printed from the parsed numbers, whether the source was dropped, count of dropped stack lines; never any caller text |
 //! | `history.cleared` | info | `clear_history` emptied the execution history |
+//! | `hint.window_failed` | warn | the beginner typing hint window could not be built; the hint stays off; error |
 //! | `hook.ping_timeout` | warn | the hook thread did not answer the self-test heartbeat in time |
 //! | `hook.install_timeout` | warn | the hook thread did not answer an install request in time |
 //! | `hook.panic` | error | hook callbacks panicked since the last report; `count` |
@@ -127,6 +128,7 @@
 //! | `permissions.requested` | info | macOS launch with a permission missing, or 「去授权」 (`source` = `ui`): the system prompts for the missing ones were shown; whether all are now `granted` |
 //! | `permissions.settings_failed` | warn | System Settings could not be opened at the privacy pane at launch; error |
 //! | `prefs.auto_listen` | info | `set_auto_listen`; `enabled` and whether it `changed` |
+//! | `prefs.candidate_hint` | info | `set_candidate_hint`; `enabled` and `duration_ms` |
 //! | `rawinput.rebuild_skipped` | info | a RawInput detector rebuild was skipped: the engine is shutting down |
 //! | `rawinput.closed` | info | the RawInput window closed; whether the close was `expected` |
 //! | `rawinput.dropped_busy` | debug | a RawInput-only match was dropped because the executor was busy; it goes to the execution history |

@@ -860,10 +860,16 @@ fn detect_candidate_with_diagnostics(
     };
     buffer.push(&event, allowed);
     if let Some(reason) = blocked {
+        crate::hint::clear();
         diagnostics.note(reason);
         return None;
     }
     if !matches!(event.kind, Kind::Text(_)) {
+        match event.kind {
+            Kind::Backspace => crate::hint::edited(&buffer.text),
+            Kind::Reset => crate::hint::clear(),
+            _ => {}
+        }
         diagnostics.note(match event.kind {
             Kind::Reset if event.modified => MatchDecision::Modifier,
             Kind::Reset | Kind::Backspace => MatchDecision::Reset,
@@ -889,19 +895,23 @@ fn detect_candidate_with_diagnostics(
         None
     };
     if let Some(reason) = target_block {
+        crate::hint::clear();
         diagnostics.note(reason);
         return None;
     }
     let Ok(compiler) = shared.compiled.lock() else {
+        crate::hint::clear();
         diagnostics.note(MatchDecision::CompilerUnavailable);
         return None;
     };
     if compiler.config.revision != event.stamp.revision {
         buffer.text.clear();
+        crate::hint::clear();
         diagnostics.note(MatchDecision::RevisionChanged);
         return None;
     }
     if !compiler.config.enabled {
+        crate::hint::clear();
         diagnostics.note(MatchDecision::Disabled);
         return None;
     }
@@ -912,6 +922,7 @@ fn detect_candidate_with_diagnostics(
         .iter()
         .any(|process| process.eq_ignore_ascii_case(&target.process))
     {
+        crate::hint::clear();
         diagnostics.note(MatchDecision::Blacklisted);
         return None;
     }
@@ -926,9 +937,12 @@ fn detect_candidate_with_diagnostics(
         previous.as_deref().zip(terminator),
         &foreground_context,
     ) else {
+        // Beginner hints (crate::hint): the word typed so far, in a target that can match.
+        crate::hint::typed(&buffer.text, &target.process);
         diagnostics.note(MatchDecision::NoMatch);
         return None;
     };
+    crate::hint::clear();
     let risky = ime_active() || (event.stamp.layout & 0x3ff) == 4;
     let rule = compiler
         .config
