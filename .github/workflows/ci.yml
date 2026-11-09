@@ -11,7 +11,8 @@
 #   deps           every PR; weekly    dependency direction + cargo deny (B-51); the
 #                                      advisories check runs weekly / on demand only (the
 #                                      weekly cron, not the nightly one)
-#   frontend       every PR            typecheck, lint, format, test (FE-53), check:bundle
+#   frontend       every PR            version:check (manifests agree, SemVer 2.0.0), typecheck,
+#                                      lint, format, test (FE-53), check:bundle
 #                                      (no mock backend in production builds, FE-18), self-test
 #                                      of the packaging check on the embedded frontend
 #   notices        every PR            every distributed Rust crate and npm package has a license
@@ -183,6 +184,11 @@ jobs:
 
       - name: Install
         run: npm ci
+
+      # package.json, package-lock.json, tauri.conf.json, Cargo.toml and Cargo.lock carry the
+      # same SemVer version (scripts/version.mjs; installers.yml stamps builds from it).
+      - name: Versions agree (SemVer)
+        run: npm run version:check
 
       # `npm run doctor` (0.4) bundles these; they run as separate steps so a failure shows
       # which gate broke.
