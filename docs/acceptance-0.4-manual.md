@@ -1920,14 +1920,14 @@ S-29 在计划里是 0.4 的 **P0** 条目（development-plan.md:630、2381）�
 - **出处**：development-plan.md:630、720、2381；s-29.md §0（第 12 行）、§3.5（第 186–199 行）。
 - **结果**：日期 ____；机器 ____；构建 ____；☐通过 ☐不通过 ☐未测；备注（探针的提交或来源：____；T-09 ____；T-10 ____；T-11 ____；T-12 ____；T-13 ____；T-14 ____；缩小范围的书面同意：____）
 
-### M4-SP-03 Backspace 擦除单元 T-15 ～ T-21
+### M4-SP-03 Backspace 擦除单元 T-15 ～ T-20
 
 - **步骤**：
   1. 按 s-29.md §4.5（第 267–281 行）操作，**不需要注入**：
      1. 把展开文本复制到剪贴板；
      2. 在目标程序里先输入前文 `x `，再粘贴；
      3. 一次一次按 Backspace，数到只剩前文为止，这个次数就是 U。
-  2. 对 T-15 ～ T-19 逐条记录。T-20 需要 espanso，可选，没做时写「未做（可选）」，不要留空。T-21 按 s-29.md:279 要等 B-34 实现（0.5.x）之后才能做，记「不适用：B-34 未实现」。
+  2. 对 T-15 ～ T-19 逐条记录。T-20 按 s-29.md:278 要等 B-34 实现（0.5.x）之后才能做，记「不适用：B-34 未实现」。
 - **预期结果**：见 s-29.md 表中的「预期」栏。
 - **通过标准**：T-15 ～ T-19 都有记录，并建立「擦除模型表」（按进程映像名列出）。
 - **出处**：s-29.md §0（第 13 行）、§4.5。
@@ -1940,7 +1940,7 @@ S-29 在计划里是 0.4 的 **P0** 条目（development-plan.md:630、2381）�
   2. 更新 §7 附录 C.2 回填表（第 317–324 行）：
      - #3 ← T-09、T-10、T-11；
      - #8 ← T-06；
-     - #27 ← T-15 ～ T-21；
+     - #27 ← T-15 ～ T-20；
      - #28 ← T-01 ～ T-08。
   3. 由开发同步 development-plan.md 附录 C.2 的状态。
 - **预期结果**：s-29.md 不再有已经测过却仍写着「待实测」的地方。
@@ -2217,7 +2217,7 @@ S-29 在计划里是 0.4 的 **P0** 条目（development-plan.md:630、2381）�
 9. **p50/p95 汇总缺失**（未修）：`get_health` 还没有 p50/p95 汇总（`src-tauri/src/commands/diagnostics.rs:506` 是 TODO），只有每条历史的 StageTimings，日志和诊断包里都没有耗时。release 界面只在「最近执行」显示总耗时（`total_us`，按毫秒取整），各阶段耗时只能在 debug-fi 构建里用 `list_history` 取（PF-01）。前端也没有调用 `report_metric`、`self_test`、`set_log_level`。
 10. **`scripts/soak/`**（已补，`9cbe400`）：计划 L6（development-plan.md:2477）要求的浸泡监视脚本已加在 `scripts/soak/`，PF-05 使用。performance-baseline.md:82 原写「目前尚不存在」，本次修订已同步。
 11. **版本号仍是 0.3.1**：所以本清单的构建栏要求写提交哈希。
-12. **§5.5「现有实现位置」过时**：引用的仍是拆分前的 `windows.rs`、`windows_espanso.rs`、`main.rs` 行号；performance-baseline.md:40 也是如此。
+12. **§5.5「现有实现位置」过时**：引用的仍是拆分前的 `windows.rs`、旧 Windows 输入后端模块、`main.rs` 行号；performance-baseline.md:40 也是如此。
 13. **S-06 与代码参数的关系**：计划 S-06 写「50 次按键」，代码中 K=5、R=8，最多 33 次按下（`liveness.rs:47-51`，符合要求）。但「10 秒内」这一条在用户不打字时由谁保证，代码注释里没有说明（SV-05 变体 b）。
 14. **计划 §11 的实机矩阵列不对应**：development-plan.md:2518-2554 的「自动」列在 0.4 没有对应物。其中管理员记事本一行（S-20）不在 0.4 范围。
 15. **TODO 26**：另一个窗口里的 `save_draft` 没有纳入保存进行中的跟踪（合并记录）。本清单没有为它单列条目。
@@ -2263,7 +2263,7 @@ S-29 在计划里是 0.4 的 **P0** 条目（development-plan.md:630、2381）�
 | `src-tauri/src/startup.rs:294` | 登录时冷启动的时序 | SV-10 |
 | `src-tauri/src/tray.rs:301` | macOS 通知 | 不适用（本清单只测 Windows） |
 | `crates/platform/src/supervisor_wiring.rs:490` | macOS 的 native_ready（权限、Secure Input） | 不适用（本清单只测 Windows） |
-| docs/spikes/s-29.md T-01 ～ T-21 | 三项 spike 的实测 | SP-01 ～ SP-04 |
+| docs/spikes/s-29.md T-01 ～ T-20 | 三项 spike 的实测 | SP-01 ～ SP-04 |
 | docs/performance-baseline.md 各「待实测」栏（第 40–67 行、第 89 行、第 115–116 行） | 性能基线和浸泡记录 | PF-01 ～ PF-05 |
 | development-plan.md:215【待核实】 | Ctrl+Shift+Esc 的实际表现 | IN-07 |
 | merge-log 第 525 行 | 剪贴板健康链在实机上的表现 | CB-07、FE-07 |

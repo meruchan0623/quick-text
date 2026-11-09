@@ -18,7 +18,7 @@
 - [2. 现状评估](#s2)
   - [2.1 已有能力](#s2-1) · [2.2 已确认问题](#s2-2) · [2.3 工程现状](#s2-3)
 - [3. 对标分析](#s3)
-  - [3.1 Quicker 文本指令功能矩阵](#s3-1) · [3.2 espanso 稳定性对标](#s3-2) · [3.3 功能路径简化：8 个任务](#s3-3) · [3.4 其他同类工具](#s3-4)
+  - [3.1 Quicker 文本指令功能矩阵](#s3-1) · [3.2 稳定性差距](#s3-2) · [3.3 功能路径简化：8 个任务](#s3-3) · [3.4 其他同类工具](#s3-4)
 - [4. 设计原则](#s4)
 - [5. 功能规划](#s5)
   - [5.1 总目录](#s5-1) · [5.2 P0 详细卡片](#s5-2) · [5.3 P1 / P2 条目](#s5-3) · [5.4 不做与推迟](#s5-4) · [5.5 不得倒退清单](#s5-5)
@@ -44,7 +44,7 @@
 | 项目 | 内容 |
 |---|---|
 | 目标 | 回答四个问题：还要加什么功能；界面怎么改；后端怎么开发；前端怎么呈现 |
-| 对标对象 | 稳定性和功能路径的简洁程度对标开源项目 espanso；功能和界面对标 Quicker 文本指令（<https://getquicker.net/KC/Manual/Doc/textcommand>），并在其基础上结合日常工作做得更实用 |
+| 对标对象 | 稳定性与功能路径力求简洁；功能和界面对标 Quicker 文本指令（<https://getquicker.net/KC/Manual/Doc/textcommand>），并在其基础上结合日常工作做得更实用 |
 | 范围 | 0.4 → 1.0 的开发计划，以及 1.0 之后的展望 |
 | 读者 | 项目所有者（产品取舍、附录 C 中的确认问题）、后端开发、前端开发、测试与验收人员 |
 | 不包含 | 代码实现。本文发布时不修改任何源码 |
@@ -72,7 +72,7 @@
 | `B-xx` | 后端实现条目 | B-01 ~ B-54 | 实现层，挂靠 S/F |
 | `FE-xx` | 前端实现条目 | FE-01 ~ FE-53 | 实现层，挂靠 S/F/U |
 | `T1–T8` | 路径简化任务 | 8 个 | §3.3 |
-| `G1–G15` | 与 espanso 的稳定性差距 | 15 个 | §3.2 |
+| `G1–G15` | 稳定性差距 | 15 个 | §3.2 |
 | `ADR-a ~ f` | 架构决策 | 6 项 | §1.4 表内 |
 | `R-09` 等 | 风险 | R-01 ~ R-15 | §12；与 Quicker 矩阵中的「R-xx 规则字段」不同，矩阵编号只在 §3.1 出现 |
 
@@ -119,7 +119,7 @@
 
 | 术语 | 含义 |
 |---|---|
-| RawInput | Windows 原始输入 API；本项目用它只识别硬件按键（`known_source != 0`）。原生检测与注入代码 vendored 自 espanso v2.4.1：`vendor/espanso-win32/{detect,inject}/native.{cpp,h}`，含本地补丁（去掉 `RIDEV_NOLEGACY`、注入事件加标记、返回发送计数，清单见 `THIRD_PARTY_NOTICES.md`）；Rust 侧桥接 `crates/platform/src/windows_espanso.rs` 为自研 |
+| RawInput | Windows 原始输入 API；本项目用它只识别硬件按键（`known_source != 0`）。原生检测与注入代码 vendored 自第三方 Win32 组件（`vendor/` 下的 Win32 组件目录，`{detect,inject}/native.{cpp,h}`，来源见 `THIRD_PARTY_NOTICES.md`），含本地补丁（去掉 `RIDEV_NOLEGACY`、注入事件加标记、返回发送计数，清单见 `THIRD_PARTY_NOTICES.md`）；Rust 侧桥接 `旧 Windows 输入后端模块` 为自研 |
 | 低级钩子 | `WH_KEYBOARD_LL`/`WH_MOUSE_LL`；回调超时（`LowLevelHooksTimeout`）后会被系统静默摘除 |
 | SendInput | 注入按键的 API；本项目注入的事件带标记 `0x51545854` |
 | UIPI | 用户界面特权隔离：普通进程不能向管理员进程注入输入 |
@@ -140,15 +140,15 @@
 <a id="s1-1"></a>
 ### 1.1 一句话现状
 
-【现状】0.3.1 的单次注入安全性已经比 espanso 更严格（剪贴板多格式租约、注入结果校验、粘贴失败不降级为键入），但长时间运行的生存能力很弱（执行线程、钩子没有容错，配置损坏就无法启动，没有日志）。新建一条短语要 8–9 步，主要卡在「保存 → 应用设置 → 恢复监听」。
+【现状】0.3.1 的单次注入安全性已经较严格（剪贴板多格式租约、注入结果校验、粘贴失败不降级为键入），但长时间运行的生存能力很弱（执行线程、钩子没有容错，配置损坏就无法启动，没有日志）。新建一条短语要 8–9 步，主要卡在「保存 → 应用设置 → 恢复监听」。
 
 <a id="s1-2"></a>
 ### 1.2 三条主线
 
 | 主线 | 对标 | 目标 | 主要编号 |
 |---|---|---|---|
-| ① 稳定性 | espanso | 「任何单点故障都不会让展开静默失效」：出错自动恢复，恢复不了就明确告诉用户；配置损坏也能启动；所有失败都有记录 | S-01 ~ S-09、S-18 ~ S-21、S-23、S-25、S-27 ~ S-29 |
-| ② 路径简化 | espanso | 常用任务步数降到 espanso 水平或更少：新建 3–4 步，忘了缩写时 3 步插入，误展开 1 步撤销 | F-01、F-05、F-11、F-15 ~ F-20（§3.3） |
+| ① 稳定性 | 自定标准 | 「任何单点故障都不会让展开静默失效」：出错自动恢复，恢复不了就明确告诉用户；配置损坏也能启动；所有失败都有记录 | S-01 ~ S-09、S-18 ~ S-21、S-23、S-25、S-27 ~ S-29 |
+| ② 路径简化 | 自定标准 | 常用任务步数尽量少：新建 3–4 步，忘了缩写时 3 步插入，误展开 1 步撤销 | F-01、F-05、F-11、F-15 ~ F-20（§3.3） |
 | ③ 功能与界面 | Quicker 文本指令 | 保留 Quicker 用户熟悉的心智模型；在多语言话术、模板填写、搜索插入、撤销与版本、诊断上超越 | F-02 ~ F-14、F-21 ~ F-30、U-01 ~ U-35 |
 
 <a id="s1-3"></a>
@@ -208,18 +208,17 @@
 
 | 领域 | 现状 | 证据 |
 |---|---|---|
-| 检测 | RawInput 只认硬件按键（`known_source != 0`）。原生检测代码 vendored 自 espanso v2.4.1（commit `a87d1723f47a59e38d370e2f0c636d66d568b8f6`）：`vendor/espanso-win32/detect/native.{cpp,h}`，含本地补丁（去掉 `RIDEV_NOLEGACY` 等）；Rust 桥接 `windows_espanso.rs` 为自研 | `crates/platform/src/windows_espanso.rs:155-157`；`THIRD_PARTY_NOTICES.md` |
+| 检测 | RawInput 只认硬件按键（`known_source != 0`）。原生检测代码 vendored 自第三方 Win32 组件（`vendor/` 下的 Win32 组件目录，`detect/native.{cpp,h}`，提交见 `THIRD_PARTY_NOTICES.md`），含本地补丁（去掉 `RIDEV_NOLEGACY` 等）；Rust 桥接 旧 Windows 输入后端模块 为自研 | `旧 Windows 输入后端模块:155-157`；`THIRD_PARTY_NOTICES.md` |
 | 注入 | SendInput 注入，事件的 `dwExtraInfo` 带标记 `MARK = 0x51545854`；键盘钩子、鼠标钩子见到该标记直接放行，自身注入不会再次触发。其他程序的模拟输入（`LLKHF_INJECTED` 且无标记）会让匹配失效 | 定义 `crates/platform/src/windows.rs:22`；写入 `:816, :932`；键盘钩子放行 `:432-434`；鼠标钩子放行 `:500`；外部模拟输入失效 `:438-442` |
 | 触发方式 | 即时、按空格、按分号；忽略大小写；正则（编译时自动以 `$` 锚定）。即时模式只接受字面缩写，正则只能用于终止键模式（编译时报 `immediate_regex`）。左边界检查只在终止键模式下生效 | `crates/domain/src/matching.rs:120-148, 230-236, 249-250` |
-| 缓冲重置 | 鼠标点击和滚轮、焦点变化、插入点移动、键盘布局变化、配置版本变化、按键序号不连续时清空输入缓冲；单独按住 Ctrl 或 Alt、或按住 Win 时的按键，以及 Tab、Enter、Esc、方向键等一律视为重置 | 鼠标 `crates/platform/src/windows.rs:540-545`；`Buffer::push` 按 Stamp（焦点、插入点、布局、版本）与序号判断 `crates/platform/src/windows_espanso.rs:83-89, 120-135`；按键分类 `:109-119, 190-191` |
+| 缓冲重置 | 鼠标点击和滚轮、焦点变化、插入点移动、键盘布局变化、配置版本变化、按键序号不连续时清空输入缓冲；单独按住 Ctrl 或 Alt、或按住 Win 时的按键，以及 Tab、Enter、Esc、方向键等一律视为重置 | 鼠标 `crates/platform/src/windows.rs:540-545`；`Buffer::push` 按 Stamp（焦点、插入点、布局、版本）与序号判断 `旧 Windows 输入后端模块:83-89, 120-135`；按键分类 `:109-119, 190-191` |
 | 操作类型 | 12 种：不执行、键入纯文本、粘贴纯文本、粘贴带格式、按快捷键、文字与按键组合、多步骤（21 条命令，可中途停止）、重放键鼠（11 个 opcode）、打开、常用电脑操作（14 项）、执行另一条、保留的 Quicker 动作 | `src/model.ts:7`；`src/ActionEditor.tsx:37` |
 | 变量 | 正文中：`{cliptext}`、`{selection}`、`{param:名称}`、`{0:格式}` 日期、`FILE:` 外部文件。`{$N}` 不是正文变量，只用于参数来源 `ParameterSource::CaptureTemplate`，代入时对捕获值做 URL 编码 | `crates/domain/src/content.rs:112-156, 271`；`crates/domain/src/matching.rs:30-93`（编码在 `:73-90`）；`src/ActionEditor.tsx:32` |
 | 停止热键 | 键盘钩子中识别 Ctrl+Shift+Esc，设置取消标志并吞掉该键。该组合同时是系统「任务管理器」快捷键，实机行为【待核实】；【计划】改为可配置、默认 Ctrl+Alt+Pause（§6.4） | `crates/platform/src/windows.rs:454-460` |
 | 剪贴板保护 | 粘贴前租用剪贴板，保存多种格式，粘贴后恢复 | `crates/platform/src/windows.rs:1714-1843` |
-| 自身窗口 | 本程序窗口中不触发展开 | `README.md:14`；`crates/platform/src/windows_espanso.rs:258-262` |
+| 自身窗口 | 本程序窗口中不触发展开 | `README.md:14`；`旧 Windows 输入后端模块:258-262` |
 | 存储 | 草稿 → 生效两段式；每次发布写一个 revision；原子写入；外部修改时按哈希拒绝覆盖；可回退一级 | `src-tauri/src/main.rs:139-248, 278-310` |
 | 导入 | Quicker JSON：类型 0/2/3/6/7 可用，其余导入后停用；冲突只按 id 判断 | `README.md:45`；`crates/domain/src/package.rs`；`src-tauri/src/main.rs:532-623` |
-| 导出 | 已有 espanso 子集导出函数，但未暴露为命令 | `crates/domain/src/package.rs:541` |
 | 自启 | 登录自启写入 HKCU Run 键，带 `--background` | `src-tauri/src/main.rs:769` |
 | 验收模式 | `QUICKER_TEXT_TEST_INPUT=1`、`--acceptance-test-input`、`QUICKER_TEXT_DATA_DIR` | `crates/platform/src/lib.rs:9-25`；`docs/windows-acceptance-mode.md` |
 | 测试 | `cargo test --workspace` 共 131 个（`crates/domain/tests` 97 个 + 文件内 34 个）：130 通过、1 忽略；前端没有测试、lint、格式化脚本 | `package.json`；`crates/domain/tests/` |
@@ -233,7 +232,7 @@
 |---|---|---|---|---|
 | 1 | 执行线程没有 `catch_unwind`；busy 标志只在末尾复位 | `crates/platform/src/windows.rs:211-228, 652-717` | 一次 panic 后，所有短语静默失效，直到重启 | S-01 |
 | 2 | 鼠标钩子中使用阻塞的 `lock().unwrap()` | `crates/platform/src/windows.rs:497-545` | 钩子超时被系统摘除；或 panic 终止进程 | S-02 |
-| 3 | RawInput 循环退出后只设置 READY=false / paused=true，不重建 | `crates/platform/src/windows_espanso.rs:356-358` | 监听永久停止，托盘仍可能显示正常 | S-03 |
+| 3 | RawInput 循环退出后只设置 READY=false / paused=true，不重建 | `旧 Windows 输入后端模块:356-358` | 监听永久停止，托盘仍可能显示正常 | S-03 |
 | 4 | 配置损坏时无法启动：`Store::load` 中任一文件读取或编译失败都用 `?` 向上返回，经 `setup` 传到 `run()` 末尾唯一的 `.expect("Quicker Text startup failed")`，进程 panic 退出 | `src-tauri/src/main.rs:67-90, 853, 1017` | 程序打不开，用户以为话术丢了 | S-04 |
 | 5 | 没有日志；release 配置 `strip = true` | `Cargo.toml:10-13` | 出问题无从排查 | S-08 |
 | 6 | 剪贴板中只要有基于句柄的 GDI / owner-display 格式（CF_BITMAP 2、CF_METAFILEPICT 3、CF_PALETTE 9、CF_ENHMETAFILE 14、私有显示格式 0x80–0x8F）就整体拒绝备份并保留缩写；大小为 0 或超过 32MB 的格式同样拒绝 | `crates/platform/src/windows.rs:1746-1755` | 【推断】截图或从 Office 复制之后剪贴板常含 CF_BITMAP 或 CF_ENHMETAFILE，粘贴类短语会失败 | S-07 |
@@ -244,7 +243,7 @@
 
 | # | 问题 | 证据 | 处理 |
 |---|---|---|---|
-| 9 | Windows 运行时只认空格和分号，但默认值和界面包含 Tab/回车 | `crates/platform/src/windows_espanso.rs:231-240`；`crates/domain/src/model.rs:12-19`；`src/model.ts:5` | S-12、S-16 |
+| 9 | Windows 运行时只认空格和分号，但默认值和界面包含 Tab/回车 | `旧 Windows 输入后端模块:231-240`；`crates/domain/src/model.rs:12-19`；`src/model.ts:5` | S-12、S-16 |
 | 10 | 输入法删除方式默认 escape，但 Windows 后端一律用退格 | `crates/domain/src/model.rs:54` | S-16 |
 | 11 | 匹配优先级只看长度，再看顺序；普通缩写可能被宽泛的正则抢走 | `crates/domain/src/matching.rs:177` | S-17 |
 | 12 | 即时触发不检查左边界，而新规则默认即时触发 | `crates/domain/src/matching.rs:143-148`（左边界只在 `:144` 对终止键模式检查）；`src/model.ts:6` | F-10 |
@@ -253,7 +252,7 @@
 | 15 | 选区通过 PowerShell UIA 获取，超时 5 秒；拾取窗口和捕获选区固定等待 3 秒 | `crates/platform/src/windows.rs:239-289`；`src-tauri/src/main.rs:451, 484, 735` | S-22、F-17 |
 | 16 | 发布配置使用两把锁；有动作正在执行时，发布会先置暂停与取消标志（正在执行的动作因此被中止），再返回错误「An action is still running; cancel it and apply again」，本次发布失败，需要再点一次「应用设置」 | `src-tauri/src/main.rs:154-160, 202-203` | S-18、F-01 |
 | 17 | `revisions/` 无限增长，且只能回退一级 | `src-tauri/src/main.rs:245-248` | F-39 |
-| 18 | 中文输入法开着时没有策略，只有事后的风险提示 | `crates/platform/src/windows.rs:354-365`；`crates/platform/src/windows_espanso.rs:286, 393-395` | S-11 |
+| 18 | 中文输入法开着时没有策略，只有事后的风险提示 | `crates/platform/src/windows.rs:354-365`；`旧 Windows 输入后端模块:286, 393-395` | S-11 |
 | 19 | 目标是管理员窗口时，只能在注入后发现失败 | `crates/platform/src/windows.rs:771-785` | S-20 |
 
 **界面**
@@ -308,10 +307,10 @@
 
 | 方面 | 现状 | 证据 |
 |---|---|---|
-| 代码规模 | `src-tauri/src/main.rs` 1304 行；`crates/platform/src/windows.rs` 2100 行；`windows_espanso.rs` 797 行；`macos.rs` 2165 行；`crates/platform/src/lib.rs` 166 行；`crates/domain` 合计 3617 行 | 各文件 |
+| 代码规模 | `src-tauri/src/main.rs` 1304 行；`crates/platform/src/windows.rs` 2100 行；旧 Windows 输入后端模块 797 行；`macos.rs` 2165 行；`crates/platform/src/lib.rs` 166 行；`crates/domain` 合计 3617 行 | 各文件 |
 | 命令 | 23 个 Tauri 命令：17 个返回 `Result<T, String>`；6 个返回裸值（`validate_config` → `Validation`、`parse_source` → `Value`、`cancel_execution` → `bool`、`choose_file` → `Option<Vec<String>>`、`get_cursor` → `Value`、`exit_app` → `()`）。5 个命令的签名含 `serde_json::Value`（`test_rule`、`parse_source`、`import_config`、`get_cursor`、`capture_selection`）；另有 `AppState.engine_detail` 字段为 `Value` | `src-tauri/src/main.rs:991-1015`；签名 `:378, 411, 536, 725, 729`；字段 `:36` |
-| unwrap/expect（非测试代码） | `main.rs` 19 个 unwrap + 2 个 expect（213 为序列化已校验配置，1017 为启动失败时的唯一出口，见 §2.2 #4）；`windows.rs` 14；`windows_espanso.rs` 7；`macos.rs` 28 | 各文件 |
-| 全局状态 | OnceLock 全局变量，引擎只能启动一次（「Engine already started」） | `crates/platform/src/windows.rs:165-166, 198, 643-645`；`windows_espanso.rs:40-45` |
+| unwrap/expect（非测试代码） | `main.rs` 19 个 unwrap + 2 个 expect（213 为序列化已校验配置，1017 为启动失败时的唯一出口，见 §2.2 #4）；`windows.rs` 14；旧 Windows 输入后端模块 7；`macos.rs` 28 | 各文件 |
+| 全局状态 | OnceLock 全局变量，引擎只能启动一次（「Engine already started」） | `crates/platform/src/windows.rs:165-166, 198, 643-645`；`旧 Windows 输入后端模块:40-45` |
 | 剪贴板租约 | 定义了三份 | `crates/domain/src/transaction.rs:303`；`crates/platform/src/windows.rs:1565`；`crates/platform/src/macos.rs:1550` |
 | 零引用模块 | domain 中导出但没有被引用的状态机模块 | `crates/domain/src/lib.rs:3, 4, 9, 11, 12, 17` |
 | 平台能力 | `capabilities()` 返回的 10 项共用一个布尔值；Enter/Tab 被禁用 | `crates/platform/src/lib.rs:111-133, 127` |
@@ -322,7 +321,7 @@
 | 前端类型 | `Data = Record<string, any>`；`bridge.ts` 在 Tauri 之外直接抛错 | `src/model.ts:1-4`；`src/bridge.ts` |
 | 窗口与安全 | 主窗口 1240×840，最小 900×650；CSP 为 `default-src 'self'` 等；没有 `src-tauri/capabilities/` 目录；插件只有 `tauri-plugin-notification`、`tauri-plugin-single-instance`；托盘用 `tauri` 的 `tray-icon` feature；文件对话框用 `rfd` 0.17，而不是对话框插件 | `src-tauri/tauri.conf.json`；`src-tauri/Cargo.toml`；`src-tauri/gen/schemas/capabilities.json` |
 | 仓库 | 没有 `.github/`、`deny.toml`、`clippy.toml`、`rustfmt.toml` | 仓库根目录 |
-| 许可 | 根 `LICENSE` 是 MIT 文本；README 写明组合程序按 GPL-3.0-or-later 分发、自研文件保留 MIT 声明；Cargo 的 workspace 与各 crate 声明 GPL-3.0-or-later；vendored espanso 代码为 GPL-3.0-or-later | `LICENSE`；`README.md:57`；`Cargo.toml:8`、`crates/domain/Cargo.toml:5`；`THIRD_PARTY_NOTICES.md` |
+| 许可 | 根 `LICENSE` 是 MIT 文本；README 写明组合程序按 GPL-3.0-or-later 分发、自研文件保留 MIT 声明；Cargo 的 workspace 与各 crate 声明 GPL-3.0-or-later；vendored 第三方 Win32 组件为 GPL-3.0-or-later | `LICENSE`；`README.md:57`；`Cargo.toml:8`、`crates/domain/Cargo.toml:5`；`THIRD_PARTY_NOTICES.md` |
 
 <a id="s3"></a>
 ## 3. 对标分析
@@ -409,13 +408,13 @@
 | 编号 | 功能 | 现状 | 结论 | 去向 |
 |---|---|---|---|---|
 | M-01 / M-02 | 只认物理按键；不支持中文缩写 | 同样限制 | 不做（平台限制）；搜索面板兜底，支持拼音首字母 | F-11 |
-| M-03 / M-04 | 点击、特殊键后重新匹配 | 已实现（`crates/platform/src/windows.rs:540-545`；`windows_espanso.rs:109-121`） | 对齐（已具备） | — |
+| M-03 / M-04 | 点击、特殊键后重新匹配 | 已实现（`crates/platform/src/windows.rs:540-545`；`旧 Windows 输入后端模块:109-121`） | 对齐（已具备） | — |
 | M-05 | 触发后重置检测 | 【待核实】 | 对齐：加入回归用例 | S-25 |
 | M-06 / M-12 | 模拟按键不触发；密码框与只读控件 | 已实现 | 超越（已具备） | — |
 | M-07 | 在自身窗口可用 | 相反：本程序窗口拒绝触发 | 超越：真实窗口仍排除，改在「试一试」中安全模拟 | F-06 |
 | M-08 | 修改后立即生效 | 需要「应用设置」 | 对齐 | F-01 |
 | M-09 | 普通优先于正则 | 按实际匹配文本长度降序，再按规则顺序；没有「普通优先于正则」（`crates/domain/src/matching.rs:177`） | 对齐（与 Quicker 2.3.1 相同）：普通优先于正则；同类中按配置的缩写长度降序，正则按表达式长度降序；仍相同按列表顺序 | S-17 |
-| M-10 | 切换窗口不丢缓冲 | 焦点变化即作废（`windows_espanso.rs:123-135`） | 不做：跨窗口拼接易误触 | — |
+| M-10 | 切换窗口不丢缓冲 | 焦点变化即作废（`旧 Windows 输入后端模块:123-135`） | 不做：跨窗口拼接易误触 | — |
 | M-11 | 表单 Esc 被误关 | 不适用 | 不适用；新表单 Esc 行为见 F-22 | — |
 | M-13 / M-14 / M-15 | 粘贴后清除剪贴板；不清除缩写；只提示不替换 | 未实现 | 对齐：触发选项 | F-35 |
 | M-16 | 按窗口标题生效 | 未实现 | 不做：ADR-d | — |
@@ -497,45 +496,43 @@
 **小结**：「不做 / 不适用 / 推迟」集中在三类：云服务与账号、Quicker 私有运行时、规则级程序范围（ADR-d）。其余全部对齐或超越。超越项集中在三处：保存与撤销（F-01、F-39、F-15）、搜索插入（F-11）、多语言话术（F-21、F-22、F-36）。
 
 <a id="s3-2"></a>
-### 3.2 espanso 稳定性对标（G1–G15）
+### 3.2 稳定性差距（G1–G15）
 
-espanso 一侧的做法来自对其公开源码与文档的调研；带【待核实】的项尚未逐条查证。
+| 机制 | 本项目现状 | 计划 |
+|---|---|---|
+| G1 执行线程容错 | 执行线程没有 `catch_unwind`，busy 只在末尾复位（`crates/platform/src/windows.rs:211-228, 652-717`） | S-01：`catch_unwind` 包住循环体；RAII `BusyGuard`；`parking_lot` 锁；panic 写日志并上报 Health |
+| G2 钩子零 panic 零阻塞 | RawInput 回调有 `catch_unwind`（`旧 Windows 输入后端模块:194-212`）；低级钩子没有，鼠标钩子用阻塞锁 | S-02：所有钩子入口 `catch_unwind`；只用原子操作；CI 检查 |
+| G3 自愈与真实就绪 | RawInput 循环退出后只置暂停，托盘可能假显示「监听中」 | S-03：进程内监督器、心跳、退避重启、熔断；Health 状态机；「修复」按钮 |
+| G4 配置损坏容错 | 任一文件损坏即启动失败：加载错误经 `?` 传到 `run()` 末尾唯一的 `.expect`（`src-tauri/src/main.rs:67-90, 853, 1017`） | S-04：`load_or_fallback` 永不返回错误；坏文件隔离；横幅说明恢复来源 |
+| G5 修饰键状态 | `Mutex<BTreeSet>`，争用时丢更新，无过期、无重同步 | S-05：原子位图；30 秒过期；会话事件后重同步 |
+| G6 输入源静默丢失 | 无存活检测。tao 0.37.1 只在创建事件循环时和 `set_device_event_filter` 中注册 RawInput；本项目未调用后者 | S-06（0.4）：低级钩子与 RawInput 交叉校验——RawInput 收到硬件按键而低级钩子在 N 毫秒内没有对应事件，即判定钩子被摘除并重装；禁止调用 `set_device_event_filter`；原生检测线程启动后再注册一次 RawInput，确保注册归本项目窗口 |
+| G7 剪贴板备份 | 多格式租约更强，但剪贴板中只要有基于句柄的 GDI / owner-display 格式（CF_BITMAP、CF_ENHMETAFILE 等）就整体拒绝，超大格式也拒绝 | S-07：可由系统从 CF_DIB 合成的 CF_BITMAP 跳过；CF_ENHMETAFILE 用 `CopyEnhMetaFile` 复制；其余句柄格式跳过并记日志；Full / BestEffort / TextOnly 三档 |
+| G8 可观测性 | 无日志；`strip = true` | S-08：tracing 滚动日志、`crash-*.txt`、诊断包 |
+| G9 开机自启 | 总以暂停启动 | S-09：自检后自动监听 |
+| G10 注入策略 | 每个操作二选一；固定 Ctrl+V 和 150ms | S-10：「自动」方式；按程序的粘贴键与延迟（剪贴板历史排除归 S-07） |
+| G11 IME | 只做风险判断（`旧 Windows 输入后端模块:286`） | S-11（0.5 P0）：探测 IME 状态，组字期间不处理终止键，默认本地模式跳过并提示 |
+| G12 Tab/Enter | 配置提供，运行时不认 | S-12 诚实化；F-32 实验性 ARM（ADR-c） |
+| G13 撤销、开关键、热加载、CLI | 都没有 | F-15、F-16、S-13、F-49 |
+| G14 修饰键等待 | 等 1 秒后拒绝 | S-14：保留「超时拒绝」，时长可配，提示「请松开 Ctrl/Shift」 |
+| G15 路径复杂度 | `transaction.rs`、`input_session.rs`、`erasure.rs` 的状态机未被运行时引用 | S-15：接入或删除，只保留一条执行路径 |
 
-| 机制 | espanso 做法 | 本项目现状 | 计划 |
-|---|---|---|---|
-| G1 执行线程容错 | worker 进程以退出码 51 退出时 daemon 重启 worker；其他任何退出码都让 daemon 整体退出（fail-stop） | 执行线程没有 `catch_unwind`，busy 只在末尾复位（`crates/platform/src/windows.rs:211-228, 652-717`） | S-01：`catch_unwind` 包住循环体；RAII `BusyGuard`；`parking_lot` 锁；panic 写日志并上报 Health |
-| G2 钩子零 panic 零阻塞 | 钩子在 C++ 侧，无 panic 穿越问题 | RawInput 回调有 `catch_unwind`（`crates/platform/src/windows_espanso.rs:194-212`）；低级钩子没有，鼠标钩子用阻塞锁 | S-02：所有钩子入口 `catch_unwind`；只用原子操作；CI 检查 |
-| G3 自愈与真实就绪 | daemon 监控 worker 退出码 | RawInput 循环退出后只置暂停，托盘可能假显示「监听中」 | S-03：进程内监督器、心跳、退避重启、熔断；Health 状态机；「修复」按钮 |
-| G4 配置损坏容错 | 先校验再重启 worker；失败保留旧 worker 并弹出排障窗口 | 任一文件损坏即启动失败：加载错误经 `?` 传到 `run()` 末尾唯一的 `.expect`（`src-tauri/src/main.rs:67-90, 853, 1017`） | S-04：`load_or_fallback` 永不返回错误；坏文件隔离；横幅说明恢复来源 |
-| G5 修饰键状态 | 30 秒过期 | `Mutex<BTreeSet>`，争用时丢更新，无过期、无重同步 | S-05：原子位图；30 秒过期；会话事件后重同步 |
-| G6 输入源静默丢失 | 无专门的存活检测【待核实】 | 无存活检测。tao 0.37.1 只在创建事件循环时和 `set_device_event_filter` 中注册 RawInput；本项目未调用后者 | S-06（0.4）：低级钩子与 RawInput 交叉校验——RawInput 收到硬件按键而低级钩子在 N 毫秒内没有对应事件，即判定钩子被摘除并重装；禁止调用 `set_device_event_filter`；espanso 检测线程启动后再注册一次 RawInput，确保注册归本项目窗口 |
-| G7 剪贴板备份 | 只备份文本，从不拒绝，但丢图片和富文本 | 多格式租约更强，但剪贴板中只要有基于句柄的 GDI / owner-display 格式（CF_BITMAP、CF_ENHMETAFILE 等）就整体拒绝，超大格式也拒绝 | S-07：可由系统从 CF_DIB 合成的 CF_BITMAP 跳过；CF_ENHMETAFILE 用 `CopyEnhMetaFile` 复制；其余句柄格式跳过并记日志；Full / BestEffort / TextOnly 三档 |
-| G8 可观测性 | 文件日志、panic 落盘、`espanso log` | 无日志；`strip = true` | S-08：tracing 滚动日志、`crash-*.txt`、诊断包 |
-| G9 开机自启 | 启动即工作 | 总以暂停启动 | S-09：自检后自动监听 |
-| G10 注入策略 | 自动：超过 100 字符改用剪贴板；粘贴键可配；恢复前等 300ms | 每个操作二选一；固定 Ctrl+V 和 150ms | S-10：「自动」方式；按程序的粘贴键与延迟（剪贴板历史排除归 S-07） |
-| G11 IME | 无专门处理 | 只做风险判断（`crates/platform/src/windows_espanso.rs:286`） | S-11（0.5 P0）：探测 IME 状态，组字期间不处理终止键，默认本地模式跳过并提示 |
-| G12 Tab/Enter | 作为词分隔符，不吞键 | 配置提供，运行时不认 | S-12 诚实化；F-32 实验性 ARM（ADR-c） |
-| G13 撤销、开关键、热加载、CLI | `undo_backspace`、toggle_key、文件监听、`espanso cmd` | 都没有 | F-15、F-16、S-13、F-49 |
-| G14 修饰键等待 | 等 3 秒，超时照常注入 | 等 1 秒后拒绝 | S-14：保留「超时拒绝」，时长可配，提示「请松开 Ctrl/Shift」 |
-| G15 路径复杂度 | 中间件链，一个关注点一个模块 | `transaction.rs`、`input_session.rs`、`erasure.rs` 的状态机未被运行时引用 | S-15：接入或删除，只保留一条执行路径 |
-
-**结论**：单次注入的安全性本项目已领先（剪贴板租约、注入校验、粘贴失败不降级为键入），这些优势列入「不得倒退清单」（§5.5）；长时间运行的生存能力全面落后，G1–G9 都排在 0.4 的 P0/P1（G6 对应的 S-06 已升为 0.4 P0，因为 0.4 的故障注入要求钩子被摘除后能自动恢复）。
+**结论**：单次注入的安全性本项目已较强（剪贴板租约、注入校验、粘贴失败不降级为键入），这些优势列入「不得倒退清单」（§5.5）；长时间运行的生存能力全面落后，G1–G9 都排在 0.4 的 P0/P1（G6 对应的 S-06 已升为 0.4 P0，因为 0.4 的故障注入要求钩子被摘除后能自动恢复）。
 
 <a id="s3-3"></a>
 ### 3.3 功能路径简化：8 个任务（T1–T8）
 
-| 任务 | 现状步数 | espanso | Quicker | 目标 | 实现手段 |
-|---|---|---|---|---|---|
-| T1 新建一条短语 | 8–9：打开主窗口 → 添加 → 缩写 → 触发方式 → 操作 → 正文 → 保存到草稿 → 应用设置 → 首次还要恢复监听 | 3（改 YAML，保存后自动重载） | 约 6 | 3–4 | F-01 保存即生效；F-05 默认只有缩写和正文；F-19 从选中新建；F-20、S-09 引导后自动监听 |
-| T2 带日期的短语 | 约 10（日期按钮插在正文末尾，不在光标处） | 约 5 | 文档未说明 | 约 5 | 输入 `{` 弹出变量补全，在光标处插入，实时预览（F-06、F-12、F-14） |
-| T3 临时填写字段的模板 | 不支持 | 3–5（`[[字段]]`） | 文档未说明 | 3–4 | 正文写 `[[客户]]` 即识别为字段，使用时在光标旁弹出表单（F-22） |
-| T4 在某程序中停用 | 4–5 | 4 | 3–4 | 2 | 托盘或搜索面板「在 <程序> 中停用」，立即生效、可撤销（F-17、F-01） |
-| T5 忘记缩写时插入 | 5 步以上且不能插入 | 3 | 5 步以上且不能插入 | 3 | 全局热键 → 输入（拼音首字母、模糊）→ Enter（F-11） |
-| T6 临时停用全部 | 1–2 | 1–2 | 2–3 | 1 | 托盘单击或 Ctrl+Alt+Q；可定时恢复（F-16） |
-| T7 导入别人的一套 | 4–5 | 1 | 5 | 2–3 | 导入向导：来源 → 冲突 → 完成，立即生效可撤销（F-18）；示例包（F-47） |
-| T8 撤销一次误展开 | 不支持 | 1（Backspace） | 不支持 | 1 | 展开后立即按 Backspace 恢复缩写（F-15） |
+| 任务 | 现状步数 | Quicker | 目标 | 实现手段 |
+|---|---|---|---|---|
+| T1 新建一条短语 | 8–9：打开主窗口 → 添加 → 缩写 → 触发方式 → 操作 → 正文 → 保存到草稿 → 应用设置 → 首次还要恢复监听 | 约 6 | 3–4 | F-01 保存即生效；F-05 默认只有缩写和正文；F-19 从选中新建；F-20、S-09 引导后自动监听 |
+| T2 带日期的短语 | 约 10（日期按钮插在正文末尾，不在光标处） | 文档未说明 | 约 5 | 输入 `{` 弹出变量补全，在光标处插入，实时预览（F-06、F-12、F-14） |
+| T3 临时填写字段的模板 | 不支持 | 文档未说明 | 3–4 | 正文写 `[[客户]]` 即识别为字段，使用时在光标旁弹出表单（F-22） |
+| T4 在某程序中停用 | 4–5 | 3–4 | 2 | 托盘或搜索面板「在 <程序> 中停用」，立即生效、可撤销（F-17、F-01） |
+| T5 忘记缩写时插入 | 5 步以上且不能插入 | 5 步以上且不能插入 | 3 | 全局热键 → 输入（拼音首字母、模糊）→ Enter（F-11） |
+| T6 临时停用全部 | 1–2 | 2–3 | 1 | 托盘单击或 Ctrl+Alt+Q；可定时恢复（F-16） |
+| T7 导入别人的一套 | 4–5 | 5 | 2–3 | 导入向导：来源 → 冲突 → 完成，立即生效可撤销（F-18）；示例包（F-47） |
+| T8 撤销一次误展开 | 不支持 | 不支持 | 1 | 展开后立即按 Backspace 恢复缩写（F-15） |
 
-- T1 的现状、espanso、Quicker 步数来自逐步走查；T2 现状按 `src/ActionEditor.tsx:32` 现有按钮行为估算。
+- T1 的现状、Quicker 步数来自逐步走查；T2 现状按 `src/ActionEditor.tsx:32` 现有按钮行为估算。
 - 从选中新建（F-19）：有全局热键时 4 步，无热键时 7 步。
 - 0.5 退出标准要求 T1、T2、T6 达标；T4、T5、T7、T8 依赖的 F-11、F-15、F-17、F-18 在 0.5.x 交付，这四项在 0.5.x 达标；T3 在 0.6 达标。
 - 附加目标（不计入 T1–T8）：把 3 条同话题的现有短语合并为一个短语族 ≤ 3 步（F-21 迁移建议，0.6）。
@@ -550,15 +547,15 @@ espanso 一侧的做法来自对其公开源码与文档的调研；带【待核
 | F1 | 全局搜索插入面板（含置顶、最近使用） | TextExpander Inline Search <https://textexpander.com/learn/using/searching-snippets/inline-search>；Lintalist <https://lintalist.github.io/>；Raycast <https://manual.raycast.com/snippets> | F-11（置顶与最近使用放在空查询视图） | 超越 | 加拼音首字母、插入回原窗口、无缩写的片段也能插入 | 0.5.x |
 | F2 | 短语族（同一话题的多语言变体）【推断】 | Zendesk Dynamic Content <https://developer.zendesk.com/api-reference/ticketing/ticket-management/dynamic_content/> | F-21、F-36；现有数据的迁移建议见 F-21 | 超越 | 用户数据就是「话题 × 语言」结构，改一处容易漏改其他语言 | 0.6 |
 | F3 | 缩写体检与冲突检测 | Raycast「Expand within Words」<https://manual.raycast.com/snippets>；AutoHotkey `?` 选项 <https://www.autohotkey.com/docs/v2/Hotstrings.htm>；Alfred 前缀建议 <https://www.alfredapp.com/help/features/snippets/> | F-10；改缩写时可把旧缩写保留为别名（F-29）。缩写后缀只是口令，不做「统一后缀」（附录 C.1 #1） | 超越 | 即时触发没有左边界，短缩写会吞掉长缩写 | 0.5 / 0.6 |
-| F4 | 多行安全插入与 `{cursor}` | espanso <https://espanso.org/docs/matches/basics/>、<https://espanso.org/docs/configuration/options/>；Raycast <https://manual.raycast.com/dynamic-placeholders>；Beeftext <https://github.com/xmichelo/Beeftext/wiki/Variables> | F-13、S-10 | 对齐 | 多行文本在按 Enter 即发送的程序中会被提前发出【推断】 | 0.5 |
-| F5 | 填空与选择；从剪贴板提取单号【推断】 | espanso forms <https://espanso.org/docs/matches/forms/>；TextExpander fill-ins <https://textexpander.com/learn/using/snippets/advanced-snippet-elements/advanced-fill-ins>；Text Blaze <https://blaze.today/guides/forms/> | F-22、F-23（命名提取器，不开放任意正则） | 超越 | 客户名、ICCID、订单号每次不同 | 0.6 |
+| F4 | 多行安全插入与 `{cursor}` | Raycast <https://manual.raycast.com/dynamic-placeholders>；Beeftext <https://github.com/xmichelo/Beeftext/wiki/Variables> | F-13、S-10 | 对齐 | 多行文本在按 Enter 即发送的程序中会被提前发出【推断】 | 0.5 |
+| F5 | 填空与选择；从剪贴板提取单号【推断】 | TextExpander fill-ins <https://textexpander.com/learn/using/snippets/advanced-snippet-elements/advanced-fill-ins>；Text Blaze <https://blaze.today/guides/forms/> | F-22、F-23（命名提取器，不开放任意正则） | 超越 | 客户名、ICCID、订单号每次不同 | 0.6 |
 | F6 | 日期偏移、工作日、问候语、随机 | Text Blaze <https://blaze.today/commands/>；Alfred <https://www.alfredapp.com/help/workflows/advanced/placeholders/> | F-14 | 对齐 | 「3 个工作日内」一类话术常见 | 0.6 |
 | F7 | 常量与片段嵌套、查找替换、链接检查 | Beeftext <https://github.com/xmichelo/Beeftext/wiki/Variables>；Raycast <https://manual.raycast.com/dynamic-placeholders> | F-26、F-27 | 对齐 | 网址、签名在多条短语中重复 | 0.6 |
 | F8 | 使用统计、清理建议、省时估算 | TextExpander <https://textexpander.com/blog/how-textexpander-calculates-your-time-savings>；PhraseExpress <https://www.phraseexpress.com/doc/features/time-savings/> | F-24（含节省字数与省时公式） | 对齐 | 找出从不使用和最常用的短语；只计数，不记正文 | 0.6 |
-| F9 | 展开后按 Backspace 撤销 | espanso `undo_backspace` <https://espanso.org/docs/configuration/options/> | F-15 | 对齐 | 误展开一步恢复 | 0.5.x |
+| F9 | 展开后按 Backspace 撤销 | — | F-15 | 对齐 | 误展开一步恢复 | 0.5.x |
 | F10 | 从选中文字新建 | TextExpander Suggested Snippets <https://textexpander.com/learn/using/snippets/create/suggested-snippets>；AutoHotkey Hotstring Helper | F-19 | 对齐 | 把刚写好的回复直接变成短语 | 0.5.x |
-| F11 | 别名（一条短语多个缩写） | espanso `triggers` <https://espanso.org/docs/matches/basics/>；LiveChat <https://www.livechat.com/help/set-canned-responses/> | F-29 | 对齐 | 新旧缩写并存 | 0.6 |
-| F12 | 导入导出增强：CSV、espanso；TextExpander 导入与 CSV 批量翻译 | Raycast 导入 <https://manual.raycast.com/snippets>；Zendesk Dynamic Content（CSV 批量翻译） | CSV 与 espanso 互通为 F-30；TextExpander 导入、CSV 批量翻译推迟到 1.x | 部分对齐 | 批量翻译要按列写入短语族，须等 F-21 经用户确认（附录 C.1 #1）；TextExpander 导出格式未核实 | 0.6 / 1.x |
+| F11 | 别名（一条短语多个缩写） | LiveChat <https://www.livechat.com/help/set-canned-responses/> | F-29 | 对齐 | 新旧缩写并存 | 0.6 |
+| F12 | 导入导出增强：CSV；TextExpander 导入与 CSV 批量翻译 | Raycast 导入 <https://manual.raycast.com/snippets>；Zendesk Dynamic Content（CSV 批量翻译） | CSV 互通为 F-30；TextExpander 导入、CSV 批量翻译推迟到 1.x | 部分对齐 | 批量翻译要按列写入短语族，须等 F-21 经用户确认（附录 C.1 #1）；TextExpander 导出格式未核实 | 0.6 / 1.x |
 | F13 | 图片与富文本编辑 | Text Blaze <https://blaze.today/commands/>；aText <https://www.trankynam.com/atext/> | F-45 | 推迟 | 1.0 功能冻结；现有 HTML 动作已能输出富文本 | 1.x |
 | F14 | 按程序的默认语言（软偏好） | Text Blaze site selector <https://blaze.today/guides/site-selector/>；PhraseExpress <https://www.phraseexpress.com/features/> | F-44 | 推迟 | 依赖短语族；与 ADR-d 的边界需用户确认 | 1.x |
 | F15 | 团队共享文件夹、逐条版本历史 | PhraseExpress <https://www.phraseexpress.com/features/>；aText <https://www.trankynam.com/atext/> | F-39（本地整库版本历史）；F-46（只读订阅） | 部分对齐 | 共享需求未确认（附录 C.1 #3）；版本历史先满足个人使用 | 0.5 / 1.x |
@@ -664,7 +661,7 @@ espanso 一侧的做法来自对其公开源码与文档的调研；带【待核
 | F-27 | 批量查找替换与链接检查 | P1 | 0.6 | F-01 | U-10 | B-24 | FE-16、FE-40 |
 | F-28 | 列表搜索增强 | P1 | 0.5 | F-02 | U-07、U-31 | B-32 | FE-12、FE-25、FE-30 |
 | F-29 | 别名 | P1 | 0.6 | F-51、F-10 | U-09 | B-22、B-33 | FE-39 |
-| F-30 | CSV / espanso 格式互通 | P1 | 0.6 | F-18 | U-25 | B-39 | FE-37 |
+| F-30 | CSV 格式互通 | P1 | 0.6 | F-18 | U-25 | B-39 | FE-37 |
 | F-31 | 自定义触发字符 | P1 | 0.6 | S-12 | U-16 | B-22 | FE-34 |
 | F-32 | Tab/Enter 实验性终止键（ARM） | P2 | 0.6 | S-12、S-02 | U-16 | B-23 | FE-34 |
 | F-33 | 常用操作补齐 | P2 | 0.6 | — | — | B-40 | FE-28 |
@@ -891,7 +888,7 @@ espanso 一侧的做法来自对其公开源码与文档的调研；带【待核
 |---|---|---|---|---|
 | S-05 | 无锁按键状态与会话重同步 | P1 / 0.4 | 锁屏解锁、远程登录之后，不会因「卡住的 Ctrl」而一直拒绝展开 | 模拟 Ctrl 按下后丢失抬起事件，30 秒后恢复正常；锁屏解锁后立即可触发；钩子线程中不再使用 `Mutex` |
 | S-09 | 开机自启后自检并自动监听 | P1 / 0.4 | 开机后不用再手动点「开始监听」 | 开启「启动时自动开始监听」并重启系统后，登录 30 秒内状态为「正常」且可以触发；自检失败时保持暂停并发通知 |
-| S-10 | 输出策略与注入配置 | P1 / 0.5 | 长话术不会在聊天程序里逐字敲出、被回车提前发送 | 「自动」方式下，超过 100 字符的正文走粘贴（阈值同 espanso `DEFAULT_CLIPBOARD_THRESHOLD`），含换行的正文也走粘贴（本项目自己的规则），其余走键入；可为指定程序设置粘贴快捷键（如 Shift+Insert）和恢复延迟（InjectProfile，预设 mstsc、PuTTY、Windows Terminal、微信）；临时内容不进剪贴板历史由 S-07 负责 |
+| S-10 | 输出策略与注入配置 | P1 / 0.5 | 长话术不会在聊天程序里逐字敲出、被回车提前发送 | 「自动」方式下，超过 100 字符的正文走粘贴（阈值固定为 100 字符），含换行的正文也走粘贴（本项目自己的规则），其余走键入；可为指定程序设置粘贴快捷键（如 Shift+Insert）和恢复延迟（InjectProfile，预设 mstsc、PuTTY、Windows Terminal、微信）；临时内容不进剪贴板历史由 S-07 负责 |
 | S-20 | 管理员权限窗口检测与提示 | P1 / 0.5 | 切到以管理员身份运行的程序时，马上知道这里不能展开 | 不依赖「先识别出缩写」：管理员窗口在前台时，本程序按 UIPI 很可能收不到它的输入（是否如此由 S-29 实测）。改为监听 `EVENT_SYSTEM_FOREGROUND`，对新前台进程用 `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `OpenProcessToken` + `GetTokenInformation(TokenIntegrityLevel)` 取完整性级别，高于本程序时在托盘提示和状态栏显示「当前窗口以管理员身份运行，无法展开」；拒绝访问时按「已提权或未知」处理。验收：切到提权窗口后 1 秒内出现提示。0.6 增加 P2 的「以管理员身份重启」按钮（经 UAC 提示；以管理员身份运行时开机自启需改用计划任务，按钮旁写明这一差异） |
 | S-21 | 结构化错误码与中文化 | P1 / 0.5 | 报错看得懂，知道下一步该做什么 | 所有命令返回 `CommandError`（只带 `code` 和 `detail`，不带文案，定义见 §7.4）；前端按 code 映射中文文案和建议操作；测试覆盖全部 code，界面不直接显示英文原始错误 |
 | S-13 | 外部修改监听与重新加载 | P2 / 0.6 | 用编辑器或同步盘改了配置，程序能感知并提示 | 外部修改 active 配置后 1 秒内（去抖 300ms）出现提示，选择「重新加载」后生效；本程序自己的写入不触发提示 |
@@ -908,7 +905,7 @@ espanso 一侧的做法来自对其公开源码与文档的调研；带【待核
 | F-08 | 批量修改字段 | 0.5 | 一次把整组话术改成「按空格触发」「粘贴输出」 | 可批量修改触发方式、终止键、输出方式、分组、忽略大小写、启用状态；修改前显示受影响条数；一次撤销即可全部还原 |
 | F-09 | 复制短语与另存为 | 0.5 | 新增一个语言版本时，复制已有话术改一改即可 | 右键「复制」生成副本，缩写留空并聚焦缩写框，由用户输入新口令；「另存为新短语」不修改原短语；批量复制保持原分组 |
 | F-14 | 动态内容扩展 | 0.6 | 「预计 3 个工作日后到货」「上午好 / 下午好」自动生成 | 支持日期偏移 `{date:fmt;±Nd}` 与工作日 `±Nwd`（只跳过周六日）、`{time}`、`{greeting}`（时段与文案可配置，0.6 起可按短语族语言分组）、`{random:a\|b}`、`{uuid}`；每个变量有单元测试，覆盖跨月、跨年和时区边界 |
-| F-15 | Backspace 撤销展开 | 0.5.x | 误展开后按一下退格就恢复原来的缩写 | 本程序用 RawInput 观察按键，不吞掉这次 Backspace（在 LL 钩子里吞键会延长回调，增加被系统按 `LowLevelHooksTimeout` 摘除的风险）；用户的 Backspace 已删掉展开结果的最后一个字素簇，因此补删「展开结果的字素簇数 − 1」个，再键入「缩写 + 原终止键（若当初被消费）」（算法见 B-34；espanso 的补偿方式与此相同是【推断】，由附录 C.2 #27 实测）；展开后 5 秒内、紧接着按 Backspace 才生效；出现选区、IME 组字、焦点变化、光标移动或任何其他按键时作废；只对 200 字以内的单行纯文本输出启用（含 `{cursor}` 的不启用），范围在设置中写明；可关闭。L2 单元测试覆盖计数（含 emoji、组合字符），L4 在记事本、Word、Chrome 中验证不会多删。定为 P1 而不是 P0：它依赖 0.4 的注入记录与执行器容错（S-01、S-02、F-25），并且补偿删除要先经 S-29 实测；误展开在此之前仍可手动删除 |
+| F-15 | Backspace 撤销展开 | 0.5.x | 误展开后按一下退格就恢复原来的缩写 | 本程序用 RawInput 观察按键，不吞掉这次 Backspace（在 LL 钩子里吞键会延长回调，增加被系统按 `LowLevelHooksTimeout` 摘除的风险）；用户的 Backspace 已删掉展开结果的最后一个字素簇，因此补删「展开结果的字素簇数 − 1」个，再键入「缩写 + 原终止键（若当初被消费）」（算法见 B-34；补偿方式由附录 C.2 #27 实测确认）；展开后 5 秒内、紧接着按 Backspace 才生效；出现选区、IME 组字、焦点变化、光标移动或任何其他按键时作废；只对 200 字以内的单行纯文本输出启用（含 `{cursor}` 的不启用），范围在设置中写明；可关闭。L2 单元测试覆盖计数（含 emoji、组合字符），L4 在记事本、Word、Chrome 中验证不会多删。定为 P1 而不是 P0：它依赖 0.4 的注入记录与执行器容错（S-01、S-02、F-25），并且补偿删除要先经 S-29 实测；误展开在此之前仍可手动删除 |
 | F-16 | 暂停热键与托盘改进 | 0.5 | 临时要打一段不想被展开的内容时，一键停用 | 托盘左键单击切换暂停/恢复；全局热键默认 Ctrl+Alt+Q（可修改）；托盘菜单有「暂停 15 分钟」「暂停到明天」；托盘图标按 §7.2 的 Health 映射表区分各状态，不只靠颜色；状态变化 200ms 内同步到所有界面 |
 | F-17 | 一键在当前程序停用与窗口拾取器 | 0.5.x | 在不需要展开的软件里，两步就能停用 | 托盘和搜索面板提供「在 <当前程序> 中停用」：<当前程序> 指最近一个既不是 Shell（`explorer.exe` 的任务栏和托盘）也不是本程序的前台窗口（由 `foreground-changed` 记录），菜单文字中显示进程名供确认；立即生效并显示可撤销 toast；拾取器显示 3 秒倒计时浮层，结果显示程序名和图标而非原始 JSON；另可「从运行中的程序列表选择」作为键盘替代（吸收）；状态栏显示当前程序是否被排除 |
 | F-19 | 从选中文字或剪贴板快速新建 | 0.5.x | 看到一段好回复，选中后一键存成话术 | 全局热键（默认不设）或搜索面板命令「从剪贴板新建」打开编辑器，正文已填好、焦点在缩写框；选中文字通过模拟复制获取并恢复剪贴板（0.6 起可改用 UIA，B-18）；保存后立即可用，焦点回到原程序 |
@@ -920,7 +917,7 @@ espanso 一侧的做法来自对其公开源码与文档的调研；带【待核
 | F-27 | 批量查找替换与链接检查 | 0.6 | 网址换域名时一次改完所有话术 | 在全部或选中短语的正文中查找替换，支持正则并预览差异（先预览、凭预览令牌提交）；一次撤销全部还原；「检查链接」列出全部 URL 及 HTTP 状态，由用户手动触发、联网前提示 |
 | F-28 | 列表搜索增强 | 0.5 | 在几十条话术里快速找到要改的那条 | 筛选覆盖缩写、说明、正文、分组；支持拼音首字母和多关键词；命中处高亮；「搜索无结果」与「列表为空」显示不同状态 |
 | F-29 | 别名 | 0.6 | 同一条话术可以用 `thx` 和 `ty` 两个缩写触发 | 一条短语可设多个缩写；冲突检测覆盖别名；统计按短语汇总 |
-| F-30 | CSV / espanso 格式互通 | 0.6 | 从表格或 espanso 迁移过来，或导出给不用本程序的同事 | 导入、导出 CSV（缩写、正文、说明、分组、语言）；导入 espanso match YAML 的纯文本子集并导出 espanso 子集；不支持的字段列入报告；往返测试一致 |
+| F-30 | CSV 格式互通 | 0.6 | 从表格迁移过来，或导出给不用本程序的同事 | 导入、导出 CSV（缩写、正文、说明、分组、语言）；不支持的字段列入报告；往返测试一致 |
 | F-31 | 自定义触发字符 | 0.6 | 习惯用 `/` 或 `.` 结尾来触发 | 全局或单条可设任意可打印字符（含小键盘键）为终止键；Enter/Tab 不在此列（见 F-32）；与词分隔符冲突时提示 |
 | F-36 | 同缩写多候选选择浮层 | 0.6 | 一个缩写对应多条话术时，弹出选择 | 多条短语以同等优先级匹配同一输入时显示候选浮层，用数字键或方向键选择；Esc 取消且不删除缩写；30 秒无操作自动取消；选择后焦点回到原窗口 |
 | F-42 | 无障碍与高 DPI | 0.5（1.0 复审） | 键盘和读屏软件能完成全部操作，高缩放屏幕上清晰 | axe 无 serious/critical；全部操作可用键盘完成；文字对比度 ≥ 4.5:1；100%–200% 缩放截图无截断；正确设置 `lang`，繁中和日文字形正确；高对比度主题（forced-colors）下控件边界与焦点可见；开启「减少动态效果」时无位移动画（吸收） |
@@ -982,7 +979,7 @@ espanso 一侧的做法来自对其公开源码与文档的调研；带【待核
 | 分组共享设置 | L-19 | 进程部分不做；触发键等用批量修改（F-08）替代 |
 | 常用正则触发模板与正则代价提示 | — | 【现状】正则触发已支持（只在终止符模式下参与匹配，`crates/domain/src/matching.rs`）；主要用户以字面缩写为主，需求弱，1.x 视反馈再做 |
 | 包管理：安装、卸载、更新第三方短语包，以只读分组呈现 | — | 需要包格式、来源校验与更新机制，1.0 前不做；1.0 只提供示例短语包（F-47）和共享文件夹只读订阅（F-46，1.x） |
-| CSV 批量翻译短语族、从 TextExpander 导入 | §3.4 | 依赖短语族（F-21）定型；导入先覆盖 Quicker 与 espanso（F-18、F-30） |
+| CSV 批量翻译短语族、从 TextExpander 导入 | §3.4 | 依赖短语族（F-21）定型；导入先覆盖 Quicker 与 CSV（F-18、F-30） |
 | 富文本输出（F-45）、共享文件夹订阅（F-46）、按程序的默认语言（F-44）、每条短语的独立热键（F-48 执行部分） | §5.3 | 1.0 以稳定为目标，不引入大功能，均移到 1.x；F-48 的 `{key:}` 在 0.6 只识别、不执行 |
 | AI 辅助起草（V2-11）、「下一句」推荐、插件协议、双向同步、工单平台字段、Markdown 输出与大小写传播 | — | 各自的启动条件见 §13 |
 | 节假日表 `holidays.json`、动态常量、重做（Ctrl+Y）、表单「记住上次输入」、必填字段语法 `[[字段!]]` | — | 设计稿建议，推迟或待决，列入附录 C.3 |
@@ -994,17 +991,17 @@ espanso 一侧的做法来自对其公开源码与文档的调研；带【待核
 <a id="s5-5"></a>
 ### 5.5 不得倒退清单
 
-0.3.1 在单次注入安全性上已有若干比 espanso 更严格的设计（§3.2 结论）。0.4 要重构执行器、钩子和模块结构（S-01、S-06、S-23），这些设计很容易被无意削弱。下表列出必须保持的 8 项；「现有实现位置」为【现状】，「回归测试」为【计划】。0.4 的退出标准包含「本清单的回归测试全部通过」（§10），之后每个里程碑都要保持。
+0.3.1 在单次注入安全性上已有若干较严格的设计（§3.2 结论）。0.4 要重构执行器、钩子和模块结构（S-01、S-06、S-23），这些设计很容易被无意削弱。下表列出必须保持的 8 项；「现有实现位置」为【现状】，「回归测试」为【计划】。0.4 的退出标准包含「本清单的回归测试全部通过」（§10），之后每个里程碑都要保持。
 
 | # | 设计点 | 现有实现位置【现状】 | 回归测试（L2 / L3）【计划】 | 负责里程碑 |
 |---|---|---|---|---|
 | 1 | 剪贴板租约：恢复前校验序列号、所有者、内容三项，任何一项变化都不覆盖用户的新内容 | `crates/platform/src/windows.rs:1592` 起（`ClipboardLease`、`verified_sequence`） | L2：模拟恢复前序列号变化、所有者变化、内容变化三种情况，均不覆盖；L3：粘贴后用户立即复制新内容，新内容保留 | 0.4（S-07、B-08 改动剪贴板代码时） |
 | 2 | 粘贴失败不降级为键入（避免把长文本逐键打进错误窗口） | `crates/platform/src/windows.rs:1159-1162` | L2：剪贴板写入失败时返回错误，不调用键入路径 | 0.4（S-01） |
-| 3 | 注入记录的 stamp / generation 与前缀连续性校验，过期或不连续的匹配不执行 | `crates/platform/src/windows_espanso.rs:241-245` | L2：generation 变化或前缀不连续时丢弃匹配 | 0.4（S-06、B-06） |
+| 3 | 注入记录的 stamp / generation 与前缀连续性校验，过期或不连续的匹配不执行 | `旧 Windows 输入后端模块:241-245` | L2：generation 变化或前缀不连续时丢弃匹配 | 0.4（S-06、B-06） |
 | 4 | 外部模拟输入（`LLKHF_INJECTED` 且非本程序标记）使当前缓冲失效 | `crates/platform/src/windows.rs:438-443` | L2：混入外部注入事件后不触发展开 | 0.4（S-06） |
 | 5 | 目标为密码框、只读或禁用的编辑框时否决注入（UIA 与原生编辑框） | `native_edit_protection`，`crates/platform/src/windows.rs:383-397`；已有测试在 `:1875-1889` | 保留已有测试；L3：记事本只读模式、浏览器密码框不展开 | 0.4（S-01） |
 | 6 | 注入计数不符时停止后续步骤（fail-stop） | `send` / `record_send_result`，`crates/platform/src/windows.rs:769-786`；`guarded`，`:1125`（`guarded_context` 在 `:1095`） | L2：模拟 `SendInput` 返回值小于请求数时后续步骤不执行，并记入执行历史 | 0.4（S-01、S-02） |
-| 7 | 键盘布局缓存间隔为 0（每次按键重新取布局，切换布局后不错码） | `crates/platform/src/windows_espanso.rs:330` | L2：断言缓存间隔为 0；L3：切换键盘布局后立即展开，字符正确 | 0.4（S-06） |
+| 7 | 键盘布局缓存间隔为 0（每次按键重新取布局，切换布局后不错码） | `旧 Windows 输入后端模块:330` | L2：断言缓存间隔为 0；L3：切换键盘布局后立即展开，字符正确 | 0.4（S-06） |
 | 8 | 发布事务化：发布失败时保留原有生效配置与暂停状态 | `src-tauri/src/main.rs:150-160`；已有测试 `failed_publish_preserves_active_and_pause`（`src-tauri/src/main.rs:1259-1275`） | 保留已有测试；0.5 改为保存即生效后，等价测试改写到 engine 层（B-03） | 0.4（S-23 拆分时迁移测试）、0.5（F-01） |
 
 <a id="s6"></a>
@@ -1450,7 +1447,7 @@ espanso 一侧的做法来自对其公开源码与文档的调研；带【待核
 - 取消或超时：缩写保留，目标窗口不变，焦点回到原处（原则 4）。
 - 跨显示器时按目标显示器的缩放比换算插入点坐标（后端给物理坐标，前端换算为逻辑坐标）。
 
-**⑩ 导入向导 · 第 2 步（U-25）**：三步为「选择来源 → 预览与冲突 → 完成」。第 1 步提供 Quicker JSON、Quicker Text 备份包、CSV（0.6）、espanso YAML（0.6）四张来源卡片和拖放区。
+**⑩ 导入向导 · 第 2 步（U-25）**：三步为「选择来源 → 预览与冲突 → 完成」。第 1 步提供 Quicker JSON、Quicker Text 备份包、CSV（0.6）三张来源卡片和拖放区。
 
 ```
 +-- 导入短语 ----------------------------------------------------------------------------------+
@@ -1621,7 +1618,7 @@ espanso 一侧的做法来自对其公开源码与文档的调研；带【待核
 | 移组 | `prompt` 输入分组名（`src/App.tsx:39`） | 下拉「移到分组」，可直接输入新分组名 |
 | 删除 | `confirm` 确认框（`src/App.tsx:39-40`） | 「已删除 2 条短语 [撤销]」 |
 | 摘要 | 「0 个步骤」（`src/App.tsx:40`） | 「按 Ctrl+C」「不执行任何操作」 |
-| 后端错误 | 英文原文 "Focus, caret, layout or configuration changed; input stopped"（`crates/platform/src/windows_espanso.rs:178`） | 「输出中途停止了：输出过程中切换了窗口、光标位置或键盘布局。目标处可能只输出了一部分，请检查后重试。」 |
+| 后端错误 | 英文原文 "Focus, caret, layout or configuration changed; input stopped"（`旧 Windows 输入后端模块:178`） | 「输出中途停止了：输出过程中切换了窗口、光标位置或键盘布局。目标处可能只输出了一部分，请检查后重试。」 |
 
 **错误提示三段式**：发生了什么 → 为什么 → 可以怎么做。不责备用户；错误码、JSON、堆栈和英文原文只出现在「显示技术详情」和诊断包中（S-21）；发布版的「显示技术详情」只显示脱敏后的字段（FE-35）。
 
@@ -1745,8 +1742,8 @@ Quicker 一侧的描述来自官方文档和用户提供的截图。「I-xx」�
 | 托盘 | 每 250ms 轮询提示文字（`src-tauri/src/main.rs:858-911`） | 删除轮询，改为订阅 EventBus（B-44） |
 | 执行器 | `sync_channel(1)`；busy 只在循环末尾复位（`crates/platform/src/windows.rs:652-717`） | BusyGuard + `catch_unwind` + 执行器纪元（B-01） |
 | 低级钩子 | `crates/platform/src/windows.rs:720-764`；`HOOK_READY` 置位后从不复位（755） | 回调零 panic、零阻塞（B-02）；存活不靠 `WM_TIMER` 心跳判断（系统按 `LowLevelHooksTimeout` 摘除钩子后，线程的定时器照常到达），改由与 RawInput 的交叉校验发现钩子被摘除并重装（B-06，0.4） |
-| RawInput | `crates/platform/src/windows_espanso.rs:327-360` | 可以重建；与钩子交叉校验存活，并校验注册目标是否被覆盖（B-06，0.4） |
-| 关停观察、分发、UIA 保护 | 分别每 30ms、30ms、25ms 轮询（`crates/platform/src/windows_espanso.rs:348-355, 223-317, 473-520`） | 关停观察删除、由 supervisor 负责；分发改 `recv_deadline`，空闲不唤醒；UIA 保护改为事件驱动（B-18） |
+| RawInput | `旧 Windows 输入后端模块:327-360` | 可以重建；与钩子交叉校验存活，并校验注册目标是否被覆盖（B-06，0.4） |
+| 关停观察、分发、UIA 保护 | 分别每 30ms、30ms、25ms 轮询（`旧 Windows 输入后端模块:348-355, 223-317, 473-520`） | 关停观察删除、由 supervisor 负责；分发改 `recv_deadline`，空闲不唤醒；UIA 保护改为事件驱动（B-18） |
 | 选区读取 | 每次都启动 PowerShell（`crates/platform/src/windows.rs:239-289`） | 常驻 UIA（B-18，0.6） |
 | supervisor | 无 | 新增。每 1s 一个 tick：检查执行器心跳、读取输入源交叉校验结果、退避重建、熔断、到期解除定时暂停、统计落盘（B-03） |
 | 会话窗口、日志写线程 | 无 | 新增。会话窗口收到 WTS、电源、桌面切换通知后重新同步按键状态（B-05），收到 `WM_QUERYENDSESSION` / `WM_ENDSESSION` 时清除运行标记（B-04）；日志用 tracing 的 `non_blocking` 写线程（B-09）；0.6 再加外部修改监听（B-11）。命令行控制经已有的 `tauri-plugin-single-instance` 转发参数，不另建命名管道线程（F-49） |
@@ -1819,20 +1816,20 @@ flowchart LR
 | B | 名称 | 需求 | 里程碑 | 关键机制 |
 |---|---|---|---|---|
 | B-01 | 执行线程容错 | S-01 | 0.4 | ① 每个任务包在 `catch_unwind` 里；② `BusyGuard` 在 Drop 中复位 busy、松开按住的键、归还剪贴板；③ 执行超出预算时，supervisor 递增执行器纪元并新建线程，旧线程醒来后发现纪元已变，不再发出任何输入；④ 所有锁改用不会毒化的 `parking_lot`；⑤ 执行器卡死（不是 panic）时 Drop 不会运行：执行器把按下的键记在原子位图中，supervisor 判定超时后按位图补发带 MARK 的 key-up；剪贴板只在短临界区内打开（打开 → 读写 → 立即关闭，不跨越等待和注入），临界区超时时把剪贴板组件标为 Degraded 并提示，新纪元的执行器在旧线程释放剪贴板之前改用键入输出（`CloseClipboard` 只能由打开剪贴板的线程调用【推断】，所以不跨线程强制关闭）；故障注入 `executor_hang` 覆盖（§11） |
-| B-02 | 钩子零 panic、零阻塞 | S-02 | 0.4 | 回调只做「读原子量 → 推入 `ArrayQueue` → 返回」；键盘钩子补上 `catch_unwind`（【现状】只有 RawInput 回调有，`crates/platform/src/windows_espanso.rs:194-212`）；鼠标钩子的阻塞锁改为原子量；这些模块加 `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]` |
+| B-02 | 钩子零 panic、零阻塞 | S-02 | 0.4 | 回调只做「读原子量 → 推入 `ArrayQueue` → 返回」；键盘钩子补上 `catch_unwind`（【现状】只有 RawInput 回调有，`旧 Windows 输入后端模块:194-212`）；鼠标钩子的阻塞锁改为原子量；这些模块加 `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]` |
 | B-03 | 监督器与健康状态 | S-03、S-19 | 0.4 | Health 五态（下图），各处显示见下文「Health 映射表」；每秒检查执行器与 supervisor 心跳，并读取输入源交叉校验结果（B-06）；退避 500ms → 1s → 2s → 5s → 15s；10 分钟内失败 5 次就熔断，等用户点「修复」（`repair_engine`）；`OnceLock` 全局量改为可替换的 `ArcSwapOption<Runtime>`；`native_ready()` 改为 `health.accepts_resume()`；托盘「恢复」失败时发通知，不再静默返回（【现状】`src-tauri/src/main.rs:958-962`） |
 | B-04 | 启动自愈与安全模式 | S-04 | 0.4 | `load_or_fallback` 从不返回错误，结果为 Normal / Recovered / SafeMode（算法见下文）；文件被占用（I/O 错误）不等于损坏，不回退旧版本；运行标记带 boot id，并在 `WM_QUERYENDSESSION` / `WM_ENDSESSION` 时清除，关机、注销和跨开机遗留的标记不计入崩溃次数；开机自启开启时，启动时核对自启项是否指向当前 exe，不一致就更正并记日志 `autostart.repair`（exe 移动或升级后自启不会静默失效） |
 | B-05 | 无锁按键状态 | S-05（0.4）、S-14（0.6） | 0.4 / 0.6 | 256 位原子位图取代 `Mutex<BTreeSet>`；修饰键按住超过 30s 时，用 `GetAsyncKeyState` 复核并自愈；会话切换和唤醒后重新同步，200ms 后再同步一次；修饰键等待时间可配置，超时返回 `ModifierHeld`，由 toast 提示（0.6） |
 | B-06 | 输入源交叉校验 | S-06 | 0.4 | RawInput 收到硬件按下（`known_source != 0`）后，若 LL 钩子在 N ms 内没有看到对应事件（N 由 0.4 基线确定），判定钩子已被系统摘除并重新挂钩；反过来，钩子看到非注入的按键而 RawInput 没有收到时，校验 RawInput 注册目标，被覆盖或丢失就重新注册；日志记 `input.reattach`。不用 `WM_TIMER` 心跳判断钩子存活（系统按 `LowLevelHooksTimeout` 摘除钩子后定时器照常到达） |
 | B-07 | 自触发防护 | S-02、S-26、F-11、F-22 | 0.4 起 | 本程序注入的事件带 MARK `0x51545854`（【现状】定义与使用见 `crates/platform/src/windows.rs:22, 432-434, 500, 816, 932`；紧随其后的 `:436-443` 是过滤外部模拟输入 `LLKHF_INJECTED` 的代码，不是 MARK 自跳过）；不进入检测缓冲；搜索面板、表单等本程序窗口不触发；开启远程控制兼容后，在 RawInput 层通过 `ExtraInformation` 识别 MARK（B-19） |
-| B-08 | 剪贴板租约 | S-07、S-10 | 0.4 | `OpenClipboard` 有界重试；句柄格式按格式分别处理，不再整次拒绝（【现状】`crates/platform/src/windows.rs:1746-1747` 遇到 CF_BITMAP、CF_METAFILEPICT、CF_PALETTE、CF_ENHMETAFILE 这几种 GDI 句柄格式或 0x80–0x8F 显示格式就拒绝整次备份，`:1749-1755` 对单个格式设 32MB 上限；这些句柄不能用 `GlobalSize`/`GlobalLock` 按字节备份）：CF_DIB / CF_DIBV5 按字节备份与恢复，CF_BITMAP 由系统从 CF_DIB 合成、备份时跳过；CF_ENHMETAFILE 用 `CopyEnhMetaFile` 复制；CF_METAFILEPICT 复制其内含的 HMETAFILE 或跳过（实测后定）；CF_PALETTE 与 0x80–0x8F 跳过并写入执行结果；恢复策略 Full / BestEffort（默认）/ TextOnly；所有者窗口挂起时跳过它的延迟渲染格式；恢复前核对剪贴板序号，用户在此期间复制了新内容就不恢复；写入时同时设置剪贴板历史与云剪贴板排除格式（Win+V 历史排除只在本条交付，S-07）；恢复前的等待由固定 150ms 改为可配置的 `restore_delay`，默认 300ms，与 espanso v2.4.1 一致 |
+| B-08 | 剪贴板租约 | S-07、S-10 | 0.4 | `OpenClipboard` 有界重试；句柄格式按格式分别处理，不再整次拒绝（【现状】`crates/platform/src/windows.rs:1746-1747` 遇到 CF_BITMAP、CF_METAFILEPICT、CF_PALETTE、CF_ENHMETAFILE 这几种 GDI 句柄格式或 0x80–0x8F 显示格式就拒绝整次备份，`:1749-1755` 对单个格式设 32MB 上限；这些句柄不能用 `GlobalSize`/`GlobalLock` 按字节备份）：CF_DIB / CF_DIBV5 按字节备份与恢复，CF_BITMAP 由系统从 CF_DIB 合成、备份时跳过；CF_ENHMETAFILE 用 `CopyEnhMetaFile` 复制；CF_METAFILEPICT 复制其内含的 HMETAFILE 或跳过（实测后定）；CF_PALETTE 与 0x80–0x8F 跳过并写入执行结果；恢复策略 Full / BestEffort（默认）/ TextOnly；所有者窗口挂起时跳过它的延迟渲染格式；恢复前核对剪贴板序号，用户在此期间复制了新内容就不恢复；写入时同时设置剪贴板历史与云剪贴板排除格式（Win+V 历史排除只在本条交付，S-07）；恢复前的等待由固定 150ms 改为可配置的 `restore_delay`，默认 300ms |
 | B-09 | 日志、崩溃记录与诊断包 | S-08、F-38 | 0.4 | 见 7.1「可观测性」；带敏感内容的类型（`Rendered`、`Buffer`、`FormValues`）不实现 `Display`，`Debug` 只输出 `<redacted len=N>`；panic hook 写 `crash-*.txt`；abort 导致的崩溃由下次启动时的运行标记发现 |
 | B-10 | 开机自检与自动监听 | S-09、F-20 | 0.4 | 启动后等待进入 Healthy（最长 30s）→ 四项自检（RawInput 注册、钩子心跳、前台探测、剪贴板可打开）→ 全部通过且 `prefs.app.auto_listen_on_start` 为真时，自动开始监听；否则保持暂停并通知原因 |
 | B-11 | 外部修改监听 | S-13、F-49 | 0.6 | 用 `notify` 监听 `active.json`，去抖后发出 `external-change-detected`；`reload_from_disk` 以验证模式重新加载，成功后以 `ExternalReload` 来源写入新版本，因此外部修改也能撤销 |
 | B-12 | 终止键一致性 | S-12 | 0.4 | 默认终止键改为空格 + 分号，只影响新配置；已有配置中的 tab/enter 加载时只给 `TerminatorUnsupported` 警告，行为不变 |
 | B-13 | 能力表 | S-16 | 0.4 | 每项能力单独判定 `Available` / `Unavailable` / `Experimental` / `Degraded` 并带原因码（【现状】10 项共用一个布尔值，`crates/platform/src/lib.rs:111-133`）；macOS 全部为 Experimental（ADR-f） |
 | B-14 | 快照与无锁发布 | S-18、F-01 | 0.5 | 配置和编译结果合并为一个 `ArcSwap<EngineSnapshot>`，一次性替换（【现状】两把锁，`src-tauri/src/main.rs:202-203`）；匹配期间不再持锁 |
-| B-15 | 输出策略与注入配置 | S-10、F-13 | 0.5 | `OutputMethod::Auto`：正文超过 100 字符时用粘贴（与 espanso Auto 模式的阈值一致，espanso 只看字符数）；含换行时也用粘贴（本项目自己的规则，避免在聊天程序中键入的换行被当作发送）；其余键入；新建规则默认 Auto；`InjectProfile` 按进程设置粘贴组合键、延迟、换行方式（Enter 或 Shift+Enter）；内置预设只是初始值，以实机测试结果为准 |
+| B-15 | 输出策略与注入配置 | S-10、F-13 | 0.5 | `OutputMethod::Auto`：正文超过 100 字符时用粘贴（只看字符数）；含换行时也用粘贴（本项目自己的规则，避免在聊天程序中键入的换行被当作发送）；其余键入；新建规则默认 Auto；`InjectProfile` 按进程设置粘贴组合键、延迟、换行方式（Enter 或 Shift+Enter）；内置预设只是初始值，以实机测试结果为准 |
 | B-16 | IME 探测与策略 | S-11、F-34 | 0.5 / 0.6 | 探测输入法是否处于中文组字状态；按 `ImePolicy` 跳过并提示，或照常展开；F-34 在展开后切换到英文模式 |
 | B-17 | 管理员窗口检测 | S-20 | 0.5（0.4 先做 S-29 原型） | 在前台切换时检测，不依赖先识别出缩写（UIPI 下本程序很可能收不到提权窗口的输入，由 S-29 实测）：监听 `EVENT_SYSTEM_FOREGROUND`，对新前台进程取令牌完整性级别，高于本程序时在托盘提示和状态栏显示「当前窗口以管理员身份运行，无法展开」；拒绝访问时按「已提权或未知」处理；注入前再比较一次，作为兜底（【现状】只能在注入之后发现失败，`crates/platform/src/windows.rs:771-785`） |
 | B-18 | 常驻 UIA 选区 | S-22、F-19 | 0.6 | 用常驻的 UIA 客户端取代每次启动 PowerShell；超时降到 300ms 以内；失败时回退到模拟复制 |
@@ -1902,7 +1899,7 @@ stateDiagram-v2
 
 | B | 名称 | 需求 | 里程碑 | 关键机制 |
 |---|---|---|---|---|
-| B-22 | 词首、别名、自定义触发字符 | F-10、F-29、F-31 | 0.5 / 0.6 | `word_start_only` 检查左边界（【现状】左边界只在 `crates/domain/src/matching.rs:144` 对终止键模式检查，即时触发不检查）；修饰键规则：按住 Ctrl、Alt 或 Win 时按下的终止键一律不展开，并清空缓冲（【现状】RawInput 路径用 `(Ctrl ^ Alt) \|\| Win` 判断修饰状态，Ctrl 和 Alt 同时按住时不算修饰，`crates/platform/src/windows_espanso.rs:203-204, 116`，所以 Ctrl+Alt+Space 中的空格可能被当作终止键；AltGr 布局的影响见附录 C.1 #10），测试用例「输入缩写后按 Ctrl+Alt+Space 不展开」；别名与主缩写共用一条规则；触发字符来自能力表允许的集合 |
+| B-22 | 词首、别名、自定义触发字符 | F-10、F-29、F-31 | 0.5 / 0.6 | `word_start_only` 检查左边界（【现状】左边界只在 `crates/domain/src/matching.rs:144` 对终止键模式检查，即时触发不检查）；修饰键规则：按住 Ctrl、Alt 或 Win 时按下的终止键一律不展开，并清空缓冲（【现状】RawInput 路径用 `(Ctrl ^ Alt) \|\| Win` 判断修饰状态，Ctrl 和 Alt 同时按住时不算修饰，`旧 Windows 输入后端模块:203-204, 116`，所以 Ctrl+Alt+Space 中的空格可能被当作终止键；AltGr 布局的影响见附录 C.1 #10），测试用例「输入缩写后按 Ctrl+Alt+Space 不展开」；别名与主缩写共用一条规则；触发字符来自能力表允许的集合 |
 | B-23 | Tab/Enter 预备拦截（ARM） | F-32 | 0.6 | 不做「先吞再重放」：匹配器每次更新缓冲后计算「下一键若是 Tab/Enter 是否命中」，结果连同当时的按键序号写入一个原子量（armed）；LL 钩子收到 Tab/Enter 时只同步读取这个原子量，序号与钩子自己计数的按键序号一致且 armed 时才吞掉这次按键并交给执行器展开，否则原样放行（匹配结果还没写入时按未命中处理，宁可不展开也不误吞）；默认关，只对勾选了「以 Tab/Enter 结束」的规则计算 armed，不设程序排除预设；armed 超时自动解除（ADR-c） |
 | B-24 | 保存模型 | F-01、F-08、F-09、F-27 | 0.5 / 0.6 | 见下文「ChangeSet」 |
 | B-25 | 版本历史与保留策略 | F-39、F-53 | 0.5 | `RevisionMeta { revision, at, origin, summary, rule_count, pinned, sha256, corrupt }`；`diff_revision` 用 `similar` 生成行级差异；`restore_revision` 作为一次 ReplaceAll 改动写入，所以恢复本身也能撤销；保留策略：至少保留最近 200 个版本或 90 天内的版本（两者取多），另有硬上限 1000 个版本或 50MB，超出时先稀疏化（最近 200 个以外每天只留最后一个），仍超出再从最旧的一天开始整天清理，即使在 90 天内也如此，硬上限优先于每日快照（与 F-39 一致）；固定版本和 LKG 永不清理；清理的进 `revisions/trash/`（F-53） |
@@ -1914,12 +1911,12 @@ stateDiagram-v2
 | B-31 | 焦点获取与归还 | F-11、F-19、F-22、F-36 | 0.4 原型（S-29）/ 0.5.x | 浮层和搜索面板由打字或热键触发，后台进程调用 `SetForegroundWindow` 受前台锁限制，可能只在任务栏闪烁：先合成一次带 MARK 的 Alt 键再调用；不成功时 `AttachThreadInput` 到前台线程后重试；仍拿不到焦点时，候选浮层降级为不激活的浮层（`WS_EX_NOACTIVATE`），由钩子转交数字键、方向键、Enter、Esc，表单则取消本次交互、不删除缩写并通知（方案以 S-29 结论为准，R-15）；弹出窗口前保存 `FocusSnapshot`；完成后归还焦点，并等待前台窗口确认（最长约 200ms）后再注入；归还失败时不注入，按偏好把结果复制到剪贴板并提示（【现状】`execute_action` 固定等待 3 秒，`src-tauri/src/main.rs:451`） |
 | B-32 | 搜索后端 | F-11、F-28、F-19 | 0.5 | `nucleo-matcher` 模糊匹配 + 拼音首字母预计算；返回以 UTF-16 码元计的高亮区间；`>` 前缀进入命令模式；`sensitive` 规则的正文不进索引（F-40）；每次查询 < 5ms（2000 条） |
 | B-33 | 静态分析 | F-10、F-29、F-43 | 0.5 / 0.6 | `analyze_rule` / `analyze_config` 返回 `RuleIssue { code, severity, related }`：前缀冲突、与常见英文词重合、键入多行有风险（`MultilineKeysRisk`）、繁简混用（0.6）；用户可以对某条问题选择「忽略」 |
-| B-34 | Backspace 撤销展开 | F-15 | 0.5.x（0.4 先做 S-29 原型） | 只对单行、≤ 200 字符、不含 `{cursor}` 的纯文本展开登记；本程序不吞掉用户的这次 Backspace（RawInput 只能观察按键，在 LL 钩子里吞键会延长回调），它已删掉展开结果的最后一个字素簇，所以补删「展开结果的字素簇数 − 1」个，再键入「缩写 + 原终止键（若当初被消费）」（与 espanso 一致是【推断】，附录 C.2 #27 实测）；展开后 5 秒内紧接着按 Backspace 才生效；其间出现其他按键、点击、焦点变化、选区或 IME 组字，记录即失效；L2 测试覆盖计数（含 emoji、组合字符） |
+| B-34 | Backspace 撤销展开 | F-15 | 0.5.x（0.4 先做 S-29 原型） | 只对单行、≤ 200 字符、不含 `{cursor}` 的纯文本展开登记；本程序不吞掉用户的这次 Backspace（RawInput 只能观察按键，在 LL 钩子里吞键会延长回调），它已删掉展开结果的最后一个字素簇，所以补删「展开结果的字素簇数 − 1」个，再键入「缩写 + 原终止键（若当初被消费）」（补偿方式由附录 C.2 #27 实测确认）；展开后 5 秒内紧接着按 Backspace 才生效；其间出现其他按键、点击、焦点变化、选区或 IME 组字，记录即失效；L2 测试覆盖计数（含 emoji、组合字符） |
 | B-35 | 执行历史 | F-25、F-52、S-19 | 0.4 | 内存环形缓冲 200 条，不含正文；每条带结果、`ReasonCode` 和各阶段耗时；因忙碌丢弃的触发记为 `dropped_busy`（【现状】自动路径的状态总是 `unknown`，`crates/platform/src/windows.rs:1448-1457`）；缓冲每次被重置之前（点击、焦点变化等），把末尾最多 32 个字符存为 `last_buffer_snapshot`，只在内存中、不落盘；`explain_last_miss`（F-52，0.5）取最近一条未展开记录，并对这个快照做一次模拟匹配，只返回原因码和命中的缩写，不返回缓冲内容（用户点击托盘或健康页时缓冲已被清空，所以不能用当前缓冲） |
 | B-36 | 使用统计 | F-24 | 0.6 | `stats.json` 只存每条规则的次数和最后使用时间；由 supervisor 定时落盘；可以清零；是否默认开启见附录 C |
 | B-37 | 暂停控制 | F-16、F-17、F-37 | 0.5 / 0.5.x / 0.6 | `PauseReasons` 位图；`pause_for(分钟 \| 到明天)`；`disable_in_process(exe)` 生成一次可撤销的改动，把进程加入全局排除列表；`pick_window` 配合倒计时浮层，取代盲等 3 秒的 `get_foreground`；定时暂停的截止时间写入 `prefs.json`，重启后仍有效；全屏时暂停（0.6） |
 | B-38 | 短语族 | F-21、F-44 | 0.6 / 1.0 | v2 的 `families` 表 + 规则上的 `family` 引用；族缩写触发时进入语言候选（Pending 的 `family_lang` 类型）；同族内的缺失语言和「待同步」状态由分析器给出 |
-| B-39 | 导入导出 | F-18、F-30、F-47、F-55 | 0.5 / 0.5.x / 0.6 / 1.0 | `import_preview` 返回逐条预览和 token，`import_commit` 按每条策略执行（`overwrite` / `keep_both` / `merge` / `rename` / `replace`）；冲突判断从「只按 id」扩展到「按 id 或缩写」；CSV 与 espanso YAML 在 0.6；F-55 导出为 0.5 可读的 v1 格式 |
+| B-39 | 导入导出 | F-18、F-30、F-47、F-55 | 0.5 / 0.5.x / 0.6 / 1.0 | `import_preview` 返回逐条预览和 token，`import_commit` 按每条策略执行（`overwrite` / `keep_both` / `merge` / `rename` / `replace`）；冲突判断从「只按 id」扩展到「按 id 或缩写」；CSV 在 0.6；F-55 导出为 0.5 可读的 v1 格式 |
 | B-40 | ActionSpec 注册表 | F-33、F-35、F-50 | 0.6 | 每种操作类型声明自己的字段、校验和能力需求；前端据此生成表单（FE-28） |
 | B-41 | 命令行控制（已取消） | F-49 | — | 原方案用命名管道把 `--cmd` 发给已运行的实例，与单实例转发重复且要新增 `interprocess` 依赖，已取消。F-49 改为：`--cmd pause \| resume \| toggle \| reload \| search` 经 `tauri-plugin-single-instance`（【现状】已在 `src-tauri/Cargo.toml` 中）的参数转发交给运行中的进程，由 `src-tauri/src/cli.rs` 解析（0.6） |
 | B-42 | F-04 中的后端缺陷 | F-04 | 0.4 | `save_draft` 加校验；取消导出返回 `Ok(None)`；文件对话框按类型过滤扩展名 |
@@ -2009,7 +2006,7 @@ sequenceDiagram
 | 设置与偏好 | `set_settings`、`get_prefs`、`set_prefs` | 0.5 |
 | 搜索与插入 | `search_rules(scope, q)`、`insert_rule(id, target_token, mode: insert \| copy)`、`list_palette_commands`、`capture_for_new_rule` | `search_rules` 0.5（主列表）；其余 0.5.x |
 | 暂停 | `pause_for`、`disable_in_process`、`pick_window` | `pause_for` 0.5；其余 0.5.x（F-17） |
-| 导入导出 | `import_preview`、`import_commit`、`export` | `export` 0.5；导入 0.5.x（F-18）；CSV、espanso 在 0.6 |
+| 导入导出 | `import_preview`、`import_commit`、`export` | `export` 0.5；导入 0.5.x（F-18）；CSV 在 0.6 |
 | 交互 | `interaction_ready`、`submit_interaction`、`cancel_interaction` | 0.6 |
 | 统计、短语族、批量文本 | `get_stats`、`reset_stats`；`save_family`、`delete_family`、`move_rules_to_family`；`find_replace_preview`、`find_replace_commit`、`check_links` | 0.6 |
 | 扩展与外部修改 | `list_action_specs`；`reload_from_disk`、`keep_current_config` | 0.6 |
@@ -2116,7 +2113,7 @@ src-tauri/src/        main.rs（< 200 行）  app_state  store/{load,atomic,revi
 |---|---|---|---|---|
 | B-44 ~ B-46 | 事件替代轮询（S-19，0.4）；`CommandError`（0.4 用纯 serde 定义并迁移，属于 S-24 一期；0.5 细化错误码，S-21）；类型生成（S-24，0.5） | — | — | 见 7.4 |
 | B-47 | 拆分 `main.rs` | S-23 | 0.4 | 【现状】1304 行，包含 Store、23 个命令、托盘、setup、自启；拆到 7.5 模块树中的 `store/`、`commands/`、`tray.rs` 等，`main.rs` 只留插件注册和 setup |
-| B-48 | 拆分 `windows.rs`，引入 ports | S-23 | 0.4 | 【现状】2100 行；三个平台后端靠同名自由函数对齐，没有 trait（`crates/platform/src/lib.rs:98-109`）；`windows_espanso.rs`、`windows_observer.rs` 通过 `#[path]` 引入（`crates/platform/src/windows.rs:18-21`） |
+| B-48 | 拆分 `windows.rs`，引入 ports | S-23 | 0.4 | 【现状】2100 行；三个平台后端靠同名自由函数对齐，没有 trait（`crates/platform/src/lib.rs:98-109`）；旧 Windows 输入后端模块、`windows_observer.rs` 通过 `#[path]` 引入（`crates/platform/src/windows.rs:18-21`） |
 | B-49 | 抽取 `crates/engine` | S-23 | 0.5 | 流水线、Pending、历史、监督策略迁入；两套 `Stamp` 概念合并为 `engine::detect::Stamp` |
 | B-50 | 处理零引用的状态机 | S-15 | 0.5 | 【现状】`crates/domain/src/lib.rs` 导出但无人引用的模块；`ClipboardLease` 有三份定义（§2.3）；逐类型决定并入 engine 或删除 |
 | B-51 | 依赖与许可证审查 | S-25 | 0.4 | `deny.toml`：只允许与 GPL-3.0-or-later 兼容的许可证；禁止 `openssl-sys`；未知源一律拒绝；`windows-sys` 多版本先告警；新增 crate 后同步更新 `scripts/package-artifacts.ps1` 的源码白名单 |
@@ -2133,7 +2130,7 @@ src-tauri/src/        main.rs（< 200 行）  app_state  store/{load,atomic,revi
 | 0.4（dev） | `proptest`、`criterion` | 属性测试、基准（不进入发布产物） |
 | 0.5 | `specta`、`tauri-specta`、`bitflags`、`unicode-segmentation`、`similar`、`tauri-plugin-global-shortcut`；`aho-corasick`（只在 B-21 实施时） | 类型生成、暂停原因、`{cursor}` 与 Backspace 撤销的字素计数、版本差异、全局热键（F-16 起，F-11 沿用）、匹配索引 |
 | 0.5 | `nucleo-matcher`（MPL-2.0【推断】）、`pinyin`（MIT【推断】） | 搜索。MPL-2.0 文件只要没有标注「Incompatible With Secondary Licenses」，就可以依据 MPL-2.0 §3.3 与 GPL 组合分发，与是否修改无关；修改过的 MPL 文件仍须按 MPL 提供源码 |
-| 0.6 | `notify`、`yaml-rust2`、`schemars`、`ureq`、`fastrand`、`csv` | 外部修改、espanso 导入、JSON Schema、链接检查、`{random}`、CSV 导入导出 |
+| 0.6 | `notify`、`schemars`、`ureq`、`fastrand`、`csv` | 外部修改、JSON Schema、链接检查、`{random}`、CSV 导入导出 |
 | 已有，继续使用 | `tauri-plugin-single-instance`、`rfd` 0.17（【现状】见 `src-tauri/Cargo.toml`） | 单实例与 `--cmd` 参数转发（F-49）；文件对话框。不引入 `interprocess`、`tauri-plugin-dialog` |
 
 - `ureq` 默认的 rustls 会引入 `ring` 和 `webpki-roots`，许可证需要单独审查【待核实】；建议改用 `native-tls` 特性，在 Windows 上走系统 SChannel，还能沿用公司网络的代理证书。
@@ -2470,7 +2467,7 @@ flowchart LR
 ## 11. 质量保障与验收
 
 **【现状】**
-- 测试：`crates/domain/tests/` 下 4 个文件共 97 个测试；源码内单元测试 34 个（`crates/platform/src/windows.rs` 14、`crates/platform/src/windows_espanso.rs` 9、`src-tauri/src/main.rs` 9、`crates/platform/src/lib.rs` 2）。
+- 测试：`crates/domain/tests/` 下 4 个文件共 97 个测试；源码内单元测试 34 个（`crates/platform/src/windows.rs` 14、`旧 Windows 输入后端模块` 9、`src-tauri/src/main.rs` 9、`crates/platform/src/lib.rs` 2）。
 - 注入夹具与验收模式：`crates/platform/examples/native_input_fixture.rs`、`crates/platform/examples/input_engine_host.rs`、`scripts/fixtures/windows-input.ps1`、`scripts/create-input-acceptance-config.ps1`；开关见 `crates/platform/src/lib.rs:9-25` 与 `docs/windows-acceptance-mode.md`。
 - 缺口：`docs/acceptance.md` 的 T01–T20 大多没有实机证据，性能一节写明「性能门槛仍未验」（`docs/acceptance.md:96`）；没有 CI、基准、属性测试和故障注入；前端没有任何测试。
 
@@ -2619,7 +2616,7 @@ flowchart LR
 | 输出格式扩展 | Markdown 转富文本输出；按缩写的大小写决定输出的大小写 | F-45 富文本正文完成 |
 | macOS 正式支持 | 从实验性升级为正式平台 | ADR-f 复审，且具备签名与公证条件 |
 
-长期目标：打字时感觉不到它的存在，出问题时一眼看懂原因。稳定性达到 espanso 的水平，日常话术管理比 Quicker 文本指令更顺手，所有数据都留在本地。
+长期目标：打字时感觉不到它的存在，出问题时一眼看懂原因。稳定性达到常驻输入工具应有的水平，日常话术管理比 Quicker 文本指令更顺手，所有数据都留在本地。
 
 <a id="sa"></a>
 ## 附录 A：编号索引
@@ -2644,12 +2641,10 @@ flowchart LR
 | 资料 | 用途 |
 |---|---|
 | Quicker 文本指令手册 <https://getquicker.net/KC/Manual/Doc/textcommand> | 功能与界面对标（§3.1） |
-| espanso <https://github.com/espanso/espanso>（本仓库 vendored v2.4.1，见 `THIRD_PARTY_NOTICES.md`） | 稳定性与路径简化对标（§3.2） |
 | Tauri 2 文档 <https://v2.tauri.app/> | 多窗口、能力文件、插件（§7.4、§8.4） |
 | `docs/acceptance.md`、`docs/browser-ime-manual-tests.md` | T01–T20 验收与浏览器 / 输入法手测矩阵（§11） |
 | `docs/windows-acceptance-mode.md` | 验收模式（L4） |
 | `docs/windows-0.3.0-refactor.md`、`docs/windows-0.3.1-notes.md` | 0.3.x 的现状依据（§2） |
-| `docs/espanso-source-audit.md`、`docs/espanso-poc.md` | vendored 代码的来源与审查记录 |
 | `docs/platform-support.md`、`docs/build-verification.md` | 平台定位（ADR-f）与构建验证 |
 | `README.md`、`THIRD_PARTY_NOTICES.md`、`LICENSE`、`Cargo.toml` | 已知限制与许可（R-09） |
 
@@ -2692,7 +2687,7 @@ flowchart LR
 | # | 事项 | 关联 | 最迟 | 核实前的兜底 |
 |---|---|---|---|---|
 | 1 | 安全桌面（UAC、Ctrl+Alt+Del）期间按键抬起事件是否一定丢失 | B-05 | 0.4 | 30 秒过期，会话事件后重同步 |
-| 2 | ~~tao 新建窗口时是否重新注册 RawInput~~（已关闭） | B-06、S-06 | — | 结论：tao 0.37.1 只在创建事件循环时（`src/platform_impl/windows/event_loop.rs:200`）和 `set_device_event_filter` 中（`:329-330`）注册 RawInput，新建窗口不会重新注册；同一进程每个 usage 只有一个注册，后续调用会覆盖之前的注册。对策见 §3.2 G6：禁止调用 `set_device_event_filter`，espanso 检测线程启动后再注册一次作为保险；钩子存活由 B-06 交叉校验 |
+| 2 | ~~tao 新建窗口时是否重新注册 RawInput~~（已关闭） | B-06、S-06 | — | 结论：tao 0.37.1 只在创建事件循环时（`src/platform_impl/windows/event_loop.rs:200`）和 `set_device_event_filter` 中（`:329-330`）注册 RawInput，新建窗口不会重新注册；同一进程每个 usage 只有一个注册，后续调用会覆盖之前的注册。对策见 §3.2 G6：禁止调用 `set_device_event_filter`，原生检测线程启动后再注册一次作为保险；钩子存活由 B-06 交叉校验 |
 | 3 | 在管理员窗口中打字时，低级钩子和 RawInput 是否都能看到按键 | B-17、S-29 | 0.4（S-29 原型） | S-20 在前台切换时检测目标进程的完整性级别并提示，不依赖先识别出缩写 |
 | 4 | Windows 剪贴板历史是否对恢复写入去重 | B-08、S-07 | 0.4 | 临时内容按 S-07 / B-08 排除出剪贴板历史 |
 | 5 | 对其他进程窗口调用 `ImmGetContext` 能否得到有效句柄；TSF 输入法对 IMM32 查询是否准确，中 / 英切换对应哪个状态 | B-16 | 0.5 | R-03 |
@@ -2717,7 +2712,7 @@ flowchart LR
 | 24 | Tauri 2 对未知路径是否回退到 `index.html` | FE-03 | 0.5 | 使用 hash history |
 | 25 | Win10 用户机器上的最低 WebView2 版本 | FE-01 | 0.5 | R-13 |
 | 26 | §11 的前端体积预算是否合理 | FE-52 | 0.5 | spike 结束后按实测值校准一次，之后固定 |
-| 27 | espanso 在 Windows 上的 Backspace 撤销如何补偿目标程序已处理的那次 Backspace（实测其删除数与还原内容） | B-34、S-29 | 0.4（S-29 原型） | 按 B-34 的计数公式（字素簇数 − 1）实现，L2 覆盖 emoji 与组合字符，L4 在记事本、Word、Chrome 上核对不多删 |
+| 27 | Windows 上 Backspace 撤销如何补偿目标程序已处理的那次 Backspace（实测各程序的删除数与还原内容） | B-34、S-29 | 0.4（S-29 原型） | 按 B-34 的计数公式（字素簇数 − 1）实现，L2 覆盖 emoji 与组合字符，L4 在记事本、Word、Chrome 上核对不多删 |
 | 28 | 由打字触发的浮层与搜索面板能否拿到焦点（前台锁）、关闭后能否归还 | B-31、S-29、R-15 | 0.4（S-29 原型） | 拿不到焦点时浮层以非激活方式显示，由 LL 钩子拦截方向键、Enter、Esc 驱动选择（R-15） |
 
 **C.3 推迟、待用户表态的设计稿建议**

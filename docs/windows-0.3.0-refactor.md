@@ -2,7 +2,7 @@
 
 # Windows 0.3.0 输入输出重构
 
-日期：2026-10-15。参考 espanso v2.4.1，commit `a87d1723f47a59e38d370e2f0c636d66d568b8f6`。
+日期：2026-10-15。参考固定版本的第三方 Win32 输入组件，来源与提交见 [第三方声明](../THIRD_PARTY_NOTICES.md)。
 
 ## 定位出的缺陷
 
@@ -14,7 +14,7 @@
 
 ## 新实现范围
 
-Windows 检测与注入采用固定版本的 espanso 原生源代码，通过 Rust 适配到本项目的匹配与执行接口。没有运行外部 Espanso 服务，没有引入上游 YAML 配置、匹配器、包管理器或界面。具体文件、上游链接与设计依据见 [源码核对](espanso-source-audit.md) 和 [第三方声明](../THIRD_PARTY_NOTICES.md)。
+Windows 检测与注入采用固定版本的第三方原生源代码，通过 Rust 适配到本项目的匹配与执行接口。没有运行外部服务，没有引入上游 YAML 配置、匹配器、包管理器或界面。具体文件与上游链接见 [第三方声明](../THIRD_PARTY_NOTICES.md)。
 
 保留本项目的 Quicker JSON 导入、草稿/生效版本、分组、进程范围、黑名单、大小写、参数、自定义动作、键鼠录制、逐字键入与整段粘贴区分，以及剪贴板多格式/并发变更保护。UIA 不再是逐键识别、退格和输出的硬依赖；它可提供明确密码/只读状态的附加阻止证据。无法识别的控件不能保证密码检测完整。
 
@@ -24,7 +24,7 @@ Windows 检测与注入采用固定版本的 espanso 原生源代码，通过 Ru
 
 原有 Esc/Backspace 偏好仍保留于配置，当前 Windows 后端统一按缩写长度退格，未执行 Esc 关闭候选。界面明确显示这一限制；没有把保留配置误称为该行为已经支持。
 
-独立对抗评审发现并复核修复：剪贴板失败时 Paste 静默降级 Keys、热键部分提交后的释放缺失、AltGr 前缀与释放等待、积压旧候选抢占执行、旧打包入口遗漏对应源码。另移除上游 `RIDEV_NOLEGACY`：espanso 原项目有独立 worker，本应用输入组件与管理窗口同进程，保留该标志会影响管理界面接收键盘。
+独立对抗评审发现并复核修复：剪贴板失败时 Paste 静默降级 Keys、热键部分提交后的释放缺失、AltGr 前缀与释放等待、积压旧候选抢占执行、旧打包入口遗漏对应源码。另移除上游 `RIDEV_NOLEGACY`：上游项目有独立 worker，本应用输入组件与管理窗口同进程，保留该标志会影响管理界面接收键盘。
 
 ## 验证记录
 
@@ -36,7 +36,7 @@ Windows 检测与注入采用固定版本的 espanso 原生源代码，通过 Ru
 | Rust workspace 回归 | 已通过 | workspace 127 passed，1 ignored（需用户私有 Quicker 样本）；新增分号专项后平台单独回归 25/25，共 128 个有效测试通过 |
 | Windows release 构建 | 已通过 | `cargo build -p quicker-text --release`，0.3.0 |
 | release 原生后端初始化 | 已通过 | release `input_engine_host` 使用禁用规则的隔离配置，`hooks_ready=true`、`rawinput_ready=true`、外部注入策略为 `filtered`；没有冒充真实按键替换验证 |
-| 原生窗口实际输入/读回 | 部分通过 | debug 验收 host + Win32 单行 Edit，微软拼音候选状态逐键输入 qtzzx，粘贴中文与 emoji 正确，保留此前正文；日志在 work/espanso-acceptance-030/results.jsonl |
+| 原生窗口实际输入/读回 | 部分通过 | debug 验收 host + Win32 单行 Edit，微软拼音候选状态逐键输入 qtzzx，粘贴中文与 emoji 正确，保留此前正文；日志在 work/acceptance-030/results.jsonl |
 | 真实硬件 RawInput 入口 | 未验收 | 自动化注入不能证明硬件入口 |
 | 微软拼音完整矩阵、聊天软件、Codex | 未完成 | 仅上述单一候选替换通过，不能外推到其他输入法操作或应用 |
 | macOS | 未改造、未实机验收 | 保留原适配层 |

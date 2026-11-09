@@ -1,8 +1,8 @@
 # Quicktext
 
-用于 Windows / macOS 的文本指令管理桌面应用。Tauri 2 + React 提供管理、参数设置和高级动作编辑，Rust 负责规则与三种脚本解析。Windows 输入检测与注入纳入 espanso v2.4.1 的原生组件，不需要另装 Espanso。规则、导入、界面与动作仍由本项目管理。源码依据见 [espanso 核对记录](docs/espanso-source-audit.md)。
+用于 Windows / macOS 的文本指令管理桌面应用。Tauri 2 + React 提供管理、参数设置和高级动作编辑，Rust 负责规则与三种脚本解析。Windows 输入检测与注入纳入第三方 Win32 原生组件（来源见 [第三方声明](THIRD_PARTY_NOTICES.md)），不需要另装其他软件。规则、导入、界面与动作仍由本项目管理。
 
-当前版本为 **0.3.1**，提供 Windows x64 绿色版，解压后运行 `quicktext.exe`。需要 Windows 的 WebView2 运行环境。绿色版表示免安装，配置仍保存在当前用户的应用数据目录，不会放在 exe 旁边。0.3.1 移除规则的允许进程限制；macOS 未迁移到 espanso，尚无实机运行、完整应用链接、签名或公证验证。
+当前版本为 **0.3.1**，提供 Windows x64 绿色版，解压后运行 `quicktext.exe`。需要 Windows 的 WebView2 运行环境。绿色版表示免安装，配置仍保存在当前用户的应用数据目录，不会放在 exe 旁边。0.3.1 移除规则的允许进程限制；macOS 未迁移到该输入组件，尚无实机运行、完整应用链接、签名或公证验证。
 
 ## Windows 绿色版与第一条指令
 
@@ -10,7 +10,7 @@
 2. 添加一条测试指令，例如缩写 `thx`、立即执行、操作“粘贴纯文本”、正文 `Thanks very much.`。点击“保存”后立即生效，无需另行应用；如果当前暂停，请恢复监听。编辑、删除、批量启停和参数保存同样在确认成功后直接生效。
 3. 先在记事本等普通输入框试用。“粘贴纯文本”一次输出整段文字；“键入纯文本”一个字一个字输入。两个操作可以在下拉框中直接选择，来回切换会保留正文。
 4. 指令不再需要设置“生效进程”，Windows 和 Mac 均已移除允许列表。旧配置中的程序限制在加载时自动忽略，例如原先只允许 `notepad.exe` 的规则，现在也会在其他符合触发条件的程序中参与匹配。
-5. Windows 使用 espanso RawInput 检测字符，对最近的输入做规则匹配，随后退格并输出。支持立即、空格和分号触发；Tab、Enter 触发不可用。RawInput 不能在目标程序收到这两个按键前阻止它们。正文不可读取不会阻止触发；这不等于所有聊天软件已经实测通过。
+5. Windows 使用 RawInput 检测字符，对最近的输入做规则匹配，随后退格并输出。支持立即、空格和分号触发；Tab、Enter 触发不可用。RawInput 不能在目标程序收到这两个按键前阻止它们。正文不可读取不会阻止触发；这不等于所有聊天软件已经实测通过。
 6. 黑名单、暂停、本程序窗口及已识别的密码/只读控件检查仍然有效。中文布局下的英文模式可输入字母、数字、标点缩写；中文选字时数字或空格可能用于选择候选词，建议切到英文模式后使用。
 7. 输出报告 `unknown` 表示系统已接受输入，目标程序是否收到尚未确认。新链路不会仅因无法读取正文而停止后续动作；焦点变化、继续按键、暂停或取消仍会中断执行。
 
@@ -73,13 +73,13 @@ SendKeys B、inputscript、replay 是三个独立格式；导入保留 dialect�
 
 新规则默认继承全局 IME 删除方式，旧规则显式设置保留。运行状态页显示当前目标观察方式、进程、组合状态及拒绝原因，不显示正文；管理窗口获焦也会改变目标。匿名浏览器测试页位于 `scripts/fixtures/browser-input.html`，使用真实键盘按 [浏览器与中文IME手测矩阵](docs/browser-ime-manual-tests.md) 验证。
 
-Windows 输出检查焦点、配置版本和执行代次，使用带本程序标记的 espanso 注入实现，防止输出再次触发规则。剪贴板继续使用本项目的多格式备份和变更保护。此实现不逐字符读取目标正文，不保证目标的自定义退格、页面脚本移动光标或输入法选词行为；复杂多步骤与 p95 延迟尚未完成完整实机验收。
+Windows 输出检查焦点、配置版本和执行代次，使用带本程序标记的原生注入实现，防止输出再次触发规则。剪贴板继续使用本项目的多格式备份和变更保护。此实现不逐字符读取目标正文，不保证目标的自定义退格、页面脚本移动光标或输入法选词行为；复杂多步骤与 p95 延迟尚未完成完整实机验收。
 
 自动验收使用独立配置与显式双门槛启动模式，详见 [Windows 验收模式](docs/windows-acceptance-mode.md)。正常启动使用真实 RawInput；自动注入验收通过不代表实物键盘入口或中文 IME 已验收。
 
 ## 许可与绿色包构建
 
-Windows 交付静态纳入 GPL-3.0-or-later 的 espanso 组件，整个项目（含自研代码）按 GPL-3.0-or-later 授权与分发，完整许可见 [LICENSE](LICENSE)。上游版权、完整许可和本地补丁清单见 [第三方声明](THIRD_PARTY_NOTICES.md)。每个发布（安装包、单文件 exe、绿色包）都附带对应的完整源码，由两个压缩包合在一起组成：`Quicktext-<版本>-Source.zip`（绿色包为其 `source/` 目录）包括修改后的原生组件、`Cargo.lock`、`package-lock.json` 与构建、打包脚本；`Quicktext-<版本>-Source-deps.zip` 是编进程序的 Rust crate（`cargo vendor --locked`）和前端运行时 npm 包（注册表的原始 tarball）的源码，附离线重建步骤。Rust 与前端依赖按各自的许可证使用，它们的版权与许可证原文汇总在 `THIRD-PARTY-LICENSES.txt`：安装包和绿色包里各有一份，发布附件里也有。这个文件由 `scripts/generate-third-party-licenses.ps1` 按实际分发的依赖生成，仓库里只放占位文件；任何依赖缺许可证文字时生成失败，打包随之失败。Rust 依赖的许可证由 `deny.toml` 对照与 GPL-3.0-or-later 兼容的清单检查，发布前的核对项见 [发布清单](docs/release-checklist.md)。也可从版本库的发布标签获取源码。已发布的 0.3.1 的许可证说明与源码获取方式见 [docs/licensing-0.3.1.md](docs/licensing-0.3.1.md)。
+Windows 交付静态纳入 GPL-3.0-or-later 的第三方组件，整个项目（含自研代码）按 GPL-3.0-or-later 授权与分发，完整许可见 [LICENSE](LICENSE)。上游版权、完整许可和本地补丁清单见 [第三方声明](THIRD_PARTY_NOTICES.md)。每个发布（安装包、单文件 exe、绿色包）都附带对应的完整源码，由两个压缩包合在一起组成：`Quicktext-<版本>-Source.zip`（绿色包为其 `source/` 目录）包括修改后的原生组件、`Cargo.lock`、`package-lock.json` 与构建、打包脚本；`Quicktext-<版本>-Source-deps.zip` 是编进程序的 Rust crate（`cargo vendor --locked`）和前端运行时 npm 包（注册表的原始 tarball）的源码，附离线重建步骤。Rust 与前端依赖按各自的许可证使用，它们的版权与许可证原文汇总在 `THIRD-PARTY-LICENSES.txt`：安装包和绿色包里各有一份，发布附件里也有。这个文件由 `scripts/generate-third-party-licenses.ps1` 按实际分发的依赖生成，仓库里只放占位文件；任何依赖缺许可证文字时生成失败，打包随之失败。Rust 依赖的许可证由 `deny.toml` 对照与 GPL-3.0-or-later 兼容的清单检查，发布前的核对项见 [发布清单](docs/release-checklist.md)。也可从版本库的发布标签获取源码。已发布的 0.3.1 的许可证说明与源码获取方式见 [docs/licensing-0.3.1.md](docs/licensing-0.3.1.md)。
 
 绿色包用 PowerShell 7 在仓库根目录构建，依赖源码包是必需的，没有它不会产出任何可分发的文件：
 

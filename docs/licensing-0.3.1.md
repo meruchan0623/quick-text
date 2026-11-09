@@ -10,24 +10,24 @@ Quicker Text 0.3.1，即已经发布的 Windows x64 绿色包 `Quicker-Text-0.3.
 
 ## 许可证声明
 
-Quicker Text 0.3.1 的整个项目，包括自研代码和静态纳入的 espanso 原生组件，按 GNU 通用公共许可证第 3 版或（由你选择）更新版本，即 GPL-3.0-or-later 授权与分发。许可证全文见仓库根目录的 [LICENSE](../LICENSE)。
+Quicker Text 0.3.1 的整个项目，包括自研代码和静态纳入的第三方 GPL 原生组件，按 GNU 通用公共许可证第 3 版或（由你选择）更新版本，即 GPL-3.0-or-later 授权与分发。许可证全文见仓库根目录的 [LICENSE](../LICENSE)。
 
 依据：
 
-- 0.3.1 的可执行文件静态链接了 espanso v2.4.1 的 Windows 原生检测与注入代码（`vendor/espanso-win32/{detect,inject}/native.{cpp,h}`，版权 Federico Terzi，GPL-3.0-or-later，提交 `a87d1723f47a59e38d370e2f0c636d66d568b8f6`）。这样的组合程序只能按 GPL 分发。
+- 0.3.1 的可执行文件静态链接了第三方 GPL 的 Windows 原生检测与注入代码（`vendor/` 下的 Win32 组件目录中的 `{detect,inject}/native.{cpp,h}`，版权人、许可与提交见 `THIRD_PARTY_NOTICES.md`，GPL-3.0-or-later）。这样的组合程序只能按 GPL 分发。
 - 项目维护者已确认整个项目采用 GPL-3.0-or-later（开发计划附录 C.1 第 23 项，2026-10-22）。
 
-对 0.3.1 发布包的更正：0.3.1 发布包里的根目录 `LICENSE` 是 MIT 文本，随包的说明文件对自研文件也保留了 MIT 的说法【待核实：对照已发布包内 `LICENSE`、`README.md`、`THIRD_PARTY_NOTICES.md` 的原文，逐条列出】。这与「组合程序按 GPL 分发」不一致。以本文为准：拿到 0.3.1 的人，可以依 GPL-3.0-or-later 使用、复制、修改和再分发整个程序及其对应源码。包内的第三方声明本来就写明了 espanso 部分适用 GPL-3.0-or-later，这一点没有变化。
+对 0.3.1 发布包的更正：0.3.1 发布包里的根目录 `LICENSE` 是 MIT 文本，随包的说明文件对自研文件也保留了 MIT 的说法【待核实：对照已发布包内 `LICENSE`、`README.md`、`THIRD_PARTY_NOTICES.md` 的原文，逐条列出】。这与「组合程序按 GPL 分发」不一致。以本文为准：拿到 0.3.1 的人，可以依 GPL-3.0-or-later 使用、复制、修改和再分发整个程序及其对应源码。包内的第三方声明本来就写明了该第三方组件部分适用 GPL-3.0-or-later，这一点没有变化。
 
 其他依赖（Rust crates、npm 包）各自保留自己的许可证，不因本声明改变。仓库用 `cargo deny` 对 Rust 依赖的许可证做兼容性检查，说明见 [第三方声明](../THIRD_PARTY_NOTICES.md)。
 
-对 0.3.1 发布包的另一处更正：0.3.1 的包里只有 `THIRD_PARTY_NOTICES.md`（espanso 的声明），没有随包提供各个 Rust crate 与 npm 包的版权和许可证原文，而 MIT、BSD、Apache-2.0 等许可证要求这些声明随二进制文件一起分发。补救办法是补发 `THIRD-PARTY-LICENSES.txt`：用当前仓库的 `scripts/generate-third-party-licenses.ps1 -ProjectRoot <0.3.1 的快照目录>` 按 0.3.1 的锁文件生成（2026-10-22 试过：286 个 crate 加 5 个 npm 包，每个包都有许可证文字；同一快照的依赖源码包也试做过，约 104 MB），放在 0.3.1 的发布页面。步骤见发布清单第 3 节。
+对 0.3.1 发布包的另一处更正：0.3.1 的包里只有 `THIRD_PARTY_NOTICES.md`（仅含该 GPL 组件的声明），没有随包提供各个 Rust crate 与 npm 包的版权和许可证原文，而 MIT、BSD、Apache-2.0 等许可证要求这些声明随二进制文件一起分发。补救办法是补发 `THIRD-PARTY-LICENSES.txt`：用当前仓库的 `scripts/generate-third-party-licenses.ps1 -ProjectRoot <0.3.1 的快照目录>` 按 0.3.1 的锁文件生成（2026-10-22 试过：286 个 crate 加 5 个 npm 包，每个包都有许可证文字；同一快照的依赖源码包也试做过，约 104 MB），放在 0.3.1 的发布页面。步骤见发布清单第 3 节。
 
 ## 获取 0.3.1 的对应源码
 
 下面三种方式，核实完成前请以第一种为准。
 
-1. 已发布绿色包内的 `source/` 目录。0.3.1 的打包脚本把工作区代码、`vendor/espanso-win32`（含本地补丁）、`Cargo.lock`、`package-lock.json` 和构建、打包脚本放进这个目录，并把每个文件的 SHA256 列在包内的 `SHA256SUMS.txt`。校验方法：解压后对每个文件计算 SHA256，与 `SHA256SUMS.txt` 对照。【待核实：用已发布的 ZIP 实际解压并校验一次】
+1. 已发布绿色包内的 `source/` 目录。0.3.1 的打包脚本把工作区代码、`vendor/` 下的 Win32 组件目录（含本地补丁）、`Cargo.lock`、`package-lock.json` 和构建、打包脚本放进这个目录，并把每个文件的 SHA256 列在包内的 `SHA256SUMS.txt`。校验方法：解压后对每个文件计算 SHA256，与 `SHA256SUMS.txt` 对照。【待核实：用已发布的 ZIP 实际解压并校验一次】
 2. 单独发布的源码包 `Quicker-Text-0.3.1-Source.zip`【待核实：0.3.1 是否单独发布；发布位置；SHA256 `……`】。0.3.1 若没有单独发布源码包，把绿色包内 `source/` 目录另行打成 ZIP 放到发布页面即可，不需要重新构建。
 3. 版本库快照：提交 `b359598`（`chore: 0.3.1 baseline`，2026-10-22）的源码树。它与已发布包的差别应当只有 `LICENSE`、`README.md`、`THIRD_PARTY_NOTICES.md` 以及 `package.json` 的 `license` 字段，这几处在 2026-10-22 已改为 GPL-3.0-or-later 口径【待核实：把已发布包的 `source/` 与该提交逐文件比较，记录差异】。版本库目前没有 `v0.3.1` 标签；比较完成后建议在该提交上补打标签，让「0.3.1 的源码」有固定的指向。
 
