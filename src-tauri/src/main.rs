@@ -129,7 +129,11 @@ fn main() {
             }
             // The beginner typing hint (settings 「新手提示」), off unless turned on.
             let hint_prefs = hint::initial_prefs(&app.state::<DataDir>().0);
-            app.manage(hint::HintControl::start(app.handle(), engine_for_hint, hint_prefs));
+            app.manage(hint::HintControl::start(
+                app.handle(),
+                engine_for_hint,
+                hint_prefs,
+            ));
             if !std::env::args().any(|x| x == "--background") {
                 tray::notify(
                     app.handle(),

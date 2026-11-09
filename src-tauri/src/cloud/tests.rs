@@ -1524,7 +1524,10 @@ fn only_allowed_automation_from_the_server_reaches_the_engine() {
         state.rules[0].problem.as_deref(),
         Some("这类操作不通过团队话术同步运行；可导出配置包后导入「我的指令」，审阅后启用")
     );
-    assert_eq!(engine_ids(&store), ["cloud:open", "cloud:html", "cloud:hotkey"]);
+    assert_eq!(
+        engine_ids(&store),
+        ["cloud:open", "cloud:html", "cloud:hotkey"]
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 

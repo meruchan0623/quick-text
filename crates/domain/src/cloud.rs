@@ -249,10 +249,9 @@ fn cloud_action_texts(action: &Action) -> Result<Vec<&str>, &'static str> {
         Action::Html { html, plain_text } => Ok(vec![html, plain_text]),
         Action::Hotkey { .. } | Action::Image { .. } | Action::Open { .. } => Ok(vec![]),
         Action::Steps { plan } | Action::Replay { plan, .. } => cloud_plan_texts(plan),
-        Action::None
-        | Action::Reusable { .. }
-        | Action::Common { .. }
-        | Action::Quicker { .. } => Err(AUTOMATION_NOT_ALLOWED),
+        Action::None | Action::Reusable { .. } | Action::Common { .. } | Action::Quicker { .. } => {
+            Err(AUTOMATION_NOT_ALLOWED)
+        }
     }
 }
 
