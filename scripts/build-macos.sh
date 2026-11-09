@@ -32,7 +32,7 @@ bundle_id="$(node -p "require('./src-tauri/tauri.conf.json').identifier")"
 identity="${QUICKTEXT_SIGNING_IDENTITY:-Quicktext Local Signing}"
 keychain="${QUICKTEXT_SIGNING_KEYCHAIN:-}"
 if security find-identity -p codesigning ${keychain:+"$keychain"} | grep -qF "\"$identity\""; then
-  # Same options as tauri's signing in CI (installers.yml): hardened runtime, bundle identifier.
+  # Hardened runtime and the bundle identifier, as tauri's own signing uses.
   codesign --force --options runtime --sign "$identity" ${keychain:+--keychain "$keychain"} \
     --identifier "$bundle_id" "$bundle"
 else

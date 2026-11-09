@@ -10,7 +10,7 @@
 #   - $env:QT_DEPENDENCY_SOURCES_ZIP names Quicktext-<version>-Source-deps.zip, built from the same lock files
 #     and complete (Assert-DependencySourcesZip). An installer is a distributable binary: the dependency code compiled into
 #     it needs its corresponding source (GPL-3.0-or-later), so it is not built without that archive.
-# scripts/build-windows.ps1 and .github/workflows/release.yml set the variable; a bare `npm run tauri build` fails here.
+# scripts/build-windows.ps1 sets the variable; a bare `npm run tauri build` fails here.
 # For a local build that is only to be run, not distributed: `npm run tauri -- build --no-bundle` (exe only).
 #
 # The raw exe in target\release is an intermediate, not a delivery: it is only distributed through

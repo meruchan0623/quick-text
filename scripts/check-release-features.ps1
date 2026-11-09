@@ -19,8 +19,7 @@
   the package's dependency graph. It fails when
     * a forbidden feature is enabled in any of them, or
     * a forbidden feature is defined by no crate in the graph. Then the check could never
-      fail, so the feature was probably renamed: update -Forbidden (and the call in
-      .github/workflows/release.yml).
+      fail, so the feature was probably renamed: update -Forbidden.
 
   This covers the Cargo.toml side (a `default = [...]` that pulls in a test feature). The
   other half of B-52 is scripts/check-binary-strings.ps1 on the archived PDB and the exe.
@@ -86,8 +85,7 @@ foreach ($member in $metadata.packages) {
 $undefined = @($Forbidden | Where-Object { -not $definesFeature.ContainsKey($_) })
 if ($undefined.Count -gt 0) {
     Write-Host "FAIL: no crate in the '$Package' graph defines the feature(s): $($undefined -join ', ')"
-    Write-Host '      The check would pass vacuously. Was a feature renamed or removed? Update -Forbidden'
-    Write-Host '      and the call in .github/workflows/release.yml.'
+    Write-Host '      The check would pass vacuously. Was a feature renamed or removed? Update -Forbidden.'
     exit 1
 }
 

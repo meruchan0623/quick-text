@@ -227,7 +227,7 @@ fn main() {
 }
 
 // B-52, Codex F3-1: the test-only features never reach an optimized build of
-// the app. Nothing in the repository builds it that way (scripts, workflows,
+// the app. Nothing in the repository builds it that way (scripts,
 // docs: fault injection and the mock run under `cargo test` and debug builds),
 // so any such build is a mistake, caught here before it can be packaged.
 // Tests and debug builds keep both (`debug_assertions` is on).

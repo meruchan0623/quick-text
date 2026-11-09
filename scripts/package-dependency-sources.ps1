@@ -196,8 +196,7 @@ Needs Rust (MSVC toolchain), the MSVC C++ build tools with the Windows SDK, Node
    this archive and the notices of step 5 are in place; an executable for local use only (not an installer)
    is `npm run tauri -- build --no-bundle`.
 
-The exact build steps used by the release workflow are in `.github/workflows/release.yml` and
-`docs/release-checklist.md` inside `Quicktext-{{VERSION}}-Source.zip`.
+The exact release build steps are in `docs/release-checklist.md` inside `Quicktext-{{VERSION}}-Source.zip`.
 '@
     $readme = $readme.Replace('{{VERSION}}', $version).Replace('{{CRATES}}', [string]$vendored.Count)
     Set-Content -LiteralPath (Join-Path $stage 'README-OFFLINE-BUILD.md') -Value $readme -Encoding utf8NoBOM

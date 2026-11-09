@@ -59,7 +59,6 @@ $SourceFiles = @(
 # Directories are traversed recursively; only files with an extension in $SourceExtensions
 # are taken. Missing directories are skipped (benches/ and tests/ exist only in some crates).
 $SourceDirectories = @(
-    '.github',
     'crates/domain/benches',
     'crates/domain/examples',
     'crates/domain/src',

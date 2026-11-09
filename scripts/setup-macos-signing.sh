@@ -1,20 +1,17 @@
 #!/usr/bin/env bash
-# One-time setup: a fixed self-signed code-signing identity for macOS builds (local and GitHub CI).
+# One-time setup: a fixed self-signed code-signing identity for local macOS builds.
 #
 # Why: macOS privacy permissions (Accessibility, Input Monitoring, ...) are keyed to the app's designated
 # requirement. An ad-hoc signed build's requirement is its cdhash, which changes on every rebuild, so each
 # reinstall asks for the permissions again. Signed with a fixed certificate, the requirement becomes
 # `identifier "com.quicktext.desktop" and certificate leaf = H"<cert hash>"`, the same on every build, and the
-# granted permissions carry over. Local builds (scripts/build-macos.sh) and the CI installers
-# (installers.yml) use the same certificate, so switching between them keeps the permissions as well.
+# granted permissions carry over. Local builds (scripts/build-macos.sh) sign with it.
 #
 # The certificate is not trusted by Gatekeeper and needs no trust setting: TCC compares the certificate hash,
 # not its trust. Keep the stored .p12: a new certificate has a new hash, and the permissions must then be
 # granted once more.
 #
-# Usage: scripts/setup-macos-signing.sh [--github]
-#   --github                    also store the certificate as the repository secrets MAC_DEV_CERTIFICATE,
-#                               MAC_DEV_CERTIFICATE_PASSWORD and MAC_DEV_SIGNING_IDENTITY (needs `gh auth`)
+# Usage: scripts/setup-macos-signing.sh
 #   QUICKTEXT_SIGNING_IDENTITY  certificate name (default "Quicktext Local Signing")
 #   QUICKTEXT_SIGNING_DIR       where the .p12 and its password are kept (default ~/.config/quicktext-signing)
 #   QUICKTEXT_SIGNING_KEYCHAIN  keychain to import into (default: login keychain)
@@ -27,9 +24,6 @@ P12="$DIR/identity.p12"
 PASSFILE="$DIR/identity.password"
 # The system LibreSSL writes a PKCS#12 that `security import` reads (OpenSSL 3 defaults need -legacy).
 OPENSSL=/usr/bin/openssl
-
-github=0
-[[ "${1:-}" == "--github" ]] && github=1
 
 has_identity() { security find-identity -p codesigning "$KEYCHAIN" | grep -qF "\"$NAME\""; }
 
@@ -72,12 +66,4 @@ else
   security import "$P12" -k "$KEYCHAIN" -P "$pass" -T /usr/bin/codesign >/dev/null
   has_identity || { echo "import failed: $NAME not found in $KEYCHAIN" >&2; exit 1; }
   echo "imported signing identity: $NAME"
-fi
-
-# 3. The GitHub secrets installers.yml signs with.
-if [[ $github -eq 1 ]]; then
-  base64 -i "$P12" | gh secret set MAC_DEV_CERTIFICATE
-  printf '%s' "$pass" | gh secret set MAC_DEV_CERTIFICATE_PASSWORD
-  printf '%s' "$NAME" | gh secret set MAC_DEV_SIGNING_IDENTITY
-  echo "stored GitHub secrets MAC_DEV_CERTIFICATE / MAC_DEV_CERTIFICATE_PASSWORD / MAC_DEV_SIGNING_IDENTITY"
 fi

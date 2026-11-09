@@ -66,7 +66,7 @@
    - 实机最小集、剪贴板、安全模式与存储、隐私、兼容、性能、浸泡、不得倒退。
 
    获取：
-   - 用 GitHub Actions `release` workflow 产出的 `…-package` artifact，或在本机执行 `scripts/build-windows.ps1`。
+   - 在本机执行 `scripts/build-windows.ps1`（GitHub Actions 流水线已于 2026-11-09 移除）。
    - 特性门禁（`scripts/check-release-features.ps1`、`scripts/check-binary-strings.ps1`）在 release-checklist 里执行，本清单不再重复。只需确认启动日志第一行是 `app.start`，且其中 `debug_build=false`（`src-tauri/src/main.rs:45-50`）。
    - release 构建**不**带开发者工具，也没有 `debug_inject_fault` 命令。
 2. **故障注入调试构建（下文称 debug-fi）**。只用于 §4 的注入条目和少数需要开发者工具的读数。

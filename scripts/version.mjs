@@ -18,18 +18,9 @@
 //       dropped by the keywords). An explicit version must be greater than the current one unless
 //       --allow-downgrade is given. Nothing is written when any manifest disagrees beforehand.
 //
-//   node scripts/version.mjs ci --ref-type <tag|branch> --ref-name <name> --run <number> [--sha <sha>]
-//       The version, tag and release kind of an installers.yml run (written to $GITHUB_OUTPUT when it
-//       is set, always printed):
-//         - tag run:     the tag must be v<manifest version>; prerelease = whether it has a `-` part.
-//         - other runs:  <base>-test.<run>, or <base>.test.<run> when the base is a prerelease already
-//                        (0.4.0-beta.1 -> 0.4.0-beta.1.test.7): always a prerelease, ordered by run
-//                        number, and below the final release of a plain base (0.3.2-test.7 < 0.3.2).
-//       bundle_version is the numeric X.Y.Z (macOS CFBundleVersion takes integers only).
-//
 //   node scripts/version.mjs compare <a> <b>
 //       Prints -1, 0 or 1 by SemVer precedence (build metadata ignored).
-import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -132,15 +123,6 @@ export function bump(current, kind, id) {
   const text = format(next);
   if (!parse(text)) throw new Error(`bump produced an invalid version: ${text}`);
   return text;
-}
-
-/** The version of a non-tag CI build of `base`, run `run`. */
-export function testVersion(base, run) {
-  const v = parse(base);
-  if (!v) throw new Error(`not a SemVer version: ${base}`);
-  if (!/^[1-9]\d*$/.test(String(run))) throw new Error(`bad run number: ${run}`);
-  const pre = v.pre.length ? [...v.pre, 'test', Number(run)] : ['test', Number(run)];
-  return format({ ...v, pre, build: [] });
 }
 
 // ---- manifests ----
@@ -252,39 +234,6 @@ function write(next) {
   return current;
 }
 
-function option(args, name) {
-  const i = args.indexOf(name);
-  return i >= 0 ? args[i + 1] : undefined;
-}
-
-function ci(args) {
-  const base = check();
-  const refType = option(args, '--ref-type') ?? process.env.GITHUB_REF_TYPE ?? '';
-  const refName = option(args, '--ref-name') ?? process.env.GITHUB_REF_NAME ?? '';
-  const run = option(args, '--run') ?? process.env.GITHUB_RUN_NUMBER ?? '';
-  const sha = option(args, '--sha') ?? process.env.GITHUB_SHA ?? '';
-  let version;
-  if (refType === 'tag') {
-    if (refName !== `v${base}`)
-      throw new Error(`tag ${refName} does not match the manifest version (expected v${base})`);
-    version = base;
-  } else {
-    version = testVersion(base, run);
-  }
-  const v = parse(version);
-  const out = {
-    version,
-    tag: `v${version}`,
-    prerelease: String(v.pre.length > 0),
-    bundle_version: `${v.major}.${v.minor}.${v.patch}`,
-    base,
-    sha,
-  };
-  const lines = Object.entries(out).map(([k, val]) => `${k}=${val}`);
-  if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, lines.join('\n') + '\n');
-  console.log(lines.join('\n'));
-}
-
 const KINDS = ['major', 'minor', 'patch', 'premajor', 'preminor', 'prepatch', 'prerelease'];
 
 function main(argv) {
@@ -310,14 +259,11 @@ function main(argv) {
       console.log(`${current} -> ${next}`);
       return;
     }
-    case 'ci':
-      ci(args);
-      return;
     case 'compare':
       console.log(String(compare(args[0], args[1])));
       return;
     default:
-      throw new Error('usage: version.mjs <check|bump|ci|compare> ...');
+      throw new Error('usage: version.mjs <check|bump|compare> ...');
   }
 }
 

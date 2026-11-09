@@ -1,9 +1,9 @@
 //! In-app update check and download, backed by the GitHub Releases of
-//! `meruchan0623/quick-text` (what `.github/workflows/installers.yml` publishes).
+//! `meruchan0623/quick-text` (published by hand since the CI workflows were removed).
 //!
-//! - Every release tag is `v<SemVer 2.0.0>` (`scripts/version.mjs ci`): plain `vX.Y.Z` is a
-//!   release, a tag with a `-` part (`v0.4.0-beta.1`, the CI test builds `v0.3.2-test.17`) a
-//!   prerelease. Tags that are not SemVer (the old `test-3-ddff827`) and drafts are ignored.
+//! - Every release tag is `v<SemVer 2.0.0>` (`scripts/version.mjs`): plain `vX.Y.Z` is a
+//!   release, a tag with a `-` part (`v0.4.0-beta.1`, the former CI test builds `v0.3.2-test.17`)
+//!   a prerelease. Tags that are not SemVer (the old `test-3-ddff827`) and drafts are ignored.
 //! - The newest release is chosen by SemVer precedence ([`select_latest`]), not by date.
 //! - Each release carries one package per platform (macOS arm64 `*.dmg`, Windows x64
 //!   `*-Windows-x64-Portable.zip`) and `SHA256SUMS-macos.txt` / `SHA256SUMS-windows.txt`, which the
