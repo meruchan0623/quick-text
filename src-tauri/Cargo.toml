@@ -42,8 +42,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "registry", "smallvec", "tracing-log"] }
 tracing-appender = "0.2"
 zip = { version = "9", default-features = false, features = ["deflate"] }
-rust_xlsxwriter = "0.93"
-calamine = "0.36"
+rust_xlsxwriter = "0.102"
+calamine = "0.38"
 quick-xml = "0.41"
 # Team phrases download (docs/cloud-phrases.md §3). Same version tauri already pulls in;
 # TLS through the platform stack only (native-tls: SChannel on Windows, Security.framework
