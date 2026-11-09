@@ -39,6 +39,7 @@ $SourceFiles = @(
     'THIRD_PARTY_NOTICES.md',
     'deny.toml',
     'eslint.config.js',
+    'hint.html',
     'index.html',
     'package-lock.json',
     'package.json',
