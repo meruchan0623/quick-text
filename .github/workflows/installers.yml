@@ -100,24 +100,51 @@ jobs:
       - name: Placeholder frontend dist
         run: mkdir -p dist
 
-      # Tauri imports APPLE_CERTIFICATE into a temporary keychain and signs the .app with the bundle identifier.
-      # The fixed certificate keeps the designated requirement stable across builds (see the header); there is
-      # no ad-hoc fallback, since such a build would make macOS ask for the permissions again.
-      # The build version replaces tauri.conf.json's; CFBundleVersion takes integers only, so it gets X.Y.Z.
-      - name: Build DMG
+      # The self-signed certificate goes into a temporary keychain and signs the .app with `codesign` (as
+      # scripts/build-macos.sh does). tauri's own signing only resolves trusted identities, so it is not used here.
+      # No ad-hoc fallback: such a build would make macOS ask for the permissions again.
+      - name: Import signing certificate
         env:
-          APPLE_CERTIFICATE: ${{ secrets.MAC_DEV_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.MAC_DEV_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.MAC_DEV_SIGNING_IDENTITY }}
-          VERSION: ${{ needs.version.outputs.version }}
-          BUNDLE_VERSION: ${{ needs.version.outputs.bundle_version }}
+          CERT: ${{ secrets.MAC_DEV_CERTIFICATE }}
+          CERT_PASSWORD: ${{ secrets.MAC_DEV_CERTIFICATE_PASSWORD }}
+          IDENTITY: ${{ secrets.MAC_DEV_SIGNING_IDENTITY }}
         run: |
-          if [ -z "$APPLE_CERTIFICATE" ] || [ -z "$APPLE_CERTIFICATE_PASSWORD" ] || [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+          if [ -z "$CERT" ] || [ -z "$CERT_PASSWORD" ] || [ -z "$IDENTITY" ]; then
             echo "::error::MAC_DEV_CERTIFICATE / _PASSWORD / MAC_DEV_SIGNING_IDENTITY not set: run scripts/setup-macos-signing.sh --github"
             exit 1
           fi
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password=$(uuidgen)
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          echo "$CERT" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security import "$RUNNER_TEMP/signing.p12" -k "$keychain" -P "$CERT_PASSWORD" -T /usr/bin/codesign >/dev/null
+          rm -f "$RUNNER_TEMP/signing.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          security find-identity -p codesigning "$keychain" | grep -F "\"$IDENTITY\"" >/dev/null \
+            || { echo "::error::identity $IDENTITY not found in the imported certificate"; exit 1; }
+          echo "KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      # The build version replaces tauri.conf.json's; CFBundleVersion takes integers only, so it gets X.Y.Z.
+      - name: Build app
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          BUNDLE_VERSION: ${{ needs.version.outputs.bundle_version }}
+        run: |
           config=$(printf '{"version":"%s","build":{"beforeBundleCommand":""},"bundle":{"macOS":{"bundleVersion":"%s"}}}' "$VERSION" "$BUNDLE_VERSION")
-          npm run tauri -- build --target aarch64-apple-darwin --bundles app,dmg --config "$config"
+          npm run tauri -- build --target aarch64-apple-darwin --bundles app --config "$config"
+
+      # Same options as scripts/build-macos.sh: hardened runtime and the bundle identifier, so the designated
+      # requirement is `identifier "com.quicktext.desktop" and certificate leaf = H"..."` on every build.
+      - name: Sign app
+        env:
+          IDENTITY: ${{ secrets.MAC_DEV_SIGNING_IDENTITY }}
+        run: |
+          app="target/aarch64-apple-darwin/release/bundle/macos/Quicktext.app"
+          bundle_id=$(node -p "require('./src-tauri/tauri.conf.json').identifier")
+          codesign --force --options runtime --sign "$IDENTITY" --keychain "$KEYCHAIN" --identifier "$bundle_id" "$app"
 
       - name: Verify signature
         env:
@@ -137,16 +164,22 @@ jobs:
           echo "CFBundleShortVersionString=$short CFBundleVersion=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")"
           [ "$short" = "$VERSION" ] || echo "::warning::CFBundleShortVersionString is $short, build version is $VERSION"
 
-      # Named by tauri after the build version: Quicktext_<version>_aarch64.dmg.
-      - name: Collect DMG
+      # Quicktext_<version>_aarch64.dmg: the signed app and an Applications link, read-only compressed image.
+      - name: Package DMG
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
-          mkdir -p out
-          dmg="target/aarch64-apple-darwin/release/bundle/dmg/Quicktext_${VERSION}_aarch64.dmg"
-          [ -f "$dmg" ] || { echo "DMG not found: $dmg" >&2; ls target/aarch64-apple-darwin/release/bundle/dmg >&2 || true; exit 1; }
-          cp "$dmg" out/
+          app="target/aarch64-apple-darwin/release/bundle/macos/Quicktext.app"
+          stage="$RUNNER_TEMP/dmg"
+          mkdir -p "$stage" out
+          ditto "$app" "$stage/Quicktext.app"
+          ln -s /Applications "$stage/Applications"
+          hdiutil create -volname Quicktext -srcfolder "$stage" -ov -format UDZO "out/Quicktext_${VERSION}_aarch64.dmg"
           cd out && shasum -a 256 *.dmg > SHA256SUMS-macos.txt
+
+      - name: Remove signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
 
       - uses: actions/upload-artifact@v4
         with:
