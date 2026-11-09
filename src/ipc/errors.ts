@@ -32,7 +32,13 @@ export type CommandError =
        * a frontend `Error`). Shown instead of the generic text so nothing gets lost.
        */
       message?: string;
-    };
+    }
+  /**
+   * In-app update check or download (src-tauri/src/update.rs): `kind` is open (network, timeout,
+   * rate_limited, http_status, no_asset, checksum_mismatch, busy, …); `message` is Chinese text
+   * for the user, shown as is.
+   */
+  | { code: 'update'; detail: { kind: string; message: string } };
 
 export type CommandErrorCode = CommandError['code'];
 
@@ -51,6 +57,7 @@ export const COMMAND_ERROR_CODES: readonly CommandErrorCode[] = [
   'token_expired',
   'cancelled',
   'internal',
+  'update',
 ];
 
 type Obj = Record<string, unknown>;
@@ -127,6 +134,8 @@ function fromObject(value: Obj): CommandError | null {
       return { code: 'hotkey_conflict', detail: { combo: str(d.combo) } };
     case 'internal':
       return { code: 'internal', detail: { trace_id: strOrNull(d.trace_id) } };
+    case 'update':
+      return { code: 'update', detail: { kind: str(d.kind), message: str(d.message) } };
     default:
       // A code added by a newer backend: keep it visible instead of failing.
       return internal(`操作没有完成（错误代码 ${value.code}）。`);
@@ -224,6 +233,8 @@ export function describeError(error: CommandError): string | null {
       const trace = error.detail.trace_id ? `（追踪编号 ${error.detail.trace_id}）` : '';
       return `操作没有完成，发生了内部错误${trace}。可在「运行状态」中导出诊断包反馈问题。`;
     }
+    case 'update':
+      return error.detail.message || `更新操作没有完成（${error.detail.kind || '未知原因'}）。`;
   }
 }
 

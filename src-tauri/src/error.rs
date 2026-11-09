@@ -45,6 +45,11 @@ pub enum CommandError {
     Cancelled,
     #[error("internal error (trace id {trace_id})")]
     Internal { trace_id: String },
+    /// Update check or download (src-tauri/src/update.rs): `kind` is a code from
+    /// `update::kind`, `message` the Chinese sentence the frontend shows as is (like the
+    /// team phrases' `last_error`); the technical detail is in the log only.
+    #[error("update failed ({kind}): {message}")]
+    Update { kind: &'static str, message: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -256,6 +261,13 @@ mod tests {
                 trace_id: "t".into()
             }),
             json!({"code":"internal","detail":{"trace_id":"t"}})
+        );
+        assert_eq!(
+            shape(CommandError::Update {
+                kind: "network",
+                message: "无法连接 GitHub".into()
+            }),
+            json!({"code":"update","detail":{"kind":"network","message":"无法连接 GitHub"}})
         );
     }
 

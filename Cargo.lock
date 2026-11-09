@@ -3350,6 +3350,7 @@ dependencies = [
  "reqwest",
  "rfd",
  "rust_xlsxwriter",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

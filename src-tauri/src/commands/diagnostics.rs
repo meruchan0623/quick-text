@@ -121,7 +121,39 @@ fn reveal(dir: &Path) -> io::Result<()> {
     } else {
         "xdg-open"
     };
-    let mut child = std::process::Command::new(program).arg(&dir).spawn()?;
+    let mut command = std::process::Command::new(program);
+    command.arg(&dir);
+    spawn_detached(command)
+}
+
+/// Shows `file` selected in the system file manager (Finder `open -R`, Explorer
+/// `/select,`; elsewhere its folder is opened). As with [`reveal`], only a failed
+/// launch is an error.
+pub(crate) fn reveal_file(file: &Path) -> io::Result<()> {
+    let file: PathBuf = file.components().collect();
+    let mut command;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command = std::process::Command::new("explorer");
+        // One argument, quoted as Explorer parses it (std's quoting would wrap the switch too).
+        command.raw_arg(format!("/select,\"{}\"", file.display()));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        command = std::process::Command::new("open");
+        command.arg("-R").arg(&file);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        command = std::process::Command::new("xdg-open");
+        command.arg(file.parent().unwrap_or(&file));
+    }
+    spawn_detached(command)
+}
+
+fn spawn_detached(mut command: std::process::Command) -> io::Result<()> {
+    let mut child = command.spawn()?;
     // Reap the child so it does not linger as a zombie on Unix.
     let _ = std::thread::Builder::new()
         .name("quicker-open-dir".into())

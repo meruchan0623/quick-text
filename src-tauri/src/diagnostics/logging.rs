@@ -217,6 +217,11 @@
 //! | `tray.notify_failed` | warn | a desktop notification was not shown; error |
 //! | `tray.notify_start_failed` | warn | the run-notification thread did not start; run notifications are off |
 //! | `ui.metric` | info / debug | `report_metric`; whitelisted name and value (first paint at info, event lag at debug) |
+//! | `update.checked` | info | `check_update`; current and latest version, `update_available`, `include_prerelease` |
+//! | `update.downloaded` | info | `download_update` finished; asset file name, bytes, `verified`, `elapsed_ms` |
+//! | `update.failed` | warn | an update check or download step failed; the error kind and a technical detail (HTTP status, reqwest error chain without URL, expected and actual SHA-256) |
+//! | `update.progress_emit_failed` | debug | an `update-download-progress` event was not delivered; error |
+//! | `update.unverified` | warn | the downloaded package has no checksum in its release (no SHA256SUMS file, or not listed in it); asset file name |
 //!
 //! # Privacy
 //!

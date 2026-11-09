@@ -33,6 +33,7 @@ const wire: Record<CommandError['code'], unknown> = {
   token_expired: { code: 'token_expired' },
   cancelled: { code: 'cancelled' },
   internal: { code: 'internal', detail: { trace_id: '6f1c' } },
+  update: { code: 'update', detail: { kind: 'network', message: '无法连接 GitHub' } },
 };
 
 const expected: Record<CommandError['code'], CommandError> = {
@@ -49,6 +50,7 @@ const expected: Record<CommandError['code'], CommandError> = {
   token_expired: { code: 'token_expired' },
   cancelled: { code: 'cancelled' },
   internal: { code: 'internal', detail: { trace_id: '6f1c' } },
+  update: { code: 'update', detail: { kind: 'network', message: '无法连接 GitHub' } },
 };
 
 const texts: Record<CommandError['code'], string | null> = {
@@ -65,6 +67,7 @@ const texts: Record<CommandError['code'], string | null> = {
   token_expired: '确认已过期，请重新操作。',
   cancelled: null,
   internal: '操作没有完成，发生了内部错误（追踪编号 6f1c）。可在「运行状态」中导出诊断包反馈问题。',
+  update: '无法连接 GitHub',
 };
 
 describe('parseCommandError', () => {

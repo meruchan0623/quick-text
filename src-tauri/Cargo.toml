@@ -51,6 +51,9 @@ quick-xml = "0.41"
 reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
 # RFC 3339 timestamps of the team phrases status; already in the tree (quicker-domain).
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# SemVer precedence of the GitHub release tags (in-app update check, src/update.rs); already in
+# the tree (tauri's PackageInfo.version is a semver::Version).
+semver = "1"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

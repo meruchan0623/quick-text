@@ -16,6 +16,7 @@ mod package_zip;
 mod startup;
 mod store;
 mod tray;
+mod update;
 
 use app_state::{DataDir, Managed};
 use std::{path::PathBuf, sync::Arc};
@@ -109,6 +110,7 @@ fn main() {
             };
             app.manage(bus);
             app.manage(cloud::CloudSync::new());
+            app.manage(commands::update::UpdateState::default());
             startup::after_load(app.handle());
             #[cfg(target_os = "macos")]
             startup::request_missing_permissions(&app.state::<DataDir>().0);
@@ -193,6 +195,10 @@ fn main() {
             commands::cloud::set_cloud_settings,
             commands::cloud::sync_cloud_now,
             commands::cloud::set_cloud_rules_disabled,
+            commands::update::app_version,
+            commands::update::check_update,
+            commands::update::download_update,
+            commands::update::reveal_update,
             #[cfg(feature = "fault-injection")]
             commands::engine::debug_inject_fault
         ])
