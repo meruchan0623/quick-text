@@ -1480,14 +1480,17 @@ mod tests {
 
         let entry = runtime.record(execution("wake"));
         wait_until("offered again", || events.lock().len() >= 3);
-        assert_eq!(
-            *events.lock(),
-            [
-                EngineEvent::Health(h1),
-                EngineEvent::State(s1),
-                EngineEvent::Execution(entry)
-            ]
-        );
+        // There is no ordering between Execution and Health/State (see `subscribe`): check
+        // that Health still comes before its State, and that the Execution arrived.
+        let got = events.lock().clone();
+        let latest: Vec<_> = got
+            .iter()
+            .filter(|event| !matches!(event, EngineEvent::Execution(_)))
+            .cloned()
+            .collect();
+        assert_eq!(latest, [EngineEvent::Health(h1), EngineEvent::State(s1)]);
+        assert!(got.contains(&EngineEvent::Execution(entry)), "{got:?}");
+        assert_eq!(got.len(), 3, "{got:?}");
     }
 
     /// Publishers race Recovering/Healthy and MANUAL on/off against a slow
