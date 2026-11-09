@@ -111,7 +111,7 @@ describe('团队话术 list', () => {
   it('shows the source, the same columns plus 状态, and every status in words', async () => {
     const { host } = phrases(ready(await cloudState()));
     expect(host.querySelector('.cloud-source')?.textContent).toMatch(
-      /^来自 TSim 客服系统 · v12 · 上次同步 \S+ \d\d:\d\d（1 条当前版本无法读取，已跳过）立即同步$/,
+      /^来自 TSim 客服系统 · v12 · 上次同步 \S+ \d\d:\d\d（1 条已跳过）立即同步$/,
     );
     expect([...host.querySelectorAll('th')].map((th) => th.textContent)).toEqual([
       '',

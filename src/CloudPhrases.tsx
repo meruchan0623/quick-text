@@ -214,57 +214,59 @@ function PhraseNote({
   return null;
 }
 
-/** 「来自 TSim 客服系统 · v12 · 上次同步 …」 and 「立即同步」, then the last error if any. */
+/** 「来自 TSim 客服系统 · v12 · 上次同步 …」 and 「立即同步」, at the end of the toolbar. */
 function SourceBar({
   state,
   busy,
   onSync,
-  onOpenSettings,
 }: {
   state: CloudState;
   busy: boolean;
   onSync: () => void;
-  onOpenSettings: () => void;
 }) {
   const { status } = state;
   const synced = syncTime(status.last_success_at);
-  const error = status.last_error;
   return (
-    <>
-      <div className="cloud-source">
-        <span>
-          {[
-            '来自 TSim 客服系统',
-            status.revision === null ? '尚未同步' : `v${status.revision}`,
-            synced === null ? null : `上次同步 ${synced}`,
-          ]
-            .filter((part) => part !== null)
-            .join(' · ')}
-          {status.unreadable_count > 0 && (
-            <small className="muted">
-              （{status.unreadable_count} 条当前版本无法读取，已跳过）
-            </small>
-          )}
-        </span>
-        <button onClick={onSync} disabled={busy || status.syncing}>
-          {status.syncing ? '正在同步…' : '立即同步'}
+    <div className="cloud-source">
+      <span>
+        {[
+          '来自 TSim 客服系统',
+          status.revision === null ? '尚未同步' : `v${status.revision}`,
+          synced === null ? null : `上次同步 ${synced}`,
+        ]
+          .filter((part) => part !== null)
+          .join(' · ')}
+        {status.unreadable_count > 0 && (
+          <small className="muted" title="当前版本无法读取，已跳过">
+            （{status.unreadable_count} 条已跳过）
+          </small>
+        )}
+      </span>
+      <button onClick={onSync} disabled={busy || status.syncing}>
+        {status.syncing ? '正在同步…' : '立即同步'}
+      </button>
+    </div>
+  );
+}
+
+/** The last sync error, if any, under the toolbar. */
+function SyncError({ state, onOpenSettings }: { state: CloudState; onOpenSettings: () => void }) {
+  const { status } = state;
+  const error = status.last_error;
+  if (!error) return null;
+  return (
+    <div className="alert error" role="alert">
+      {`同步失败${status.last_attempt_at ? `（${syncTime(status.last_attempt_at) ?? ''}）` : ''}：`}
+      {cloudErrorText(error)}
+      {status.revision !== null &&
+        error.code !== ASSET_DOWNLOAD_ERROR &&
+        '目前仍使用上次同步的内容。'}
+      {SETTINGS_ERRORS.includes(error.code) && (
+        <button className="retry" onClick={onOpenSettings}>
+          去设置
         </button>
-      </div>
-      {error && (
-        <div className="alert error" role="alert">
-          {`同步失败${status.last_attempt_at ? `（${syncTime(status.last_attempt_at) ?? ''}）` : ''}：`}
-          {cloudErrorText(error)}
-          {status.revision !== null &&
-            error.code !== ASSET_DOWNLOAD_ERROR &&
-            '目前仍使用上次同步的内容。'}
-          {SETTINGS_ERRORS.includes(error.code) && (
-            <button className="retry" onClick={onOpenSettings}>
-              去设置
-            </button>
-          )}
-        </div>
       )}
-    </>
+    </div>
   );
 }
 
@@ -359,7 +361,6 @@ export default function CloudPhrases({
   const detail = viewing === null ? null : (phrases.find((p) => p.entry.id === viewing) ?? null);
   return (
     <div className="panel">
-      <SourceBar state={state} busy={busy} onSync={onSync} onOpenSettings={onOpenSettings} />
       <div className="toolbar">
         <input
           className="search"
@@ -368,36 +369,40 @@ export default function CloudPhrases({
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
+        <SourceBar state={state} busy={busy} onSync={onSync} />
       </div>
-      <div className="group-tabs">
-        {groups.map((g) => (
-          <button key={g} className={current === g ? 'active' : ''} onClick={() => setGroup(g)}>
-            {g}
-            <small>{g === '全部' ? rows.length : (groupCounts.get(g) ?? 0)}</small>
+      <SyncError state={state} onOpenSettings={onOpenSettings} />
+      <div className="list-bar">
+        <div className="group-tabs">
+          {groups.map((g) => (
+            <button key={g} className={current === g ? 'active' : ''} onClick={() => setGroup(g)}>
+              {g}
+              <small>{g === '全部' ? rows.length : (groupCounts.get(g) ?? 0)}</small>
+            </button>
+          ))}
+        </div>
+        <div className="batch cloud-batch">
+          <span>
+            共 {rows.length} 条{unreadable.length > 0 && `（${unreadable.length} 条无法显示）`} ·
+            已选 {chosen.length} 条
+          </span>
+          <button
+            disabled={busy || chosen.length === 0}
+            onClick={() => {
+              onSetDisabled(chosen, false);
+            }}
+          >
+            本机启用
           </button>
-        ))}
-      </div>
-      <div className="batch cloud-batch">
-        <span>
-          共 {rows.length} 条{unreadable.length > 0 && `（${unreadable.length} 条无法显示）`} · 已选{' '}
-          {chosen.length} 条
-        </span>
-        <button
-          disabled={busy || chosen.length === 0}
-          onClick={() => {
-            onSetDisabled(chosen, false);
-          }}
-        >
-          本机启用
-        </button>
-        <button
-          disabled={busy || chosen.length === 0}
-          onClick={() => {
-            onSetDisabled(chosen, true);
-          }}
-        >
-          本机停用
-        </button>
+          <button
+            disabled={busy || chosen.length === 0}
+            onClick={() => {
+              onSetDisabled(chosen, true);
+            }}
+          >
+            本机停用
+          </button>
+        </div>
       </div>
       <div className="table-wrap">
         <table className="cloud-table">

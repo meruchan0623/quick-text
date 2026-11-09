@@ -296,7 +296,7 @@ label {
   overscroll-behavior: contain;
 }
 header {
-  height: 60px;
+  height: 52px;
   padding: 0 24px;
   background: var(--surface);
   display: flex;
@@ -547,7 +547,7 @@ header > .revision + .settings-toggle {
   flex: 1;
   display: flex;
   flex-direction: column;
-  padding: 16px 20px;
+  padding: 12px 20px;
 }
 .panel {
   flex: 1;
@@ -560,7 +560,7 @@ header > .revision + .settings-toggle {
   overflow: hidden;
 }
 .toolbar {
-  padding: 14px 16px;
+  padding: 10px 16px;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -652,6 +652,40 @@ header > .revision + .settings-toggle {
 }
 .batch button:last-child {
   margin-left: auto;
+}
+/* Group tabs on the left, the count and batch actions on the right: one row above the table. */
+.list-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 8px 16px;
+  background: var(--surface-2);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.list-bar .group-tabs {
+  flex: 1 1 240px;
+  min-width: 0;
+  padding: 0;
+  scrollbar-width: none;
+}
+.list-bar .group-tabs button {
+  min-height: 28px;
+}
+.list-bar .batch {
+  margin-left: auto;
+  padding: 0;
+  background: none;
+  border: 0;
+  flex-shrink: 0;
+}
+.list-bar .batch span {
+  margin-right: 6px;
+}
+.list-bar .batch button:last-child {
+  margin-left: 0;
 }
 .table-wrap {
   flex: 1;
@@ -1972,8 +2006,8 @@ input[aria-invalid='true'] {
   display: inline-flex;
   align-self: flex-start;
   gap: 2px;
-  padding: 3px;
-  margin-bottom: 12px;
+  padding: 2px;
+  margin-bottom: 10px;
   background: var(--surface-3);
   border: 1px solid var(--border);
   border-radius: 999px;
@@ -1986,8 +2020,8 @@ input[aria-invalid='true'] {
   border-radius: 999px;
   background: none;
   box-shadow: none;
-  padding: 4px 8px 4px 16px;
-  min-height: 30px;
+  padding: 2px 6px 2px 14px;
+  min-height: 26px;
   color: var(--text-secondary);
   font-weight: 500;
 }
@@ -2016,24 +2050,26 @@ input[aria-invalid='true'] {
   background: var(--accent-soft);
   color: var(--accent-soft-text);
 }
-/* 「来自 TSim 客服系统 · v12 · 上次同步 …」 and 「立即同步」. */
+/* 「来自 TSim 客服系统 · v12 · 上次同步 …」 and 「立即同步」, at the end of the toolbar. */
 .cloud-source {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 10px 16px;
-  background: var(--surface-2);
-  border-bottom: 1px solid var(--border);
+  margin-left: auto;
+  min-width: 0;
   color: var(--text-secondary);
-  flex-shrink: 0;
+  font-size: 12px;
 }
 .cloud-source > span {
-  flex: 1;
   min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .cloud-source button {
+  flex-shrink: 0;
   border-radius: 999px;
-  min-height: 30px;
+  min-height: 32px;
 }
 .panel > .alert {
   margin: 12px 16px 0;
@@ -2219,13 +2255,18 @@ td .cloud-problem {
   margin: 6px 0 0 45px;
   font-size: 12px;
 }
+.hint-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 .hint-badge {
   font-size: 11px;
-  padding: 1px 8px;
+  line-height: 18px;
+  padding: 0 8px;
   border-radius: 999px;
   background: var(--accent-soft);
   color: var(--accent-soft-text);
-  margin-left: 8px;
 }
 .hint-duration {
   padding-left: 45px;

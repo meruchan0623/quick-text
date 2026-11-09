@@ -1130,72 +1130,78 @@ export default function App({
                 onExport={exportData}
               />
             </div>
-            <div className="group-tabs">
-              {groups.map((g) => (
-                <button key={g} className={group === g ? 'active' : ''} onClick={() => setGroup(g)}>
-                  {g}
-                  <small>{g === '全部' ? config.rules.length : (groupCounts.get(g) ?? 0)}</small>
+            <div className="list-bar">
+              <div className="group-tabs">
+                {groups.map((g) => (
+                  <button
+                    key={g}
+                    className={group === g ? 'active' : ''}
+                    onClick={() => setGroup(g)}
+                  >
+                    {g}
+                    <small>{g === '全部' ? config.rules.length : (groupCounts.get(g) ?? 0)}</small>
+                  </button>
+                ))}
+              </div>
+              <div className="batch">
+                <span>
+                  共 {config.rules.length} 条
+                  {unreadable.length > 0 && `（${unreadable.length} 条无法读取）`} · 已选{' '}
+                  {selected.length} 条
+                </span>
+                <button
+                  disabled={!writable || !selected.length}
+                  onClick={() =>
+                    mutate((rs) =>
+                      rs.map((r) => (selectedSet.has(r.id) ? { ...r, enabled: true } : r)),
+                    )
+                  }
+                >
+                  启用
                 </button>
-              ))}
-            </div>
-            <div className="batch">
-              <span>
-                共 {config.rules.length} 条
-                {unreadable.length > 0 && `（${unreadable.length} 条无法读取）`} · 已选{' '}
-                {selected.length} 条
-              </span>
-              <button
-                disabled={!writable || !selected.length}
-                onClick={() =>
-                  mutate((rs) =>
-                    rs.map((r) => (selectedSet.has(r.id) ? { ...r, enabled: true } : r)),
-                  )
-                }
-              >
-                启用
-              </button>
-              <button
-                disabled={!writable || !selected.length}
-                onClick={() =>
-                  mutate((rs) =>
-                    rs.map((r) => (selectedSet.has(r.id) ? { ...r, enabled: false } : r)),
-                  )
-                }
-              >
-                停用
-              </button>
-              <button
-                disabled={!writable || !selected.length}
-                onClick={async () => {
-                  const g = await askValue({
-                    title: `把所选 ${selected.length} 条指令移到哪个分组？`,
-                    confirm: '移动',
-                    input: { label: '分组名称', value: '默认' },
-                  });
-                  if (g)
-                    void mutate((rs) =>
-                      rs.map((r) => (selectedSet.has(r.id) ? { ...r, group: g } : r)),
-                    );
-                }}
-              >
-                移至分组
-              </button>
-              <button
-                className="danger"
-                disabled={!writable || !selected.length}
-                onClick={async () => {
-                  if (
-                    await confirmAction({
-                      title: `删除所选 ${selected.length} 条指令？`,
-                      detail: '确认后立即生效。',
-                      confirm: '删除',
-                    })
-                  )
-                    void mutate((rs) => rs.filter((r) => !selectedSet.has(r.id)));
-                }}
-              >
-                删除
-              </button>
+                <button
+                  disabled={!writable || !selected.length}
+                  onClick={() =>
+                    mutate((rs) =>
+                      rs.map((r) => (selectedSet.has(r.id) ? { ...r, enabled: false } : r)),
+                    )
+                  }
+                >
+                  停用
+                </button>
+                <button
+                  disabled={!writable || !selected.length}
+                  onClick={async () => {
+                    const g = await askValue({
+                      title: `把所选 ${selected.length} 条指令移到哪个分组？`,
+                      confirm: '移动',
+                      input: { label: '分组名称', value: '默认' },
+                    });
+                    if (g)
+                      void mutate((rs) =>
+                        rs.map((r) => (selectedSet.has(r.id) ? { ...r, group: g } : r)),
+                      );
+                  }}
+                >
+                  移至分组
+                </button>
+                <button
+                  className="danger"
+                  disabled={!writable || !selected.length}
+                  onClick={async () => {
+                    if (
+                      await confirmAction({
+                        title: `删除所选 ${selected.length} 条指令？`,
+                        detail: '确认后立即生效。',
+                        confirm: '删除',
+                      })
+                    )
+                      void mutate((rs) => rs.filter((r) => !selectedSet.has(r.id)));
+                  }}
+                >
+                  删除
+                </button>
+              </div>
             </div>
             <div className="table-wrap">
               <table>
