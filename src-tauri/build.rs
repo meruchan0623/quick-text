@@ -104,6 +104,9 @@ fn main() {
 /// tauri-codegen embeds no assets then (src/context.rs:182-204).
 fn frontend_dist() -> Result<PathBuf, String> {
     println!("cargo:rerun-if-env-changed=TAURI_CONFIG");
+    // The auto-update channel (src/autoupdate.rs), set by the CI release workflow only.
+    println!("cargo:rerun-if-env-changed=QT_UPDATE_CHANNEL");
+    println!("cargo:rerun-if-changed=update-keys/current.pub");
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").map_err(|e| e.to_string())?);
     let target = Target::from_triple(&env::var("TARGET").map_err(|e| e.to_string())?);
     let (mut config, _) = tauri_utils::config::parse::read_from(target, &root)

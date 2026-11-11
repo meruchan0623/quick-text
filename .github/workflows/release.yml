@@ -1,0 +1,355 @@
+# Release pipeline and signed auto-update feed (docs/auto-update.md).
+#
+#   push to main (app sources) -> beta,   version <major>.<minor>.<run_number> (major.minor from
+#                                 tauri.conf.json), GitHub pre-release v<version>
+#   tag vX.Y.Z                 -> stable, version X.Y.Z, GitHub release v<version> (marked latest)
+#   workflow_dispatch          -> test build, no update channel, artifacts only
+#
+# Channel builds upload every file to the versioned release v<version> first and overwrite
+# `latest.json` on the fixed release `updater-<channel>` LAST; installed clients only read that
+# file. Before it is written, scripts/update-manifest.mjs verifies every update package against
+# the public key the client embeds (src-tauri/update-keys/current.pub), so a wrong signing secret
+# fails here instead of on every client. Afterwards scripts/prune-releases.mjs keeps the newest 10
+# beta releases (plus anything a manifest points at); stable releases are all kept.
+#
+# These are test-signed builds without the compliance gate (build.beforeBundleCommand: generated
+# third-party notices, dependency source archive), like the former installers.yml.
+#
+# Secrets:
+#   MAC_DEV_CERTIFICATE / MAC_DEV_CERTIFICATE_PASSWORD / MAC_DEV_SIGNING_IDENTITY
+#       fixed self-signed identity (scripts/setup-macos-signing.sh): stable designated requirement,
+#       so macOS keeps granted permissions across updates
+#   TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+#       `tauri signer generate` key (content, not a path); public half in update-keys/current.pub.
+#       Set it from a file (`gh secret set NAME < file`): a PowerShell pipe adds a BOM.
+#   WINDOWS_DEV_CERTIFICATE / WINDOWS_DEV_CERTIFICATE_PASSWORD   optional, base64 .pfx
+name: release
+
+on:
+  push:
+    branches: [main]
+    # Path filters are not applied to tag pushes. Docs and tests never reach the shipped app.
+    paths:
+      - "src/**"
+      - "src-tauri/**"
+      - "crates/**"
+      - "vendor/**"
+      - "index.html"
+      - "hint.html"
+      - "package.json"
+      - "package-lock.json"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "vite.config.ts"
+      - "tsconfig.json"
+      - "!**/*.md"
+      - "!**/*.test.ts"
+      - "!**/*.test.tsx"
+      - "!crates/**/tests/**"
+      - ".github/workflows/release.yml"
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  # Queue, do not cancel: GitHub keeps only the newest pending run, so a burst of pushes costs at
+  # most two builds, and a half-built release is never abandoned.
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  meta:
+    name: Version and channel
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.m.outputs.version }}
+      channel: ${{ steps.m.outputs.channel }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: src-tauri
+      - id: m
+        env:
+          EVENT: ${{ github.event_name }}
+          RUN: ${{ github.run_number }}
+        run: |
+          base="$(jq -r .version src-tauri/tauri.conf.json)"
+          channel=""
+          version="$base"
+          if [ "$EVENT" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then
+            channel=stable; version="${GITHUB_REF_NAME#v}"
+          elif [ "$EVENT" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+            channel=beta; version="$(echo "$base" | cut -d. -f1-2).$RUN"
+          fi
+          echo "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+            || { echo "::error::version must be x.y.z, got $version"; exit 1; }
+          grep -q '[^[:space:]]' src-tauri/update-keys/current.pub \
+            || { echo "::error::src-tauri/update-keys/current.pub is empty"; exit 1; }
+          echo "version=$version channel=${channel:-none}"
+          { echo "version=$version"; echo "channel=$channel"; } >> "$GITHUB_OUTPUT"
+
+  build-macos:
+    name: macOS arm64
+    needs: meta
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      CHANNEL: ${{ needs.meta.outputs.channel }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-apple-darwin
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: mkdir -p dist
+
+      # tauri's own signing only resolves trusted identities, so the self-signed one signs with
+      # codesign after the build (as scripts/build-macos.sh does). No ad-hoc fallback: such a
+      # build would make macOS ask for the permissions again after every update.
+      - name: Import signing certificate
+        env:
+          CERT: ${{ secrets.MAC_DEV_CERTIFICATE }}
+          CERT_PASSWORD: ${{ secrets.MAC_DEV_CERTIFICATE_PASSWORD }}
+          IDENTITY: ${{ secrets.MAC_DEV_SIGNING_IDENTITY }}
+        run: |
+          if [ -z "$CERT" ] || [ -z "$CERT_PASSWORD" ] || [ -z "$IDENTITY" ]; then
+            echo "::error::MAC_DEV_CERTIFICATE / _PASSWORD / MAC_DEV_SIGNING_IDENTITY not set"; exit 1
+          fi
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password=$(uuidgen)
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          echo "$CERT" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security import "$RUNNER_TEMP/signing.p12" -k "$keychain" -P "$CERT_PASSWORD" -T /usr/bin/codesign >/dev/null
+          rm -f "$RUNNER_TEMP/signing.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          security find-identity -p codesigning "$keychain" | grep -F "\"$IDENTITY\"" >/dev/null \
+            || { echo "::error::identity $IDENTITY not found in the imported certificate"; exit 1; }
+          echo "KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: Build app
+        env:
+          QT_UPDATE_CHANNEL: ${{ needs.meta.outputs.channel }}
+        run: |
+          if [ -z "$QT_UPDATE_CHANNEL" ]; then unset QT_UPDATE_CHANNEL; fi
+          printf '{"version":"%s","build":{"beforeBundleCommand":""},"bundle":{"macOS":{"bundleVersion":"%s"}}}' "$VERSION" "$VERSION" > "$RUNNER_TEMP/release.conf.json"
+          npx tauri build --target aarch64-apple-darwin --bundles app --config "$RUNNER_TEMP/release.conf.json"
+
+      - name: Sign and verify app
+        env:
+          IDENTITY: ${{ secrets.MAC_DEV_SIGNING_IDENTITY }}
+        run: |
+          app="target/aarch64-apple-darwin/release/bundle/macos/Quicktext.app"
+          bundle_id=$(node -p "require('./src-tauri/tauri.conf.json').identifier")
+          codesign --force --options runtime --sign "$IDENTITY" --keychain "$KEYCHAIN" --identifier "$bundle_id" "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          requirement=$(codesign -d -r- "$app" 2>&1 | grep designated)
+          echo "$requirement"
+          case "$requirement" in
+            *'identifier "com.quicktext.desktop" and certificate leaf = H"'*) ;;
+            *) echo "::error::unstable designated requirement: $requirement"; exit 1 ;;
+          esac
+          short=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
+          [ "$short" = "$VERSION" ] || { echo "::error::CFBundleShortVersionString is $short, expected $VERSION"; exit 1; }
+
+      - name: Package DMG and update bundle
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          dir="target/aarch64-apple-darwin/release/bundle/macos"
+          stage="$RUNNER_TEMP/dmg"
+          mkdir -p "$stage" out
+          ditto "$dir/Quicktext.app" "$stage/Quicktext.app"
+          ln -s /Applications "$stage/Applications"
+          hdiutil create -volname Quicktext -srcfolder "$stage" -ov -format UDZO "out/Quicktext_${VERSION}_aarch64.dmg"
+          (cd out && shasum -a 256 *.dmg > SHA256SUMS-macos.txt)
+          # The update bundle holds the codesigned app; the updater replaces the .app with it.
+          [ -n "$TAURI_SIGNING_PRIVATE_KEY" ] || { echo "::error::TAURI_SIGNING_PRIVATE_KEY not set"; exit 1; }
+          bundle="out/Quicktext_${VERSION}_aarch64.app.tar.gz"
+          COPYFILE_DISABLE=1 tar -czf "$bundle" -C "$dir" Quicktext.app
+          tar -tzf "$bundle" | head -n1 | grep -qx "Quicktext.app/" \
+            || { echo "::error::update bundle must start with Quicktext.app/"; exit 1; }
+          npx tauri signer sign --app-version "$VERSION" "$bundle"
+          node scripts/update-manifest.mjs --version "$VERSION" --pubkey src-tauri/update-keys/current.pub \
+            --base-url https://example.invalid/check --out "$RUNNER_TEMP/check.json" "darwin-aarch64=$bundle"
+          ls -l out
+
+      - name: Remove signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: out/*
+          if-no-files-found: error
+          retention-days: 5
+
+  build-windows:
+    name: Windows x64
+    needs: meta
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      CHANNEL: ${{ needs.meta.outputs.channel }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-pc-windows-msvc
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - shell: bash
+        run: mkdir -p dist
+
+      - name: Signing certificate (optional)
+        id: winsign
+        shell: pwsh
+        env:
+          CERT_B64: ${{ secrets.WINDOWS_DEV_CERTIFICATE }}
+          CERT_PW: ${{ secrets.WINDOWS_DEV_CERTIFICATE_PASSWORD }}
+        run: |
+          $cfg = @{ version = $env:VERSION; build = @{ beforeBundleCommand = '' } }
+          if ($env:CERT_B64) {
+            $pfx = Join-Path $env:RUNNER_TEMP 'cert.pfx'
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_B64))
+            $pw = ConvertTo-SecureString $env:CERT_PW -AsPlainText -Force
+            $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $pw
+            Remove-Item $pfx
+            $cfg.bundle = @{ windows = @{ certificateThumbprint = $cert.Thumbprint } }
+          } else {
+            Write-Host '::warning::WINDOWS_DEV_CERTIFICATE not set: exe and installer are unsigned (SmartScreen warns on first install)'
+          }
+          $cfg | ConvertTo-Json -Depth 5 -Compress | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'release.conf.json') -Encoding utf8NoBOM
+
+      - name: Build NSIS installer
+        shell: pwsh
+        env:
+          QT_UPDATE_CHANNEL: ${{ needs.meta.outputs.channel }}
+        run: |
+          if (-not $env:QT_UPDATE_CHANNEL) { Remove-Item Env:QT_UPDATE_CHANNEL -ErrorAction SilentlyContinue }
+          npx tauri build --bundles nsis --config (Join-Path $env:RUNNER_TEMP 'release.conf.json')
+          if ($LASTEXITCODE -ne 0) { throw 'tauri build failed' }
+
+      - name: Package installer, portable ZIP and update signature
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          setup="out/Quicktext_${VERSION}_x64-setup.exe"
+          cp "target/release/bundle/nsis/Quicktext_${VERSION}_x64-setup.exe" "$setup"
+          # Portable ZIP + SHA256SUMS: what the in-app manual check downloads (src-tauri/src/update.rs).
+          name="Quicktext-${VERSION}-Windows-x64-Portable"
+          mkdir -p "$RUNNER_TEMP/$name"
+          cp target/release/quicktext.exe README.md LICENSE THIRD_PARTY_NOTICES.md "$RUNNER_TEMP/$name/"
+          pwsh -NoProfile -Command "Compress-Archive -Path '$RUNNER_TEMP/$name' -DestinationPath 'out/$name.zip'"
+          (cd out && sha256sum "$name.zip" > SHA256SUMS-windows.txt)
+          [ -n "$TAURI_SIGNING_PRIVATE_KEY" ] || { echo "::error::TAURI_SIGNING_PRIVATE_KEY not set"; exit 1; }
+          npx tauri signer sign --app-version "$VERSION" "$setup"
+          node scripts/update-manifest.mjs --version "$VERSION" --pubkey src-tauri/update-keys/current.pub \
+            --base-url https://example.invalid/check --out "$RUNNER_TEMP/check.json" "windows-x86_64=$setup"
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*
+          if-no-files-found: error
+          retention-days: 5
+
+  publish:
+    name: Publish ${{ needs.meta.outputs.channel }} ${{ needs.meta.outputs.version }}
+    if: needs.meta.outputs.channel != ''
+    needs: [meta, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-updates
+      cancel-in-progress: false
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      CHANNEL: ${{ needs.meta.outputs.channel }}
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts
+            src-tauri/update-keys
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          path: files
+          merge-multiple: true
+
+      - name: latest.json (verifies every update package)
+        run: |
+          ls -l files
+          node scripts/update-manifest.mjs --version "$VERSION" --pubkey src-tauri/update-keys/current.pub \
+            --base-url "https://github.com/$REPO/releases/download/v$VERSION" \
+            --notes "$CHANNEL $VERSION (${GITHUB_SHA::7})" --out latest.json \
+            "darwin-aarch64=files/Quicktext_${VERSION}_aarch64.app.tar.gz" \
+            "windows-x86_64=files/Quicktext_${VERSION}_x64-setup.exe"
+          cat latest.json
+
+      - name: Versioned release, then the channel manifest
+        run: |
+          tag="v$VERSION"
+          if gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$tag" --repo "$REPO" --clobber files/*
+          else
+            if [ "$CHANNEL" = beta ]; then kind=(--prerelease); title="Quicktext $VERSION (beta)"; else kind=(--latest); title="Quicktext $VERSION"; fi
+            cat > notes.md <<EOF
+          ${CHANNEL} build ${VERSION} from commit ${GITHUB_SHA}.
+
+          - macOS (Apple silicon): Quicktext_${VERSION}_aarch64.dmg. Self-signed: the first launch needs right-click → Open (or System Settings → Privacy & Security). Later updates install in the app.
+          - Windows: Quicktext_${VERSION}_x64-setup.exe (installer, auto-updates), or the portable ZIP (no auto-update).
+          - Installed ${CHANNEL} builds update themselves from this channel.
+          EOF
+            gh release create "$tag" --repo "$REPO" --target "$GITHUB_SHA" "${kind[@]}" --title "$title" --notes-file notes.md files/*
+          fi
+          manifest="updater-$CHANNEL"
+          if ! gh release view "$manifest" --repo "$REPO" >/dev/null 2>&1; then
+            gh release create "$manifest" --repo "$REPO" --target "$GITHUB_SHA" --prerelease --latest=false \
+              --title "Update channel: $CHANNEL" \
+              --notes "Update manifest of the $CHANNEL channel, read by installed clients. Do not delete."
+          fi
+          gh release upload "$manifest" --repo "$REPO" --clobber latest.json
+          curl -fsSL "https://github.com/$REPO/releases/download/$manifest/latest.json" | jq -e --arg v "$VERSION" '.version == $v'
+
+      - name: Prune old beta releases
+        continue-on-error: true
+        run: node scripts/prune-releases.mjs --repo "$REPO" --keep-beta 10 --keep-stable all

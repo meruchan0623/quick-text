@@ -2,6 +2,7 @@
 mod app_state;
 mod assets;
 mod autostart;
+mod autoupdate;
 mod cloud;
 mod commands;
 mod config_package;
@@ -32,6 +33,7 @@ fn main() {
             tray::show_main(app);
         }))
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // Release isolation is available only in the explicit input acceptance mode.
             let acceptance_dir =
@@ -78,7 +80,8 @@ fn main() {
             // The tray and the EventBus come before anything that can
             // change the engine or find a problem, so the frontend and the
             // tray miss nothing after the state `load_state` reads.
-            let pause_item = tray::build(app)?;
+            let (pause_item, tray_menu) = tray::build(app)?;
+            autoupdate::init(app.handle(), tray_menu);
             let status = tray::TrayStatus::new(app.handle().clone(), pause_item, engine.clone());
             let bus = {
                 let managed = app.state::<Managed>();
@@ -222,6 +225,7 @@ fn main() {
             if exiting {
                 tracing::info!(event = "app.exit", "Quicktext exiting");
                 diagnostics::logging::flush();
+                autoupdate::install_on_exit(app);
             }
         });
 }

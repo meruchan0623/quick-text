@@ -217,6 +217,18 @@
 //! | `tray.notify_failed` | warn | a desktop notification was not shown; error |
 //! | `tray.notify_start_failed` | warn | the run-notification thread did not start; run notifications are off |
 //! | `ui.metric` | info / debug | `report_metric`; whitelisted name and value (first paint at info, event lag at debug) |
+//! | `autoupdate.enabled` | info | background auto-update is on (src/autoupdate.rs); the channel |
+//! | `autoupdate.disabled` | info/warn | no update channel (local build) or no public key in this build |
+//! | `autoupdate.unavailable` | warn | the updater could not be built; error |
+//! | `autoupdate.up_to_date` | info | the channel has no newer version |
+//! | `autoupdate.check_failed` | warn | the channel manifest could not be read; error |
+//! | `autoupdate.found` | info | a newer version is being downloaded; version |
+//! | `autoupdate.download_failed` | warn | download or signature check of an update failed; error |
+//! | `autoupdate.ready` | info | an update is downloaded and verified; version |
+//! | `autoupdate.tray_failed` | warn | the 「重启以更新」 tray entry could not be added; error |
+//! | `autoupdate.install` | info | installing an update from the tray, then restarting; version |
+//! | `autoupdate.install_on_exit` | info | installing a downloaded update after 「退出全部」; version |
+//! | `autoupdate.install_failed` | warn | installing an update failed; error |
 //! | `update.checked` | info | `check_update`; current and latest version, `update_available`, `include_prerelease` |
 //! | `update.downloaded` | info | `download_update` finished; asset file name, bytes, `verified`, `elapsed_ms` |
 //! | `update.failed` | warn | an update check or download step failed; the error kind and a technical detail (HTTP status, reqwest error chain without URL, expected and actual SHA-256) |

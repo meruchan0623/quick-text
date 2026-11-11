@@ -66,8 +66,8 @@ fn pause_label(listening: bool) -> &'static str {
 }
 
 /// Builds the tray; returns the pause/resume entry so [`TrayStatus`] can
-/// relabel it.
-pub fn build(app: &tauri::App) -> tauri::Result<MenuItem<Wry>> {
+/// relabel it, and the menu (the auto-update entry goes on top of it).
+pub fn build(app: &tauri::App) -> tauri::Result<(MenuItem<Wry>, tauri::menu::Menu<Wry>)> {
     let pause = MenuItem::with_id(app, PAUSE_ID, pause_label(false), true, None::<&str>)?;
     let menu = tauri::menu::Menu::with_items(
         app,
@@ -98,17 +98,25 @@ pub fn build(app: &tauri::App) -> tauri::Result<MenuItem<Wry>> {
             "show" => show_main(app),
             PAUSE_ID => toggle_pause(app),
             "quit" => {
-                let state = app.state::<Managed>();
-                let s = state.lock();
-                s.engine.cancel.store(true, Ordering::SeqCst);
-                s.runtime.set_pause(PauseReasons::MANUAL, true);
-                crate::store::clear_run_marker_on_session_end();
+                crate::autoupdate::note_quit(app);
+                end_session(app);
                 app.exit(0)
             }
+            crate::autoupdate::MENU_ID => crate::autoupdate::install_now(app),
             _ => {}
         })
         .build(app)?;
-    Ok(pause)
+    Ok((pause, menu))
+}
+
+/// Stops the engine and clears the run marker (safe mode, B-04): the end of a
+/// session the user asked for (「退出全部」, or restarting into an update).
+pub(crate) fn end_session(app: &AppHandle) {
+    let state = app.state::<Managed>();
+    let s = state.lock();
+    s.engine.cancel.store(true, Ordering::SeqCst);
+    s.runtime.set_pause(PauseReasons::MANUAL, true);
+    crate::store::clear_run_marker_on_session_end();
 }
 
 /// Shows and focuses the management window (restored if minimized).
