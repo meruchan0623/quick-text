@@ -6,8 +6,9 @@
 #     (QT_DEPENDENCY_SOURCES_ZIP), which refuses to bundle without it.
 # The third-party notices are generated here and bundled in place of the committed placeholder
 # (src-tauri\resources\THIRD-PARTY-LICENSES.txt); the placeholder is put back afterwards, whether the build worked or not.
+# The build follows the stable update channel (QT_UPDATE_CHANNEL, docs/auto-update.md) unless the variable is already set.
 param(
-    [ValidateSet('nsis','msi')][string]$Bundle = 'nsis',
+    [ValidateSet('nsis','msi')][string]$Bundle = 'msi',
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$DependencySourcesZip
 )
 $ErrorActionPreference = 'Stop'
@@ -21,6 +22,8 @@ $resource = Join-Path $projectRoot 'src-tauri\resources\THIRD-PARTY-LICENSES.txt
 $placeholder = [IO.File]::ReadAllBytes($resource)
 $noticeDir = Join-Path ([IO.Path]::GetTempPath()) ('qt-notices-' + [Guid]::NewGuid().ToString('N'))
 $previousDeps = $env:QT_DEPENDENCY_SOURCES_ZIP
+$previousChannel = $env:QT_UPDATE_CHANNEL
+if (-not $env:QT_UPDATE_CHANNEL) { $env:QT_UPDATE_CHANNEL = 'stable' }
 Push-Location $projectRoot
 try {
     Write-Host 'Installing locked frontend dependencies'
@@ -40,6 +43,7 @@ try {
     if($LASTEXITCODE -ne 0){throw 'Desktop build failed'}
 } finally {
     [IO.File]::WriteAllBytes($resource, $placeholder)
+    if ($null -eq $previousChannel) { Remove-Item Env:\QT_UPDATE_CHANNEL -ErrorAction SilentlyContinue } else { $env:QT_UPDATE_CHANNEL = $previousChannel }
     if ($null -eq $previousDeps) { Remove-Item Env:\QT_DEPENDENCY_SOURCES_ZIP -ErrorAction SilentlyContinue } else { $env:QT_DEPENDENCY_SOURCES_ZIP = $previousDeps }
     Remove-Item -LiteralPath $noticeDir -Recurse -Force -ErrorAction SilentlyContinue
     Pop-Location

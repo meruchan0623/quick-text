@@ -1,10 +1,10 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Quicktext",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "identifier": "com.quicktext.desktop",
   "build": { "beforeDevCommand": "npm run dev", "devUrl": "http://localhost:1420", "beforeBuildCommand": "npm run build", "beforeBundleCommand": "pwsh -NoProfile -File scripts/check-bundle-preconditions.ps1", "frontendDist": "../dist" },
   "app": { "windows": [{ "label": "main", "title": "Quicktext", "create": false, "visible": false, "width": 1240, "height": 840, "minWidth": 900, "minHeight": 650 }], "security": { "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data:; connect-src ipc: http://ipc.localhost" } },
-  "bundle": { "active": true, "targets": "all", "icon": ["icons/icon.png", "icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.ico"], "shortDescription": "跨平台文本指令管理", "category": "Utility", "license": "GPL-3.0-or-later", "licenseFile": "../LICENSE", "resources": { "resources/THIRD-PARTY-LICENSES.txt": "THIRD-PARTY-LICENSES.txt", "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md", "../LICENSE": "LICENSE.txt", "../vendor/espanso-win32/LICENSE": "LICENSE-ESPANSO-GPL-3.0.txt" }, "windows": { "nsis": { "displayLanguageSelector": true, "languages": ["SimpChinese", "English"] } }, "macOS": { "minimumSystemVersion": "10.15" } },
+  "bundle": { "active": true, "targets": "all", "icon": ["icons/icon.png", "icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.ico"], "shortDescription": "跨平台文本指令管理", "category": "Utility", "license": "GPL-3.0-or-later", "licenseFile": "../LICENSE", "resources": { "resources/THIRD-PARTY-LICENSES.txt": "THIRD-PARTY-LICENSES.txt", "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md", "../LICENSE": "LICENSE.txt", "../vendor/espanso-win32/LICENSE": "LICENSE-ESPANSO-GPL-3.0.txt" }, "windows": { "nsis": { "displayLanguageSelector": true, "languages": ["SimpChinese", "English"] }, "wix": { "language": "zh-CN", "template": "wix/main.wxs" } }, "macOS": { "minimumSystemVersion": "10.15" } },
   "plugins": { "updater": { "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDlGNTNFRkEwMjFBQ0Y4RTcKUldUbitLd2hvTzlUbjZzTHVFRUd5azhrM0I4bG1UeXE5bnhzQXk2VlkvRDkxcEFLV0t1eFBqaEoK", "requireSignedVersion": true, "windows": { "installMode": "passive" } } }
 }

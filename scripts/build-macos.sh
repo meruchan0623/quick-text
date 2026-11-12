@@ -9,6 +9,9 @@
 # Run scripts/setup-macos-signing.sh once first: with its signing identity the granted macOS permissions
 # survive rebuilds and reinstalls (see that script for why).
 #
+# The app follows the stable update channel (QT_UPDATE_CHANNEL, docs/auto-update.md) unless the
+# variable is already set; QT_UPDATE_CHANNEL= (empty) builds without auto-update.
+#
 # Usage: scripts/build-macos.sh [--no-install]
 set -euo pipefail
 
@@ -19,6 +22,8 @@ cd "$(dirname "$0")/.."
 install=1
 [[ "${1:-}" == "--no-install" ]] && install=0
 
+export QT_UPDATE_CHANNEL="${QT_UPDATE_CHANNEL-stable}"
+[[ -n "$QT_UPDATE_CHANNEL" ]] || unset QT_UPDATE_CHANNEL
 npm run tauri -- build --bundles app --config '{"build":{"beforeBundleCommand":""}}'
 
 bundle="target/release/bundle/macos/${APP_NAME}.app"

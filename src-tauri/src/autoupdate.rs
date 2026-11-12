@@ -1,7 +1,8 @@
 //! Background auto-update (docs/auto-update.md), on top of `tauri-plugin-updater`.
 //!
-//! - The channel (`beta` / `stable`) is fixed at compile time by `QT_UPDATE_CHANNEL`, which only
-//!   the CI release workflow sets. Local builds have none and never contact the update feed.
+//! - The channel is fixed at compile time by `QT_UPDATE_CHANNEL`: `stable` (CI and the local
+//!   build scripts; `beta` only in the retired 0.4.4 beta build), none for plain local builds,
+//!   which never contact the update feed.
 //! - The feed is the fixed address
 //!   `https://github.com/meruchan0623/quick-text/releases/download/updater-<channel>/latest.json`.
 //!   The minisign public key is compiled in (`update-keys/current.pub`); the plugin verifies every

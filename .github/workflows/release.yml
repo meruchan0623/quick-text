@@ -1,16 +1,21 @@
 # Release pipeline and signed auto-update feed (docs/auto-update.md).
 #
-#   push to main (app sources) -> beta,   version <major>.<minor>.<run_number> (major.minor from
-#                                 tauri.conf.json), GitHub pre-release v<version>
-#   tag vX.Y.Z                 -> stable, version X.Y.Z, GitHub release v<version> (marked latest)
-#   workflow_dispatch          -> test build, no update channel, artifacts only
+#   push to main that raises "version" in src-tauri/tauri.conf.json
+#                   -> stable channel, exactly that version, GitHub release v<version> (latest).
+#                      meta skips the build unless the version is above what
+#                      updater-stable/latest.json already serves.
+#   workflow_dispatch -> test build, no update channel, artifacts only
 #
-# Channel builds upload every file to the versioned release v<version> first and overwrite
-# `latest.json` on the fixed release `updater-<channel>` LAST; installed clients only read that
-# file. Before it is written, scripts/update-manifest.mjs verifies every update package against
-# the public key the client embeds (src-tauri/update-keys/current.pub), so a wrong signing secret
-# fails here instead of on every client. Afterwards scripts/prune-releases.mjs keeps the newest 10
-# beta releases (plus anything a manifest points at); stable releases are all kept.
+# Stable only: no beta channel. Every build ships exactly two installers - an Apple silicon dmg
+# (fixed self-signed identity) and a per-user x64 MSI (src-tauri/wix/main.wxs: installs to
+# %LOCALAPPDATA%\Programs, no UAC on install or update) - plus the macOS update bundle and the
+# portable ZIP + SHA256SUMS the in-app manual check reads (src-tauri/src/update.rs). The MSI is
+# itself the Windows update payload. No NSIS, no Intel Mac.
+#
+# Every file goes to the versioned release v<version> first; `latest.json` on the fixed release
+# `updater-stable` is overwritten LAST; installed clients only read that file. Before it is
+# written, scripts/update-manifest.mjs verifies every update package against the public key the
+# client embeds (src-tauri/update-keys/current.pub). Stable releases are all kept.
 #
 # These are test-signed builds without the compliance gate (build.beforeBundleCommand: generated
 # third-party notices, dependency source archive), like the former installers.yml.
@@ -28,26 +33,11 @@ name: release
 on:
   push:
     branches: [main]
-    # Path filters are not applied to tag pushes. Docs and tests never reach the shipped app.
+    # The version lives in tauri.conf.json; touching it (or this workflow) only starts the cheap
+    # meta job, which builds only when the version actually went up.
     paths:
-      - "src/**"
-      - "src-tauri/**"
-      - "crates/**"
-      - "vendor/**"
-      - "index.html"
-      - "hint.html"
-      - "package.json"
-      - "package-lock.json"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "vite.config.ts"
-      - "tsconfig.json"
-      - "!**/*.md"
-      - "!**/*.test.ts"
-      - "!**/*.test.tsx"
-      - "!crates/**/tests/**"
+      - "src-tauri/tauri.conf.json"
       - ".github/workflows/release.yml"
-    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
   workflow_dispatch:
 
 permissions:
@@ -71,6 +61,7 @@ jobs:
     outputs:
       version: ${{ steps.m.outputs.version }}
       channel: ${{ steps.m.outputs.channel }}
+      build: ${{ steps.m.outputs.build }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -78,26 +69,38 @@ jobs:
       - id: m
         env:
           EVENT: ${{ github.event_name }}
-          RUN: ${{ github.run_number }}
+          REPO: ${{ github.repository }}
         run: |
-          base="$(jq -r .version src-tauri/tauri.conf.json)"
+          version="$(jq -r .version src-tauri/tauri.conf.json)"
           channel=""
-          version="$base"
-          if [ "$EVENT" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then
-            channel=stable; version="${GITHUB_REF_NAME#v}"
-          elif [ "$EVENT" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
-            channel=beta; version="$(echo "$base" | cut -d. -f1-2).$RUN"
-          fi
+          if [ "$EVENT" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then channel=stable; fi
           echo "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
             || { echo "::error::version must be x.y.z, got $version"; exit 1; }
           grep -q '[^[:space:]]' src-tauri/update-keys/current.pub \
             || { echo "::error::src-tauri/update-keys/current.pub is empty"; exit 1; }
-          echo "version=$version channel=${channel:-none}"
-          { echo "version=$version"; echo "channel=$channel"; } >> "$GITHUB_OUTPUT"
+          # Build only a version that is new for the channel: strictly above what its manifest
+          # serves (the same public URL clients read; 404 = never published).
+          build=true
+          if [ -n "$channel" ]; then
+            code="$(curl -sL -o "$RUNNER_TEMP/served.json" -w '%{http_code}' "https://github.com/$REPO/releases/download/updater-$channel/latest.json")"
+            case "$code" in
+              200) served="$(jq -r .version "$RUNNER_TEMP/served.json")" ;;
+              404) served="" ;;
+              *) echo "::error::cannot read updater-$channel/latest.json (HTTP $code)"; exit 1 ;;
+            esac
+            newest="$(printf '%s\n%s\n' "$served" "$version" | sort -V | tail -n1)"
+            if [ -n "$served" ] && { [ "$served" = "$version" ] || [ "$newest" != "$version" ]; }; then
+              build=false
+              echo "::notice::$channel already serves $served; tauri.conf.json version $version is not newer - nothing to build"
+            fi
+          fi
+          echo "version=$version channel=${channel:-none} build=$build"
+          { echo "version=$version"; echo "channel=$channel"; echo "build=$build"; } >> "$GITHUB_OUTPUT"
 
   build-macos:
     name: macOS arm64
     needs: meta
+    if: needs.meta.outputs.build == 'true'
     runs-on: macos-latest
     timeout-minutes: 60
     env:
@@ -207,6 +210,7 @@ jobs:
   build-windows:
     name: Windows x64
     needs: meta
+    if: needs.meta.outputs.build == 'true'
     runs-on: windows-latest
     timeout-minutes: 60
     env:
@@ -247,16 +251,16 @@ jobs:
           }
           $cfg | ConvertTo-Json -Depth 5 -Compress | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'release.conf.json') -Encoding utf8NoBOM
 
-      - name: Build NSIS installer
+      - name: Build per-user MSI
         shell: pwsh
         env:
           QT_UPDATE_CHANNEL: ${{ needs.meta.outputs.channel }}
         run: |
           if (-not $env:QT_UPDATE_CHANNEL) { Remove-Item Env:QT_UPDATE_CHANNEL -ErrorAction SilentlyContinue }
-          npx tauri build --bundles nsis --config (Join-Path $env:RUNNER_TEMP 'release.conf.json')
+          npx tauri build --bundles msi --config (Join-Path $env:RUNNER_TEMP 'release.conf.json')
           if ($LASTEXITCODE -ne 0) { throw 'tauri build failed' }
 
-      - name: Package installer, portable ZIP and update signature
+      - name: Package MSI, portable ZIP and update signature
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -264,8 +268,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-          setup="out/Quicktext_${VERSION}_x64-setup.exe"
-          cp "target/release/bundle/nsis/Quicktext_${VERSION}_x64-setup.exe" "$setup"
+          setup="out/Quicktext_${VERSION}_x64_zh-CN.msi"
+          cp "target/release/bundle/msi/Quicktext_${VERSION}_x64_zh-CN.msi" "$setup"
           # Portable ZIP + SHA256SUMS: what the in-app manual check downloads (src-tauri/src/update.rs).
           name="Quicktext-${VERSION}-Windows-x64-Portable"
           mkdir -p "$RUNNER_TEMP/$name"
@@ -287,7 +291,7 @@ jobs:
 
   publish:
     name: Publish ${{ needs.meta.outputs.channel }} ${{ needs.meta.outputs.version }}
-    if: needs.meta.outputs.channel != ''
+    if: needs.meta.outputs.channel != '' && needs.meta.outputs.build == 'true'
     needs: [meta, build-macos, build-windows]
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -322,7 +326,7 @@ jobs:
             --base-url "https://github.com/$REPO/releases/download/v$VERSION" \
             --notes "$CHANNEL $VERSION (${GITHUB_SHA::7})" --out latest.json \
             "darwin-aarch64=files/Quicktext_${VERSION}_aarch64.app.tar.gz" \
-            "windows-x86_64=files/Quicktext_${VERSION}_x64-setup.exe"
+            "windows-x86_64=files/Quicktext_${VERSION}_x64_zh-CN.msi"
           cat latest.json
 
       - name: Versioned release, then the channel manifest
@@ -331,12 +335,12 @@ jobs:
           if gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
             gh release upload "$tag" --repo "$REPO" --clobber files/*
           else
-            if [ "$CHANNEL" = beta ]; then kind=(--prerelease); title="Quicktext $VERSION (beta)"; else kind=(--latest); title="Quicktext $VERSION"; fi
+            kind=(--latest); title="Quicktext $VERSION"
             cat > notes.md <<EOF
           ${CHANNEL} build ${VERSION} from commit ${GITHUB_SHA}.
 
           - macOS (Apple silicon): Quicktext_${VERSION}_aarch64.dmg. Self-signed: the first launch needs right-click → Open (or System Settings → Privacy & Security). Later updates install in the app.
-          - Windows: Quicktext_${VERSION}_x64-setup.exe (installer, auto-updates), or the portable ZIP (no auto-update).
+          - Windows: Quicktext_${VERSION}_x64_zh-CN.msi (installs for the current user, no administrator rights; auto-updates), or the portable ZIP (no auto-update). If 0.4.4 (setup.exe) is installed, uninstall it first.
           - Installed ${CHANNEL} builds update themselves from this channel.
           EOF
             gh release create "$tag" --repo "$REPO" --target "$GITHUB_SHA" "${kind[@]}" --title "$title" --notes-file notes.md files/*
@@ -350,6 +354,13 @@ jobs:
           gh release upload "$manifest" --repo "$REPO" --clobber latest.json
           curl -fsSL "https://github.com/$REPO/releases/download/$manifest/latest.json" | jq -e --arg v "$VERSION" '.version == $v'
 
-      - name: Prune old beta releases
-        continue-on-error: true
-        run: node scripts/prune-releases.mjs --repo "$REPO" --keep-beta 10 --keep-stable all
+      # The retired beta channel (only 0.4.4 ever shipped on it) gets the macOS entry only: Macs
+      # move on to stable by themselves, while a Windows 0.4.4 (NSIS) must not run the per-user
+      # MSI over itself (that would leave two installs); it is uninstalled and replaced by hand.
+      - name: Point the retired beta channel's Macs at this version
+        run: |
+          gh release view updater-beta --repo "$REPO" >/dev/null 2>&1 || exit 0
+          jq '.platforms |= {"darwin-aarch64": .["darwin-aarch64"]}' latest.json > beta.json
+          mkdir -p beta && cp beta.json beta/latest.json
+          gh release upload updater-beta --repo "$REPO" --clobber beta/latest.json
+

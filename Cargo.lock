@@ -3338,7 +3338,7 @@ dependencies = [
 
 [[package]]
 name = "quicker-domain"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -3352,7 +3352,7 @@ dependencies = [
 
 [[package]]
 name = "quicker-platform"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arboard",
  "arc-swap",
@@ -3376,7 +3376,7 @@ dependencies = [
 
 [[package]]
 name = "quicktext"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arboard",
  "arc-swap",
