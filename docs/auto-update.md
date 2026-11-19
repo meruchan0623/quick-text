@@ -24,12 +24,13 @@
 
 | 平台 | 命令 | 产物 |
 |---|---|---|
-| macOS（Apple silicon） | `scripts/publish-tsim.sh --server test\|prod\|both [--publish] [--skip-build]` | `Quicktext_<v>_aarch64.app.tar.gz`（更新包）+ `.dmg`（安装包） |
+| macOS（Apple silicon） | `scripts/publish-tsim.sh --server test\|prod\|both [--publish] [--skip-build]` | `Quicktext_<v>_aarch64.app.tar.gz`（既是更新包也是安装包） |
 | Windows x64 | `pwsh -File scripts/publish-tsim.ps1 -Server test\|prod\|both -DependencySourcesZip <…Source-deps.zip> [-Publish] [-SkipBuild] [-CertificateThumbprint …]` | `Quicktext_<v>_x64_zh-CN.msi`（既是安装包也是更新包） |
 
 - 脚本依次执行：检查版本和说明 → 构建 → 系统签名 → 用 `tauri signer sign --app-version` 签更新包，并用 `src-tauri/update-keys/current.pub` 验签 → multipart 上传到 `POST {服务器}/client-updates/v1/publish`。不带 `--publish` / `-Publish` 时上传为草稿，到管理页「客户端发布」里发布。
 - `--skip-build` / `-SkipBuild` 复用已构建的 .app 或 MSI，只重新打包、签名、上传。某台服务器上传失败时，用它加 `--server <那一台>` 重传。
 - Windows 构建走 `scripts/build-windows.ps1`，和其他可分发构建一样，必须带第三方声明和依赖源码包（`-DependencySourcesZip`），缺了直接失败。macOS 沿用原 CI 的做法：跳过这道只针对 Windows 的检查，因为 macOS 的声明和源码包流程还没有。
+- 每个平台服务器上只保留一个包，自动更新和首次下载共用，不再上传 dmg。Mac 首次安装：下载 `.app.tar.gz`，双击解压，把 Quicktext.app 拖进「应用程序」。新版本发布后，服务器会撤回同平台的旧版本并删除其文件。
 - 建议先传 `test`，装机验证后再传 `prod`。两台的版本相同时，客户端使用生产服的包。
 
 ## 密钥（只放在打包机上，不进仓库，也不上传 TSim）

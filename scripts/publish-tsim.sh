@@ -9,8 +9,10 @@
 #      already in target/aarch64-apple-darwin/release/bundle/macos is reused)
 #   3. codesign with the fixed self-signed identity (scripts/setup-macos-signing.sh); no ad-hoc
 #      fallback: an app with another designated requirement loses the granted permissions
-#   4. dmg + update bundle Quicktext_<v>_aarch64.app.tar.gz, signed with `tauri signer sign
-#      --app-version` and verified against src-tauri/update-keys/current.pub
+#   4. update bundle Quicktext_<v>_aarch64.app.tar.gz, signed with `tauri signer sign
+#      --app-version` and verified against src-tauri/update-keys/current.pub. It is the only macOS
+#      file on the server: auto-update and first install both use it (double-click to extract, drag
+#      Quicktext.app to Applications); no dmg
 #   5. multipart upload to POST <server>/client-updates/v1/publish (draft, or published with
 #      --publish)
 #
@@ -45,7 +47,7 @@ while [[ $# -gt 0 ]]; do
     --skip-build) skip_build=1; shift ;;
     --notes) notes="${2:-}"; shift 2 ;;
     --notes-file) notes_file="${2:-}"; shift 2 ;;
-    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -106,23 +108,19 @@ esac
 short="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")"
 [[ "$short" == "$version" ]] || die "CFBundleShortVersionString is $short, expected $version"
 
-# 4. dmg and the signed update bundle.
+# 4. The signed update bundle.
 out="target/tsim-publish/$version/macos"
 rm -rf "$out"
 mkdir -p "$out"
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
-ditto "$app" "$stage/Quicktext.app"
-ln -s /Applications "$stage/Applications"
-dmg="$out/Quicktext_${version}_aarch64.dmg"
-hdiutil create -volname Quicktext -srcfolder "$stage" -ov -format UDZO "$dmg" >/dev/null
 bundle="$out/Quicktext_${version}_aarch64.app.tar.gz"
 COPYFILE_DISABLE=1 tar -czf "$bundle" -C "$(dirname "$app")" Quicktext.app
 tar -tzf "$bundle" | head -n1 | grep -qx "Quicktext.app/" || die "update bundle must start with Quicktext.app/"
 npx tauri signer sign --app-version "$version" "$bundle" >/dev/null
 node scripts/update-manifest.mjs --version "$version" --pubkey src-tauri/update-keys/current.pub \
   --base-url https://example.invalid/check --out "$stage/check.json" "darwin-aarch64=$bundle" >/dev/null
-echo "packaged and verified: $dmg, $bundle"
+echo "packaged and verified: $bundle"
 
 # 5. Upload. The key goes to curl on stdin, not on its command line.
 failed=0
@@ -131,7 +129,7 @@ for s in "${servers[@]}"; do
   args=(-sS -o "$stage/response-$s.json" -w '%{http_code}' -X POST "$base/client-updates/v1/publish"
     --form-string "product=$PRODUCT" --form-string "platform=macos" --form-string "version=$version"
     --form-string "notes=$notes" --form-string "signature=$(cat "$bundle.sig")"
-    -F "updater_file=@$bundle" -F "installer_file=@$dmg")
+    -F "updater_file=@$bundle")
   [[ $publish -eq 1 ]] && args+=(--form-string "publish=true")
   echo "uploading $version to $s ($base)…"
   code="$(printf 'header = "X-Client-Publish-Key: %s"\n' "$key" | curl -K - "${args[@]}")" || code="000"
