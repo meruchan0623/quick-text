@@ -7,9 +7,11 @@
 # The third-party notices are generated here and bundled in place of the committed placeholder
 # (src-tauri\resources\THIRD-PARTY-LICENSES.txt); the placeholder is put back afterwards, whether the build worked or not.
 # The build follows the stable update channel (QT_UPDATE_CHANNEL, docs/auto-update.md) unless the variable is already set.
+# -CertificateThumbprint (optional): code-signing certificate in Cert:\CurrentUser\My for the exe and the installer.
 param(
     [ValidateSet('nsis','msi')][string]$Bundle = 'msi',
-    [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$DependencySourcesZip
+    [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$DependencySourcesZip,
+    [string]$CertificateThumbprint = ''
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
@@ -39,7 +41,14 @@ try {
     Copy-Item -LiteralPath $notices -Destination $resource -Force
     $env:QT_DEPENDENCY_SOURCES_ZIP = $depsZip
     Write-Host "Building desktop application and $Bundle installer"
-    & npm.cmd run tauri -- build --bundles $Bundle
+    $buildArgs = @('run', 'tauri', '--', 'build', '--bundles', $Bundle)
+    if ($CertificateThumbprint) {
+        # A file, not inline JSON: npm.cmd goes through cmd.exe, which mangles the quotes.
+        $signConfig = Join-Path $noticeDir 'sign.conf.json'
+        @{ bundle = @{ windows = @{ certificateThumbprint = $CertificateThumbprint } } } | ConvertTo-Json -Depth 5 -Compress | Set-Content -LiteralPath $signConfig -Encoding utf8NoBOM
+        $buildArgs += @('--config', $signConfig)
+    }
+    & npm.cmd @buildArgs
     if($LASTEXITCODE -ne 0){throw 'Desktop build failed'}
 } finally {
     [IO.File]::WriteAllBytes($resource, $placeholder)

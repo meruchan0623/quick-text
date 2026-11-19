@@ -1,15 +1,18 @@
-# Release pipeline and signed auto-update feed (docs/auto-update.md).
+# FORMER release pipeline and GitHub auto-update feed (docs/auto-update.md). Releases now go to the
+# TSim update servers from the packaging machines (scripts/publish-tsim.sh / publish-tsim.ps1);
+# this workflow runs only by hand:
 #
-#   push to main that raises "version" in src-tauri/tauri.conf.json
-#                   -> stable channel, exactly that version, GitHub release v<version> (latest).
-#                      meta skips the build unless the version is above what
-#                      updater-stable/latest.json already serves.
+#   workflow_dispatch, github_bridge = true (on main)
+#                   -> the bridge release: stable channel, GitHub release v<version> (latest) and
+#                      updater-stable/latest.json, so clients that still read GitHub update once to
+#                      a build that reads the TSim servers. meta skips the build unless the version
+#                      is above what updater-stable/latest.json already serves.
 #   workflow_dispatch -> test build, no update channel, artifacts only
 #
 # Stable only: no beta channel. Every build ships exactly two installers - an Apple silicon dmg
 # (fixed self-signed identity) and a per-user x64 MSI (src-tauri/wix/main.wxs: installs to
 # %LOCALAPPDATA%\Programs, no UAC on install or update) - plus the macOS update bundle and the
-# portable ZIP + SHA256SUMS the in-app manual check reads (src-tauri/src/update.rs). The MSI is
+# portable ZIP + SHA256SUMS (read by the manual check of 0.5.0 and earlier). The MSI is
 # itself the Windows update payload. No NSIS, no Intel Mac.
 #
 # Every file goes to the versioned release v<version> first; `latest.json` on the fixed release
@@ -31,14 +34,12 @@
 name: release
 
 on:
-  push:
-    branches: [main]
-    # The version lives in tauri.conf.json; touching it (or this workflow) only starts the cheap
-    # meta job, which builds only when the version actually went up.
-    paths:
-      - "src-tauri/tauri.conf.json"
-      - ".github/workflows/release.yml"
   workflow_dispatch:
+    inputs:
+      github_bridge:
+        description: "Publish to GitHub Releases + updater-stable (the one bridge release to the TSim servers)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -68,12 +69,12 @@ jobs:
           sparse-checkout: src-tauri
       - id: m
         env:
-          EVENT: ${{ github.event_name }}
+          BRIDGE: ${{ inputs.github_bridge }}
           REPO: ${{ github.repository }}
         run: |
           version="$(jq -r .version src-tauri/tauri.conf.json)"
           channel=""
-          if [ "$EVENT" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then channel=stable; fi
+          if [ "$BRIDGE" = true ] && [ "$GITHUB_REF" = refs/heads/main ]; then channel=stable; fi
           echo "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
             || { echo "::error::version must be x.y.z, got $version"; exit 1; }
           grep -q '[^[:space:]]' src-tauri/update-keys/current.pub \
