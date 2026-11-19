@@ -1,19 +1,25 @@
-//! Background auto-update (docs/auto-update.md), on top of `tauri-plugin-updater`.
+//! Auto-update (docs/auto-update.md), on top of `tauri-plugin-updater`.
 //!
-//! - The channel is fixed at compile time by `QT_UPDATE_CHANNEL`: `stable` (CI and the local
-//!   build scripts; `beta` only in the retired 0.4.4 beta build), none for plain local builds,
-//!   which never contact the update feed.
-//! - The feed is the fixed address
-//!   `https://github.com/meruchan0623/quick-text/releases/download/updater-<channel>/latest.json`.
-//!   The minisign public key is compiled in (`update-keys/current.pub`); the plugin verifies every
-//!   package against it, and `requireSignedVersion` (tauri.conf.json) binds the signature to the
-//!   announced version, so an old signed package cannot be served as a newer one.
+//! - The channel is fixed at compile time by `QT_UPDATE_CHANNEL`: `stable` (the local release
+//!   scripts), none for plain local builds, which never contact the update servers.
+//! - The feed is the two TSim servers ([`crate::update::manifest_urls`]): every check reads both
+//!   manifests at once and takes the newest version (production on a tie); one server failing
+//!   does not fail the check. The minisign public key is compiled in (`update-keys/current.pub`);
+//!   the plugin verifies every package against it, and `requireSignedVersion` (tauri.conf.json)
+//!   binds the signature to the announced version, so an old signed package cannot be served as a
+//!   newer one.
 //! - 60 s after start, then every 6 h: check; a newer version is downloaded and verified in the
 //!   background. Then the tray gets 「重启以更新到 x.y.z」 at the top and a notification is shown.
 //!   Not restarting is fine too: quitting from the tray installs it (without restarting). Other
 //!   exits (shutdown, logoff) do not install, so an installer is never killed halfway.
-//!
-//! The manual check in the settings page (`crate::update`) is unchanged.
+//! - The manual check in 设置 (`commands::update`) goes through the same check, download and
+//!   install ([`check_now`], [`download_now`], [`install_from_settings`]).
+//! - A downloaded package remembers the manifest address that announced it; the exit install
+//!   restores the update through an updater for that same address.
+use crate::{
+    error::CommandError,
+    update::{self, kind, Source, UpdateCheck, UpdateDownload, UpdateInfo},
+};
 use parking_lot::Mutex;
 use std::{
     sync::atomic::{AtomicBool, Ordering},
@@ -25,7 +31,7 @@ use tauri::{
 };
 use tauri_plugin_updater::{Update, UpdaterExt};
 
-/// `beta`, `stable`, or `None` (no auto-update in this build).
+/// `stable`, or `None` (no auto-update in this build).
 pub const CHANNEL: Option<&str> = option_env!("QT_UPDATE_CHANNEL");
 const PUBKEY: &str = include_str!("../update-keys/current.pub");
 const FIRST_CHECK: Duration = Duration::from_secs(60);
@@ -34,32 +40,70 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Tray menu id of the 「重启以更新」 entry.
 pub const MENU_ID: &str = "update-install";
 
-pub fn manifest_url(channel: &str) -> Option<String> {
-    matches!(channel, "beta" | "stable").then(|| {
-        format!(
-            "https://github.com/meruchan0623/quick-text/releases/download/updater-{channel}/latest.json"
-        )
-    })
+/// An update one server announced, with the manifest address it came from.
+#[derive(Clone)]
+struct Candidate {
+    update: Update,
+    source: Source,
+    url: String,
+}
+
+impl Candidate {
+    fn info(&self) -> UpdateInfo {
+        UpdateInfo {
+            version: self.update.version.clone(),
+            notes: self.update.body.clone().unwrap_or_default(),
+            pub_date: self
+                .update
+                .raw_json
+                .get("pub_date")
+                .and_then(|d| d.as_str())
+                .map(str::to_owned),
+            source: self.source,
+        }
+    }
 }
 
 struct Ready {
-    update: Update,
+    candidate: Candidate,
     bytes: Vec<u8>,
 }
 
 /// Managed state.
 pub struct AutoUpdate {
-    url: String,
+    urls: [(Source, String); 2],
     busy: AtomicBool,
     quit_requested: AtomicBool,
+    /// What the last manual check found, for 「下载更新」.
+    pending: Mutex<Option<Candidate>>,
     ready: Mutex<Option<Ready>>,
     /// The tray menu, to put the install entry on top.
     menu: Mutex<Option<Menu<Wry>>>,
 }
 
+/// Clears `busy` when a check or download ends, however it ends.
+struct Busy<'a>(&'a AtomicBool);
+
+impl<'a> Busy<'a> {
+    fn take(flag: &'a AtomicBool) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(flag))
+    }
+}
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// Starts the background loop when this build has an update channel.
 pub fn init(app: &AppHandle, tray_menu: Menu<Wry>) {
-    let Some(url) = CHANNEL.and_then(manifest_url) else {
+    let Some(urls) = CHANNEL
+        .zip(update::platform_segment())
+        .and_then(|(channel, platform)| update::manifest_urls(channel, platform))
+    else {
         tracing::info!(
             event = "autoupdate.disabled",
             "no update channel in this build"
@@ -79,9 +123,10 @@ pub fn init(app: &AppHandle, tray_menu: Menu<Wry>) {
         "auto-update enabled"
     );
     app.manage(AutoUpdate {
-        url,
+        urls,
         busy: AtomicBool::new(false),
         quit_requested: AtomicBool::new(false),
+        pending: Mutex::new(None),
         ready: Mutex::new(None),
         menu: Mutex::new(Some(tray_menu)),
     });
@@ -117,23 +162,63 @@ fn updater(app: &AppHandle, url: &str, restart: bool) -> Option<tauri_plugin_upd
         .ok()
 }
 
+/// Reads both manifests at once. `Ok(None)`: no newer version; `Err`: both servers failed.
+async fn find(app: &AppHandle, urls: &[(Source, String); 2]) -> Result<Option<Candidate>, String> {
+    let tasks: Vec<_> = urls
+        .iter()
+        .cloned()
+        .map(|(source, url)| {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let Some(updater) = updater(&app, &url, true) else {
+                    return Err(format!("{source:?}: updater unavailable"));
+                };
+                match updater.check().await {
+                    Ok(found) => Ok(found.map(|update| Candidate {
+                        update,
+                        source,
+                        url,
+                    })),
+                    Err(e) => {
+                        tracing::warn!(event = "autoupdate.source_failed", source = ?source, error = %e, "update server not usable");
+                        Err(format!("{source:?}: {e}"))
+                    }
+                }
+            })
+        })
+        .collect();
+    let mut answers = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let answer = match task.await {
+            Ok(answer) => answer,
+            Err(e) => Err(format!("check task failed: {e}")),
+        };
+        answers.push(answer.and_then(|found| {
+            match found {
+                None => Ok(None),
+                Some(c) => semver::Version::parse(&c.update.version)
+                    .map(|v| Some((v, c)))
+                    .map_err(|e| format!("bad version: {e}")),
+            }
+        }));
+    }
+    update::pick_newest(answers)
+        .map(|best| best.map(|(_, c)| c))
+        .map_err(|errors| errors.join("; "))
+}
+
 async fn check(app: &AppHandle) {
     let Some(state) = app.try_state::<AutoUpdate>() else {
         return;
     };
-    if state.ready.lock().is_some() || state.busy.swap(true, Ordering::AcqRel) {
+    if state.ready.lock().is_some() {
         return;
     }
-    run_check(app, &state).await;
-    state.busy.store(false, Ordering::Release);
-}
-
-async fn run_check(app: &AppHandle, state: &AutoUpdate) {
-    let Some(updater) = updater(app, &state.url, true) else {
+    let Some(_busy) = Busy::take(&state.busy) else {
         return;
     };
-    let update = match updater.check().await {
-        Ok(Some(u)) => u,
+    let candidate = match find(app, &state.urls).await {
+        Ok(Some(c)) => c,
         Ok(None) => {
             tracing::info!(event = "autoupdate.up_to_date", "no newer version");
             return;
@@ -143,19 +228,11 @@ async fn run_check(app: &AppHandle, state: &AutoUpdate) {
             return;
         }
     };
-    let target = update.version.clone();
-    tracing::info!(event = "autoupdate.found", version = %target, "downloading update");
-    // `download` verifies the minisign signature (and the signed version) before returning.
-    let bytes = match update.download(|_, _| {}, || {}).await {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(event = "autoupdate.download_failed", error = %e, "update download failed");
-            return;
-        }
-    };
-    tracing::info!(event = "autoupdate.ready", version = %target, "update downloaded and verified");
-    *state.ready.lock() = Some(Ready { update, bytes });
-    show_tray_entry(app, state, &target);
+    let target = candidate.update.version.clone();
+    tracing::info!(event = "autoupdate.found", version = %target, source = ?candidate.source, "downloading update");
+    if fetch(app, &state, candidate, |_, _| {}).await.is_err() {
+        return;
+    }
     crate::tray::notify(
         app,
         "Quicktext 有新版本",
@@ -163,6 +240,137 @@ async fn run_check(app: &AppHandle, state: &AutoUpdate) {
             "{target} 已下载。可在托盘菜单里重启更新；不重启的话，下次从托盘退出时会自动安装。"
         ),
     );
+}
+
+/// Downloads and verifies `candidate`, then offers it in the tray.
+async fn fetch(
+    app: &AppHandle,
+    state: &AutoUpdate,
+    candidate: Candidate,
+    mut progress: impl FnMut(u64, Option<u64>),
+) -> Result<(), String> {
+    let target = candidate.update.version.clone();
+    let mut downloaded = 0u64;
+    // `download` verifies the minisign signature (and the signed version) before returning.
+    let bytes = match candidate
+        .update
+        .download(
+            |chunk, total| {
+                downloaded += chunk as u64;
+                progress(downloaded, total);
+            },
+            || {},
+        )
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(event = "autoupdate.download_failed", error = %e, "update download failed");
+            return Err(e.to_string());
+        }
+    };
+    tracing::info!(event = "autoupdate.ready", version = %target, source = ?candidate.source, "update downloaded and verified");
+    *state.ready.lock() = Some(Ready { candidate, bytes });
+    *state.pending.lock() = None;
+    show_tray_entry(app, state, &target);
+    Ok(())
+}
+
+fn state_of(app: &AppHandle) -> Result<tauri::State<'_, AutoUpdate>, CommandError> {
+    app.try_state::<AutoUpdate>().ok_or_else(|| {
+        update::fail(
+            kind::DISABLED,
+            "这个版本没有内置更新渠道（本机构建），不能检查更新",
+            "no update channel in this build",
+        )
+    })
+}
+
+fn busy_error() -> CommandError {
+    update::fail(
+        kind::BUSY,
+        "正在检查或下载更新，请稍后再试",
+        "a check or download is already running",
+    )
+}
+
+/// The manual 「检查更新」: the same dual-server check as the background loop.
+pub async fn check_now(app: &AppHandle) -> Result<UpdateCheck, CommandError> {
+    let current = app.package_info().version.to_string();
+    let state = state_of(app)?;
+    if let Some(ready) = state.ready.lock().as_ref() {
+        return Ok(UpdateCheck {
+            current,
+            latest: Some(ready.candidate.info()),
+            update_available: true,
+            ready: true,
+        });
+    }
+    let _busy = Busy::take(&state.busy).ok_or_else(busy_error)?;
+    let found = find(app, &state.urls)
+        .await
+        .map_err(|e| update::fail(kind::NETWORK, "无法连接更新服务器，请检查网络连接后重试", e))?;
+    let latest = found.as_ref().map(Candidate::info);
+    *state.pending.lock() = found;
+    Ok(UpdateCheck {
+        current,
+        update_available: latest.is_some(),
+        latest,
+        ready: false,
+    })
+}
+
+/// The manual 「下载更新」 of the version the last check found.
+pub async fn download_now(
+    app: &AppHandle,
+    version: &str,
+    progress: impl FnMut(u64, Option<u64>),
+) -> Result<UpdateDownload, CommandError> {
+    let state = state_of(app)?;
+    if let Some(ready) = state.ready.lock().as_ref() {
+        if ready.candidate.update.version == version {
+            return Ok(UpdateDownload {
+                version: version.to_owned(),
+            });
+        }
+    }
+    let _busy = Busy::take(&state.busy).ok_or_else(busy_error)?;
+    let candidate = state
+        .pending
+        .lock()
+        .clone()
+        .filter(|c| c.update.version == version)
+        .ok_or_else(|| {
+            update::fail(
+                kind::STALE,
+                "请先重新检查更新",
+                format!("{version} is not the version the last check found"),
+            )
+        })?;
+    fetch(app, &state, candidate, progress)
+        .await
+        .map_err(|e| update::fail(kind::DOWNLOAD, "下载或签名校验没有通过，请稍后重试", e))?;
+    Ok(UpdateDownload {
+        version: version.to_owned(),
+    })
+}
+
+/// 「重启并更新」 in 设置. Returns only when the install did not start.
+pub fn install_from_settings(app: &AppHandle) -> Result<(), CommandError> {
+    let state = state_of(app)?;
+    if state.ready.lock().is_none() {
+        return Err(update::fail(
+            kind::NOT_READY,
+            "还没有下载好的更新",
+            "nothing downloaded",
+        ));
+    }
+    install_now(app);
+    Err(update::fail(
+        kind::INSTALL,
+        "安装没有完成，请稍后再试",
+        "install returned",
+    ))
 }
 
 fn show_tray_entry(app: &AppHandle, state: &AutoUpdate, version: &str) {
@@ -192,12 +400,12 @@ pub fn install_now(app: &AppHandle) {
     let Some(ready) = state.ready.lock().take() else {
         return;
     };
-    tracing::info!(event = "autoupdate.install", version = %ready.update.version, "installing update");
+    tracing::info!(event = "autoupdate.install", version = %ready.candidate.update.version, "installing update");
     // On Windows the plugin starts the installer and ends the process right away, without the
     // normal exit path: end the session the way the tray's 「退出全部」 does first.
     crate::tray::end_session(app);
     crate::diagnostics::logging::flush();
-    match ready.update.install(&ready.bytes) {
+    match ready.candidate.update.install(&ready.bytes) {
         Ok(()) => app.restart(),
         Err(e) => {
             tracing::warn!(event = "autoupdate.install_failed", error = %e, "install failed");
@@ -229,9 +437,10 @@ pub fn install_on_exit(app: &AppHandle) {
     let Some(ready) = state.ready.lock().take() else {
         return;
     };
-    // The same verified package, through an updater that does not restart the app afterwards.
-    let restored = updater(app, &state.url, false).and_then(|u| {
-        u.restore_update(ready.update.raw_json.clone())
+    // The same verified package, through an updater for the manifest address that announced it,
+    // that does not restart the app afterwards.
+    let restored = updater(app, &ready.candidate.url, false).and_then(|u| {
+        u.restore_update(ready.candidate.update.raw_json.clone())
             .ok()
             .flatten()
     });
@@ -254,16 +463,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn feed_address_is_fixed_per_channel() {
-        assert_eq!(
-            manifest_url("beta").as_deref(),
-            Some("https://github.com/meruchan0623/quick-text/releases/download/updater-beta/latest.json")
-        );
-        assert!(manifest_url("stable").is_some());
-        assert_eq!(manifest_url("nightly"), None);
-    }
-
-    #[test]
     fn the_embedded_key_is_a_tauri_minisign_public_key() {
         use base64::Engine;
         let decoded = base64::engine::general_purpose::STANDARD
@@ -271,5 +470,27 @@ mod tests {
             .expect("base64");
         let text = String::from_utf8(decoded).expect("utf8");
         assert!(text.starts_with("untrusted comment: minisign public key"));
+    }
+
+    #[test]
+    fn the_embedded_key_is_the_one_the_servers_trust() {
+        // CONTRACT.md §3.4: key id 9F53EFA021ACF8E7 is the quicktext key the TSim servers accept.
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(PUBKEY.trim())
+            .unwrap();
+        assert!(String::from_utf8(decoded)
+            .unwrap()
+            .contains("9F53EFA021ACF8E7"));
+    }
+
+    #[test]
+    fn the_busy_guard_is_exclusive_and_released() {
+        let flag = AtomicBool::new(false);
+        let first = Busy::take(&flag);
+        assert!(first.is_some());
+        assert!(Busy::take(&flag).is_none());
+        drop(first);
+        assert!(Busy::take(&flag).is_some());
     }
 }

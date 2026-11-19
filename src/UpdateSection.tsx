@@ -1,7 +1,8 @@
-// 「更新」 in 设置: check the releases CI publishes, download the installer of this platform and show
-// it in its folder. The state lives in App (`useUpdates`), so a check made at startup marks the
-// 设置 button and a download goes on while another page is shown. Talks to the backend through
-// ./lib/update; nothing is opened from the webview.
+// 「更新」 in 设置: the same check as the background auto-update (both TSim update servers, the newer
+// version wins), then download and verify it, and restart into it. The state lives in App
+// (`useUpdates`), so a check made at startup marks the 设置 button and a download goes on while
+// another page is shown. Talks to the backend through ./lib/update; nothing is opened from the
+// webview.
 import { useEffect, useRef, useState } from 'react';
 import { errorText } from './ipc/errors';
 import type { Unlisten } from './ipc/transport';
@@ -9,15 +10,12 @@ import {
   appVersion,
   checkUpdate,
   downloadUpdate,
-  isPrerelease,
+  installUpdate,
   onUpdateProgress,
-  revealUpdate,
   type UpdateCheck,
-  type UpdateDownload,
   type UpdateProgress,
 } from './lib/update';
 
-export const PRERELEASE_KEY = 'quicktext.update.include-prerelease';
 export const AUTO_CHECK_KEY = 'quicktext.update.auto-check';
 /** The startup check waits this long, so it does not compete with loading the configuration. */
 export const AUTO_CHECK_DELAY_MS = 3000;
@@ -43,28 +41,27 @@ function writeFlag(key: string, value: boolean): void {
 const message = (e: unknown) => errorText(e) ?? '已取消';
 
 export interface DownloadState {
-  tag: string;
+  version: string;
   running: boolean;
   progress: UpdateProgress | null;
-  result: UpdateDownload | null;
+  done: boolean;
   error: string;
 }
 
 export interface UpdateController {
-  /** The version running, once a check has said it. */
+  /** The version running, once known. */
   current: string | null;
   result: UpdateCheck | null;
   checking: boolean;
   error: string;
-  includePrerelease: boolean;
-  setIncludePrerelease: (value: boolean) => void;
   autoCheck: boolean;
   setAutoCheck: (value: boolean) => void;
   check: () => Promise<void>;
   download: DownloadState | null;
   startDownload: () => Promise<void>;
-  reveal: () => Promise<void>;
-  revealError: string;
+  installing: boolean;
+  install: () => Promise<void>;
+  installError: string;
 }
 
 /**
@@ -72,15 +69,13 @@ export interface UpdateController {
  * `autoCheckDelayMs` after mount; null never checks by itself (the mock backend, tests).
  */
 export function useUpdates(autoCheckDelayMs: number | null): UpdateController {
-  // The stored choice, also as a ref: a check started in the same event reads it.
-  const [storedPrerelease, setStoredPrerelease] = useState(() => readFlag(PRERELEASE_KEY));
-  const prerelease = useRef(storedPrerelease);
   const [autoCheck, setAutoCheckState] = useState(() => readFlag(AUTO_CHECK_KEY) ?? true);
   const [result, setResult] = useState<UpdateCheck | null>(null);
   const [checking, setChecking] = useState(false);
   const [error, setError] = useState('');
   const [download, setDownload] = useState<DownloadState | null>(null);
-  const [revealError, setRevealError] = useState('');
+  const [installing, setInstalling] = useState(false);
+  const [installError, setInstallError] = useState('');
   const [version, setVersion] = useState<string | null>(null);
   useEffect(() => {
     let live = true;
@@ -95,8 +90,6 @@ export function useUpdates(autoCheckDelayMs: number | null): UpdateController {
     };
   }, []);
   const current = result?.current ?? version;
-  // Without a choice of its own, a test build looks for test builds too.
-  const includePrerelease = storedPrerelease ?? (current !== null && isPrerelease(current));
   // Checks overlap (the startup one and a click): only the last one's answer is shown.
   const checks = useRef(0);
   const unlisten = useRef<Unlisten | null>(null);
@@ -115,12 +108,7 @@ export function useUpdates(autoCheckDelayMs: number | null): UpdateController {
       setError('');
     }
     try {
-      const stored = prerelease.current;
-      const include = stored ?? (current !== null && isPrerelease(current));
-      let answer = await checkUpdate(include);
-      // The first check tells the version: a test build without a choice looks again with them.
-      if (stored === null && !include && isPrerelease(answer.current))
-        answer = await checkUpdate(true);
+      const answer = await checkUpdate();
       if (request !== checks.current) return;
       setResult(answer);
       setError('');
@@ -146,14 +134,6 @@ export function useUpdates(autoCheckDelayMs: number | null): UpdateController {
     return () => clearTimeout(timer);
   }, [autoDelay]);
 
-  const setIncludePrerelease = (value: boolean) => {
-    writeFlag(PRERELEASE_KEY, value);
-    prerelease.current = value;
-    setStoredPrerelease(value);
-    // What was shown answered the other choice: ask again.
-    if (result !== null || error !== '' || checking) void run(false);
-  };
-
   const setAutoCheck = (value: boolean) => {
     writeFlag(AUTO_CHECK_KEY, value);
     setAutoCheckState(value);
@@ -161,38 +141,41 @@ export function useUpdates(autoCheckDelayMs: number | null): UpdateController {
 
   const startDownload = async () => {
     const latest = result?.latest;
-    if (!latest || download?.running) return;
-    const { tag } = latest;
-    setRevealError('');
-    setDownload({ tag, running: true, progress: null, result: null, error: '' });
+    if (!latest || result.ready || download?.running) return;
+    const { version: target } = latest;
+    setInstallError('');
+    setDownload({ version: target, running: true, progress: null, done: false, error: '' });
     try {
       unlisten.current?.();
       unlisten.current = await onUpdateProgress((p) => {
-        if (p.tag !== tag) return;
-        setDownload((d) => (d?.tag === tag && d.running ? { ...d, progress: p } : d));
+        if (p.version !== target) return;
+        setDownload((d) => (d?.version === target && d.running ? { ...d, progress: p } : d));
       });
     } catch {
       // No progress events: the download still runs, without a bar.
     }
     try {
-      const done = await downloadUpdate(tag);
-      setDownload((d) => (d?.tag === tag ? { ...d, running: false, result: done } : d));
+      await downloadUpdate(target);
+      setDownload((d) => (d?.version === target ? { ...d, running: false, done: true } : d));
     } catch (e) {
-      setDownload((d) => (d?.tag === tag ? { ...d, running: false, error: message(e) } : d));
+      setDownload((d) => (d?.version === target ? { ...d, running: false, error: message(e) } : d));
     } finally {
       unlisten.current?.();
       unlisten.current = null;
     }
   };
 
-  const reveal = async () => {
-    const path = download?.result?.path;
-    if (!path) return;
-    setRevealError('');
+  const install = async () => {
+    if (installing) return;
+    setInstallError('');
+    setInstalling(true);
     try {
-      await revealUpdate(path);
+      // Restarts the app; it returns only when the install did not start.
+      await installUpdate();
     } catch (e) {
-      setRevealError(message(e));
+      setInstallError(message(e));
+    } finally {
+      setInstalling(false);
     }
   };
 
@@ -201,15 +184,14 @@ export function useUpdates(autoCheckDelayMs: number | null): UpdateController {
     result,
     checking,
     error,
-    includePrerelease,
-    setIncludePrerelease,
     autoCheck,
     setAutoCheck,
     check: () => run(false),
     download,
     startDownload,
-    reveal,
-    revealError,
+    installing,
+    install,
+    installError,
   };
 }
 
@@ -259,8 +241,10 @@ function Progress({ progress, size }: { progress: UpdateProgress | null; size: n
 export default function UpdateSection({ updates }: { updates: UpdateController }) {
   const { current, result, checking, error, download } = updates;
   const latest = result?.update_available ? result.latest : null;
-  const date = releaseDate(latest?.published_at ?? null);
-  const fetched = download !== null && latest !== null && download.tag === latest.tag;
+  const date = releaseDate(latest?.pub_date ?? null);
+  const mine = download !== null && latest !== null && download.version === latest.version;
+  const ready = latest !== null && (result?.ready === true || (mine && download.done));
+  const running = mine && download.running;
   return (
     <>
       <h3>更新</h3>
@@ -271,7 +255,7 @@ export default function UpdateSection({ updates }: { updates: UpdateController }
           </span>
           <button
             onClick={() => void updates.check()}
-            disabled={checking || (download?.running ?? false)}
+            disabled={checking || (download?.running ?? false) || updates.installing}
           >
             {checking ? '正在检查…' : '检查更新'}
           </button>
@@ -290,7 +274,9 @@ export default function UpdateSection({ updates }: { updates: UpdateController }
           <div className="update-found" role="status">
             <div className="update-title">
               <strong>发现新版本 {withV(latest.version)}</strong>
-              {latest.prerelease && <span className="capability-tag experimental">测试版</span>}
+              {latest.source === 'test' && (
+                <span className="capability-tag experimental">测试服</span>
+              )}
               {date && <small className="muted">{date}</small>}
             </div>
             {latest.notes.trim() && (
@@ -299,57 +285,45 @@ export default function UpdateSection({ updates }: { updates: UpdateController }
                 <pre>{latest.notes}</pre>
               </details>
             )}
-            {latest.asset === null ? (
-              <p className="update-error">这个版本没有适用于本机的安装包。</p>
-            ) : (
-              <div className="update-download">
-                {!(fetched && download.result) && (
+            <div className="update-download">
+              {ready ? (
+                <>
+                  <span className="update-ok">已下载 · 签名校验通过</span>
                   <button
                     className="primary"
-                    disabled={fetched && download.running}
-                    onClick={() => void updates.startDownload()}
+                    disabled={updates.installing}
+                    onClick={() => void updates.install()}
                   >
-                    {fetched && download.running
-                      ? '正在下载…'
-                      : `下载（${sizeText(latest.asset.size)}）`}
+                    {updates.installing ? '正在安装…' : '重启并更新'}
                   </button>
-                )}
-                {fetched && download.running && (
-                  <Progress progress={download.progress} size={latest.asset.size} />
-                )}
-                {fetched && download.result && (
-                  <>
-                    {download.result.verified ? (
-                      <span className="update-ok">已下载 · 校验通过</span>
-                    ) : (
-                      <span className="update-warning">已下载 · 未能校验</span>
-                    )}
-                    <button onClick={() => void updates.reveal()}>在文件夹中显示</button>
-                  </>
-                )}
-              </div>
+                </>
+              ) : (
+                <button
+                  className="primary"
+                  disabled={running}
+                  onClick={() => void updates.startDownload()}
+                >
+                  {running ? '正在下载…' : '下载更新'}
+                </button>
+              )}
+              {running && <Progress progress={download.progress} size={null} />}
+            </div>
+            {ready && (
+              <small className="muted">不重启的话，下次从托盘「退出全部」时会自动安装。</small>
             )}
-            {fetched && download.error && (
+            {mine && download.error && (
               <p className="update-error" role="alert">
                 下载失败：{download.error}
               </p>
             )}
-            {updates.revealError && (
+            {updates.installError && (
               <p className="update-error" role="alert">
-                {updates.revealError}
+                {updates.installError}
               </p>
             )}
           </div>
         )}
         <div className="inline update-options">
-          <label>
-            <input
-              type="checkbox"
-              checked={updates.includePrerelease}
-              onChange={(e) => updates.setIncludePrerelease(e.target.checked)}
-            />
-            包含测试版
-          </label>
           <label>
             <input
               type="checkbox"

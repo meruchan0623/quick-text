@@ -5,10 +5,10 @@ import {
   checkUpdate,
   compareSemver,
   downloadUpdate,
+  installUpdate,
   isPrerelease,
   onUpdateProgress,
   parseSemver,
-  revealUpdate,
   type UpdateProgress,
 } from './update';
 
@@ -117,67 +117,58 @@ describe('update commands (mock backend)', () => {
     setTransport(null);
   });
 
-  it('checks, downloads with progress and reveals', async () => {
+  it('checks, downloads with progress and installs', async () => {
     const backend = new MockBackend({ platform: 'macos', updateDelayMs: 0 });
     setTransport(createMockTransport(backend));
 
-    const stable = await checkUpdate(false);
-    expect(stable.update_available).toBe(false);
-    expect(stable.latest?.version).toBe(stable.current);
-    const check = await checkUpdate(true);
-    expect(check.update_available).toBe(true);
-    const latest = check.latest;
-    expect(latest?.prerelease).toBe(true);
-    expect(latest?.asset?.name.endsWith('.dmg')).toBe(true);
-    expect(backend.calls.at(-1)).toEqual({
-      command: 'check_update',
-      args: { includePrerelease: true },
+    await expect(installUpdate()).rejects.toMatchObject({
+      code: 'update',
+      detail: { kind: 'not_ready' },
     });
+    const check = await checkUpdate();
+    expect(check.update_available).toBe(true);
+    expect(check.ready).toBe(false);
+    const latest = check.latest;
+    expect(latest?.source).toBe('production');
+    expect(compareSemver(latest?.version ?? '', check.current)).toBe(1);
+    expect(backend.calls.at(-1)).toEqual({ command: 'check_update', args: {} });
 
     const seen: UpdateProgress[] = [];
     const unlisten = await onUpdateProgress((p) => seen.push(p));
-    const result = await downloadUpdate(latest?.tag ?? '');
+    const result = await downloadUpdate(latest?.version ?? '');
     unlisten();
-    expect(result.verified).toBe(true);
-    expect(result.path.endsWith(latest?.asset?.name ?? '?')).toBe(true);
+    expect(result).toEqual({ version: latest?.version });
     expect(seen.length).toBeGreaterThan(1);
-    expect(seen.at(-1)).toEqual({
-      tag: latest?.tag,
-      downloaded: latest?.asset?.size,
-      total: latest?.asset?.size,
-    });
+    expect(seen.at(-1)?.version).toBe(latest?.version);
+    expect(seen.at(-1)?.downloaded).toBe(seen.at(-1)?.total);
 
-    await expect(revealUpdate(result.path)).resolves.toBeUndefined();
-    await expect(revealUpdate('/elsewhere/x.dmg')).rejects.toMatchObject({
-      code: 'update',
-      detail: { kind: 'not_downloaded' },
-    });
+    expect((await checkUpdate()).ready).toBe(true);
+    await expect(installUpdate()).resolves.toBeUndefined();
+    expect(backend.updateInstalls).toBe(1);
   });
 
-  it('refuses a second download while one runs, and an unknown tag', async () => {
+  it('refuses a second download while one runs, and a version the check did not find', async () => {
     const backend = new MockBackend({ platform: 'windows', updateDelayMs: 5 });
     setTransport(createMockTransport(backend));
-    const { latest } = await checkUpdate(true);
-    expect(latest?.asset?.name).toMatch(/-Windows-x64-Portable\.zip$/);
-    const first = downloadUpdate(latest?.tag ?? '');
-    await expect(downloadUpdate(latest?.tag ?? '')).rejects.toMatchObject({
+    const { latest } = await checkUpdate();
+    const first = downloadUpdate(latest?.version ?? '');
+    await expect(downloadUpdate(latest?.version ?? '')).rejects.toMatchObject({
       code: 'update',
       detail: { kind: 'busy' },
     });
-    await expect(first).resolves.toMatchObject({ verified: true });
-    await expect(downloadUpdate('v9.9.9')).rejects.toMatchObject({
+    await expect(first).resolves.toEqual({ version: latest?.version });
+    await expect(downloadUpdate('9.9.9')).rejects.toMatchObject({
       code: 'update',
-      detail: { kind: 'release_not_found' },
+      detail: { kind: 'stale' },
     });
   });
 
-  it('has no package for other platforms', async () => {
+  it('reports up to date, unreachable servers and builds without an update channel', async () => {
+    setTransport(createMockTransport(new MockBackend({ update: 'none' })));
+    expect(await checkUpdate()).toMatchObject({ latest: null, update_available: false });
+    setTransport(createMockTransport(new MockBackend({ update: 'error' })));
+    await expect(checkUpdate()).rejects.toMatchObject({ detail: { kind: 'network' } });
     setTransport(createMockTransport(new MockBackend({ platform: 'linux' })));
-    const { latest } = await checkUpdate(true);
-    expect(latest?.asset).toBeNull();
-    await expect(downloadUpdate(latest?.tag ?? '')).rejects.toMatchObject({
-      code: 'update',
-      detail: { kind: 'no_asset' },
-    });
+    await expect(checkUpdate()).rejects.toMatchObject({ detail: { kind: 'disabled' } });
   });
 });

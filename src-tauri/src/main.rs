@@ -113,7 +113,6 @@ fn main() {
             };
             app.manage(bus);
             app.manage(cloud::CloudSync::new());
-            app.manage(commands::update::UpdateState::default());
             startup::after_load(app.handle());
             #[cfg(target_os = "macos")]
             startup::request_missing_permissions(&app.state::<DataDir>().0);
@@ -205,7 +204,7 @@ fn main() {
             commands::update::app_version,
             commands::update::check_update,
             commands::update::download_update,
-            commands::update::reveal_update,
+            commands::update::install_update,
             #[cfg(feature = "fault-injection")]
             commands::engine::debug_inject_fault
         ])

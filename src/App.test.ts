@@ -932,39 +932,28 @@ describe('更新 (src/UpdateSection.tsx)', () => {
     localStorage.clear();
   });
 
-  it('checks after start and marks 设置 when a newer release was found', async () => {
-    // The mock runs 0.3.1; its only newer release is a test build.
-    localStorage.setItem('quicktext.update.include-prerelease', '1');
+  it('checks after start and marks 设置 when a newer version was found', async () => {
     const mounted = await mount({}, undefined, { updateCheckDelayMs: 0 });
     const { backend, container } = mounted;
     await waitFor(mounted, () => {
       expect(button(container, '设置')?.querySelector('.update-dot')).not.toBeNull();
     });
-    expect(callsOf(backend, 'check_update').map((c) => c.args)).toEqual([
-      { includePrerelease: true },
-    ]);
+    expect(callsOf(backend, 'check_update').map((c) => c.args)).toEqual([{}]);
     expect(button(container, '设置')?.getAttribute('aria-label')).toBe('设置（有新版本）');
     await showSettings(mounted);
-    expect(container.querySelector('.update-title')?.textContent).toContain(
-      '发现新版本 v0.4.0-test.12',
-    );
-    const download = [...container.querySelectorAll('button')].find((b) =>
-      b.textContent.startsWith('下载'),
-    );
-    await mounted.act(() => {
-      download?.click();
-    });
+    expect(container.querySelector('.update-title')?.textContent).toContain('发现新版本 v0.4.0');
+    await click(mounted, '下载更新');
     await waitFor(mounted, () => {
-      expect(container.querySelector('.update-ok')?.textContent).toContain('校验通过');
+      expect(container.querySelector('.update-ok')?.textContent).toContain('签名校验通过');
     });
-    await click(mounted, '在文件夹中显示');
+    await click(mounted, '重启并更新');
     await settle(mounted);
-    expect(callsOf(backend, 'reveal_update')).toHaveLength(1);
+    expect(callsOf(backend, 'install_update')).toHaveLength(1);
     expect(container.querySelector('.update-error')).toBeNull();
   });
 
   it('checks nothing by itself in the tests and the browser preview', async () => {
-    const mounted = await mount();
+    const mounted = await mount({ update: 'none' });
     const { backend, container } = mounted;
     await waitFor(mounted, () => {
       expect(callsOf(backend, 'load_state')).toHaveLength(1);

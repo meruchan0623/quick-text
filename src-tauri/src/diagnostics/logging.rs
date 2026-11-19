@@ -220,8 +220,9 @@
 //! | `autoupdate.enabled` | info | background auto-update is on (src/autoupdate.rs); the channel |
 //! | `autoupdate.disabled` | info/warn | no update channel (local build) or no public key in this build |
 //! | `autoupdate.unavailable` | warn | the updater could not be built; error |
-//! | `autoupdate.up_to_date` | info | the channel has no newer version |
-//! | `autoupdate.check_failed` | warn | the channel manifest could not be read; error |
+//! | `autoupdate.up_to_date` | info | neither update server has a newer version |
+//! | `autoupdate.check_failed` | warn | neither update server could be read; error |
+//! | `autoupdate.source_failed` | warn | one update server could not be read or answered badly; source, error |
 //! | `autoupdate.found` | info | a newer version is being downloaded; version |
 //! | `autoupdate.download_failed` | warn | download or signature check of an update failed; error |
 //! | `autoupdate.ready` | info | an update is downloaded and verified; version |
@@ -229,11 +230,10 @@
 //! | `autoupdate.install` | info | installing an update from the tray, then restarting; version |
 //! | `autoupdate.install_on_exit` | info | installing a downloaded update after 「退出全部」; version |
 //! | `autoupdate.install_failed` | warn | installing an update failed; error |
-//! | `update.checked` | info | `check_update`; current and latest version, `update_available`, `include_prerelease` |
-//! | `update.downloaded` | info | `download_update` finished; asset file name, bytes, `verified`, `elapsed_ms` |
-//! | `update.failed` | warn | an update check or download step failed; the error kind and a technical detail (HTTP status, reqwest error chain without URL, expected and actual SHA-256) |
+//! | `update.checked` | info | `check_update`; current and latest version, the server it came from, `ready` |
+//! | `update.downloaded` | info | `download_update` finished (downloaded and verified); version |
+//! | `update.failed` | warn | an update check, download or install from 设置 failed; the error kind and a technical detail |
 //! | `update.progress_emit_failed` | debug | an `update-download-progress` event was not delivered; error |
-//! | `update.unverified` | warn | the downloaded package has no checksum in its release (no SHA256SUMS file, or not listed in it); asset file name |
 //!
 //! # Privacy
 //!

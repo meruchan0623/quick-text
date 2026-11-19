@@ -1,46 +1,41 @@
-// In-app updates (src-tauri/src/update.rs): the newest GitHub release of meruchan0623/quick-text,
-// downloaded into the Downloads folder and checked against the release's SHA256SUMS file.
-// Release tags are `v<SemVer 2.0.0>` (scripts/version.mjs); a tag with a `-` part is a prerelease.
+// In-app updates (src-tauri/src/commands/update.rs): the same check as the background auto-update,
+// against both TSim update servers (production and test; the newest version wins, production on a
+// tie). A found update is downloaded and verified against the key built into the app, then
+// installed by restarting. Version numbers are SemVer 2.0.0 (scripts/version.mjs).
 import { call, listen, type Unlisten } from '../ipc/transport';
 
 export type { Unlisten };
 
-export interface UpdateAsset {
-  name: string;
-  size: number;
-}
+/** The server that announced an update. */
+export type UpdateSource = 'production' | 'test';
 
-export interface UpdateRelease {
-  /** SemVer, without the tag's `v`. */
+export interface UpdateInfo {
   version: string;
-  tag: string;
-  prerelease: boolean;
-  /** RFC 3339. */
-  published_at: string | null;
-  /** Markdown, as on the release page. */
+  /** Plain text, as published. */
   notes: string;
-  html_url: string;
-  /** This platform's package; null when the release has none for it. */
-  asset: UpdateAsset | null;
+  /** RFC 3339. */
+  pub_date: string | null;
+  source: UpdateSource;
 }
 
 export interface UpdateCheck {
   current: string;
-  latest: UpdateRelease | null;
+  /** The newer version found; null when the running one is the newest. */
+  latest: UpdateInfo | null;
   update_available: boolean;
+  /** `latest` is downloaded and verified: installUpdate restarts into it. */
+  ready: boolean;
 }
 
 export interface UpdateProgress {
-  tag: string;
+  version: string;
   downloaded: number;
   total: number | null;
 }
 
 export interface UpdateDownload {
-  path: string;
-  sha256: string;
-  /** False when the release lists no checksum for the package (the file is kept). */
-  verified: boolean;
+  /** Downloaded and verified. */
+  version: string;
 }
 
 export const UPDATE_PROGRESS_EVENT = 'update-download-progress';
@@ -54,18 +49,18 @@ export function appVersion(): Promise<string> {
  * Rejects with a CommandError; update failures are `{ code: 'update', detail: { kind, message } }`
  * with a Chinese `message` (`errorText` shows it).
  */
-export function checkUpdate(includePrerelease: boolean): Promise<UpdateCheck> {
-  return call<UpdateCheck>('check_update', { includePrerelease });
+export function checkUpdate(): Promise<UpdateCheck> {
+  return call<UpdateCheck>('check_update');
 }
 
-/** One download at a time: a second one rejects with kind `busy`. */
-export function downloadUpdate(tag: string): Promise<UpdateDownload> {
-  return call<UpdateDownload>('download_update', { tag });
+/** Only the version the last check found; one download at a time (kind `busy`). */
+export function downloadUpdate(version: string): Promise<UpdateDownload> {
+  return call<UpdateDownload>('download_update', { version });
 }
 
-/** Only a `path` that downloadUpdate returned in this run. */
-export async function revealUpdate(path: string): Promise<void> {
-  await call<null>('reveal_update', { path });
+/** Installs the downloaded update and restarts the app; resolves only if nothing happened. */
+export async function installUpdate(): Promise<void> {
+  await call<null>('install_update');
 }
 
 export function onUpdateProgress(handler: (p: UpdateProgress) => void): Promise<Unlisten> {

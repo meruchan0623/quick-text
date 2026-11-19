@@ -13,8 +13,8 @@
 // (e.g. `quickerMock.recordExecution({ outcome: 'dropped_busy' })`).
 import { AUTO_SYNC_MINUTES } from '../lib/cloud';
 import { isReadableRule } from '../lib/rules';
-import { UPDATE_PROGRESS_EVENT, compareSemver, isPrerelease, parseSemver } from '../lib/update';
-import type { UpdateCheck, UpdateDownload, UpdateProgress, UpdateRelease } from '../lib/update';
+import { UPDATE_PROGRESS_EVENT } from '../lib/update';
+import type { UpdateCheck, UpdateDownload, UpdateInfo, UpdateProgress } from '../lib/update';
 import { DEFAULT_TERMINATORS } from '../lib/terminators';
 import type { CommandError } from './errors';
 import type { CommandArgs, Transport, Unlisten } from './transport';
@@ -122,9 +122,8 @@ export interface MockOptions {
   /** How long a team phrase sync takes, in ms. Default 0 (settles with the command). */
   cloudDelayMs?: number;
   /**
-   * In-app updates: `available` (a newer prerelease is published; the newest release is the
-   * current version), `none` (only the current version) or `error` (GitHub cannot be reached).
-   * Default `available`.
+   * In-app updates: `available` (a server announces a newer version), `none` (the current
+   * version is the newest) or `error` (neither update server can be reached). Default `available`.
    */
   update?: 'available' | 'none' | 'error';
   /** Delay between two download progress events, in ms. Default 0. */
@@ -134,52 +133,17 @@ export interface MockOptions {
 /** The version the mock backend reports as running (`check_update.current`). */
 export const MOCK_APP_VERSION = '0.3.1';
 
-/** A synthetic release as the backend reads it from GitHub (src-tauri/src/update.rs GhRelease). */
-interface MockRelease {
-  tag: string;
-  prerelease: boolean;
-  published_at: string;
-  notes: string;
-}
+/** The update both servers announce in the mock (src-tauri/src/update.rs UpdateInfo). */
+export const MOCK_UPDATE: UpdateInfo = {
+  version: '0.4.0',
+  notes: '浏览器预览：示例更新说明。\n\n- 新增：从 TSim 更新服务器检查更新',
+  pub_date: '2026-11-19T02:00:00Z',
+  source: 'production',
+};
 
-/** Newest first, as the GitHub API lists them; one non-SemVer tag that is ignored. */
-function mockReleases(update: 'available' | 'none' | 'error'): MockRelease[] {
-  const day = 86_400_000;
-  const current: MockRelease = {
-    tag: `v${MOCK_APP_VERSION}`,
-    prerelease: false,
-    published_at: new Date(Date.now() - 30 * day).toISOString(),
-    notes: '浏览器预览：示例发布说明（当前版本）。',
-  };
-  if (update === 'none') return [current];
-  return [
-    {
-      tag: 'v0.4.0-test.12',
-      prerelease: true,
-      published_at: new Date(Date.now() - 2 * day).toISOString(),
-      notes:
-        '浏览器预览：示例测试版。\n\n- 新增：应用内检查更新\n- 构建自提交 `0000000`（示例）\n\nChecksums: SHA256SUMS-macos.txt, SHA256SUMS-windows.txt.',
-    },
-    {
-      tag: 'test-4-eb4eebb',
-      prerelease: true,
-      published_at: new Date(Date.now() - 10 * day).toISOString(),
-      notes: '',
-    },
-    current,
-  ];
-}
-
-/** This platform's package of a mock release (src-tauri/src/update.rs pick_asset). */
-function mockAsset(
-  platform: 'windows' | 'macos' | 'linux',
-  version: string,
-): UpdateRelease['asset'] {
-  if (platform === 'macos') return { name: `Quicktext_${version}_aarch64.dmg`, size: 18_400_000 };
-  if (platform === 'windows')
-    return { name: `Quicktext-${version}-Windows-x64-Portable.zip`, size: 9_800_000 };
-  return null;
-}
+/** Size of the mock update package of a platform, in bytes. */
+const mockPackageSize = (platform: 'windows' | 'macos' | 'linux') =>
+  platform === 'macos' ? 18_400_000 : 9_800_000;
 
 const updateError = (kind: string, message: string): CommandError => ({
   code: 'update',
@@ -507,8 +471,11 @@ export class MockBackend {
   #cloudSync: Promise<CloudState> | null = null;
   /** An update download is running (one at a time). */
   #updateDownloading = false;
-  /** Paths download_update returned; the only ones reveal_update accepts. */
-  readonly updateDownloads = new Set<string>();
+  /** The version the last check found, and whether it is downloaded. */
+  #updateFound: UpdateInfo | null = null;
+  #updateReady = false;
+  /** install_update calls that would have restarted the app. */
+  updateInstalls = 0;
   #seq = 0;
   #historySeq = 0;
   readonly #handlers = new Map<string, Set<(payload: unknown) => void>>();
@@ -1101,14 +1068,13 @@ export class MockBackend {
     },
     // In-app updates (src-tauri/src/commands/update.rs); camelCase arguments.
     app_version: () => MOCK_APP_VERSION,
-    check_update: (args) => this.#checkUpdate(args.includePrerelease === true),
-    download_update: (args) => this.#downloadUpdate(typeof args.tag === 'string' ? args.tag : ''),
-    reveal_update: (args) => {
-      if (typeof args.path !== 'string' || !this.updateDownloads.has(args.path))
-        this.#fail(
-          updateError('not_downloaded', '只能打开本次运行中下载的更新文件'),
-          'reveal_update',
-        );
+    check_update: () => this.#checkUpdate(),
+    download_update: (args) =>
+      this.#downloadUpdate(typeof args.version === 'string' ? args.version : ''),
+    install_update: () => {
+      if (!this.#updateReady)
+        this.#fail(updateError('not_ready', '还没有下载好的更新'), 'install_update');
+      this.updateInstalls += 1;
       return null;
     },
   };
@@ -1236,56 +1202,36 @@ export class MockBackend {
     return this.#cloudState();
   }
 
-  /** src-tauri/src/update.rs `evaluate` over the synthetic releases. */
-  #checkUpdate(includePrerelease: boolean): UpdateCheck {
-    if (this.options.update === 'error')
+  /** src-tauri/src/autoupdate.rs `check_now`. */
+  #checkUpdate(): UpdateCheck {
+    if (this.options.platform === 'linux')
       this.#fail(
-        updateError('network', '无法连接 GitHub，请检查网络连接（公司网络可能需要代理）后重试'),
+        updateError('disabled', '这个版本没有内置更新渠道（本机构建），不能检查更新'),
         'check_update',
       );
-    const include = includePrerelease;
-    let latest: UpdateRelease | null = null;
-    for (const release of mockReleases(this.options.update)) {
-      const version = release.tag.slice(1);
-      if (!release.tag.startsWith('v') || parseSemver(version) === null) continue;
-      const prerelease = release.prerelease || isPrerelease(version);
-      if (prerelease && !include) continue;
-      if (latest && compareSemver(version, latest.version) <= 0) continue;
-      latest = {
-        version,
-        tag: release.tag,
-        prerelease,
-        published_at: release.published_at,
-        notes: release.notes,
-        html_url: `https://github.com/meruchan0623/quick-text/releases/tag/${release.tag}`,
-        asset: mockAsset(this.options.platform, version),
-      };
-    }
+    if (this.options.update === 'error')
+      this.#fail(
+        updateError('network', '无法连接更新服务器，请检查网络连接后重试'),
+        'check_update',
+      );
+    const latest = this.options.update === 'available' ? MOCK_UPDATE : null;
+    this.#updateFound = latest;
     return {
       current: MOCK_APP_VERSION,
       latest,
-      update_available: latest !== null && compareSemver(latest.version, MOCK_APP_VERSION) > 0,
+      update_available: latest !== null,
+      ready: latest !== null && this.#updateReady,
     };
   }
 
-  /** Simulated progress in five steps, then a verified file in a synthetic Downloads folder. */
-  async #downloadUpdate(tag: string): Promise<UpdateDownload> {
+  /** Simulated progress in five steps, then a verified package kept for install_update. */
+  async #downloadUpdate(version: string): Promise<UpdateDownload> {
+    if (this.#updateReady && this.#updateFound?.version === version) return { version };
     if (this.#updateDownloading)
-      this.#fail(updateError('busy', '正在下载更新，请等这次下载完成'), 'download_update');
-    const release = mockReleases(this.options.update).find(
-      (r) => r.tag === tag && r.tag.startsWith('v'),
-    );
-    if (!release)
-      this.#fail(
-        updateError('release_not_found', 'GitHub 上没有找到这个版本，它可能已被撤下'),
-        'download_update',
-      );
-    const asset = mockAsset(this.options.platform, release.tag.slice(1));
-    if (!asset)
-      this.#fail(
-        updateError('no_asset', '这个版本没有适用于本机系统的安装包，请到发布页查看'),
-        'download_update',
-      );
+      this.#fail(updateError('busy', '正在检查或下载更新，请稍后再试'), 'download_update');
+    if (this.#updateFound?.version !== version)
+      this.#fail(updateError('stale', '请先重新检查更新'), 'download_update');
+    const size = mockPackageSize(this.options.platform);
     this.#updateDownloading = true;
     try {
       const delay = this.options.updateDelayMs;
@@ -1295,20 +1241,16 @@ export class MockBackend {
             ? new Promise((resolve) => setTimeout(resolve, delay))
             : Promise.resolve());
         this.#push(UPDATE_PROGRESS_EVENT, {
-          tag,
-          downloaded: Math.round((asset.size * step) / 5),
-          total: asset.size,
+          version,
+          downloaded: Math.round((size * step) / 5),
+          total: size,
         } satisfies UpdateProgress);
       }
     } finally {
       this.#updateDownloading = false;
     }
-    const path =
-      this.options.platform === 'windows'
-        ? `C:\\Users\\mock\\Downloads\\${asset.name}`
-        : `/Users/mock/Downloads/${asset.name}`;
-    this.updateDownloads.add(path);
-    return { path, sha256: '0'.repeat(64), verified: true };
+    this.#updateReady = true;
+    return { version };
   }
 
   /** Push an event outside the runtime stream (no seq), like cloud-state. */
