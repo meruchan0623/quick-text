@@ -69,7 +69,15 @@ try {
         $buildArgs = @{ Bundle = 'msi'; DependencySourcesZip = $DependencySourcesZip }
         if ($CertificateThumbprint) { $buildArgs.CertificateThumbprint = $CertificateThumbprint }
         else { Write-Warning 'no -CertificateThumbprint: exe and MSI are not code-signed (SmartScreen warns on first install)' }
-        & (Join-Path $PSScriptRoot 'build-windows.ps1') @buildArgs
+        # build-windows.ps1 keeps a QT_UPDATE_CHANNEL that is already set (e.g. a leftover `beta`); a published build
+        # must read the stable feed, or it can never update again.
+        $previousChannel = $env:QT_UPDATE_CHANNEL
+        $env:QT_UPDATE_CHANNEL = 'stable'
+        try {
+            & (Join-Path $PSScriptRoot 'build-windows.ps1') @buildArgs
+        } finally {
+            if ($null -eq $previousChannel) { Remove-Item Env:\QT_UPDATE_CHANNEL -ErrorAction SilentlyContinue } else { $env:QT_UPDATE_CHANNEL = $previousChannel }
+        }
     }
     if (-not (Test-Path -LiteralPath $built -PathType Leaf)) { throw "MSI not found: $built" }
 
