@@ -63,6 +63,8 @@ macOS 分发的 Developer ID、签名和公证凭据未提供；尚未生成已�
 
 在仓库根目录运行 `npm ci`、`npm run tauri dev`。自动检查使用 `npm run build` 和 `cargo test --workspace`；最终通过数量以本轮检查输出为准。这些检查不证明目标程序实际收到输入。本机自用的 exe 用 `npm run tauri -- build --no-bundle`（或先 `npm run build` 再 `cargo build -p quicktext --release`）构建；`target\release\quicktext.exe` 只是中间产物，不能直接分发。要分发的构建（安装包、绿色包）必须同时带第三方声明和依赖源码包：安装包用 `./scripts/build-windows.ps1 -DependencySourcesZip <Source-deps.zip>`，绿色包见下一节；缺少依赖源码包时两者都直接失败。直接运行 `npm run tauri build`（会打安装包）同样被 `scripts/check-bundle-preconditions.ps1` 拒绝。
 
+更新与发布：客户端同时检查 TSim 的生产服和测试服，取较新的版本更新；设置页的「检查更新」走同一套逻辑。正式包由打包机上的 `scripts/publish-tsim.sh`（macOS）和 `scripts/publish-tsim.ps1`（Windows MSI）构建、签名并上传，不再发布到 GitHub Releases。已安装的旧版本仍从 GitHub 检查更新，所以还需要在 GitHub 上最后发布一次带新地址的版本。详见[自动更新与发布](docs/auto-update.md)。
+
 配置在 Tauri 当前用户应用数据目录，以 `active.json` 为当前生效配置，`revisions/` 保存历史版本及对应原始迁移元数据。保存先校验，再一次提交到磁盘和监听引擎；版本冲突或保存失败时继续使用旧配置。没有待应用草稿，也没有独立的“应用设置”操作。导出使用已保存配置；历史恢复会创建新版本并恢复对应原始元数据。升级前通过 GUI 导出本地包并保留旧版程序。旧版未确认的文件仅保全，不自动启用。详见[保存即生效](docs/direct-save.md)。不要直接读取原 Quicker 的加密数据库。
 
 SendKeys B、inputscript、replay 是三个独立格式；导入保留 dialect、行列和不支持报告。高级源码不是主入口。原 Quicker 私有动作、账户、私有云和任意脚本没有直接运行承诺；需明确映射为自有动作。

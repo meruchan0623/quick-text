@@ -111,3 +111,4 @@ GPL-3.0-or-later 第 1 节的「对应源码」包括编进二进制文件的第
 - [ ] 0.4 起：按 `docs/acceptance-0.4-manual.md`（0.4 实机验收清单）逐条填写结果，连同日志、诊断包一起存档；§12 汇总表的退出标准全部打勾后才能发布。
 - [ ] 创建 GitHub Release（草稿）：上传 `package-artifacts.ps1` 输出目录里的全部文件，包括 `Source.zip`、`Source-deps.zip`（体积大，上传需要一些时间）和 `THIRD-PARTY-LICENSES.txt`，一个都不能少；说明开头写许可证与源码获取（文件名、`Source.zip` 与 `Source-deps.zip` 的 SHA256、两者合起来才是完整对应源码、版本库位置），之后写更新内容和已知限制；说明平台定位（macOS 未验收）。
 - [ ] 对照第 2 节核对完毕后再点发布。
+- [ ] 推送更新：用 `scripts/publish-tsim.ps1` / `scripts/publish-tsim.sh` 上传到 TSim 更新服务器（[自动更新与发布](auto-update.md)），先传 `test` 并装机验证，再传 `prod`。
