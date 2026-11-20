@@ -49,9 +49,18 @@ fn tray_icon(app: &tauri::App) -> tauri::image::Image<'_> {
             return icon;
         }
     }
-    app.default_window_icon()
-        .cloned()
-        .unwrap_or_else(|| tauri::include_image!("icons/32x32.png"))
+    // macOS menu bar: a white monochrome glyph (transparent background).
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app;
+        tauri::include_image!("icons/tray-white.png")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        app.default_window_icon()
+            .cloned()
+            .unwrap_or_else(|| tauri::include_image!("icons/32x32.png"))
+    }
 }
 
 /// The pause/resume entry's label for the current state: listening offers
@@ -121,6 +130,8 @@ pub(crate) fn end_session(app: &AppHandle) {
 
 /// Shows and focuses the management window (restored if minimized).
 pub fn show_main(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.unminimize();
         let _ = w.show();

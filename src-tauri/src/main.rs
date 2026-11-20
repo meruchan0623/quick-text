@@ -149,6 +149,12 @@ fn main() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = w.hide();
+                // macOS: Cmd+W / the close button leaves only the menu-bar
+                // tray; drop the Dock icon until the window is shown again.
+                #[cfg(target_os = "macos")]
+                let _ = w
+                    .app_handle()
+                    .set_activation_policy(tauri::ActivationPolicy::Accessory);
             }
         })
         .invoke_handler(tauri::generate_handler![
