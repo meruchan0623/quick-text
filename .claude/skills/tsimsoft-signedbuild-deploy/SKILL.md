@@ -82,6 +82,8 @@ node <skill>/scripts/signed-build.mjs verify  [--server ...] [--version X.Y.Z]
 | 上传 422 `签名公钥 ... 不在受信列表中` | 服务端没配置该 key id，见上文 |
 | 上传 409 `version_not_newer` | 服务器已有该版本或更高版本 |
 | 网络中断导致上传失败 | `publish --skip-build --server <失败那台>` 重传 |
+| `incorrect updater private key password` | 私钥有密码：在 env 文件里用 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 从密码文件读取（本机 `~/.tauri/quicktext-update.password`），构建已完成时用 `--skip-build` 重试 |
+| 构建前 Rust 测试偶发 `DirectoryNotEmpty` | Windows 临时目录被占用，单独重跑该测试确认通过后重新 publish |
 | Windows 依赖源码包生成失败 | 检查网络与 cargo/npm；也可先手动生成后用 `--deps` 指定 |
 
 Linux 不出包；Intel Mac 包不在本流程内。
