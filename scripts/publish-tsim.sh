@@ -17,10 +17,13 @@
 # Like the former CI build, the bundle skips build.beforeBundleCommand (the Windows-only gate for
 # the third-party notices and dependency sources, which do not exist for macOS yet).
 #
-# Usage: scripts/publish-tsim.sh --server prod|test|both [--publish] [--skip-build]
+# Usage: scripts/publish-tsim.sh [--server test|prod|both] [--publish] [--skip-build] [--dry-run]
 #                                [--notes TEXT | --notes-file FILE]
+#   --server   default test (the customer-service test server); both = test first, then prod
+#   --dry-run  build, sign and verify only; nothing is uploaded and no publish key is needed
 #
-# Environment (never committed, never printed):
+# Environment (never committed, never printed). Loaded first from ${QT_RELEASE_ENV:-~/.quicktext-release.env}
+# when that file exists:
 #   TSIM_PUBLISH_KEY_PROD / TSIM_PUBLISH_KEY_TEST   publish keys of the servers uploaded to
 #   TAURI_SIGNING_PRIVATE_KEY (content) or TAURI_SIGNING_PRIVATE_KEY_PATH (file; default
 #     ~/.config/quicktext-signing/updater.key when it exists), TAURI_SIGNING_PRIVATE_KEY_PASSWORD
@@ -37,15 +40,16 @@ TARGET="aarch64-apple-darwin"
 
 die() { echo "error: $*" >&2; exit 1; }
 
-server="" publish=0 skip_build=0 notes="" notes_file=""
+server="test" publish=0 skip_build=0 dry_run=0 notes="" notes_file=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --server) server="${2:-}"; shift 2 ;;
     --publish) publish=1; shift ;;
     --skip-build) skip_build=1; shift ;;
+    --dry-run) dry_run=1; shift ;;
     --notes) notes="${2:-}"; shift 2 ;;
     --notes-file) notes_file="${2:-}"; shift 2 ;;
-    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,36p' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -53,9 +57,13 @@ done
 case "$server" in
   prod) servers=(prod) ;;
   test) servers=(test) ;;
-  both) servers=(prod test) ;;
-  *) die "--server prod|test|both is required" ;;
+  both) servers=(test prod) ;;
+  *) die "--server must be test, prod or both" ;;
 esac
+release_env="${QT_RELEASE_ENV:-$HOME/.quicktext-release.env}"
+if [[ -f "$release_env" ]]; then
+  set -a; . "$release_env"; set +a
+fi
 [[ "$(uname -s)" == Darwin ]] || die "macOS only (Windows: scripts/publish-tsim.ps1)"
 
 # 1. Version and notes: everything checked before the long build.
@@ -69,7 +77,7 @@ fi
 notes_len="$(printf '%s' "$notes" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log([...s.trim()].length))')"
 (( notes_len >= 1 && notes_len <= 4000 )) || die "update notes must be 1-4000 characters (got $notes_len)"
 
-for s in "${servers[@]}"; do
+[[ $dry_run -eq 1 ]] || for s in "${servers[@]}"; do
   var="TSIM_PUBLISH_KEY_$(echo "$s" | tr '[:lower:]' '[:upper:]')"
   [[ -n "${!var:-}" ]] || die "$var is not set"
 done
@@ -123,6 +131,7 @@ npx tauri signer sign --app-version "$version" "$bundle" >/dev/null
 node scripts/update-manifest.mjs --version "$version" --pubkey src-tauri/update-keys/current.pub \
   --base-url https://example.invalid/check --out "$stage/check.json" "darwin-aarch64=$bundle" >/dev/null
 echo "packaged and verified: $dmg, $bundle"
+if [[ $dry_run -eq 1 ]]; then echo "dry run: nothing uploaded"; exit 0; fi
 
 # 5. Upload. The key goes to curl on stdin, not on its command line.
 failed=0

@@ -13,18 +13,22 @@
 #   4. multipart upload to POST <server>/client-updates/v1/publish (draft, or published with -Publish)
 #
 # Usage:
-#   pwsh -NoProfile -File scripts/publish-tsim.ps1 -Server prod|test|both `
-#        -DependencySourcesZip <dir>\Quicktext-<version>-Source-deps.zip [-Publish] [-SkipBuild] `
+#   pwsh -NoProfile -File scripts/publish-tsim.ps1 [-Server test|prod|both] `
+#        -DependencySourcesZip <dir>\Quicktext-<version>-Source-deps.zip [-Publish] [-SkipBuild] [-DryRun] `
 #        [-Notes <text> | -NotesFile <file>] [-CertificateThumbprint <thumbprint>]
+#   -Server   default test (the customer-service test server); both = test first, then prod
+#   -DryRun   build, sign and verify only; nothing is uploaded and no publish key is needed
 #
-# Environment (never committed, never printed):
+# Environment (never committed, never printed). Dot-sourced first from $env:QT_RELEASE_ENV, default
+# %USERPROFILE%\.quicktext-release.env.ps1, when that file exists ($env:NAME = '...' lines):
 #   TSIM_PUBLISH_KEY_PROD / TSIM_PUBLISH_KEY_TEST   publish keys of the servers uploaded to
 #   TAURI_SIGNING_PRIVATE_KEY (content) or TAURI_SIGNING_PRIVATE_KEY_PATH (file; default
 #     %USERPROFILE%\.config\quicktext-signing\updater.key when it exists), TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 # Distribute the Source.zip / Source-deps.zip of this version alongside (docs/release-checklist.md).
 param(
-    [Parameter(Mandatory = $true)][ValidateSet('prod', 'test', 'both')][string]$Server,
+    [ValidateSet('prod', 'test', 'both')][string]$Server = 'test',
     [switch]$Publish,
+    [switch]$DryRun,
     [switch]$SkipBuild,
     [string]$Notes = '',
     [string]$NotesFile = '',
@@ -35,7 +39,10 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $product = 'quicktext'
 $bases = @{ prod = 'https://csapi.tsim.tech'; test = 'https://test-csapi.tsim.tech' }
-$servers = if ($Server -eq 'both') { @('prod', 'test') } else { @($Server) }
+$servers = if ($Server -eq 'both') { @('test', 'prod') } else { @($Server) }
+$releaseEnv = if ($env:QT_RELEASE_ENV) { $env:QT_RELEASE_ENV } else { Join-Path $HOME '.quicktext-release.env.ps1' }
+if (Test-Path -LiteralPath $releaseEnv -PathType Leaf) { . $releaseEnv }
+if (-not $CertificateThumbprint -and $env:QT_WIN_CERT_THUMBPRINT) { $CertificateThumbprint = $env:QT_WIN_CERT_THUMBPRINT }
 
 Push-Location $projectRoot
 try {
@@ -51,9 +58,9 @@ try {
     $Notes = $Notes.Trim()
     $length = [Globalization.StringInfo]::new($Notes).LengthInTextElements
     if ($length -lt 1 -or $length -gt 4000) { throw "update notes must be 1-4000 characters (got $length)" }
-    foreach ($s in $servers) {
+    if (-not $DryRun) { foreach ($s in $servers) {
         if (-not [Environment]::GetEnvironmentVariable("TSIM_PUBLISH_KEY_$($s.ToUpper())")) { throw "TSIM_PUBLISH_KEY_$($s.ToUpper()) is not set" }
-    }
+    } }
     if (-not $env:TAURI_SIGNING_PRIVATE_KEY -and -not $env:TAURI_SIGNING_PRIVATE_KEY_PATH) {
         $defaultKey = Join-Path $HOME '.config\quicktext-signing\updater.key'
         if (-not (Test-Path -LiteralPath $defaultKey -PathType Leaf)) {
@@ -95,6 +102,7 @@ try {
     Remove-Item -LiteralPath (Join-Path $out 'check.json')
     $signature = (Get-Content -LiteralPath "$msi.sig" -Raw).Trim()
     Write-Host "packaged and verified: $msi"
+    if ($DryRun) { Write-Host 'dry run: nothing uploaded'; return }
 
     # 4. Upload.
     $failed = @()
