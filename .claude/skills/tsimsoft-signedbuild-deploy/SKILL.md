@@ -1,6 +1,6 @@
 ---
 name: tsimsoft-signedbuild-deploy
-description: 在 macOS（Apple Silicon）或 Windows（x64）上把 Quicktext（quicker-text）做 Tauri/Rust 签名打包，发布到 TSim 客服系统更新源（默认测试服 test-csapi.tsim.tech，生产服 csapi.tsim.tech），并读回核对下载链接。用于“打包签名版”“发版到测试服/生产服”“上传 Quicktext 更新包”“发 Mac / Windows 包”“TSim 软件发布”“给我下载链接”。
+description: 在 macOS（Apple Silicon）或 Windows（x64）上把 Quicktext（quicker-text）做 Tauri/Rust 签名打包，发布到 TSim 客服系统更新源（默认测试服 test-csapi.tsim.tech，生产服 csapi.tsim.tech），上架到客服系统下载页（测试服 https://test-agent.tsim.tech/downloads，生产服 https://csagent.tsim.tech/downloads），并读回核对下载链接。用于“打包签名版”“发版到测试服/生产服”“上传 Quicktext 更新包”“发 Mac / Windows 包”“TSim 软件发布”“给我下载链接”“传到下载页 / test-agent.tsim.tech/downloads”。
 ---
 
 # TSim Quicktext 签名打包与发布
@@ -10,6 +10,17 @@ description: 在 macOS（Apple Silicon）或 Windows（x64）上把 Quicktext（
 真正的构建、签名、更新签名、验签、上传逻辑在平台脚本里，**两份平台脚本要同步修改，本 skill 不复制它们的步骤**。
 更新源与 VBookingIM（Ctrip-vbk-refact 的 tsimvbk-signedbuild-deploy）相同：`POST <server>/client-updates/v1/publish`，
 产品名 `quicktext`。背景见仓库 `docs/auto-update.md`。
+
+## 下载页上架
+
+“传到 https://test-agent.tsim.tech/downloads” 就是 `publish --server test`（生产服下载页 https://csagent.tsim.tech/downloads
+对应 `--server prod`）。下载页没有单独的上传入口：它读 `GET <server>/client-updates/v1/quicktext/downloads`，
+**只展示已发布（published）的版本**，所以：
+
+- 默认的 `publish`（直接发布）完成后就会出现在下载页；`--draft` 不会，要到管理页「客户端发布」点发布。
+- Windows 下载的是 MSI（既是安装包也是更新包）；Mac 下载的是 dmg，`.app.tar.gz` 只给自动更新用。
+- 上架成功以 `verify` 为准：下载页数据里的版本等于本次版本，且匿名下载的 sha256 与登记一致；最后把下载页地址和文件直链交给用户。
+- 同一服务器同平台只保留最新已发布版本，旧版本会被撤下，下载页随之切换。
 
 ## 命令
 
